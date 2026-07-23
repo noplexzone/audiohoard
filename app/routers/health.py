@@ -1,115 +1,71 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import Settings
+from app.auth import require_admin_read
 from app.database import get_db
+from app.models.auth import AppUser
 from app.schemas.health import HealthResponse, SourceStatus
-from app.settings_service import effective_settings_dep
-from app.sources.base import SourceAdapter
-from app.sources.prowlarr import ProwlarrAdapter
-from app.sources.sabnzbd import SabnzbdAdapter
-from app.sources.slskd import SlskdAdapter
-from app.sources.tidal import TidalAdapter
-from app.sources.youtube import YouTubeAdapter
+from app.services.health_status import get_health_status_service
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def _build_adapters(settings: Settings) -> dict[str, SourceAdapter]:
-    return {
-        "slskd": SlskdAdapter(settings.slskd_url, settings.slskd_api_key),
-        "prowlarr": ProwlarrAdapter(settings.prowlarr_url, settings.prowlarr_api_key),
-        "sabnzbd": SabnzbdAdapter(settings.sabnzbd_url, settings.sabnzbd_api_key),
-        "youtube": YouTubeAdapter(settings.ytdlp_cookies_file),
-        "tidal": TidalAdapter(
-            settings.tidal_config_path,
-            settings.tidal_session_path,
-            settings.tidal_quality,
-        ),
-    }
-
-
 async def _check_db(db: AsyncSession) -> bool:
     try:
-        await db.execute(text("CREATE TEMP TABLE IF NOT EXISTS health_write_check (id INTEGER)"))
-        await db.execute(text("INSERT INTO health_write_check (id) VALUES (1)"))
+        await db.execute(text("SELECT 1"))
         return True
-    except Exception as exc:
-        logger.warning("DB write check failed: %s", exc)
+    except Exception:
+        logger.warning("database readiness check failed", exc_info=True)
         return False
+
+
+def _readiness_response(db_ready: bool) -> HealthResponse:
+    return HealthResponse(
+        status="ok" if db_ready else "down",
+        sources={},
+        db_writable=db_ready,
+    )
+
+
+@router.get("/health/live", response_model=dict[str, str])
+async def liveness() -> dict[str, str]:
+    """Process liveness only; never performs network or database probes."""
+    return {"status": "ok"}
+
+
+@router.get("/health/ready", response_model=HealthResponse)
+async def readiness(
+    response: Response,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> HealthResponse:
+    """Cheap readiness check. A failed database check returns HTTP 503."""
+    db_ready = await _check_db(db)
+    if not db_ready:
+        response.status_code = 503
+    return _readiness_response(db_ready)
 
 
 @router.get("/health", response_model=HealthResponse)
 async def health(
-    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    response: Response,
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> HealthResponse:
-    adapters = _build_adapters(settings)
-
-    checks = await asyncio.gather(
-        *[adapter.health() for adapter in adapters.values()],
-        return_exceptions=True,
-    )
-
-    sources: dict[str, SourceStatus] = {}
-    for name, result in zip(adapters.keys(), checks, strict=True):
-        if isinstance(result, BaseException):
-            sources[name] = SourceStatus(
-                available=False,
-                reason="Source health check failed",
-                details={"code": "health_check_failed"},
-            )
-        else:
-            sources[name] = SourceStatus(
-                available=result.available, reason=result.reason, details=result.extra
-            )
-
-    db_writable = await _check_db(db)
-
-    all_available = all(s.available for s in sources.values())
-    none_available = not any(s.available for s in sources.values())
-
-    if not db_writable or none_available:
-        status = "down"
-    elif all_available and db_writable:
-        status = "ok"
-    else:
-        status = "degraded"
-
-    return HealthResponse(status=status, sources=sources, db_writable=db_writable)
+    """Backward-compatible readiness endpoint without live provider probes."""
+    return await readiness(response, db)
 
 
 @router.get("/health/sources", response_model=dict[str, SourceStatus])
 async def health_sources(
-    settings: Annotated[Settings, Depends(effective_settings_dep)],
-    db: Annotated[AsyncSession, Depends(get_db)],
+    request: Request,
+    _admin: Annotated[AppUser, Depends(require_admin_read)],
 ) -> dict[str, SourceStatus]:
-    adapters = _build_adapters(settings)
-
-    checks = await asyncio.gather(
-        *[adapter.health() for adapter in adapters.values()],
-        return_exceptions=True,
-    )
-
-    sources: dict[str, SourceStatus] = {}
-    for name, result in zip(adapters.keys(), checks, strict=True):
-        if isinstance(result, BaseException):
-            sources[name] = SourceStatus(
-                available=False,
-                reason="Source health check failed",
-                details={"code": "health_check_failed"},
-            )
-        else:
-            sources[name] = SourceStatus(
-                available=result.available, reason=result.reason, details=result.extra
-            )
-
-    return sources
+    """Authenticated cached provider diagnostics; refresh runs in the background."""
+    service = getattr(request.app.state, "health_status_service", get_health_status_service())
+    return {name: cached.status for name, cached in service.snapshot().items()}

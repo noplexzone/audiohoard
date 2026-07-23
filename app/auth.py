@@ -130,6 +130,7 @@ async def get_current_user(
         expires = expires.replace(tzinfo=UTC)
     if expires <= datetime.now(UTC):
         await db.delete(session)
+        await db.commit()
         raise HTTPException(status_code=401, detail="Session expired")
     request.state.auth_session = session
     return user

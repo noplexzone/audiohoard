@@ -19,6 +19,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Removed arbitrary positional catalog-track assignment and album-level MBID promotion to resolved track identity.
 - Successful complete album imports now update catalog ownership; incomplete and rolled-back imports remain Wanted.
 - Monitoring refresh failures are isolated per artist and no longer terminate the scheduler.
+- Public liveness/readiness checks no longer probe or expose provider diagnostics, and failed readiness returns HTTP 503.
+- Expired browser sessions are deleted and HTML requests redirect to login while API clients retain JSON 401 responses.
 
 ## [0.6.0] - 2026-07-22
 

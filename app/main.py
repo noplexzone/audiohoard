@@ -9,8 +9,10 @@ from contextlib import asynccontextmanager
 from importlib.resources import files
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -75,6 +77,19 @@ def create_app() -> FastAPI:
     app.state.templates.env.filters["display_name"] = display_name
     app.state.templates.env.globals["display_name"] = display_name
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    @app.exception_handler(HTTPException)
+    async def browser_auth_exception_handler(request: Request, exc: HTTPException) -> Response:
+        accepts_html = "text/html" in request.headers.get("accept", "").casefold()
+        if exc.status_code == 401 and request.method == "GET" and accepts_html:
+            target = request.url.path
+            if request.url.query:
+                target = f"{target}?{request.url.query}"
+            response = RedirectResponse(f"/login?next={quote(target, safe='')}", status_code=303)
+            response.delete_cookie("session")
+            response.delete_cookie("csrf")
+            return response
+        return await http_exception_handler(request, exc)
 
     @app.middleware("http")
     async def html_timing_middleware(
