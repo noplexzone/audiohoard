@@ -15,6 +15,7 @@ from sqlalchemy.orm import selectinload
 from app.config import Settings, get_settings
 from app.database import get_session_factory
 from app.fingerprint.acoustid import fingerprint_file, lookup_acoustid
+from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS
 from app.metadata.deezer import DeezerClient
 from app.metadata.filename_parse import parse_filename
 from app.metadata.musicbrainz import MusicBrainzClient
@@ -46,11 +47,6 @@ def _now() -> datetime:
     return datetime.now(tz=UTC)
 
 
-_AUDIO_EXTENSIONS: frozenset[str] = frozenset(
-    {"flac", "mp3", "aac", "m4a", "ogg", "opus", "wav", "alac", "aiff", "wv", "webm"}
-)
-
-
 def _resolve_staged_path(raw_path: Path, staging_root: Path) -> Path:
     """Return resolved path, verify it is under staging_root. Raises ProviderError on traversal."""
     resolved = raw_path.resolve()
@@ -68,7 +64,7 @@ def _find_audio_files_sync(directory: Path) -> list[Path]:
     return sorted(
         p
         for p in directory.rglob("*")
-        if p.is_file() and p.suffix.lower().lstrip(".") in _AUDIO_EXTENSIONS
+        if p.is_file() and p.suffix.lower().lstrip(".") in IMPORTABLE_AUDIO_EXTENSIONS
     )
 
 

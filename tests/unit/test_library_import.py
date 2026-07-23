@@ -6,6 +6,8 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS, is_importable_audio
+from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.import_plan import CollisionState, ImportPlan, TagVerificationState
 from app.models.job import Job, JobStatus
 from app.models.release import Release
@@ -229,24 +231,21 @@ async def test_execute_import_writes_and_verifies_flac_tags(
     assert readback["musicbrainz_albumid"] == "release-mbid"
 
 
-async def test_execute_import_does_not_verify_unsupported_formats(
+async def test_plan_rejects_unsupported_formats_before_execution(
     db_session: AsyncSession, tmp_path: Path
 ) -> None:
     release, _tracks = await _release_with_staged_tracks(
         db_session, tmp_path, count=1, suffix=".wav"
     )
     library = tmp_path / "library"
+
     plans = await plan_release_import(db_session, release, library_root=library)
 
-    with pytest.raises(ImportExecutionError, match="tag readback failed"):
-        await execute_release_import(
-            db_session, release, library_root=library, tag_writer=MutagenTagWriter()
-        )
-
-    destination = Path(plans[0].destination_path)
-    assert not destination.exists()  # noqa: ASYNC240
-    assert plans[0].tag_verification_state == TagVerificationState.failed
-    assert release.import_state == ImportWorkflowState.rolled_back
+    assert plans[0].status == ImportWorkflowState.needs_review
+    assert plans[0].collision_state == CollisionState.needs_review
+    assert "unsupported audio format '.wav'" in (plans[0].error_detail or "")
+    with pytest.raises(ImportExecutionError, match="not ready"):
+        await execute_release_import(db_session, release, library_root=library)
 
 
 async def test_execute_import_rechecks_destination_race_and_rolls_back(
@@ -466,3 +465,80 @@ async def test_rollback_restores_backup_when_first_destination_unlink_fails(
     assert failed_once
     assert destination.read_bytes() == old_bytes  # noqa: ASYNC240
     assert staged_source.exists()  # noqa: ASYNC240
+
+
+def test_audio_format_contract_excludes_unverifiable_formats() -> None:
+    assert {"flac", "mp3", "m4a", "mp4", "ogg", "oga", "opus"} == set(IMPORTABLE_AUDIO_EXTENSIONS)
+    for extension in IMPORTABLE_AUDIO_EXTENSIONS:
+        assert is_importable_audio(f"track.{extension}")
+    for extension in {"aac", "wav", "webm", "aiff", "wv"}:
+        assert not is_importable_audio(f"track.{extension}")
+
+
+async def _link_catalog_album(
+    db: AsyncSession,
+    release: Release,
+    tracks: list[Track],
+    *,
+    expected_count: int,
+) -> CatalogAlbum:
+    artist = CatalogArtist(name="Artist")
+    album = CatalogAlbum(title="Album", monitored=True, in_library=False)
+    artist.albums.append(album)
+    expected = [
+        CatalogAlbumTrack(position=index, disc=1, title=f"Song {index}")
+        for index in range(1, expected_count + 1)
+    ]
+    album.tracks.extend(expected)
+    db.add(artist)
+    await db.flush()
+    for track, catalog_track in zip(tracks, expected, strict=False):
+        track.catalog_album_id = album.id
+        track.catalog_track_id = catalog_track.id
+    await db.flush()
+    return album
+
+
+async def test_complete_import_marks_catalog_album_in_library(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    release, tracks = await _release_with_staged_tracks(db_session, tmp_path, count=2)
+    album = await _link_catalog_album(db_session, release, tracks, expected_count=2)
+    library = tmp_path / "library"
+    await plan_release_import(db_session, release, library_root=library)
+
+    await execute_release_import(db_session, release, library_root=library)
+
+    assert album.in_library is True
+
+
+async def test_incomplete_import_keeps_catalog_album_wanted(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    release, tracks = await _release_with_staged_tracks(db_session, tmp_path, count=1)
+    album = await _link_catalog_album(db_session, release, tracks, expected_count=2)
+    library = tmp_path / "library"
+    await plan_release_import(db_session, release, library_root=library)
+
+    await execute_release_import(db_session, release, library_root=library)
+
+    assert album.in_library is False
+
+
+async def test_failed_import_does_not_change_catalog_ownership(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    release, tracks = await _release_with_staged_tracks(db_session, tmp_path, count=2)
+    album = await _link_catalog_album(db_session, release, tracks, expected_count=2)
+    library = tmp_path / "library"
+    await plan_release_import(db_session, release, library_root=library)
+
+    with pytest.raises(ImportExecutionError, match="tag readback failed"):
+        await execute_release_import(
+            db_session,
+            release,
+            library_root=library,
+            tag_writer=FailingSecondTagWriter(),
+        )
+
+    assert album.in_library is False

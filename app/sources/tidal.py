@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 import mutagen
 
+from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS
 from app.schemas.search import SearchRequest, SearchResult
 from app.sources.base import CapabilityState
 from app.sources.youtube import AcquiredMedia, ProviderError, _open_pinned_directory
@@ -25,7 +26,7 @@ from app.sources.youtube import AcquiredMedia, ProviderError, _open_pinned_direc
 _DEFAULT_TIMEOUT_SEC = 300.0
 _PROCESS_STOP_GRACE_SEC = 2.0
 _MAX_OUTPUT_BYTES = 64 * 1024
-_SUPPORTED_AUDIO_EXTENSIONS = frozenset({"aac", "flac", "m4a", "mp3", "ogg", "opus", "wav"})
+_SUPPORTED_AUDIO_EXTENSIONS = IMPORTABLE_AUDIO_EXTENSIONS
 _QUALITIES = frozenset({"Normal", "High", "HiFi", "Master"})
 
 

@@ -4,6 +4,22 @@ All notable changes to Audiohoard are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- Added restart-safe in-process job dispatch with startup recovery, retry, cancellation, and monitored-album scheduling.
+- Added terminal-state polling and artifact verification for slskd and SABnzbd acquisitions.
+
+### Changed
+- Prowlarr album search results are handled as alternative release candidates instead of individual tracks.
+- Audio discovery and import now share one verified format contract for FLAC, MP3, M4A/MP4, Ogg Vorbis, and Opus.
+
+### Fixed
+- Prevented external acquisitions from completing before a usable staged artifact exists.
+- Removed arbitrary positional catalog-track assignment and album-level MBID promotion to resolved track identity.
+- Successful complete album imports now update catalog ownership; incomplete and rolled-back imports remain Wanted.
+- Monitoring refresh failures are isolated per artist and no longer terminate the scheduler.
+
 ## [0.6.0] - 2026-07-22
 
 ### Added
