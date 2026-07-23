@@ -101,14 +101,23 @@ async def test_cancellation_persists_job_and_track_state(
 
 
 async def test_prowlarr_result_is_enqueued_to_sabnzbd(
-    db_session: AsyncSession, test_settings: Settings, monkeypatch: object
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: object, tmp_path: object
 ) -> None:
+    from pathlib import Path
+
     from pytest import MonkeyPatch
 
     mp = monkeypatch
     assert isinstance(mp, MonkeyPatch)
+    assert isinstance(tmp_path, Path)
     job = await _create_job(db_session, source="prowlarr")
-    test_settings = test_settings.model_copy(update={"prowlarr_url": "https://prowlarr.test"})
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    audio_file = staging / "track.flac"
+    audio_file.write_bytes(b"audio")
+    test_settings = test_settings.model_copy(
+        update={"prowlarr_url": "https://prowlarr.test", "staging_root": staging}
+    )
     calls: list[str] = []
 
     async def fake_fetch_results(job: Job, cfg: Settings) -> Sequence[SearchResult]:
@@ -135,9 +144,15 @@ async def test_prowlarr_result_is_enqueued_to_sabnzbd(
             calls.append(f"enqueue:{nzb_url}:{name}")
             return "SAB123"
 
-        async def status(self, nzo_id: str) -> CapabilityState:
-            calls.append(f"status:{nzo_id}")
-            return CapabilityState(available=True, reason="Downloading")
+    async def fake_poll_sab_job(
+        nzo_id: str,
+        adapter: object,
+        staging_root: Path,
+        poll_interval: float,
+        poll_timeout: float,
+    ) -> Path:
+        calls.append(f"poll:{nzo_id}")
+        return audio_file
 
     mp.setattr(runner, "_fetch_results", fake_fetch_results)
     mp.setattr(runner, "_enrich_musicbrainz", noop)
@@ -145,17 +160,16 @@ async def test_prowlarr_result_is_enqueued_to_sabnzbd(
     mp.setattr(runner, "_run_fingerprint", noop)
     mp.setattr(runner, "_compute_path_preview", noop_preview)
     mp.setattr(runner, "SabnzbdAdapter", FakeSabnzbdAdapter)
+    mp.setattr(runner, "_poll_sab_job", fake_poll_sab_job)
 
     await runner.run_job(job.id, db_session, test_settings)
 
     track = (await db_session.execute(select(Track))).scalar_one()
     assert job.status == JobStatus.done
     assert track.source_job_id == "SAB123"
-    assert track.source_status == "Downloading"
-    assert calls[-2:] == [
-        "enqueue:https://prowlarr.test/download/file.nzb:Artist - Album",
-        "status:SAB123",
-    ]
+    assert track.source_status == "downloaded"
+    assert "enqueue:https://prowlarr.test/download/file.nzb:Artist - Album" in calls
+    assert "poll:SAB123" in calls
 
 
 async def test_path_preview_naming_error_marks_job_failed(

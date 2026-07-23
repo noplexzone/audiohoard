@@ -83,5 +83,23 @@ class SabnzbdAdapter:
     async def job_status(self, nzo_id: str) -> CapabilityState:
         return await self.status(nzo_id)
 
+    async def history_status(self, nzo_id: str) -> CapabilityState:
+        """Check the completed/failed SABnzbd job history for nzo_id."""
+        async with self._client() as client:
+            resp = await request_with_retry(
+                client,
+                "GET",
+                "/api",
+                params=self._params(mode="history", search=nzo_id),
+            )
+            resp.raise_for_status()
+            data = cast(dict[str, Any], resp.json())
+            history = data.get("history", {})
+            slots = history.get("slots", []) if isinstance(history, dict) else []
+            for slot in slots:
+                if slot.get("nzo_id") == nzo_id:
+                    return CapabilityState(available=True, reason=slot.get("status"), extra=slot)
+        return CapabilityState(available=False, reason="not found in history")
+
     async def search(self, query: SearchRequest) -> list[SearchResult]:
         return []

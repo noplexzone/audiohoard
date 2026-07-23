@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     # slskd
     slskd_url: str = ""
     slskd_api_key: str = ""
+    slskd_poll_interval: float = Field(default=5.0, ge=0.1)
+    slskd_poll_timeout: float = Field(default=1800.0, ge=10.0)
 
     # Prowlarr
     prowlarr_url: str = ""
@@ -45,6 +47,8 @@ class Settings(BaseSettings):
     # SABnzbd
     sabnzbd_url: str = ""
     sabnzbd_api_key: str = ""
+    sabnzbd_poll_interval: float = Field(default=10.0, ge=0.1)
+    sabnzbd_poll_timeout: float = Field(default=3600.0, ge=10.0)
 
     # yt-dlp
     ytdlp_cookies_file: str = ""

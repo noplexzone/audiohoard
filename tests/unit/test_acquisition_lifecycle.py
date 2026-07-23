@@ -1,0 +1,623 @@
+"""Unit tests for external-client download completion lifecycle (Task 2).
+
+Tests cover slskd and SABnzbd polling: success, failure, timeout, missing
+artifact, traversal rejection, and cancellation propagation.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from app.config import Settings
+from app.jobs import runner
+from app.sources.base import CapabilityState
+from app.sources.youtube import ProviderError  # noqa: F401 (used by type-check below)
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def staging_root(tmp_path: Path) -> Path:
+    root = tmp_path / "staging"
+    root.mkdir()
+    return root
+
+
+@pytest.fixture
+def fast_settings(test_settings: Settings, staging_root: Path) -> Settings:
+    return test_settings.model_copy(
+        update={
+            "staging_root": staging_root,
+            "slskd_poll_interval": 0.01,
+            "slskd_poll_timeout": 0.2,
+            "sabnzbd_poll_interval": 0.01,
+            "sabnzbd_poll_timeout": 0.2,
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fake adapters
+# ---------------------------------------------------------------------------
+
+
+class _FakeSlskdAdapter:
+    def __init__(self, states: list[CapabilityState]) -> None:
+        self._iter = iter(states)
+        self.cancel_calls: list[tuple[str, str]] = []
+
+    async def status(self, transfer_id: str) -> CapabilityState:  # noqa: ARG002
+        return next(self._iter)
+
+    async def cancel(self, username: str, filename: str) -> None:
+        self.cancel_calls.append((username, filename))
+
+
+class _FakeSabAdapter:
+    def __init__(
+        self,
+        queue_states: list[CapabilityState],
+        history_states: list[CapabilityState],
+    ) -> None:
+        self._queue = iter(queue_states)
+        self._history = iter(history_states)
+
+    async def status(self, nzo_id: str) -> CapabilityState:  # noqa: ARG002
+        return next(self._queue)
+
+    async def history_status(self, nzo_id: str) -> CapabilityState:  # noqa: ARG002
+        return next(self._history)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_staged_path — traversal
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_staged_path_accepts_valid_path(staging_root: Path) -> None:
+    target = staging_root / "song.flac"
+    target.write_bytes(b"audio")
+    result = runner._resolve_staged_path(target, staging_root)
+    assert result == target.resolve()
+
+
+def test_resolve_staged_path_rejects_traversal(staging_root: Path, tmp_path: Path) -> None:
+    outside = tmp_path / "secret.txt"
+    outside.write_text("bad")
+    with pytest.raises(ProviderError) as exc_info:
+        runner._resolve_staged_path(outside, staging_root)
+    assert exc_info.value.code == "path_traversal"
+
+
+def test_resolve_staged_path_rejects_dotdot_path(staging_root: Path) -> None:
+    # Construct a path that would escape via ..
+    escaped = staging_root / ".." / "escaped.txt"
+    with pytest.raises(ProviderError) as exc_info:
+        runner._resolve_staged_path(escaped, staging_root)
+    assert exc_info.value.code == "path_traversal"
+
+
+# ---------------------------------------------------------------------------
+# _poll_slskd_transfer — success
+# ---------------------------------------------------------------------------
+
+
+async def test_slskd_success_waits_for_completed_state(staging_root: Path) -> None:
+    filename = "music\\Artist\\Album\\01 Song.flac"
+    staged = staging_root / "01 Song.flac"
+    staged.write_bytes(b"flacdata")
+
+    adapter = _FakeSlskdAdapter(
+        [CapabilityState(True, "InProgress"), CapabilityState(True, "Completed")]
+    )
+
+    result = await runner._poll_slskd_transfer(
+        transfer_id="t1",
+        username="peer",
+        filename=filename,
+        adapter=adapter,
+        staging_root=staging_root,
+        poll_interval=0.01,
+        poll_timeout=5.0,
+    )
+    assert result == staged.resolve()
+
+
+async def test_slskd_success_finds_nested_completed_file(staging_root: Path) -> None:
+    nested = staging_root / "peer" / "Artist" / "Album"
+    nested.mkdir(parents=True)
+    staged = nested / "01 Song.flac"
+    staged.write_bytes(b"flacdata")
+    adapter = _FakeSlskdAdapter([CapabilityState(True, "Completed")])
+
+    result = await runner._poll_slskd_transfer(
+        transfer_id="t1",
+        username="peer",
+        filename="Artist\\Album\\01 Song.flac",
+        adapter=adapter,
+        staging_root=staging_root,
+        poll_interval=0.01,
+        poll_timeout=5.0,
+    )
+
+    assert result == staged.resolve()
+
+
+async def test_slskd_rejects_ambiguous_completed_file(staging_root: Path) -> None:
+    for peer in ("peer-a", "peer-b"):
+        directory = staging_root / peer
+        directory.mkdir()
+        (directory / "song.flac").write_bytes(b"audio")
+    adapter = _FakeSlskdAdapter([CapabilityState(True, "Completed")])
+
+    with pytest.raises(ProviderError) as exc_info:
+        await runner._poll_slskd_transfer(
+            transfer_id="t1",
+            username="peer",
+            filename="song.flac",
+            adapter=adapter,
+            staging_root=staging_root,
+            poll_interval=0.01,
+            poll_timeout=5.0,
+        )
+
+    assert exc_info.value.code == "artifact_ambiguous"
+
+
+# ---------------------------------------------------------------------------
+# _poll_slskd_transfer — failure
+# ---------------------------------------------------------------------------
+
+
+async def test_slskd_failure_raises_provider_error(staging_root: Path) -> None:
+    adapter = _FakeSlskdAdapter([CapabilityState(True, "Failed")])
+
+    with pytest.raises(ProviderError) as exc_info:
+        await runner._poll_slskd_transfer(
+            transfer_id="t1",
+            username="peer",
+            filename="song.flac",
+            adapter=adapter,
+            staging_root=staging_root,
+            poll_interval=0.01,
+            poll_timeout=5.0,
+        )
+    assert exc_info.value.code == "transfer_failed"
+    assert exc_info.value.retryable is True
+
+
+async def test_slskd_not_found_raises_provider_error(staging_root: Path) -> None:
+    adapter = _FakeSlskdAdapter([CapabilityState(False, "transfer not found")])
+
+    with pytest.raises(ProviderError) as exc_info:
+        await runner._poll_slskd_transfer(
+            transfer_id="t1",
+            username="peer",
+            filename="song.flac",
+            adapter=adapter,
+            staging_root=staging_root,
+            poll_interval=0.01,
+            poll_timeout=5.0,
+        )
+    assert exc_info.value.code == "transfer_failed"
+
+
+# ---------------------------------------------------------------------------
+# _poll_slskd_transfer — timeout
+# ---------------------------------------------------------------------------
+
+
+async def test_slskd_timeout_raises_provider_error(staging_root: Path) -> None:
+    class NeverDoneAdapter:
+        call_count = 0
+
+        async def status(self, transfer_id: str) -> CapabilityState:  # noqa: ARG002
+            NeverDoneAdapter.call_count += 1
+            return CapabilityState(True, "InProgress")
+
+        async def cancel(self, username: str, filename: str) -> None:  # noqa: ARG002
+            pass
+
+    t0 = time.monotonic()
+    with pytest.raises(ProviderError) as exc_info:
+        await runner._poll_slskd_transfer(
+            transfer_id="t1",
+            username="peer",
+            filename="song.flac",
+            adapter=NeverDoneAdapter(),
+            staging_root=staging_root,
+            poll_interval=0.01,
+            poll_timeout=0.1,
+        )
+    elapsed = time.monotonic() - t0
+    assert exc_info.value.code == "transfer_timeout"
+    assert exc_info.value.retryable is True
+    assert elapsed < 2.0
+    assert NeverDoneAdapter.call_count > 0
+
+
+# ---------------------------------------------------------------------------
+# _poll_slskd_transfer — missing artifact
+# ---------------------------------------------------------------------------
+
+
+async def test_slskd_missing_artifact_raises_provider_error(staging_root: Path) -> None:
+    adapter = _FakeSlskdAdapter([CapabilityState(True, "Completed")])
+
+    with pytest.raises(ProviderError) as exc_info:
+        await runner._poll_slskd_transfer(
+            transfer_id="t1",
+            username="peer",
+            filename="missing_song.flac",
+            adapter=adapter,
+            staging_root=staging_root,
+            poll_interval=0.01,
+            poll_timeout=5.0,
+        )
+    assert exc_info.value.code == "artifact_missing"
+
+
+# ---------------------------------------------------------------------------
+# _poll_slskd_transfer — cancellation
+# ---------------------------------------------------------------------------
+
+
+async def test_slskd_cancellation_calls_adapter_cancel(staging_root: Path) -> None:
+    cancel_calls: list[tuple[str, str]] = []
+
+    class CancelRaisingAdapter:
+        async def status(self, transfer_id: str) -> CapabilityState:  # noqa: ARG002
+            raise asyncio.CancelledError
+
+        async def cancel(self, username: str, filename: str) -> None:
+            cancel_calls.append((username, filename))
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._poll_slskd_transfer(
+            transfer_id="t1",
+            username="peer",
+            filename="song.flac",
+            adapter=CancelRaisingAdapter(),
+            staging_root=staging_root,
+            poll_interval=0.01,
+            poll_timeout=5.0,
+        )
+    assert cancel_calls == [("peer", "song.flac")]
+
+
+# ---------------------------------------------------------------------------
+# _poll_sab_job — success
+# ---------------------------------------------------------------------------
+
+
+async def test_sab_success_finds_file_in_history(staging_root: Path) -> None:
+    download_dir = staging_root / "Artist - Album"
+    download_dir.mkdir()
+    audio_file = download_dir / "01 Track.flac"
+    audio_file.write_bytes(b"flacdata")
+
+    adapter = _FakeSabAdapter(
+        queue_states=[
+            CapabilityState(True, "Downloading"),
+            CapabilityState(False, "not found"),
+        ],
+        history_states=[
+            CapabilityState(
+                True,
+                "Completed",
+                extra={"nzo_id": "SAB1", "storage": str(download_dir)},
+            )
+        ],
+    )
+
+    result = await runner._poll_sab_job(
+        nzo_id="SAB1",
+        adapter=adapter,
+        staging_root=staging_root,
+        poll_interval=0.01,
+        poll_timeout=5.0,
+    )
+    assert result == audio_file.resolve()
+
+
+# ---------------------------------------------------------------------------
+# _poll_sab_job — failure
+# ---------------------------------------------------------------------------
+
+
+async def test_sab_history_failure_raises_provider_error(staging_root: Path) -> None:
+    adapter = _FakeSabAdapter(
+        queue_states=[CapabilityState(False, "not found")],
+        history_states=[CapabilityState(True, "Failed", extra={"nzo_id": "SAB1", "storage": ""})],
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        await runner._poll_sab_job(
+            nzo_id="SAB1",
+            adapter=adapter,
+            staging_root=staging_root,
+            poll_interval=0.01,
+            poll_timeout=5.0,
+        )
+    assert exc_info.value.code == "transfer_failed"
+    assert exc_info.value.retryable is True
+
+
+async def test_sab_queue_failure_raises_provider_error(staging_root: Path) -> None:
+    adapter = _FakeSabAdapter(
+        queue_states=[CapabilityState(True, "Failed")],
+        history_states=[],
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        await runner._poll_sab_job(
+            nzo_id="SAB1",
+            adapter=adapter,
+            staging_root=staging_root,
+            poll_interval=0.01,
+            poll_timeout=5.0,
+        )
+    assert exc_info.value.code == "transfer_failed"
+
+
+# ---------------------------------------------------------------------------
+# _poll_sab_job — timeout
+# ---------------------------------------------------------------------------
+
+
+async def test_sab_timeout_raises_provider_error(staging_root: Path) -> None:
+    class StuckAdapter:
+        call_count = 0
+
+        async def status(self, nzo_id: str) -> CapabilityState:  # noqa: ARG002
+            StuckAdapter.call_count += 1
+            return CapabilityState(True, "Downloading")
+
+        async def history_status(self, nzo_id: str) -> CapabilityState:  # noqa: ARG002
+            return CapabilityState(False, "not found in history")
+
+    t0 = time.monotonic()
+    with pytest.raises(ProviderError) as exc_info:
+        await runner._poll_sab_job(
+            nzo_id="SAB1",
+            adapter=StuckAdapter(),
+            staging_root=staging_root,
+            poll_interval=0.01,
+            poll_timeout=0.1,
+        )
+    elapsed = time.monotonic() - t0
+    assert exc_info.value.code == "transfer_timeout"
+    assert exc_info.value.retryable is True
+    assert elapsed < 2.0
+    assert StuckAdapter.call_count > 0
+
+
+# ---------------------------------------------------------------------------
+# _poll_sab_job — missing artifact
+# ---------------------------------------------------------------------------
+
+
+async def test_sab_missing_artifact_raises_provider_error(staging_root: Path) -> None:
+    empty_dir = staging_root / "empty"
+    empty_dir.mkdir()
+
+    adapter = _FakeSabAdapter(
+        queue_states=[CapabilityState(False, "not found")],
+        history_states=[
+            CapabilityState(
+                True,
+                "Completed",
+                extra={"nzo_id": "SAB1", "storage": str(empty_dir)},
+            )
+        ],
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        await runner._poll_sab_job(
+            nzo_id="SAB1",
+            adapter=adapter,
+            staging_root=staging_root,
+            poll_interval=0.01,
+            poll_timeout=5.0,
+        )
+    assert exc_info.value.code == "artifact_missing"
+
+
+# ---------------------------------------------------------------------------
+# _poll_sab_job — traversal from SABnzbd history storage path
+# ---------------------------------------------------------------------------
+
+
+async def test_sab_traversal_in_storage_path_raises_provider_error(
+    staging_root: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "track.flac").write_bytes(b"audio")
+
+    adapter = _FakeSabAdapter(
+        queue_states=[CapabilityState(False, "not found")],
+        history_states=[
+            CapabilityState(
+                True,
+                "Completed",
+                extra={"nzo_id": "SAB1", "storage": str(outside)},
+            )
+        ],
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        await runner._poll_sab_job(
+            nzo_id="SAB1",
+            adapter=adapter,
+            staging_root=staging_root,
+            poll_interval=0.01,
+            poll_timeout=5.0,
+        )
+    assert exc_info.value.code == "path_traversal"
+
+
+# ---------------------------------------------------------------------------
+# _poll_sab_job — lost job (disappeared from queue and history)
+# ---------------------------------------------------------------------------
+
+
+async def test_sab_lost_job_raises_provider_error(staging_root: Path) -> None:
+    adapter = _FakeSabAdapter(
+        queue_states=[CapabilityState(False, "not found")],
+        history_states=[CapabilityState(False, "not found in history")],
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        await runner._poll_sab_job(
+            nzo_id="SAB1",
+            adapter=adapter,
+            staging_root=staging_root,
+            poll_interval=0.01,
+            poll_timeout=5.0,
+        )
+    assert exc_info.value.code == "transfer_lost"
+
+
+# ---------------------------------------------------------------------------
+# Integration: _prepare_acquisition wires polling for slskd
+# ---------------------------------------------------------------------------
+
+
+async def test_prepare_acquisition_slskd_polls_and_populates_track(
+    fast_settings: Settings,
+) -> None:
+    staging = fast_settings.staging_root
+    audio_file = staging / "song.flac"
+    audio_file.write_bytes(b"flacdata")
+
+    from app.models.track import Track
+    from app.models.workflow import AcquisitionState
+    from app.schemas.search import SearchResult
+
+    track = Track(
+        job_id=1,
+        source="slskd",
+        acquisition_state=AcquisitionState.queued,
+    )
+
+    polled: list[str] = []
+
+    async def fake_poll(
+        transfer_id: str,
+        username: str,
+        filename: str,
+        adapter: Any,
+        staging_root: Path,
+        poll_interval: float,
+        poll_timeout: float,
+    ) -> Path:
+        polled.append(transfer_id)
+        return audio_file
+
+    import unittest.mock
+
+    enqueue_mock = unittest.mock.AsyncMock(return_value="tid-42")
+
+    class FakeSlskd:
+        def __init__(self, url: str, key: str) -> None:
+            pass
+
+        async def enqueue(self, username: str, filename: str, size: int | None = None) -> str:
+            return await enqueue_mock(username, filename, size)
+
+    original_poll = runner._poll_slskd_transfer
+    original_adapter = runner.SlskdAdapter
+    runner._poll_slskd_transfer = fake_poll  # type: ignore[assignment]
+    runner.SlskdAdapter = FakeSlskd  # type: ignore[assignment]
+    try:
+        result = SearchResult(
+            source="slskd",
+            title="Song",
+            url="slskd://peer/music/song.flac",
+            metadata={"username": "peer", "filename": "music/song.flac"},
+        )
+        job_id, status = await runner._prepare_acquisition(result, "slskd", fast_settings, track)
+    finally:
+        runner._poll_slskd_transfer = original_poll  # type: ignore[assignment]
+        runner.SlskdAdapter = original_adapter  # type: ignore[assignment]
+
+    assert polled == ["tid-42"]
+    assert status == "downloaded"
+    assert track.acquisition_state == AcquisitionState.downloaded
+    assert track.source_path == str(audio_file)
+    assert track.staging_path == str(audio_file)
+
+
+# ---------------------------------------------------------------------------
+# Integration: _prepare_acquisition wires polling for SABnzbd
+# ---------------------------------------------------------------------------
+
+
+async def test_prepare_acquisition_prowlarr_polls_and_populates_track(
+    fast_settings: Settings,
+) -> None:
+    fast_settings = fast_settings.model_copy(update={"prowlarr_url": "https://prowlarr.test"})
+    staging = fast_settings.staging_root
+    audio_file = staging / "track.flac"
+    audio_file.write_bytes(b"flacdata")
+
+    from app.models.track import Track
+    from app.models.workflow import AcquisitionState
+    from app.schemas.search import SearchResult
+
+    track = Track(
+        job_id=1,
+        source="prowlarr",
+        acquisition_state=AcquisitionState.queued,
+    )
+
+    polled: list[str] = []
+
+    async def fake_poll(
+        nzo_id: str,
+        adapter: Any,
+        staging_root: Path,
+        poll_interval: float,
+        poll_timeout: float,
+    ) -> Path:
+        polled.append(nzo_id)
+        return audio_file
+
+    class FakeSab:
+        def __init__(self, url: str, key: str) -> None:
+            pass
+
+        async def enqueue(self, nzb_url: str, name: str | None = None) -> str:
+            return "SAB99"
+
+    original_poll = runner._poll_sab_job
+    original_sab = runner.SabnzbdAdapter
+    runner._poll_sab_job = fake_poll  # type: ignore[assignment]
+    runner.SabnzbdAdapter = FakeSab  # type: ignore[assignment]
+    try:
+        result = SearchResult(
+            source="prowlarr",
+            title="Artist - Album",
+            url="https://prowlarr.test/download/file.nzb",
+            format="nzb",
+        )
+        job_id, status = await runner._prepare_acquisition(
+            result, "prowlarr", fast_settings, track
+        )
+    finally:
+        runner._poll_sab_job = original_poll  # type: ignore[assignment]
+        runner.SabnzbdAdapter = original_sab  # type: ignore[assignment]
+
+    assert polled == ["SAB99"]
+    assert status == "downloaded"
+    assert track.acquisition_state == AcquisitionState.downloaded
+    assert track.source_path == str(audio_file)
+    assert track.staging_path == str(audio_file)
