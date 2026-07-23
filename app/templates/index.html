@@ -35,7 +35,7 @@
     <section class="panel" aria-labelledby="jobs-heading">
       <div class="section-heading"><div><p class="eyebrow">Pipeline</p><h2 id="jobs-heading">Jobs</h2></div><a href="/jobs/ui/list">View all</a></div>
       <div class="status-strip" aria-label="Job state counts">
-        {% for status in ['running', 'pending', 'done', 'failed', 'cancelled'] %}
+        {% for status in ['running', 'pending', 'partial', 'done', 'failed', 'cancelled'] %}
         <div><span class="status-dot {{ status }}"></span><strong data-job-status="{{ status }}">{{ dashboard.job_counts[status] }}</strong><small>{{ status | title }}</small></div>
         {% endfor %}
       </div>

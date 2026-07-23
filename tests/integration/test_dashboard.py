@@ -17,6 +17,7 @@ async def dashboard_client(client: AsyncClient) -> AsyncClient:
             Job(source="slskd", query="completed album", status=JobStatus.done),
             Job(source="youtube", query="active single", status=JobStatus.running),
             Job(source="prowlarr", query="failed release", status=JobStatus.failed),
+            Job(source="priority", query="partial album", status=JobStatus.partial),
             Job(source="slskd", query="cancelled request", status=JobStatus.cancelled),
         ]
         session.add_all(jobs)
@@ -73,11 +74,12 @@ async def test_dashboard_shows_real_aggregates_and_activity(
     assert 'data-job-status="done">1<' in body
     assert 'data-job-status="running">1<' in body
     assert 'data-job-status="failed">1<' in body
+    assert 'data-job-status="partial">1<' in body
     assert 'data-job-status="cancelled">1<' in body
     assert "Real Track One" in body
     assert "Real Track Two" in body
-    assert "completed album" in body
-    assert "active single" in body
+    assert "partial album" in body
+    assert "cancelled request" in body
 
 
 async def test_dashboard_empty_state_is_truthful(client: AsyncClient) -> None:
@@ -100,6 +102,11 @@ async def test_shared_shell_has_accessible_active_navigation(client: AsyncClient
     assert 'href="/library"' in body
     assert 'aria-current="page"' in body
     assert 'aria-label="Mobile navigation"' in body
+    assert "<span>Artists</span>" in body
+    assert "<span>Imports</span>" in body
+    assert 'action="/logout"' in body
+    assert "Sign out" in body
+    assert "v0.6.0" in body
     assert "fonts.googleapis.com" not in body
     assert "fonts.gstatic.com" not in body
 

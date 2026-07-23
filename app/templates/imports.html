@@ -19,8 +19,16 @@
         <td>{{ release.album_artist or "Unknown Artist" }}</td>
         <td><span class="badge {{ state_class }}">{{ state | replace('_', ' ') }}</span></td>
         <td class="action-cell">
-          <form method="post" action="/imports/ui/releases/{{ release.id }}/plan"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Plan</button></form>
-          <form method="post" action="/imports/ui/releases/{{ release.id }}/execute"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn" type="submit">Import</button></form>
+          {% set release_plans = plans | selectattr('release_id', 'equalto', release.id) | list %}
+          {% set gate = namespace(ready=(release_plans | length > 0)) %}
+          {% for plan in release_plans %}{% if plan.status.value != 'ready' %}{% set gate.ready = false %}{% endif %}{% endfor %}
+          <form method="post" action="/imports/ui/releases/{{ release.id }}/plan"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">{{ 'Re-plan' if release_plans else 'Plan' }}</button></form>
+          {% if gate.ready %}
+          <form method="post" action="/imports/ui/releases/{{ release.id }}/execute"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn" type="submit">Import reviewed plan</button></form>
+          {% else %}
+          <button class="btn" type="button" disabled title="Generate and review a ready plan before importing">Import</button>
+          <span class="hint">Plan and review first</span>
+          {% endif %}
         </td>
       </tr>
     {% endfor %}

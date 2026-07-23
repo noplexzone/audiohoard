@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - Added restart-safe in-process job dispatch with startup recovery, retry, cancellation, and monitored-album scheduling.
 - Added terminal-state polling and artifact verification for slskd and SABnzbd acquisitions.
+- Added download queue details, live refresh, actionable errors, and browser retry/cancel controls.
+- Added visible account logout controls and direct Artists/Imports navigation on mobile.
 
 ### Changed
 - Prowlarr album search results are handled as alternative release candidates instead of individual tracks.
@@ -21,6 +23,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Monitoring refresh failures are isolated per artist and no longer terminate the scheduler.
 - Public liveness/readiness checks no longer probe or expose provider diagnostics, and failed readiness returns HTTP 503.
 - Expired browser sessions are deleted and HTML requests redirect to login while API clients retain JSON 401 responses.
+- Import execution now requires a persisted, reviewed ready plan instead of silently planning and importing in one action.
+- Dashboard status counts include partial jobs and remain responsive with all six terminal/active states.
+- Runtime version labels, README examples, Compose image tags, and health checks now match v0.6.0.
 
 ## [0.6.0] - 2026-07-22
 

@@ -59,6 +59,13 @@ async def test_import_review_form_actions_use_post_redirect_get(
         await session.commit()
         release_id = release.id
 
+    unplanned_review = await client.get("/imports/ui/review")
+    assert "Plan and review first" in unplanned_review.text
+    assert f'action="/imports/ui/releases/{release_id}/execute"' not in unplanned_review.text
+    unplanned_execute = await client.post(f"/imports/releases/{release_id}/execute")
+    assert unplanned_execute.status_code == 409
+    assert unplanned_execute.json()["detail"] == "release has no reviewed import plan"
+
     csrf_header = client.headers.pop("X-CSRF-Token")
     for action in ("plan", "execute"):
         rejected = await client.post(

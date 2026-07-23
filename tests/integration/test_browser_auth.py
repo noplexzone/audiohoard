@@ -55,3 +55,14 @@ async def test_api_auth_failure_remains_json_401(
 
     assert response.status_code == 401
     assert response.json()["detail"] == "Authentication required"
+
+
+async def test_browser_logout_clears_session_and_redirects(client: AsyncClient) -> None:
+    response = await client.post("/logout", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+    assert "session=" in response.headers.get("set-cookie", "")
+    factory = get_session_factory()
+    async with factory() as db:
+        assert await db.scalar(select(func.count(AuthSession.id))) == 0

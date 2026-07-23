@@ -77,8 +77,22 @@ async def downloads_page(
     templates = _get_templates(request)
     result = await db.execute(select(Job).order_by(Job.created_at.desc()).limit(100))
     downloads = list(result.scalars().all())
+    notices = {
+        "cancelled": ("Cancellation requested.", "info"),
+        "retried": ("Retry scheduled.", "info"),
+        "invalid_state": ("That job can no longer be changed.", "error"),
+        "not_found": ("Job not found.", "error"),
+    }
+    notice, notice_type = notices.get(request.query_params.get("notice", ""), (None, "info"))
     return templates.TemplateResponse(
-        request, "downloads.html", {"downloads": downloads, "jobs": downloads}
+        request,
+        "downloads.html",
+        {
+            "downloads": downloads,
+            "jobs": downloads,
+            "notice": notice,
+            "notice_type": notice_type,
+        },
     )
 
 
@@ -159,3 +173,34 @@ async def retry_job(
     except JobStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"status": "retry_scheduled"}
+
+
+async def _job_action_redirect(action: str, job_id: int) -> RedirectResponse:
+    try:
+        if action == "cancel":
+            await job_dispatcher.cancel_job(job_id)
+            notice = "cancelled"
+        else:
+            await job_dispatcher.retry(job_id)
+            notice = "retried"
+    except JobNotFoundError:
+        notice = "not_found"
+    except JobStateError:
+        notice = "invalid_state"
+    return RedirectResponse(f"/downloads?notice={notice}", status_code=303)
+
+
+@router.post("/downloads/{job_id}/cancel", include_in_schema=False)
+async def cancel_job_ui(
+    job_id: int,
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    return await _job_action_redirect("cancel", job_id)
+
+
+@router.post("/downloads/{job_id}/retry", include_in_schema=False)
+async def retry_job_ui(
+    job_id: int,
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    return await _job_action_redirect("retry", job_id)

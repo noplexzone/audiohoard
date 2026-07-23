@@ -1,6 +1,6 @@
 # Audiohoard
 
-**Private, self-hosted music acquisition and library management — v0.5.0**
+**Private, self-hosted music acquisition and library management — v0.6.0**
 
 A FastAPI application that coordinates multiple acquisition sources, enriches tracks with metadata, fingerprints audio, and enforces strict library naming conventions. Designed to run entirely on-premises; no data leaves the host.
 
@@ -52,9 +52,9 @@ Extension tokens are sanitized with the same filesystem safety rules as other na
 
 ## Stack
 
-- **Backend** — Python 3.12, FastAPI, SQLAlchemy 2.x (async), SQLite
+- **Backend** — Python 3.12+, FastAPI, SQLAlchemy 2.x (async), SQLite
 - **Templates** — Jinja2 (server-side HTML for admin UI)
-- **Task Queue** — persistent job and acquisition/import workflow records in SQLite (no external broker in v0.5.0)
+- **Task Queue** — restart-recoverable in-process dispatcher backed by persistent SQLite job and acquisition/import workflow records; no external broker
 - **Containerisation** — Docker + Docker Compose
 
 ## Requirements
@@ -85,10 +85,10 @@ HTTP. Set `AUTH_COOKIE_SECURE=true` whenever Audiohoard is served behind HTTPS.
 
 ## Container image
 
-The release workflow publishes tagged builds to `noplexzone/audiohoard` on Docker Hub after the quality gate passes. Pull v0.5.0 with:
+The release workflow publishes tagged builds to `noplexzone/audiohoard` on Docker Hub after the quality gate passes. Pull v0.6.0 with:
 
 ```bash
-docker pull noplexzone/audiohoard:0.5.0
+docker pull noplexzone/audiohoard:0.6.0
 ```
 
 ## Continuous integration
@@ -97,4 +97,4 @@ Pull requests and pushes to `main` run pytest, Ruff lint and formatting checks, 
 
 ## Version
 
-v0.5.0 — Audiohoard rename, branding assets, display name helpers, and v0.5 packaging
+v0.6.0 — monitored artist catalogs, Wanted acquisition, server-rendered management UI, and durable acquisition/import workflows

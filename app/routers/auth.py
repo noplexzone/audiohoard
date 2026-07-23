@@ -199,6 +199,21 @@ async def login(
     return {"username": user.username, "role": user.role.value, "csrf_token": session.csrf_token}
 
 
+@router.post("/logout", include_in_schema=False)
+async def logout_ui(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[AppUser, Depends(require_mutation)],
+) -> RedirectResponse:
+    del user
+    session: AuthSession = request.state.auth_session
+    await db.delete(session)
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie("session")
+    response.delete_cookie("csrf")
+    return response
+
+
 @router.post("/api/auth/logout", status_code=204)
 async def logout(
     request: Request,

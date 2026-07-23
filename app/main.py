@@ -6,6 +6,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from importlib.metadata import version as package_version
 from importlib.resources import files
 from pathlib import Path
 from typing import Annotated
@@ -57,6 +58,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    app_version = package_version("audiohoard")
 
     logging.basicConfig(
         level=getattr(logging, settings.log_level),
@@ -65,7 +67,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="Audiohoard",
-        version="0.6.0",
+        version=app_version,
         description="Self-hosted music acquisition and library management",
         docs_url="/api/docs",
         redoc_url="/api/redoc",
@@ -76,6 +78,7 @@ def create_app() -> FastAPI:
     app.state.templates.env.filters["from_json"] = lambda value: json.loads(value or "[]")
     app.state.templates.env.filters["display_name"] = display_name
     app.state.templates.env.globals["display_name"] = display_name
+    app.state.templates.env.globals["app_version"] = app_version
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
     @app.exception_handler(HTTPException)

@@ -533,7 +533,7 @@ async def execute_release_import(
     )
     plans = list(plans_result.scalars().all())
     if not plans:
-        plans = await plan_release_import(db, release, library_root=library_root)
+        raise ImportExecutionError("release has no reviewed import plan")
     if any(plan.status != ImportWorkflowState.ready for plan in plans):
         raise ImportExecutionError("release has import plans that are not ready")
 
