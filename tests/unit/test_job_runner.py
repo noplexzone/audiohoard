@@ -9,7 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.jobs import runner
+from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
+from app.models.release import Release
 from app.models.track import IdentityResolutionState, Track
 from app.models.workflow import AcquisitionState
 from app.naming.convention import NamingError
@@ -443,3 +445,81 @@ async def test_priority_job_records_clear_failure_when_all_sources_exhausted(
     assert job.source == "priority"
     assert '"status": "empty"' in (job.result_json or "")
     assert '"code": "timeout"' in (job.result_json or "")
+
+
+async def test_album_prowlarr_results_are_candidates_not_tracks(
+    db_session: AsyncSession,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artist = CatalogArtist(name="Artist")
+    album = CatalogAlbum(
+        title="Album",
+        year="2024",
+        mbid="00000000-0000-0000-0000-000000000001",
+        track_count=1,
+    )
+    artist.albums.append(album)
+    catalog_track = CatalogAlbumTrack(position=1, disc=1, title="Song")
+    album.tracks.append(catalog_track)
+    db_session.add(artist)
+    await db_session.flush()
+    job = Job(
+        source="prowlarr",
+        query="Artist Album",
+        status=JobStatus.pending,
+        catalog_album_id=album.id,
+    )
+    db_session.add(job)
+    await db_session.flush()
+    acquired: list[str] = []
+
+    async def fake_fetch(*args: object, **kwargs: object) -> Sequence[SearchResult]:
+        return [
+            SearchResult(source="prowlarr", title="Song", url="https://indexer/one.nzb"),
+            SearchResult(source="prowlarr", title="Other release", url="https://indexer/two.nzb"),
+        ]
+
+    async def fake_acquire(
+        result: SearchResult,
+        source: str,
+        cfg: Settings,
+        track: Track | None = None,
+    ) -> tuple[str, str]:
+        acquired.append(result.url)
+        return "sab-1", "downloaded"
+
+    async def noop_track(track: Track, cfg: Settings) -> None:
+        return None
+
+    async def noop_preview(track: Track, db: AsyncSession, cfg: Settings) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(runner, "_prepare_acquisition", fake_acquire)
+    monkeypatch.setattr(runner, "_enrich_musicbrainz", noop_track)
+    monkeypatch.setattr(runner, "_enrich_deezer", noop_track)
+    monkeypatch.setattr(runner, "_run_fingerprint", noop_track)
+    monkeypatch.setattr(runner, "_compute_path_preview", noop_preview)
+
+    await runner.run_job(job.id, db_session, test_settings)
+
+    tracks = list((await db_session.scalars(select(Track).where(Track.job_id == job.id))).all())
+    release = (await db_session.scalars(select(Release).where(Release.job_id == job.id))).one()
+    assert acquired == ["https://indexer/one.nzb"]
+    assert len(tracks) == 1
+    assert tracks[0].catalog_track_id == catalog_track.id
+    assert tracks[0].identity_state == IdentityResolutionState.unresolved
+    assert release.release_mbid == album.mbid
+    assert release.year == "2024"
+    assert release.track_count == 1
+
+
+def test_catalog_track_matching_never_falls_back_to_result_position() -> None:
+    first = CatalogAlbumTrack(id=1, position=1, disc=1, title="First")
+    second = CatalogAlbumTrack(id=2, position=2, disc=1, title="Second")
+    result = SearchResult(source="prowlarr", title="Unrelated NZB", url="https://indexer/file.nzb")
+
+    matched = runner._catalog_track_for_result(result, [first, second], None)
+
+    assert matched is None

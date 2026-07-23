@@ -273,13 +273,21 @@ async def _run_job_in_session(job_id: int, db: AsyncSession, cfg: Settings) -> N
         results = _selected_result(job) or await _call_fetch_results(job, cfg, db)
         catalog_album = await _load_catalog_album(db, job.catalog_album_id)
         catalog_tracks = list(catalog_album.tracks) if catalog_album is not None else []
+        if (
+            catalog_album is not None
+            and job.catalog_track_id is None
+            and results
+            and all(result.source == "prowlarr" for result in results)
+        ):
+            # Prowlarr results are alternative release candidates, not tracks.
+            # Acquire one candidate and report manifest gaps rather than enqueueing
+            # every NZB and assigning candidates to tracks by position.
+            results = results[:1]
         tracks_created = 0
         failures: list[str] = []
         releases: dict[tuple[str | None, str | None], Release] = {}
-        for index, result in enumerate(results):
-            catalog_track = _catalog_track_for_result(
-                result, catalog_tracks, index, job.catalog_track_id
-            )
+        for result in results:
+            catalog_track = _catalog_track_for_result(result, catalog_tracks, job.catalog_track_id)
             track: Track | None = None
             try:
                 release_key = (
@@ -299,6 +307,15 @@ async def _run_job_in_session(job_id: int, db: AsyncSession, cfg: Settings) -> N
                         album_artist=catalog_album.artist.name
                         if catalog_album is not None
                         else result.artist,
+                        year=catalog_album.year if catalog_album is not None else None,
+                        release_mbid=catalog_album.mbid if catalog_album is not None else None,
+                        track_count=(
+                            len(catalog_tracks)
+                            if catalog_tracks
+                            else catalog_album.track_count
+                            if catalog_album is not None
+                            else None
+                        ),
                     )
                     db.add(release)
                     await db.flush()
@@ -324,8 +341,7 @@ async def _run_job_in_session(job_id: int, db: AsyncSession, cfg: Settings) -> N
                     mbid=catalog_track.recording_mbid if catalog_track is not None else None,
                     identity_state=(
                         IdentityResolutionState.resolved
-                        if (catalog_track and catalog_track.recording_mbid)
-                        or (catalog_album and catalog_album.mbid)
+                        if catalog_track and catalog_track.recording_mbid
                         else IdentityResolutionState.unresolved
                     ),
                     source_path=None,
@@ -434,7 +450,6 @@ async def _load_catalog_album(db: AsyncSession, album_id: int | None) -> Catalog
 def _catalog_track_for_result(
     result: SearchResult,
     tracks: list[CatalogAlbumTrack],
-    index: int,
     selected_track_id: int | None,
 ) -> CatalogAlbumTrack | None:
     if selected_track_id is not None:
@@ -444,7 +459,7 @@ def _catalog_track_for_result(
         for track in tracks:
             if track.title.casefold().strip() == title:
                 return track
-    return tracks[index] if index < len(tracks) else None
+    return None
 
 
 def _selected_result(job: Job) -> list[SearchResult] | None:

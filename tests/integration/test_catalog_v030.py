@@ -76,20 +76,18 @@ async def test_catalog_artist_album_pages_and_album_download_create_linked_job(
         assert job.query == "Daft Punk Discovery"
 
 
-def test_catalog_track_matching_prefers_title_then_position() -> None:
+def test_catalog_track_matching_requires_title_or_explicit_selection() -> None:
     tracks = [
         CatalogAlbumTrack(id=1, album_id=1, position=1, disc=1, title="One More Time"),
         CatalogAlbumTrack(id=2, album_id=1, position=2, disc=1, title="Aerodynamic"),
     ]
     result = SearchResult(source="slskd", title="Aerodynamic")
-    assert _catalog_track_for_result(result, tracks, 0, None).id == 2
+    assert _catalog_track_for_result(result, tracks, None).id == 2
     assert (
-        _catalog_track_for_result(
-            SearchResult(source="slskd", title="Unknown"), tracks, 1, None
-        ).id
-        == 2
+        _catalog_track_for_result(SearchResult(source="slskd", title="Unknown"), tracks, None)
+        is None
     )
-    assert _catalog_track_for_result(result, tracks, 0, 1).id == 1
+    assert _catalog_track_for_result(result, tracks, 1).id == 1
 
 
 async def test_quick_monitor_toggles_catalog_artist_and_albums(client: AsyncClient) -> None:
