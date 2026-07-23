@@ -21,6 +21,7 @@ from app.auth import get_current_user, setup_complete
 from app.config import Settings, get_settings
 from app.database import get_db
 from app.display_names import display_name
+from app.jobs.dispatcher import job_dispatcher
 from app.routers import auth, health, imports, jobs, naming, search, tracks
 from app.routers import catalog as catalog_router
 from app.routers import settings as settings_router
@@ -41,6 +42,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     health_status = get_health_status_service()
     app.state.discography_scheduler = scheduler
     app.state.health_status_service = health_status
+    await job_dispatcher.recover()
     await scheduler.start()
     await health_status.start()
     try:
@@ -48,6 +50,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         await health_status.stop()
         await scheduler.stop()
+        await job_dispatcher.shutdown()
 
 
 def create_app() -> FastAPI:

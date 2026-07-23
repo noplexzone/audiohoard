@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from datetime import UTC, datetime
 
 from sqlalchemy import select
@@ -10,10 +11,14 @@ from sqlalchemy.orm import selectinload
 
 from app.config import Settings, get_settings
 from app.database import get_session_factory
+from app.jobs.dispatcher import job_dispatcher
 from app.models.catalog_entities import CatalogAlbum, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.services.catalog_metadata import fetch_and_store_discography
 from app.settings_service import build_effective_settings, get_runtime_settings
+
+logger = logging.getLogger(__name__)
+_ACTIVE_JOB_STATES = {JobStatus.pending, JobStatus.running}
 
 
 def apply_monitor_policy(artist: CatalogArtist, new_albums: list[CatalogAlbum]) -> None:
@@ -29,30 +34,51 @@ def apply_monitor_policy(artist: CatalogArtist, new_albums: list[CatalogAlbum]) 
 
 
 def wanted_albums(artist: CatalogArtist) -> list[CatalogAlbum]:
-    return [a for a in artist.albums if a.monitored and not a.in_library]
+    return [album for album in artist.albums if album.monitored and not album.in_library]
 
 
 async def refresh_monitored_artist(
-    db: AsyncSession, settings: Settings, artist: CatalogArtist, *, auto_download: bool = False
-) -> list[CatalogAlbum]:
-    before = {a.id for a in artist.albums}
+    db: AsyncSession,
+    settings: Settings,
+    artist: CatalogArtist,
+    *,
+    auto_download: bool = False,
+) -> tuple[list[CatalogAlbum], list[int]]:
+    before = {album.id for album in artist.albums}
     await fetch_and_store_discography(db, settings, artist)
     await db.refresh(artist, ["albums"])
-    new = [a for a in artist.albums if a.id not in before]
+    new = [album for album in artist.albums if album.id not in before]
     apply_monitor_policy(artist, new)
     artist.last_refreshed_at = datetime.now(tz=UTC)
+
+    job_ids: list[int] = []
     if auto_download:
-        for album in wanted_albums(artist):
-            db.add(
-                Job(
-                    source="priority",
-                    query=f"{artist.name} {album.title}",
-                    status=JobStatus.pending,
-                    catalog_album_id=album.id,
+        wanted = wanted_albums(artist)
+        wanted_ids = [album.id for album in wanted]
+        active_album_ids: set[int] = set()
+        if wanted_ids:
+            result = await db.execute(
+                select(Job.catalog_album_id).where(
+                    Job.catalog_album_id.in_(wanted_ids),
+                    Job.status.in_(_ACTIVE_JOB_STATES),
                 )
             )
+            active_album_ids = {album_id for album_id in result.scalars() if album_id is not None}
+        for album in wanted:
+            if album.id in active_album_ids:
+                continue
+            job = Job(
+                source="priority",
+                query=f"{artist.name} {album.title}",
+                status=JobStatus.pending,
+                catalog_album_id=album.id,
+            )
+            db.add(job)
+            await db.flush()
+            job_ids.append(job.id)
+            active_album_ids.add(album.id)
     await db.flush()
-    return new
+    return new, job_ids
 
 
 class DiscographyRefreshScheduler:
@@ -62,6 +88,7 @@ class DiscographyRefreshScheduler:
 
     async def start(self) -> None:
         if self._task is None:
+            self._stop.clear()
             self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
@@ -72,25 +99,55 @@ class DiscographyRefreshScheduler:
                 await self._task
             self._task = None
 
+    async def _refresh_cycle(self) -> float:
+        factory = get_session_factory()
+        async with factory() as db:
+            cfg = await build_effective_settings(db, get_settings())
+            runtime = await get_runtime_settings(db)
+            result = await db.execute(
+                select(CatalogArtist.id).where(CatalogArtist.monitored.is_(True))
+            )
+            artist_ids = list(result.scalars().all())
+
+        for artist_id in artist_ids:
+            job_ids: list[int] = []
+            try:
+                async with factory() as db:
+                    artist_result = await db.execute(
+                        select(CatalogArtist)
+                        .where(CatalogArtist.id == artist_id)
+                        .options(selectinload(CatalogArtist.albums))
+                    )
+                    artist = artist_result.scalar_one_or_none()
+                    if artist is None or not artist.monitored:
+                        continue
+                    _, job_ids = await refresh_monitored_artist(
+                        db,
+                        cfg,
+                        artist,
+                        auto_download=runtime.auto_download_wanted,
+                    )
+                    await db.commit()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Discography refresh failed for artist %s", artist_id)
+                continue
+            for job_id in job_ids:
+                await job_dispatcher.dispatch(job_id)
+
+        return runtime.discography_refresh_hours * 3600
+
     async def _run(self) -> None:
         while not self._stop.is_set():
-            factory = get_session_factory()
-            async with factory() as db:
-                cfg = await build_effective_settings(db, get_settings())
-                runtime = await get_runtime_settings(db)
-                result = await db.execute(
-                    select(CatalogArtist)
-                    .where(CatalogArtist.monitored.is_(True))
-                    .options(selectinload(CatalogArtist.albums))
-                )
-                for artist in result.scalars():
-                    await refresh_monitored_artist(
-                        db, cfg, artist, auto_download=runtime.auto_download_wanted
-                    )
-                await db.commit()
+            delay = 3600.0
             try:
-                await asyncio.wait_for(
-                    self._stop.wait(), timeout=runtime.discography_refresh_hours * 3600
-                )
+                delay = await self._refresh_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Discography refresh cycle failed")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=delay)
             except TimeoutError:
                 continue
