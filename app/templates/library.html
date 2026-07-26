@@ -113,18 +113,23 @@
   <table aria-label="Track list">
     <thead>
       <tr>
+        <th scope="col">File</th>
         <th scope="col">Title</th>
         <th scope="col">Artist</th>
         <th scope="col">Album</th>
         <th scope="col">Year</th>
         <th scope="col">Format</th>
+        <th scope="col">Size</th>
+        <th scope="col">Duration</th>
         <th scope="col">Source</th>
-        <th scope="col">Status</th>
+        <th scope="col">Acquisition</th>
+        <th scope="col">Import</th>
       </tr>
     </thead>
     <tbody>
       {% for track in tracks.items %}
       <tr>
+        <td><code title="{{ track.file_path | e }}">{{ track.file_path.rsplit('/', 1)[-1] }}</code><div class="hint"><code>{{ track.file_path }}</code></div></td>
         <td><a href="/tracks/{{ track.id }}/ui">{{ track.title }}</a></td>
         <td>
           <a href="/artists/detail?name={{ track.artist | urlencode }}">{{ track.artist }}</a>
@@ -134,7 +139,10 @@
         <td>
           {% if track.fmt %}<span class="badge info">{{ track.fmt }}</span>{% else %}—{% endif %}
         </td>
+        <td>{% if track.file_size_bytes %}{{ "%.1f"|format(track.file_size_bytes / 1048576) }} MB{% else %}—{% endif %}</td>
+        <td>{% if track.duration_sec %}{{ "%d:%02d" % (track.duration_sec // 60, track.duration_sec % 60) }}{% else %}—{% endif %}</td>
         <td><span class="badge info">{{ track.source }}</span></td>
+        <td><span class="badge ok">{{ track.acquisition_state }}</span></td>
         <td>
           {% if track.import_state == "imported" %}
             <span class="badge ok">{{ track.import_state }}</span>

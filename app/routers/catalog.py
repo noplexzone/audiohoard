@@ -21,8 +21,8 @@ from app.models.catalog_entities import CatalogAlbum, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.services.catalog import (
     get_artist_detail,
-    get_artists_page,
     get_library_stats,
+    get_watchlisted_artists_page,
     list_distinct_formats,
     list_distinct_sources,
     list_library_tracks,
@@ -160,23 +160,7 @@ async def artists_page(
     page: int = Query(default=1, ge=1, le=10_000),
     per_page: int = Query(default=50, ge=1, le=200),
 ) -> HTMLResponse:
-    artists = await get_artists_page(db, q=q, sort=sort, page=page, per_page=per_page)
-    monitored_count = (
-        (await db.execute(select(CatalogArtist).where(CatalogArtist.monitored.is_(True))))
-        .scalars()
-        .all()
-    )
-    wanted_count = (
-        (
-            await db.execute(
-                select(CatalogAlbum).where(
-                    CatalogAlbum.monitored.is_(True), CatalogAlbum.in_library.is_(False)
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    artists = await get_watchlisted_artists_page(db, q=q, sort=sort, page=page, per_page=per_page)
 
     filter_params: dict[str, str] = {}
     if q:
@@ -194,8 +178,6 @@ async def artists_page(
             "sort": sort,
             "per_page": per_page,
             "filter_qs": filter_qs,
-            "monitored_count": len(monitored_count),
-            "wanted_count": len(wanted_count),
         },
     )
 
@@ -461,41 +443,14 @@ async def monitor_catalog_artist_page(
     return RedirectResponse(f"/artists/catalog/{artist.id}", status_code=303)
 
 
-@router.get("/artists/monitored", response_class=HTMLResponse, include_in_schema=False)
-async def monitored_artists_page(
-    request: Request, db: Annotated[AsyncSession, Depends(get_db)]
-) -> HTMLResponse:
-    result = await db.execute(
-        select(CatalogArtist)
-        .where(CatalogArtist.monitored.is_(True))
-        .options(selectinload(CatalogArtist.albums))
-    )
-    artists = list(result.scalars().all())
-    return _templates(request).TemplateResponse(
-        request, "monitored.html", {"artists": artists, "monitored_count": len(artists)}
-    )
+@router.get("/artists/monitored", include_in_schema=False)
+async def monitored_artists_page() -> RedirectResponse:
+    return RedirectResponse("/artists", status_code=303)
 
 
-@router.get("/wanted", response_class=HTMLResponse, include_in_schema=False)
-async def wanted_page(
-    request: Request, db: Annotated[AsyncSession, Depends(get_db)]
-) -> HTMLResponse:
-    result = await db.execute(
-        select(CatalogAlbum)
-        .where(CatalogAlbum.monitored.is_(True), CatalogAlbum.in_library.is_(False))
-        .options(selectinload(CatalogAlbum.artist))
-    )
-    albums = list(result.scalars().all())
-    monitored_count = len(
-        (await db.execute(select(CatalogArtist).where(CatalogArtist.monitored.is_(True))))
-        .scalars()
-        .all()
-    )
-    return _templates(request).TemplateResponse(
-        request,
-        "wanted.html",
-        {"albums": albums, "wanted_count": len(albums), "monitored_count": monitored_count},
-    )
+@router.get("/wanted", include_in_schema=False)
+async def wanted_page() -> RedirectResponse:
+    return RedirectResponse("/artists", status_code=303)
 
 
 @router.get("/albums/{album_id}", response_class=HTMLResponse)

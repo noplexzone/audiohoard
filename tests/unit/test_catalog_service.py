@@ -29,10 +29,10 @@ def _make_track(
     album: str | None = "Alb",
     year: str | None = "2020",
     source: str = "slskd",
-    source_path: str | None = None,
+    source_path: str | None = "/music/track.flac",
     duration_sec: int | None = 200,
     file_format: str | None = None,
-    file_size_bytes: int | None = None,
+    file_size_bytes: int | None = 1024,
     release_id: int | None = None,
 ) -> Track:
     return Track(
