@@ -29,7 +29,12 @@
       {% if counts_by_type.compilations %}{% if counts_by_type.albums or counts_by_type.singles_eps %} · {% endif %}{{ counts_by_type.compilations }} compilation{{ '' if counts_by_type.compilations == 1 else 's' }}{% endif %}
       {% if not total_releases %}No releases stored yet{% endif %}
     </p>
-    {% if provenance.last_enrichment_error %}<p class="alert error compact">Last enrichment failed: {{ provenance.last_enrichment_error.message }}</p>{% endif %}
+    {% if enrichment == 'failed' or provenance.last_enrichment_error %}
+    <div role="alert" class="alert error dismissible" id="enrichment-error-banner">
+      <span>Last enrichment failed{% if provenance.last_enrichment_error %}: {{ provenance.last_enrichment_error.message | e }}{% endif %}</span>
+      <button type="button" class="dismiss-btn" aria-label="Dismiss" onclick="this.closest('[role=alert]').remove()">×</button>
+    </div>
+    {% endif %}
     <div class="artist-actions">
       <form method="post" action="/artists/catalog/{{ artist.id }}/monitor">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

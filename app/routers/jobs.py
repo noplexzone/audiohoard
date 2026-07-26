@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC
+from datetime import datetime as dt
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -9,6 +11,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user, require_mutation
 from app.database import get_db
@@ -77,7 +80,9 @@ async def downloads_page(
     status: JobStatus | None = None,
 ) -> HTMLResponse:
     templates = _get_templates(request)
-    query = select(Job).order_by(Job.created_at.desc()).limit(100)
+    query = (
+        select(Job).options(selectinload(Job.tracks)).order_by(Job.created_at.desc()).limit(100)
+    )
     if status is not None:
         query = query.where(Job.status == status)
     result = await db.execute(query)
@@ -89,6 +94,7 @@ async def downloads_page(
         "not_found": ("Job not found.", "error"),
     }
     notice, notice_type = notices.get(request.query_params.get("notice", ""), (None, "info"))
+    now = dt.now(UTC)
     return templates.TemplateResponse(
         request,
         "downloads.html",
@@ -98,6 +104,7 @@ async def downloads_page(
             "notice": notice,
             "notice_type": notice_type,
             "selected_status": status.value if status is not None else None,
+            "now": now,
         },
     )
 

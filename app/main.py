@@ -21,13 +21,14 @@ from starlette.responses import Response
 
 from app.auth import get_current_user, setup_complete
 from app.config import Settings, get_settings
-from app.database import get_db
+from app.database import get_db, get_session_factory
 from app.display_names import display_name
 from app.jobs.dispatcher import job_dispatcher
 from app.routers import auth, health, imports, jobs, naming, search, tracks
 from app.routers import catalog as catalog_router
 from app.routers import settings as settings_router
 from app.services.artist_monitoring import DiscographyRefreshScheduler
+from app.services.catalog_metadata import reconcile_duplicate_catalog_artists
 from app.services.dashboard import get_dashboard_data
 from app.services.health_status import get_health_status_service
 from app.settings_service import effective_settings_dep
@@ -45,7 +46,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     health_status = get_health_status_service()
     app.state.discography_scheduler = scheduler
     app.state.health_status_service = health_status
+    async with get_session_factory()() as db:
+        n = await reconcile_duplicate_catalog_artists(db)
+        await db.commit()
+        if n:
+            logger.info("Reconciled %d duplicate catalog artist(s) at startup", n)
     await job_dispatcher.recover()
+    settings = get_settings()
+    await job_dispatcher.start_watchdog(
+        threshold_seconds=settings.job_watchdog_threshold_seconds,
+        interval_seconds=settings.job_watchdog_interval_seconds,
+    )
     await scheduler.start()
     await health_status.start()
     try:

@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
-    image: noplexzone/audiohoard:${AUDIOHOARD_TAG:-0.6.0}
+    image: noplexzone/audiohoard:${AUDIOHOARD_TAG:-0.6.1}
     container_name: audiohoard
     restart: unless-stopped
     ports:

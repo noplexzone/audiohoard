@@ -10,7 +10,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import Settings
 from app.metadata.base import AlbumDetail, AlbumHit, ArtistDetail, ArtistHit, MetadataProvider
@@ -80,6 +82,14 @@ async def search_catalog_artists(
 
 
 async def upsert_catalog_artist(db: AsyncSession, hit: ArtistHit | ArtistDetail) -> CatalogArtist:
+    try:
+        return await _upsert_catalog_artist(db, hit)
+    except IntegrityError:
+        await db.rollback()
+        return await _upsert_catalog_artist(db, hit)
+
+
+async def _upsert_catalog_artist(db: AsyncSession, hit: ArtistHit | ArtistDetail) -> CatalogArtist:
     ids = provider_ids_for_hit(hit)
     filters = []
     if ids["mbid"]:
@@ -88,17 +98,50 @@ async def upsert_catalog_artist(db: AsyncSession, hit: ArtistHit | ArtistDetail)
         filters.append(CatalogArtist.deezer_id == ids["deezer_id"])
     if ids["itunes_id"]:
         filters.append(CatalogArtist.itunes_id == ids["itunes_id"])
-    artist = None
-    if filters:
-        artist = (await db.scalars(select(CatalogArtist).where(or_(*filters)).limit(1))).first()
+    candidates: list[CatalogArtist] = []
+    with db.no_autoflush:
+        if filters:
+            candidates.extend(
+                list(
+                    (
+                        await db.scalars(
+                            select(CatalogArtist)
+                            .where(or_(*filters))
+                            .options(selectinload(CatalogArtist.albums))
+                        )
+                    ).all()
+                )
+            )
+        if ids["mbid"]:
+            all_artists = list(
+                (
+                    await db.scalars(
+                        select(CatalogArtist).options(selectinload(CatalogArtist.albums))
+                    )
+                ).all()
+            )
+            candidates.extend(
+                candidate
+                for candidate in all_artists
+                if _norm_title(candidate.name) == _norm_title(hit.name)
+                and candidate.mbid in {None, ids["mbid"]}
+            )
+    candidates = list({candidate.id: candidate for candidate in candidates}.values())
+    artist: CatalogArtist | None = None
+    if candidates:
+        artist = candidates[0]
+        for duplicate in candidates[1:]:
+            artist = await merge_catalog_artists(db, artist, duplicate)
     if artist is None:
         artist = CatalogArtist(name=hit.name)
         db.add(artist)
+        await db.flush()
+    artist = await _merge_artist_id_collisions(db, artist, ids)
     artist.name = hit.name or artist.name
     artist.artwork_url = hit.artwork_url or artist.artwork_url
-    artist.mbid = ids["mbid"] or artist.mbid
-    artist.deezer_id = ids["deezer_id"] or artist.deezer_id
-    artist.itunes_id = ids["itunes_id"] or artist.itunes_id
+    artist.mbid = artist.mbid or ids["mbid"]
+    artist.deezer_id = artist.deezer_id or ids["deezer_id"]
+    artist.itunes_id = artist.itunes_id or ids["itunes_id"]
     await db.flush()
     return artist
 
@@ -261,6 +304,138 @@ def _norm_title(value: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", ascii_text.casefold())).strip()
 
 
+def _artist_data_score(artist: CatalogArtist) -> tuple[int, int, int, int]:
+    """Rank identity richness first, then preserve the oldest row as the tie-breaker."""
+    normalized_name = _norm_title(artist.name)
+    return (
+        1 if artist.mbid else 0,
+        1 if artist.artwork_url else 0,
+        len(normalized_name.replace(" ", "")),
+        -(artist.id or 0),
+    )
+
+
+def _load_provenance(raw: str | None) -> dict[str, object]:
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+async def merge_catalog_artists(
+    db: AsyncSession, left: CatalogArtist, right: CatalogArtist
+) -> CatalogArtist:
+    """Merge two artist identities and return the richer/older surviving row."""
+    if left.id == right.id:
+        return left
+    survivor, duplicate = (
+        max((left, right), key=_artist_data_score),
+        min((left, right), key=_artist_data_score),
+    )
+    with db.no_autoflush:
+        await db.refresh(survivor, ["albums"])
+        await db.refresh(duplicate, ["albums"])
+        duplicate_ids = {
+            "mbid": duplicate.mbid,
+            "deezer_id": duplicate.deezer_id,
+            "itunes_id": duplicate.itunes_id,
+        }
+        duplicate.mbid = None
+        duplicate.deezer_id = None
+        duplicate.itunes_id = None
+        await db.flush()
+
+        survivor.monitored = bool(survivor.monitored or duplicate.monitored)
+        if not survivor.monitor_policy:
+            survivor.monitor_policy = duplicate.monitor_policy
+        survivor.name = survivor.name or duplicate.name
+        survivor.artwork_url = survivor.artwork_url or duplicate.artwork_url
+        survivor.mbid = survivor.mbid or duplicate_ids["mbid"]
+        survivor.deezer_id = survivor.deezer_id or duplicate_ids["deezer_id"]
+        survivor.itunes_id = survivor.itunes_id or duplicate_ids["itunes_id"]
+        survivor.last_enriched_at = survivor.last_enriched_at or duplicate.last_enriched_at
+        survivor.last_refreshed_at = survivor.last_refreshed_at or duplicate.last_refreshed_at
+        provenance = _load_provenance(duplicate.provenance_json)
+        provenance.update(_load_provenance(survivor.provenance_json))
+        survivor.provenance_json = json.dumps(provenance, sort_keys=True) if provenance else None
+
+        for album in list(duplicate.albums):
+            album.artist = survivor
+        await db.flush()
+        await db.delete(duplicate)
+        await db.flush()
+        await reconcile_duplicate_catalog_albums(db, survivor.id)
+        await db.refresh(survivor, ["albums"])
+    return survivor
+
+
+async def _merge_artist_id_collisions(
+    db: AsyncSession, artist: CatalogArtist, ids: dict[str, str | None]
+) -> CatalogArtist:
+    """Merge every row that owns an incoming provider id before assigning it."""
+    for field in ("mbid", "deezer_id", "itunes_id"):
+        value = ids[field]
+        if not value:
+            continue
+        with db.no_autoflush:
+            existing = (
+                await db.scalars(
+                    select(CatalogArtist)
+                    .where(getattr(CatalogArtist, field) == value, CatalogArtist.id != artist.id)
+                    .options(selectinload(CatalogArtist.albums))
+                    .limit(1)
+                )
+            ).first()
+        if existing is not None:
+            artist = await merge_catalog_artists(db, artist, existing)
+    return artist
+
+
+def _artists_should_merge(left: CatalogArtist, right: CatalogArtist) -> bool:
+    shared_provider_id = any(
+        getattr(left, field) is not None and getattr(left, field) == getattr(right, field)
+        for field in ("mbid", "deezer_id", "itunes_id")
+    )
+    same_name_one_resolved = _norm_title(left.name) == _norm_title(right.name) and bool(
+        left.mbid
+    ) != bool(right.mbid)
+    return shared_provider_id or same_name_one_resolved
+
+
+async def reconcile_duplicate_catalog_artists(db: AsyncSession) -> int:
+    """Repair legacy duplicate artist identities; safe to run repeatedly at startup."""
+    merged = 0
+    while True:
+        with db.no_autoflush:
+            artists = list(
+                (
+                    await db.scalars(
+                        select(CatalogArtist)
+                        .options(selectinload(CatalogArtist.albums))
+                        .order_by(CatalogArtist.id)
+                    )
+                ).all()
+            )
+        pair = next(
+            (
+                (left, right)
+                for index, left in enumerate(artists)
+                for right in artists[index + 1 :]
+                if _artists_should_merge(left, right)
+            ),
+            None,
+        )
+        if pair is None:
+            break
+        await merge_catalog_artists(db, *pair)
+        merged += 1
+    await db.flush()
+    return merged
+
+
 def _norm_release_type(value: str | None) -> str:
     normalized = _norm_title(value or "album")
     if normalized in {"ep", "single"}:
@@ -385,6 +560,8 @@ async def enrich_catalog_artist(
         chosen = choices.get(provider_name, scored[0][1].provider_id)
         detail = await provider.get_artist(chosen)
         ids = provider_ids_for_hit(detail)
+        artist = await _merge_artist_id_collisions(db, artist, ids)
+        existing_albums = list(artist.albums)
         if not artist.mbid and ids.get("mbid"):
             artist.mbid = ids["mbid"]
             provenance["mbid"] = provider_name
@@ -409,12 +586,13 @@ async def enrich_catalog_artist(
             )
             providers.add(provider_name)
             album.providers_json = json.dumps(sorted(providers))
+    provenance.pop("last_enrichment_error", None)
     artist.provenance_json = json.dumps(provenance, sort_keys=True)
     artist.last_enriched_at = datetime.now(tz=UTC)
     await db.flush()
     if ambiguous:
-        return {"status": "ambiguous", "candidates": ambiguous}
-    return {"status": "ok"}
+        return {"status": "ambiguous", "candidates": ambiguous, "artist_id": artist.id}
+    return {"status": "ok", "artist_id": artist.id}
 
 
 async def reconcile_duplicate_catalog_albums(

@@ -6,11 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-26
+
 ### Added
 - Added restart-safe in-process job dispatch with startup recovery, retry, cancellation, and monitored-album scheduling.
 - Added terminal-state polling and artifact verification for slskd and SABnzbd acquisitions.
 - Added download queue details, live refresh, actionable errors, and browser retry/cancel controls.
 - Added visible account logout controls and direct Artists/Imports navigation on mobile.
+- Added a dispatcher watchdog that recovers orphaned active jobs once and then fails recurring losses with a structured `dispatch_lost` reason.
 - Added filterable dashboard and download status links, source-priority reordering controls, and library/staging path diagnostics.
 
 ### Changed
@@ -19,6 +22,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Browser settings validation now tests entered provider credentials before saving and reports Ready, Degraded, and Disabled states consistently.
 - Search and settings screens now use clearer labels, table semantics, contrast, and accessible target sizes.
 - The release workflow can publish the moving `develop` image on demand without creating a version tag.
+- Job state and per-result progress now commit in short transactions so active downloads expose elapsed time, last activity, transfer source, and track-level progress while work is running.
 
 ### Fixed
 - Prevented external acquisitions from completing before a usable staged artifact exists.
@@ -29,10 +33,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Expired browser sessions are deleted and HTML requests redirect to login while API clients retain JSON 401 responses.
 - Import execution now requires a persisted, reviewed ready plan instead of silently planning and importing in one action.
 - Dashboard status counts include partial jobs and remain responsive with all six terminal/active states.
-- Runtime version labels, README examples, Compose image tags, and health checks now match v0.6.0.
+- Runtime version labels, README examples, Compose image tags, and health checks now match v0.6.1.
 - Login redirects now preserve safe deep links, show the signed-in username, and reject open redirects.
 - Import and settings form failures now redirect with browser-readable errors instead of returning server errors.
 - Invalid behavior, metadata, and naming values are rejected without partially saving settings.
+- Guarded job startup and dispatcher exception observation prevent provider or settings failures from leaving jobs invisibly pending.
+- Artist enrichment and startup repair merge duplicate provider identities without losing monitoring state or albums, including legacy rows where only one normalized-name match has an MBID.
+- Manual and background enrichment failures now render concise sanitized banners and redirect cleanly instead of exposing SQL details or returning a raw HTTP 500.
+- Main-branch protection now requires the full `Quality checks` and Docker build checks; tag publication remains dependent on the release workflow’s full quality job.
 
 ## [0.6.0] - 2026-07-22
 

@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     tidal_session_path: str = ""
     tidal_quality: Literal["", "Normal", "High", "HiFi", "Master"] = ""
 
+    # Job dispatcher watchdog
+    job_watchdog_threshold_seconds: int = Field(default=300, ge=60)
+    job_watchdog_interval_seconds: int = Field(default=60, ge=10)
+
     # Logging
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 

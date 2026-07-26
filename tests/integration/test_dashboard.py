@@ -108,7 +108,7 @@ async def test_shared_shell_has_accessible_active_navigation(client: AsyncClient
     assert 'action="/logout"' in body
     assert "Sign out" in body
     assert "Signed in as <strong>test-owner</strong>" in body
-    assert "v0.6.0" in body
+    assert "v0.6.1" in body
     assert "fonts.googleapis.com" not in body
     assert "fonts.gstatic.com" not in body
 

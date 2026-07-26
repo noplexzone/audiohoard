@@ -621,3 +621,168 @@ async def test_prepare_acquisition_prowlarr_polls_and_populates_track(
     assert track.acquisition_state == AcquisitionState.downloaded
     assert track.source_path == str(audio_file)
     assert track.staging_path == str(audio_file)
+
+
+async def test_prepare_acquisition_resumes_slskd_without_enqueue(
+    fast_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.models.track import Track
+    from app.models.workflow import AcquisitionState
+    from app.schemas.search import SearchResult
+
+    audio_file = fast_settings.staging_root / "resumed.flac"
+    audio_file.write_bytes(b"audio")
+    enqueue_calls: list[tuple[str, str, int | None]] = []
+    poll_calls: list[str] = []
+
+    class FakeSlskd:
+        def __init__(self, url: str, key: str) -> None:
+            pass
+
+        async def enqueue(self, username: str, filename: str, size: int | None = None) -> str:
+            enqueue_calls.append((username, filename, size))
+            return "unexpected-new-transfer"
+
+    async def fake_poll(
+        transfer_id: str,
+        username: str,
+        filename: str,
+        adapter: Any,
+        staging_root: Path,
+        poll_interval: float,
+        poll_timeout: float,
+    ) -> Path:
+        poll_calls.append(transfer_id)
+        return audio_file
+
+    monkeypatch.setattr(runner, "SlskdAdapter", FakeSlskd)
+    monkeypatch.setattr(runner, "_poll_slskd_transfer", fake_poll)
+    track = Track(
+        job_id=1,
+        source="slskd",
+        source_job_id="existing-transfer",
+        source_status="acquiring",
+        acquisition_state=AcquisitionState.acquiring,
+    )
+    result = SearchResult(
+        source="slskd",
+        title="Song",
+        metadata={"username": "peer", "filename": "music/song.flac"},
+    )
+
+    source_job_id, status = await runner._prepare_acquisition(
+        result, "slskd", fast_settings, track
+    )
+
+    assert enqueue_calls == []
+    assert poll_calls == ["existing-transfer"]
+    assert source_job_id == "existing-transfer"
+    assert status == "downloaded"
+    assert track.acquisition_state == AcquisitionState.downloaded
+
+
+async def test_prepare_acquisition_checkpoints_enqueue_before_poll(
+    fast_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.models.track import Track
+    from app.models.workflow import AcquisitionState
+    from app.schemas.search import SearchResult
+
+    audio_file = fast_settings.staging_root / "checkpointed.flac"
+    audio_file.write_bytes(b"audio")
+    events: list[str] = []
+
+    class FakeSlskd:
+        def __init__(self, url: str, key: str) -> None:
+            pass
+
+        async def enqueue(self, username: str, filename: str, size: int | None = None) -> str:
+            events.append("enqueue")
+            return "new-transfer"
+
+    async def checkpoint() -> None:
+        assert track.source_job_id == "new-transfer"
+        assert track.source_status == "acquiring"
+        assert track.acquisition_state == AcquisitionState.acquiring
+        assert track.acquisition_provenance_json is not None
+        events.append("checkpoint")
+
+    async def fake_poll(
+        transfer_id: str,
+        username: str,
+        filename: str,
+        adapter: Any,
+        staging_root: Path,
+        poll_interval: float,
+        poll_timeout: float,
+    ) -> Path:
+        events.append("poll")
+        return audio_file
+
+    monkeypatch.setattr(runner, "SlskdAdapter", FakeSlskd)
+    monkeypatch.setattr(runner, "_poll_slskd_transfer", fake_poll)
+    track = Track(job_id=1, source="slskd", acquisition_state=AcquisitionState.acquiring)
+    result = SearchResult(
+        source="slskd",
+        title="Song",
+        metadata={"username": "peer", "filename": "music/song.flac"},
+    )
+
+    await runner._prepare_acquisition(result, "slskd", fast_settings, track, checkpoint=checkpoint)
+
+    assert events == ["enqueue", "checkpoint", "poll"]
+
+
+async def test_prepare_acquisition_resumes_sab_without_enqueue(
+    fast_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.models.track import Track
+    from app.models.workflow import AcquisitionState
+    from app.schemas.search import SearchResult
+
+    settings = fast_settings.model_copy(update={"prowlarr_url": "https://prowlarr.test"})
+    audio_file = settings.staging_root / "resumed-sab.flac"
+    audio_file.write_bytes(b"audio")
+    enqueue_calls: list[str] = []
+    poll_calls: list[str] = []
+
+    class FakeSab:
+        def __init__(self, url: str, key: str) -> None:
+            pass
+
+        async def enqueue(self, nzb_url: str, name: str | None = None) -> str:
+            enqueue_calls.append(nzb_url)
+            return "unexpected-new-job"
+
+    async def fake_poll(
+        nzo_id: str,
+        adapter: Any,
+        staging_root: Path,
+        poll_interval: float,
+        poll_timeout: float,
+    ) -> Path:
+        poll_calls.append(nzo_id)
+        return audio_file
+
+    monkeypatch.setattr(runner, "SabnzbdAdapter", FakeSab)
+    monkeypatch.setattr(runner, "_poll_sab_job", fake_poll)
+    track = Track(
+        job_id=1,
+        source="prowlarr",
+        source_job_id="existing-sab-job",
+        source_status="acquiring",
+        acquisition_state=AcquisitionState.acquiring,
+    )
+    result = SearchResult(
+        source="prowlarr",
+        title="Artist - Album",
+        url="https://prowlarr.test/download/file.nzb",
+        format="nzb",
+    )
+
+    source_job_id, status = await runner._prepare_acquisition(result, "prowlarr", settings, track)
+
+    assert enqueue_calls == []
+    assert poll_calls == ["existing-sab-job"]
+    assert source_job_id == "existing-sab-job"
+    assert status == "downloaded"

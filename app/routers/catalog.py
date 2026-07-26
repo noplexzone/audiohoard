@@ -40,6 +40,12 @@ router = APIRouter(dependencies=[Depends(get_current_user)])
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_error_class(exc: BaseException) -> str:
+    first_line = str(exc).splitlines()[0] if str(exc) else ""
+    raw = f"{type(exc).__name__}: {first_line}" if first_line else type(exc).__name__
+    return raw[:200]
+
+
 async def _enrich_artist_task(artist_id: int, providers: list[str]) -> None:
     from app.config import get_settings
     from app.database import get_session_factory
@@ -59,7 +65,9 @@ async def _enrich_artist_task(artist_id: int, providers: list[str]) -> None:
                 await enrich_catalog_artist(session, cfg, artist, providers)
                 await session.commit()
             except Exception as exc:
-                logger.exception("Catalog artist enrichment failed for artist %s", artist_id)
+                logger.error(
+                    "Catalog artist enrichment failed for artist %s", artist_id, exc_info=True
+                )
                 await session.rollback()
                 artist = await session.get(CatalogArtist, artist_id)
                 if artist is not None:
@@ -70,7 +78,7 @@ async def _enrich_artist_task(artist_id: int, providers: list[str]) -> None:
                     )
                     provenance["last_enrichment_error"] = {
                         "at": datetime.now(tz=UTC).isoformat(),
-                        "message": str(exc),
+                        "message": _sanitize_error_class(exc),
                     }
                     artist.provenance_json = json.dumps(provenance, sort_keys=True)
                     await session.commit()
@@ -259,6 +267,7 @@ async def catalog_artist_page(
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     release_type: str = "",
     sort: str = "desc",
+    enrichment: str = "",
 ) -> HTMLResponse:
     result = await db.execute(
         select(CatalogArtist)
@@ -350,6 +359,7 @@ async def catalog_artist_page(
             "sort": sort,
             "counts_by_type": counts_by_type,
             "filter_options": filter_options,
+            "enrichment": enrichment,
         },
     )
 
@@ -370,10 +380,41 @@ async def enrich_catalog_artist_page(
     if artist is None:
         raise HTTPException(status_code=404, detail="Catalog artist not found")
     runtime = await get_runtime_settings(db)
-    outcome = await enrich_catalog_artist(db, settings, artist, runtime.enabled_metadata_providers)
-    await db.commit()
-    suffix = "?enrichment=ambiguous" if outcome.get("status") == "ambiguous" else "?enrichment=ok"
-    return RedirectResponse(f"/artists/catalog/{artist.id}{suffix}", status_code=303)
+    try:
+        outcome = await enrich_catalog_artist(
+            db, settings, artist, runtime.enabled_metadata_providers
+        )
+        redirect_value = outcome.get("artist_id", artist.id)
+        redirect_artist_id = redirect_value if isinstance(redirect_value, int) else artist.id
+        survivor = await db.get(CatalogArtist, redirect_artist_id)
+        if survivor is None:
+            raise RuntimeError("Enrichment survivor was not found")
+        provenance = (
+            json.loads(survivor.provenance_json or "{}") if survivor.provenance_json else {}
+        )
+        provenance.pop("last_enrichment_error", None)
+        survivor.provenance_json = json.dumps(provenance, sort_keys=True)
+        await db.commit()
+        artist_id = redirect_artist_id
+        suffix = (
+            "?enrichment=ambiguous" if outcome.get("status") == "ambiguous" else "?enrichment=ok"
+        )
+    except Exception as exc:
+        logger.error(
+            "Manual catalog artist enrichment failed for artist %s", artist_id, exc_info=True
+        )
+        await db.rollback()
+        fresh = await db.get(CatalogArtist, artist_id)
+        if fresh is not None:
+            provenance = json.loads(fresh.provenance_json or "{}") if fresh.provenance_json else {}
+            provenance["last_enrichment_error"] = {
+                "at": datetime.now(tz=UTC).isoformat(),
+                "message": _sanitize_error_class(exc),
+            }
+            fresh.provenance_json = json.dumps(provenance, sort_keys=True)
+        await db.commit()
+        suffix = "?enrichment=failed"
+    return RedirectResponse(f"/artists/catalog/{artist_id}{suffix}", status_code=303)
 
 
 @router.post("/artists/catalog/{artist_id}/monitor", include_in_schema=False)
