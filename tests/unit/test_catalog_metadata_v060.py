@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
+import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.config import Settings
+from app.database import Base
 from app.metadata.base import AlbumHit, ArtistDetail, ArtistHit
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
@@ -269,3 +273,36 @@ async def test_repair_merges_exact_juice_wrld_fixture_and_success_clears_error(
     outcome = await enrich_catalog_artist(db_session, test_settings, survivor, ["musicbrainz"])
     assert outcome["status"] == "ok"
     assert "last_enrichment_error" not in json.loads(survivor.provenance_json or "{}")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_upsert_both_sessions_complete_one_artist_survives(
+    tmp_path,
+) -> None:
+    """Two sessions racing to upsert the same mbid: both complete without exception and exactly
+    one artist row survives with the provider ID intact."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'race.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    hit = ArtistHit(
+        provider="musicbrainz",
+        provider_id="concurrent-mbid",
+        name="Concurrent Artist",
+        mbid="concurrent-mbid",
+    )
+
+    async def run_upsert() -> CatalogArtist:
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            artist = await upsert_catalog_artist(db, hit)
+            await db.commit()
+            return artist
+
+    results = await asyncio.gather(run_upsert(), run_upsert(), return_exceptions=True)
+    assert not any(isinstance(r, Exception) for r in results), results
+
+    async with AsyncSession(engine) as check:
+        artists = list((await check.scalars(select(CatalogArtist))).all())
+    assert len(artists) == 1
+    assert artists[0].mbid == "concurrent-mbid"
+    await engine.dispose()

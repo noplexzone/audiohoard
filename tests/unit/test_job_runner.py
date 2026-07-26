@@ -736,6 +736,42 @@ async def test_background_second_session_sees_running_and_acquiring_track_during
     assert observed_acq_state == AcquisitionState.acquiring
 
 
+async def test_background_phase2_get_raises_persists_failed(
+    bg_factory: async_sessionmaker,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase-2 db.get or commit failure must leave job as failed, never pending."""
+    async with bg_factory() as s:
+        job = Job(source="youtube", query="test", status=JobStatus.pending)
+        s.add(job)
+        await s.commit()
+        job_id = job.id
+
+    # Phase-1 get succeeds (call_count==1), phase-2 get raises (call_count==2),
+    # recovery get succeeds (call_count==3+).
+    call_count = 0
+    _orig_get = AsyncSession.get
+
+    async def patched_get(self: AsyncSession, *args: object, **kwargs: object) -> object:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("phase-2 db.get exploded")
+        return await _orig_get(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "get", patched_get)
+
+    await runner.run_job(job_id, settings=None)
+
+    async with bg_factory() as s:
+        loaded = await s.get(Job, job_id)
+        assert loaded is not None
+        assert loaded.status == JobStatus.failed
+        assert loaded.result_json is not None
+        assert "running_transition_error" in loaded.result_json
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher robustness / watchdog tests
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -81,6 +82,14 @@ async def search_catalog_artists(
 
 
 async def upsert_catalog_artist(db: AsyncSession, hit: ArtistHit | ArtistDetail) -> CatalogArtist:
+    try:
+        return await _upsert_catalog_artist(db, hit)
+    except IntegrityError:
+        await db.rollback()
+        return await _upsert_catalog_artist(db, hit)
+
+
+async def _upsert_catalog_artist(db: AsyncSession, hit: ArtistHit | ArtistDetail) -> CatalogArtist:
     ids = provider_ids_for_hit(hit)
     filters = []
     if ids["mbid"]:

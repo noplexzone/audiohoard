@@ -286,13 +286,35 @@ async def run_job(
     cfg = cfg_built
 
     # Phase 2: commit pending->running before any provider work so observers see it.
-    async with factory() as s:
-        job = await s.get(Job, job_id)
-        if job is None:
-            return
-        job.status = JobStatus.running
-        job.updated_at = _now()
-        await s.commit()
+    try:
+        async with factory() as s:
+            job = await s.get(Job, job_id)
+            if job is None:
+                return
+            job.status = JobStatus.running
+            job.updated_at = _now()
+            await s.commit()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Job %d phase-2 running transition failed", job_id)
+        with contextlib.suppress(Exception):
+            async with factory() as s:
+                j = await s.get(Job, job_id)
+                if j is not None:
+                    j.status = JobStatus.failed
+                    j.result_json = json.dumps(
+                        {
+                            "error": {
+                                "code": "running_transition_error",
+                                "operation": "init",
+                                "retryable": False,
+                            }
+                        }
+                    )
+                    j.updated_at = _now()
+                    await s.commit()
+        return
 
     # Phase 3: execute with per-result progress commits; terminal state persisted on failure.
     try:
