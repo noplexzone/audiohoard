@@ -10,10 +10,10 @@ import app.database as db_module
 from app.models.catalog_entities import CatalogArtist
 
 
-async def _seed_artist(name: str = "Test Artist") -> int:
+async def _seed_artist(name: str = "Test Artist", mbid: str = "test-provider-id") -> int:
     factory = db_module.get_session_factory()
     async with factory() as session:
-        artist = CatalogArtist(name=name, mbid="test-provider-id")
+        artist = CatalogArtist(name=name, mbid=mbid)
         session.add(artist)
         await session.commit()
         await session.refresh(artist)
@@ -73,7 +73,7 @@ async def test_manual_enrich_failure_redirect_has_no_sql_fragment(client: AsyncC
 @pytest.mark.asyncio
 async def test_manual_enrich_success_redirects_to_surviving_artist(client: AsyncClient) -> None:
     original_id = await _seed_artist("Duplicate Artist")
-    survivor_id = await _seed_artist("Surviving Artist")
+    survivor_id = await _seed_artist("Surviving Artist", "survivor-provider-id")
 
     with patch(
         "app.routers.catalog.enrich_catalog_artist",

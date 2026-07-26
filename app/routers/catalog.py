@@ -384,7 +384,8 @@ async def enrich_catalog_artist_page(
         outcome = await enrich_catalog_artist(
             db, settings, artist, runtime.enabled_metadata_providers
         )
-        redirect_artist_id = int(outcome.get("artist_id", artist.id))
+        redirect_value = outcome.get("artist_id", artist.id)
+        redirect_artist_id = redirect_value if isinstance(redirect_value, int) else artist.id
         survivor = await db.get(CatalogArtist, redirect_artist_id)
         if survivor is None:
             raise RuntimeError("Enrichment survivor was not found")
