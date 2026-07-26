@@ -384,10 +384,17 @@ async def enrich_catalog_artist_page(
         outcome = await enrich_catalog_artist(
             db, settings, artist, runtime.enabled_metadata_providers
         )
-        provenance = json.loads(artist.provenance_json or "{}") if artist.provenance_json else {}
+        redirect_artist_id = int(outcome.get("artist_id", artist.id))
+        survivor = await db.get(CatalogArtist, redirect_artist_id)
+        if survivor is None:
+            raise RuntimeError("Enrichment survivor was not found")
+        provenance = (
+            json.loads(survivor.provenance_json or "{}") if survivor.provenance_json else {}
+        )
         provenance.pop("last_enrichment_error", None)
-        artist.provenance_json = json.dumps(provenance, sort_keys=True)
+        survivor.provenance_json = json.dumps(provenance, sort_keys=True)
         await db.commit()
+        artist_id = redirect_artist_id
         suffix = (
             "?enrichment=ambiguous" if outcome.get("status") == "ambiguous" else "?enrichment=ok"
         )

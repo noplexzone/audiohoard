@@ -71,6 +71,22 @@ async def test_manual_enrich_failure_redirect_has_no_sql_fragment(client: AsyncC
 
 
 @pytest.mark.asyncio
+async def test_manual_enrich_success_redirects_to_surviving_artist(client: AsyncClient) -> None:
+    original_id = await _seed_artist("Duplicate Artist")
+    survivor_id = await _seed_artist("Surviving Artist")
+
+    with patch(
+        "app.routers.catalog.enrich_catalog_artist",
+        new_callable=AsyncMock,
+        return_value={"status": "ok", "artist_id": survivor_id},
+    ):
+        resp = await client.post(f"/artists/catalog/{original_id}/enrich", follow_redirects=False)
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == f"/artists/catalog/{survivor_id}?enrichment=ok"
+
+
+@pytest.mark.asyncio
 async def test_manual_enrich_success_clears_prior_error(client: AsyncClient) -> None:
     artist_id = await _seed_artist()
     factory = db_module.get_session_factory()
