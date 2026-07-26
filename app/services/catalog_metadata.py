@@ -118,9 +118,11 @@ async def upsert_catalog_artist(db: AsyncSession, hit: ArtistHit | ArtistDetail)
                 and candidate.mbid in {None, ids["mbid"]}
             )
     candidates = list({candidate.id: candidate for candidate in candidates}.values())
-    artist = candidates[0] if candidates else None
-    for duplicate in candidates[1:]:
-        artist = await merge_catalog_artists(db, artist, duplicate)
+    artist: CatalogArtist | None = None
+    if candidates:
+        artist = candidates[0]
+        for duplicate in candidates[1:]:
+            artist = await merge_catalog_artists(db, artist, duplicate)
     if artist is None:
         artist = CatalogArtist(name=hit.name)
         db.add(artist)
