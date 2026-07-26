@@ -423,3 +423,201 @@ async def test_changelog_page_renders_markdown_links(client: object) -> None:
     assert "0.4.1" in response.text
     assert "Keep a Changelog" in response.text
     assert "https://keepachangelog.com" in response.text
+
+
+@pytest.mark.asyncio
+async def test_html_connection_test_uses_entered_values_without_saving(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.sources.base import CapabilityState
+    from app.sources.slskd import SlskdAdapter
+
+    captured: dict[str, str] = {}
+
+    async def healthy(self: SlskdAdapter) -> CapabilityState:
+        captured["url"] = self._base_url
+        captured["key"] = self._api_key
+        return CapabilityState(available=True)
+
+    monkeypatch.setattr(SlskdAdapter, "health", healthy)
+    response = await client.post(
+        "/settings/test",
+        data={
+            "provider": "slskd",
+            "slskd_url": "http://entered-slskd:5030",
+            "slskd_api_key": "entered-key",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert captured == {"url": "http://entered-slskd:5030", "key": "entered-key"}
+    settings = (await client.get("/api/settings")).json()
+    assert settings["slskd_url"]["configured"] is False
+
+
+@pytest.mark.asyncio
+async def test_html_save_uses_provider_validation_and_writes_nothing_on_failure(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.sources.base import CapabilityState
+    from app.sources.slskd import SlskdAdapter
+
+    async def unavailable(self: SlskdAdapter) -> CapabilityState:
+        return CapabilityState(available=False, reason="connection refused")
+
+    monkeypatch.setattr(SlskdAdapter, "health", unavailable)
+    response = await client.post(
+        "/settings/save",
+        data={
+            "section": "download-clients",
+            "slskd_url": "http://bad-slskd",
+            "slskd_api_key": "bad-key",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert "error=" in response.headers["location"]
+    settings = (await client.get("/api/settings")).json()
+    assert settings["slskd_url"]["configured"] is False
+
+
+@pytest.mark.asyncio
+async def test_source_priority_move_control_persists_order(client: AsyncClient) -> None:
+    from app.database import get_session_factory
+    from app.settings_service import get_runtime_settings
+
+    response = await client.post(
+        "/settings",
+        data={
+            "section": "download-sources",
+            "source_order": ["slskd", "prowlarr", "youtube", "tidal"],
+            "source_enabled": ["slskd", "prowlarr", "youtube", "tidal"],
+            "move_source": "up:youtube",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    factory = get_session_factory()
+    async with factory() as db:
+        runtime = await get_runtime_settings(db)
+    assert [item["name"] for item in runtime.source_priority] == [
+        "slskd",
+        "youtube",
+        "prowlarr",
+        "tidal",
+    ]
+    assert all(item["enabled"] for item in runtime.source_priority)
+
+
+@pytest.mark.asyncio
+async def test_invalid_behavior_form_redirects_with_error_instead_of_500(
+    client: AsyncClient,
+) -> None:
+    response = await client.post(
+        "/settings",
+        data={"section": "behavior", "free_text_result_limit": "not-a-number"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/settings/behavior?error=")
+
+
+@pytest.mark.asyncio
+async def test_download_client_section_renders_disabled_source_states(client: AsyncClient) -> None:
+    response = await client.post(
+        "/settings",
+        data={
+            "section": "download-sources",
+            "source_order": ["slskd", "prowlarr", "youtube", "tidal"],
+            "source_enabled": ["slskd", "youtube"],
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+    page = await client.get("/settings/download-clients")
+    assert page.status_code == 200
+    assert page.text.count("Disabled") >= 3
+
+
+@pytest.mark.asyncio
+async def test_saving_download_sources_preserves_auto_download_behavior(
+    client: AsyncClient,
+) -> None:
+    enabled = await client.post(
+        "/settings",
+        data={
+            "section": "behavior",
+            "free_text_result_limit": "10",
+            "discography_refresh_hours": "24",
+            "source_search_budget_seconds": "15",
+            "auto_download_wanted": "true",
+        },
+        follow_redirects=False,
+    )
+    assert enabled.status_code == 303
+
+    saved_sources = await client.post(
+        "/settings",
+        data={
+            "section": "download-sources",
+            "source_order": ["slskd", "prowlarr", "youtube", "tidal"],
+            "source_enabled": ["slskd", "prowlarr", "youtube"],
+        },
+        follow_redirects=False,
+    )
+    assert saved_sources.status_code == 303
+
+    from app.database import get_session_factory
+    from app.settings_service import get_runtime_settings
+
+    factory = get_session_factory()
+    async with factory() as db:
+        runtime = await get_runtime_settings(db)
+    assert runtime.auto_download_wanted is True
+
+
+@pytest.mark.asyncio
+async def test_disabling_primary_metadata_provider_selects_an_enabled_replacement(
+    client: AsyncClient,
+) -> None:
+    response = await client.post(
+        "/settings",
+        data={
+            "section": "metadata",
+            "metadata_order": ["musicbrainz", "deezer", "itunes"],
+            "metadata_enabled": ["deezer", "itunes"],
+            "primary_metadata_provider": "musicbrainz",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+    from app.database import get_session_factory
+    from app.settings_service import get_runtime_settings
+
+    factory = get_session_factory()
+    async with factory() as db:
+        runtime = await get_runtime_settings(db)
+    assert runtime.primary_metadata_provider == "deezer"
+    assert runtime.enabled_metadata_providers == ["deezer", "itunes"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_provider_settings_form_redirects_with_error_instead_of_500(
+    client: AsyncClient,
+) -> None:
+    response = await client.post(
+        "/settings/save",
+        data={
+            "section": "download-clients",
+            "tidal_quality": "lossless-plus",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/settings/download-clients?error=")

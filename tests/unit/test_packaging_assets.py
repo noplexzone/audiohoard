@@ -77,3 +77,15 @@ def test_favicon_ico_entries_carry_alpha() -> None:
         ico.seek(index)
         image = ico.convert("RGBA")
         assert image.getpixel((0, 0))[3] == 0
+
+
+def test_dockerfile_version_and_healthcheck_match_current_runtime_contract() -> None:
+    dockerfile = Path("docker/Dockerfile").read_text(encoding="utf-8")
+    assert 'org.opencontainers.image.version="0.6.0"' in dockerfile
+    assert "http://localhost:8000/health/ready" in dockerfile
+
+
+def test_manual_develop_publish_is_restricted_to_main() -> None:
+    workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+    assert "workflow_dispatch:" in workflow
+    assert "if: github.event_name == 'push' || github.ref == 'refs/heads/main'" in workflow

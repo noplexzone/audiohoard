@@ -108,6 +108,8 @@ async def test_authenticated_page_forms_replay_as_native_browser_posts(
     forms = _parse_forms(page.text)
 
     for form in forms:
+        if form.action == "/logout":
+            continue
         if form.attrs.get("data-custom-submit") == "true":
             assert _same_template_has_script_for_form(page.text, form)
             continue

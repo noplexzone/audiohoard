@@ -4,9 +4,11 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 jobs:
   quality:
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
     name: Quality checks
     runs-on: ubuntu-latest
     steps:

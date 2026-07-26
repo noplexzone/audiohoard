@@ -9,7 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.jobs import runner
+from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
+from app.models.release import Release
 from app.models.track import IdentityResolutionState, Track
 from app.models.workflow import AcquisitionState
 from app.naming.convention import NamingError
@@ -101,14 +103,23 @@ async def test_cancellation_persists_job_and_track_state(
 
 
 async def test_prowlarr_result_is_enqueued_to_sabnzbd(
-    db_session: AsyncSession, test_settings: Settings, monkeypatch: object
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: object, tmp_path: object
 ) -> None:
+    from pathlib import Path
+
     from pytest import MonkeyPatch
 
     mp = monkeypatch
     assert isinstance(mp, MonkeyPatch)
+    assert isinstance(tmp_path, Path)
     job = await _create_job(db_session, source="prowlarr")
-    test_settings = test_settings.model_copy(update={"prowlarr_url": "https://prowlarr.test"})
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    audio_file = staging / "track.flac"
+    audio_file.write_bytes(b"audio")
+    test_settings = test_settings.model_copy(
+        update={"prowlarr_url": "https://prowlarr.test", "staging_root": staging}
+    )
     calls: list[str] = []
 
     async def fake_fetch_results(job: Job, cfg: Settings) -> Sequence[SearchResult]:
@@ -135,9 +146,15 @@ async def test_prowlarr_result_is_enqueued_to_sabnzbd(
             calls.append(f"enqueue:{nzb_url}:{name}")
             return "SAB123"
 
-        async def status(self, nzo_id: str) -> CapabilityState:
-            calls.append(f"status:{nzo_id}")
-            return CapabilityState(available=True, reason="Downloading")
+    async def fake_poll_sab_job(
+        nzo_id: str,
+        adapter: object,
+        staging_root: Path,
+        poll_interval: float,
+        poll_timeout: float,
+    ) -> Path:
+        calls.append(f"poll:{nzo_id}")
+        return audio_file
 
     mp.setattr(runner, "_fetch_results", fake_fetch_results)
     mp.setattr(runner, "_enrich_musicbrainz", noop)
@@ -145,17 +162,16 @@ async def test_prowlarr_result_is_enqueued_to_sabnzbd(
     mp.setattr(runner, "_run_fingerprint", noop)
     mp.setattr(runner, "_compute_path_preview", noop_preview)
     mp.setattr(runner, "SabnzbdAdapter", FakeSabnzbdAdapter)
+    mp.setattr(runner, "_poll_sab_job", fake_poll_sab_job)
 
     await runner.run_job(job.id, db_session, test_settings)
 
     track = (await db_session.execute(select(Track))).scalar_one()
     assert job.status == JobStatus.done
     assert track.source_job_id == "SAB123"
-    assert track.source_status == "Downloading"
-    assert calls[-2:] == [
-        "enqueue:https://prowlarr.test/download/file.nzb:Artist - Album",
-        "status:SAB123",
-    ]
+    assert track.source_status == "downloaded"
+    assert "enqueue:https://prowlarr.test/download/file.nzb:Artist - Album" in calls
+    assert "poll:SAB123" in calls
 
 
 async def test_path_preview_naming_error_marks_job_failed(
@@ -429,3 +445,81 @@ async def test_priority_job_records_clear_failure_when_all_sources_exhausted(
     assert job.source == "priority"
     assert '"status": "empty"' in (job.result_json or "")
     assert '"code": "timeout"' in (job.result_json or "")
+
+
+async def test_album_prowlarr_results_are_candidates_not_tracks(
+    db_session: AsyncSession,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artist = CatalogArtist(name="Artist")
+    album = CatalogAlbum(
+        title="Album",
+        year="2024",
+        mbid="00000000-0000-0000-0000-000000000001",
+        track_count=1,
+    )
+    artist.albums.append(album)
+    catalog_track = CatalogAlbumTrack(position=1, disc=1, title="Song")
+    album.tracks.append(catalog_track)
+    db_session.add(artist)
+    await db_session.flush()
+    job = Job(
+        source="prowlarr",
+        query="Artist Album",
+        status=JobStatus.pending,
+        catalog_album_id=album.id,
+    )
+    db_session.add(job)
+    await db_session.flush()
+    acquired: list[str] = []
+
+    async def fake_fetch(*args: object, **kwargs: object) -> Sequence[SearchResult]:
+        return [
+            SearchResult(source="prowlarr", title="Song", url="https://indexer/one.nzb"),
+            SearchResult(source="prowlarr", title="Other release", url="https://indexer/two.nzb"),
+        ]
+
+    async def fake_acquire(
+        result: SearchResult,
+        source: str,
+        cfg: Settings,
+        track: Track | None = None,
+    ) -> tuple[str, str]:
+        acquired.append(result.url)
+        return "sab-1", "downloaded"
+
+    async def noop_track(track: Track, cfg: Settings) -> None:
+        return None
+
+    async def noop_preview(track: Track, db: AsyncSession, cfg: Settings) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(runner, "_prepare_acquisition", fake_acquire)
+    monkeypatch.setattr(runner, "_enrich_musicbrainz", noop_track)
+    monkeypatch.setattr(runner, "_enrich_deezer", noop_track)
+    monkeypatch.setattr(runner, "_run_fingerprint", noop_track)
+    monkeypatch.setattr(runner, "_compute_path_preview", noop_preview)
+
+    await runner.run_job(job.id, db_session, test_settings)
+
+    tracks = list((await db_session.scalars(select(Track).where(Track.job_id == job.id))).all())
+    release = (await db_session.scalars(select(Release).where(Release.job_id == job.id))).one()
+    assert acquired == ["https://indexer/one.nzb"]
+    assert len(tracks) == 1
+    assert tracks[0].catalog_track_id == catalog_track.id
+    assert tracks[0].identity_state == IdentityResolutionState.unresolved
+    assert release.release_mbid == album.mbid
+    assert release.year == "2024"
+    assert release.track_count == 1
+
+
+def test_catalog_track_matching_never_falls_back_to_result_position() -> None:
+    first = CatalogAlbumTrack(id=1, position=1, disc=1, title="First")
+    second = CatalogAlbumTrack(id=2, position=2, disc=1, title="Second")
+    result = SearchResult(source="prowlarr", title="Unrelated NZB", url="https://indexer/file.nzb")
+
+    matched = runner._catalog_track_for_result(result, [first, second], None)
+
+    assert matched is None

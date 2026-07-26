@@ -13,10 +13,15 @@ from typing import BinaryIO, no_type_check
 
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK, TXXX
+from mutagen.mp4 import MP4
+from mutagen.oggopus import OggOpus
+from mutagen.oggvorbis import OggVorbis
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import register_transaction_callbacks
+from app.media_formats import is_importable_audio, supported_audio_formats_display
+from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
 from app.models.import_plan import CollisionState, ImportPlan, TagVerificationState
 from app.models.release import Release
 from app.models.track import Track
@@ -193,6 +198,32 @@ class MutagenTagWriter:
             for key, value in tags.items():
                 flac[key] = value
             flac.save()
+        elif suffix in {".ogg", ".oga", ".opus"}:
+            ogg = OggOpus(path) if suffix == ".opus" else OggVorbis(path)
+            for key, value in tags.items():
+                ogg[key] = value
+            ogg.save()
+        elif suffix in {".m4a", ".mp4"}:
+            mp4 = MP4(path)
+            text_atoms = {
+                "title": "\xa9nam",
+                "artist": "\xa9ART",
+                "album": "\xa9alb",
+                "album_artist": "aART",
+                "date": "\xa9day",
+            }
+            for key, atom in text_atoms.items():
+                if value := tags.get(key):
+                    mp4[atom] = [value]
+            if value := tags.get("tracknumber"):
+                mp4["trkn"] = [(int(value), 0)]
+            if value := tags.get("discnumber"):
+                mp4["disk"] = [(int(value), 0)]
+            if value := tags.get("musicbrainz_trackid"):
+                mp4["----:com.apple.iTunes:MusicBrainz Track Id"] = [value.encode()]
+            if value := tags.get("musicbrainz_albumid"):
+                mp4["----:com.apple.iTunes:MusicBrainz Album Id"] = [value.encode()]
+            mp4.save()
         else:
             return False
         readback = self.read_tags(path)
@@ -218,6 +249,48 @@ class MutagenTagWriter:
                 if tag_values := flac.get(key):
                     flac_values[key] = str(tag_values[0])
             return flac_values
+        if suffix in {".ogg", ".oga", ".opus"}:
+            ogg = OggOpus(path) if suffix == ".opus" else OggVorbis(path)
+            return {
+                key: str(ogg_values[0])
+                for key in (
+                    "title",
+                    "artist",
+                    "album",
+                    "album_artist",
+                    "date",
+                    "tracknumber",
+                    "discnumber",
+                    "musicbrainz_trackid",
+                    "musicbrainz_albumid",
+                )
+                if (ogg_values := ogg.get(key))
+            }
+        if suffix in {".m4a", ".mp4"}:
+            mp4 = MP4(path)
+            mp4_values: dict[str, str] = {}
+            text_atoms = {
+                "title": "\xa9nam",
+                "artist": "\xa9ART",
+                "album": "\xa9alb",
+                "album_artist": "aART",
+                "date": "\xa9day",
+            }
+            for key, atom in text_atoms.items():
+                if atom_values := mp4.get(atom):
+                    mp4_values[key] = str(atom_values[0])
+            if track_values := mp4.get("trkn"):
+                mp4_values["tracknumber"] = str(track_values[0][0])
+            if disc_values := mp4.get("disk"):
+                mp4_values["discnumber"] = str(disc_values[0][0])
+            for key, atom in {
+                "musicbrainz_trackid": "----:com.apple.iTunes:MusicBrainz Track Id",
+                "musicbrainz_albumid": "----:com.apple.iTunes:MusicBrainz Album Id",
+            }.items():
+                if atom_values := mp4.get(atom):
+                    raw = atom_values[0]
+                    mp4_values[key] = raw.decode() if isinstance(raw, bytes) else str(raw)
+            return mp4_values
         if suffix != ".mp3":
             return {}
         id3 = ID3(path)
@@ -283,6 +356,11 @@ async def plan_release_import(
 
         try:
             _ensure_regular_source(source)
+            if not is_importable_audio(source):
+                raise ImportPlanningError(
+                    f"unsupported audio format '{source.suffix.casefold() or '(none)'}'; "
+                    f"supported formats: {supported_audio_formats_display()}"
+                )
             source_hash = _sha256(source)
             if artifact is not None and source_hash != artifact[1]:
                 raise ImportPlanningError(
@@ -373,6 +451,48 @@ def _close_pinned_destinations(destinations: list[PinnedDestination]) -> None:
         pinned.close()
 
 
+async def _reconcile_catalog_ownership(db: AsyncSession, release: Release) -> None:
+    album_ids = set(
+        (
+            await db.scalars(
+                select(Track.catalog_album_id).where(
+                    Track.release_id == release.id,
+                    Track.catalog_album_id.is_not(None),
+                )
+            )
+        ).all()
+    )
+    for album_id in album_ids:
+        expected_ids = set(
+            (
+                await db.scalars(
+                    select(CatalogAlbumTrack.id).where(CatalogAlbumTrack.album_id == album_id)
+                )
+            ).all()
+        )
+        imported_rows = (
+            await db.execute(
+                select(Track.catalog_track_id, ImportPlan.destination_path)
+                .join(ImportPlan, ImportPlan.track_id == Track.id)
+                .where(
+                    Track.catalog_album_id == album_id,
+                    Track.import_state == ImportWorkflowState.imported,
+                    ImportPlan.status == ImportWorkflowState.imported,
+                )
+            )
+        ).all()
+        present_ids = {
+            catalog_track_id
+            for catalog_track_id, destination_path in imported_rows
+            if catalog_track_id is not None
+            and destination_path
+            and _is_regular_non_symlink(Path(destination_path))
+        }
+        album = await db.get(CatalogAlbum, album_id)
+        if album is not None:
+            album.in_library = bool(expected_ids) and expected_ids <= present_ids
+
+
 def _rollback_pinned_filesystem(
     temp_paths: list[tuple[PinnedDestination, str]],
     created_destinations: list[tuple[PinnedDestination, str]],
@@ -413,7 +533,7 @@ async def execute_release_import(
     )
     plans = list(plans_result.scalars().all())
     if not plans:
-        plans = await plan_release_import(db, release, library_root=library_root)
+        raise ImportExecutionError("release has no reviewed import plan")
     if any(plan.status != ImportWorkflowState.ready for plan in plans):
         raise ImportExecutionError("release has import plans that are not ready")
 
@@ -471,6 +591,7 @@ async def execute_release_import(
             plan.status = ImportWorkflowState.imported
             plan.collision_state = CollisionState.clear
         release.import_state = ImportWorkflowState.imported
+        await _reconcile_catalog_ownership(db, release)
         await db.flush()
 
         committed_destinations = tuple(created_destinations)

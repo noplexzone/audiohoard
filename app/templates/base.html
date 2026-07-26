@@ -22,6 +22,7 @@
   <symbol id="i-jobs" viewBox="0 0 24 24"><path d="M5 7h14v13H5zM9 7V4h6v3M8 12h8M8 16h5"/></symbol>
   <symbol id="i-import" viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M4 18v2h16v-2"/></symbol>
   <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2M19 5l-2 2M7 17l-2 2"/></symbol>
+  <symbol id="i-logout" viewBox="0 0 24 24"><path d="M10 5H5v14h5M14 8l4 4-4 4M8 12h10"/></symbol>
 </svg>
 {% set path = request.url.path %}
 {% set auth_view = path in ['/login', '/setup'] %}
@@ -41,11 +42,23 @@
     <nav class="utility-nav" aria-label="Utilities">
       <a href="/settings" {% if path.startswith("/settings") or path.startswith("/changelog") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-settings"/></svg><span>Settings</span></a>
       <a href="/api/docs"><span class="nav-symbol" aria-hidden="true">{ }</span><span>API docs</span></a>
+      {% if request.state.current_username is defined %}<p class="account-name">Signed in as <strong>{{ request.state.current_username }}</strong></p>{% endif %}
+      <form class="nav-logout" method="post" action="/logout">
+        <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+        <button type="submit"><svg><use href="#i-logout"/></svg><span>Sign out</span></button>
+      </form>
     </nav>
-    <p class="sidebar-meta"><a href="/changelog">v0.5.0</a> · private &amp; local</p>
+    <p class="sidebar-meta"><a href="/changelog">v{{ app_version }}</a> · private &amp; local</p>
   </aside>
   <header class="mobile-header">
     <a class="brand" href="/" aria-label="Audiohoard home"><span class="brand-mark"><img src="/static/branding/icon-32.png" alt="" width="32" height="32"></span><span>Audiohoard</span></a>
+    <div class="mobile-account" aria-label="Account controls">
+      <a href="/settings" aria-label="Settings"><svg><use href="#i-settings"/></svg></a>
+      <form method="post" action="/logout">
+        <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+        <button type="submit" aria-label="Sign out"><svg><use href="#i-logout"/></svg></button>
+      </form>
+    </div>
   </header>
   {% endif %}
   <main id="main-content" tabindex="-1">
@@ -57,8 +70,9 @@
     <a href="/" {% if path == "/" %}class="active" aria-current="page"{% endif %}><svg><use href="#i-home"/></svg><span>Home</span></a>
     <a href="/search" {% if path.startswith("/search") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-search"/></svg><span>Search</span></a>
     <a href="/library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
-    <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") or path.startswith("/imports") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span></a>
-    <a href="/settings" {% if path.startswith("/settings") or path.startswith("/changelog") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-settings"/></svg><span>Settings</span></a>
+    <a href="/artists" {% if path.startswith("/artists") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-artists"/></svg><span>Artists</span></a>
+    <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span></a>
+    <a href="/imports/ui/review" {% if path.startswith("/imports") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Imports</span></a>
   </nav>
   {% endif %}
 </div>

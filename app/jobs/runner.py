@@ -15,6 +15,7 @@ from sqlalchemy.orm import selectinload
 from app.config import Settings, get_settings
 from app.database import get_session_factory
 from app.fingerprint.acoustid import fingerprint_file, lookup_acoustid
+from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS
 from app.metadata.deezer import DeezerClient
 from app.metadata.filename_parse import parse_filename
 from app.metadata.musicbrainz import MusicBrainzClient
@@ -26,6 +27,7 @@ from app.models.track import FingerprintState, IdentityResolutionState, Track
 from app.models.workflow import AcquisitionState
 from app.naming.convention import NamingError, render_path
 from app.schemas.search import SearchRequest, SearchResult
+from app.services.monitoring import map_slskd_transfer_state
 from app.settings_service import (
     DEFAULT_FREE_TEXT_RESULT_LIMIT,
     build_effective_settings,
@@ -43,6 +45,192 @@ logger = logging.getLogger(__name__)
 
 def _now() -> datetime:
     return datetime.now(tz=UTC)
+
+
+def _resolve_staged_path(raw_path: Path, staging_root: Path) -> Path:
+    """Return resolved path, verify it is under staging_root. Raises ProviderError on traversal."""
+    resolved = raw_path.resolve()
+    root_resolved = staging_root.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError:
+        raise ProviderError(
+            "path_traversal", "artifact path escapes staging root", "acquire"
+        ) from None
+    return resolved
+
+
+def _find_audio_files_sync(directory: Path) -> list[Path]:
+    return sorted(
+        p
+        for p in directory.rglob("*")
+        if p.is_file() and p.suffix.lower().lstrip(".") in IMPORTABLE_AUDIO_EXTENSIONS
+    )
+
+
+async def _find_audio_files(directory: Path, staging_root: Path) -> list[Path]:
+    resolved_dir = _resolve_staged_path(directory, staging_root)
+    return await asyncio.to_thread(_find_audio_files_sync, resolved_dir)
+
+
+def _locate_slskd_artifact_sync(
+    filename: str,
+    transfer_details: dict[str, object],
+    staging_root: Path,
+) -> Path:
+    root = staging_root.resolve()
+    basename = Path(filename.replace("\\", "/")).name
+    candidates: list[Path] = []
+    for key in ("localPath", "localFilename", "downloadPath", "path"):
+        value = transfer_details.get(key)
+        if isinstance(value, str) and value.strip():
+            candidate = Path(value)
+            candidates.append(candidate if candidate.is_absolute() else root / candidate)
+    candidates.append(root / basename)
+
+    for candidate in candidates:
+        try:
+            resolved = _resolve_staged_path(candidate, root)
+        except ProviderError:
+            continue
+        if resolved.is_file():
+            return resolved
+
+    matches: list[Path] = []
+    for match in root.rglob(basename):
+        try:
+            resolved = _resolve_staged_path(match, root)
+        except ProviderError:
+            continue
+        if resolved.is_file():
+            matches.append(resolved)
+    unique_matches = sorted(set(matches))
+    if len(unique_matches) == 1:
+        return unique_matches[0]
+    if len(unique_matches) > 1:
+        raise ProviderError(
+            "artifact_ambiguous",
+            f"multiple completed files match {basename} beneath the staging root",
+            "acquire",
+        )
+    raise ProviderError(
+        "artifact_missing",
+        f"slskd transfer completed but file not found beneath the staging root: {basename}",
+        "acquire",
+    )
+
+
+async def _locate_slskd_artifact(
+    filename: str,
+    transfer_details: dict[str, object],
+    staging_root: Path,
+) -> Path:
+    return await asyncio.to_thread(
+        _locate_slskd_artifact_sync,
+        filename,
+        transfer_details,
+        staging_root,
+    )
+
+
+async def _poll_slskd_transfer(
+    transfer_id: str,
+    username: str,
+    filename: str,
+    adapter: SlskdAdapter,
+    staging_root: Path,
+    poll_interval: float,
+    poll_timeout: float,
+) -> Path:
+    """Poll slskd until transfer reaches a terminal state. Returns verified staged file path."""
+    import time as _time
+
+    deadline = _time.monotonic() + poll_timeout
+    while True:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            with contextlib.suppress(Exception):
+                await adapter.cancel(username, filename)
+            raise ProviderError("transfer_timeout", "slskd transfer timed out", "acquire", True)
+        try:
+            state = await adapter.status(transfer_id)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await adapter.cancel(username, filename)
+            raise
+
+        acq_state = map_slskd_transfer_state(state)
+        if acq_state == AcquisitionState.downloaded:
+            return await _locate_slskd_artifact(filename, state.extra, staging_root)
+        if acq_state == AcquisitionState.failed:
+            raise ProviderError(
+                "transfer_failed", f"slskd transfer failed: {state.reason}", "acquire", True
+            )
+        if acq_state == AcquisitionState.cancelled:
+            raise ProviderError("transfer_failed", "slskd transfer was cancelled", "acquire", True)
+
+        await asyncio.sleep(min(poll_interval, max(0.01, remaining)))
+
+
+async def _poll_sab_job(
+    nzo_id: str,
+    adapter: SabnzbdAdapter,
+    staging_root: Path,
+    poll_interval: float,
+    poll_timeout: float,
+) -> Path:
+    """Poll SABnzbd queue then history until the job reaches a terminal state."""
+    import time as _time
+
+    deadline = _time.monotonic() + poll_timeout
+    while True:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            raise ProviderError("transfer_timeout", "SABnzbd job timed out", "acquire", True)
+
+        queue_state = await adapter.status(nzo_id)
+        if queue_state.available:
+            status = (queue_state.reason or "").casefold()
+            if status == "failed":
+                raise ProviderError(
+                    "transfer_failed", "SABnzbd job failed in queue", "acquire", True
+                )
+            # Still active in queue — keep polling
+        else:
+            # Not in queue; check history for terminal state
+            hist_state = await adapter.history_status(nzo_id)
+            if not hist_state.available:
+                raise ProviderError(
+                    "transfer_lost",
+                    "SABnzbd job disappeared from queue and history",
+                    "acquire",
+                    True,
+                )
+            hist_status = (hist_state.reason or "").casefold()
+            if hist_status == "completed":
+                storage = str(hist_state.extra.get("storage", ""))
+                if not storage:
+                    raise ProviderError(
+                        "artifact_missing",
+                        "SABnzbd completed job has no storage path",
+                        "acquire",
+                    )
+                audio_files = await _find_audio_files(Path(storage), staging_root)
+                if not audio_files:
+                    raise ProviderError(
+                        "artifact_missing",
+                        f"SABnzbd completed but no audio files found in {storage}",
+                        "acquire",
+                    )
+                return audio_files[0]
+            raise ProviderError(
+                "transfer_failed",
+                f"SABnzbd job in terminal failure state: {hist_status}",
+                "acquire",
+                True,
+            )
+
+        await asyncio.sleep(min(poll_interval, max(0.01, remaining)))
 
 
 async def run_job(
@@ -81,13 +269,21 @@ async def _run_job_in_session(job_id: int, db: AsyncSession, cfg: Settings) -> N
         results = _selected_result(job) or await _call_fetch_results(job, cfg, db)
         catalog_album = await _load_catalog_album(db, job.catalog_album_id)
         catalog_tracks = list(catalog_album.tracks) if catalog_album is not None else []
+        if (
+            catalog_album is not None
+            and job.catalog_track_id is None
+            and results
+            and all(result.source == "prowlarr" for result in results)
+        ):
+            # Prowlarr results are alternative release candidates, not tracks.
+            # Acquire one candidate and report manifest gaps rather than enqueueing
+            # every NZB and assigning candidates to tracks by position.
+            results = results[:1]
         tracks_created = 0
         failures: list[str] = []
         releases: dict[tuple[str | None, str | None], Release] = {}
-        for index, result in enumerate(results):
-            catalog_track = _catalog_track_for_result(
-                result, catalog_tracks, index, job.catalog_track_id
-            )
+        for result in results:
+            catalog_track = _catalog_track_for_result(result, catalog_tracks, job.catalog_track_id)
             track: Track | None = None
             try:
                 release_key = (
@@ -107,6 +303,15 @@ async def _run_job_in_session(job_id: int, db: AsyncSession, cfg: Settings) -> N
                         album_artist=catalog_album.artist.name
                         if catalog_album is not None
                         else result.artist,
+                        year=catalog_album.year if catalog_album is not None else None,
+                        release_mbid=catalog_album.mbid if catalog_album is not None else None,
+                        track_count=(
+                            len(catalog_tracks)
+                            if catalog_tracks
+                            else catalog_album.track_count
+                            if catalog_album is not None
+                            else None
+                        ),
                     )
                     db.add(release)
                     await db.flush()
@@ -132,8 +337,7 @@ async def _run_job_in_session(job_id: int, db: AsyncSession, cfg: Settings) -> N
                     mbid=catalog_track.recording_mbid if catalog_track is not None else None,
                     identity_state=(
                         IdentityResolutionState.resolved
-                        if (catalog_track and catalog_track.recording_mbid)
-                        or (catalog_album and catalog_album.mbid)
+                        if catalog_track and catalog_track.recording_mbid
                         else IdentityResolutionState.unresolved
                     ),
                     source_path=None,
@@ -242,7 +446,6 @@ async def _load_catalog_album(db: AsyncSession, album_id: int | None) -> Catalog
 def _catalog_track_for_result(
     result: SearchResult,
     tracks: list[CatalogAlbumTrack],
-    index: int,
     selected_track_id: int | None,
 ) -> CatalogAlbumTrack | None:
     if selected_track_id is not None:
@@ -252,7 +455,7 @@ def _catalog_track_for_result(
         for track in tracks:
             if track.title.casefold().strip() == title:
                 return track
-    return tracks[index] if index < len(tracks) else None
+    return None
 
 
 def _selected_result(job: Job) -> list[SearchResult] | None:
@@ -398,19 +601,33 @@ async def _prepare_acquisition(
     if source == "slskd":
         username = str(result.metadata.get("username") or "")
         filename = str(result.metadata.get("filename") or "")
-        transfer_id = await SlskdAdapter(cfg.slskd_url, cfg.slskd_api_key).enqueue(
-            username, filename, result.size_bytes
-        )
+        adapter = SlskdAdapter(cfg.slskd_url, cfg.slskd_api_key)
+        transfer_id = await adapter.enqueue(username, filename, result.size_bytes)
         if track is not None:
-            safe_name = Path(filename.replace("\\", "/")).name
-            staging_path = cfg.staging_root / safe_name
-            track.source_path = str(staging_path)
-            track.staging_path = str(staging_path)
             track.acquisition_state = AcquisitionState.acquiring
             track.acquisition_provenance_json = json.dumps(
                 {"source": "slskd", "username": username, "filename": filename}, sort_keys=True
             )
-        return transfer_id, "queued"
+        staged = await _poll_slskd_transfer(
+            transfer_id,
+            username,
+            filename,
+            adapter,
+            cfg.staging_root,
+            cfg.slskd_poll_interval,
+            cfg.slskd_poll_timeout,
+        )
+        if track is not None:
+            track.source_path = str(staged)
+            track.staging_path = str(staged)
+            track.acquisition_state = AcquisitionState.downloaded
+            with contextlib.suppress(OSError):
+                st = await asyncio.to_thread(staged.stat)
+                track.file_size_bytes = st.st_size
+                suffix = staged.suffix.lower().lstrip(".")
+                if suffix and len(suffix) <= 16 and suffix.isalnum():
+                    track.file_format = suffix
+        return transfer_id, "downloaded"
     if source != "prowlarr":
         if track is not None:
             track.source_path = result.url
@@ -421,10 +638,24 @@ async def _prepare_acquisition(
     sab_job_id = await sab.enqueue(nzb_url, name=result.title)
     if not sab_job_id:
         raise RuntimeError("SABnzbd enqueue returned no job id")
-    state = await sab.status(sab_job_id)
-    if not state.available:
-        raise RuntimeError(f"SABnzbd job status unavailable: {state.reason}")
-    return sab_job_id, state.reason
+    staged = await _poll_sab_job(
+        sab_job_id,
+        sab,
+        cfg.staging_root,
+        cfg.sabnzbd_poll_interval,
+        cfg.sabnzbd_poll_timeout,
+    )
+    if track is not None:
+        track.source_path = str(staged)
+        track.staging_path = str(staged)
+        track.acquisition_state = AcquisitionState.downloaded
+        with contextlib.suppress(OSError):
+            st = await asyncio.to_thread(staged.stat)
+            track.file_size_bytes = st.st_size
+            suffix = staged.suffix.lower().lstrip(".")
+            if suffix and len(suffix) <= 16 and suffix.isalnum():
+                track.file_format = suffix
+    return sab_job_id, "downloaded"
 
 
 def _validated_nzb_url(result: SearchResult, cfg: Settings) -> str:

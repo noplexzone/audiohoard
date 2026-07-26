@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlparse
 
 import mutagen
 
+from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS
 from app.schemas.search import SearchRequest, SearchResult
 from app.sources.base import CapabilityState
 
@@ -25,9 +26,7 @@ _DEFAULT_SEARCH_TIMEOUT_SEC = 30.0
 _PROCESS_STOP_GRACE_SEC = 2.0
 _YTDLP_SOCKET_TIMEOUT_SEC = 15
 _HEALTH_PROBE_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
-_SUPPORTED_AUDIO_EXTENSIONS = frozenset(
-    {"aac", "flac", "m4a", "mp3", "ogg", "opus", "wav", "webm"}
-)
+_SUPPORTED_AUDIO_EXTENSIONS = IMPORTABLE_AUDIO_EXTENSIONS
 
 
 @dataclass(frozen=True)

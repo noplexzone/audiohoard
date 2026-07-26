@@ -8,6 +8,7 @@
   <p>Sign in to manage your music library and acquisition queue.</p>
   {% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
   <form method="post" action="/login">
+    <input type="hidden" name="next" value="{{ next_target | default('/') | e }}">
     <label for="login-username">Username<input id="login-username" name="username" required autocomplete="username"></label>
     <label for="login-password">Password<input id="login-password" name="password" type="password" required autocomplete="current-password"></label>
     <button type="submit">Sign in</button>

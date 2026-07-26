@@ -16,7 +16,7 @@ from sqlalchemy.orm import selectinload
 from app.auth import get_current_user, require_mutation
 from app.config import Settings
 from app.database import get_db
-from app.jobs.runner import run_job
+from app.jobs.dispatcher import job_dispatcher
 from app.models.catalog_entities import CatalogAlbum, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.services.catalog import (
@@ -489,7 +489,6 @@ async def catalog_album_page(
 @router.post("/artists/catalog/{artist_id}/download-monitored", include_in_schema=False)
 async def download_monitored_catalog_albums(
     artist_id: int,
-    background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
@@ -501,6 +500,7 @@ async def download_monitored_catalog_albums(
     artist = result.scalar_one_or_none()
     if artist is None:
         raise HTTPException(status_code=404, detail="Catalog artist not found")
+    job_ids: list[int] = []
     for album in artist.albums:
         if not album.monitored or album.in_library:
             continue
@@ -510,15 +510,16 @@ async def download_monitored_catalog_albums(
         )
         db.add(job)
         await db.flush()
-        background_tasks.add_task(run_job, job.id)
+        job_ids.append(job.id)
     await db.commit()
+    for job_id in job_ids:
+        await job_dispatcher.dispatch(job_id)
     return RedirectResponse("/downloads", status_code=303)
 
 
 @router.post("/albums/{album_id}/download", include_in_schema=False)
 async def download_catalog_album(
     album_id: int,
-    background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
@@ -535,7 +536,7 @@ async def download_catalog_album(
     db.add(job)
     await db.commit()
     await db.refresh(job)
-    background_tasks.add_task(run_job, job.id)
+    await job_dispatcher.dispatch(job.id)
     return RedirectResponse("/downloads", status_code=303)
 
 
@@ -543,7 +544,6 @@ async def download_catalog_album(
 async def download_catalog_track(
     album_id: int,
     track_id: int,
-    background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
@@ -569,5 +569,5 @@ async def download_catalog_track(
     db.add(job)
     await db.commit()
     await db.refresh(job)
-    background_tasks.add_task(run_job, job.id)
+    await job_dispatcher.dispatch(job.id)
     return RedirectResponse("/downloads", status_code=303)

@@ -9,8 +9,10 @@ from contextlib import asynccontextmanager
 from importlib.resources import files
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -21,6 +23,7 @@ from app.auth import get_current_user, setup_complete
 from app.config import Settings, get_settings
 from app.database import get_db
 from app.display_names import display_name
+from app.jobs.dispatcher import job_dispatcher
 from app.routers import auth, health, imports, jobs, naming, search, tracks
 from app.routers import catalog as catalog_router
 from app.routers import settings as settings_router
@@ -28,6 +31,7 @@ from app.services.artist_monitoring import DiscographyRefreshScheduler
 from app.services.dashboard import get_dashboard_data
 from app.services.health_status import get_health_status_service
 from app.settings_service import effective_settings_dep
+from app.version import APP_VERSION
 
 _TEMPLATES_DIR = files("app") / "templates"
 _STATIC_DIR = files("app") / "static"
@@ -41,6 +45,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     health_status = get_health_status_service()
     app.state.discography_scheduler = scheduler
     app.state.health_status_service = health_status
+    await job_dispatcher.recover()
     await scheduler.start()
     await health_status.start()
     try:
@@ -48,10 +53,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         await health_status.stop()
         await scheduler.stop()
+        await job_dispatcher.shutdown()
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    app_version = APP_VERSION
 
     logging.basicConfig(
         level=getattr(logging, settings.log_level),
@@ -60,7 +67,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="Audiohoard",
-        version="0.6.0",
+        version=app_version,
         description="Self-hosted music acquisition and library management",
         docs_url="/api/docs",
         redoc_url="/api/redoc",
@@ -71,7 +78,21 @@ def create_app() -> FastAPI:
     app.state.templates.env.filters["from_json"] = lambda value: json.loads(value or "[]")
     app.state.templates.env.filters["display_name"] = display_name
     app.state.templates.env.globals["display_name"] = display_name
+    app.state.templates.env.globals["app_version"] = app_version
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    @app.exception_handler(HTTPException)
+    async def browser_auth_exception_handler(request: Request, exc: HTTPException) -> Response:
+        accepts_html = "text/html" in request.headers.get("accept", "").casefold()
+        if exc.status_code == 401 and request.method == "GET" and accepts_html:
+            target = request.url.path
+            if request.url.query:
+                target = f"{target}?{request.url.query}"
+            response = RedirectResponse(f"/login?next={quote(target, safe='')}", status_code=303)
+            response.delete_cookie("session")
+            response.delete_cookie("csrf")
+            return response
+        return await http_exception_handler(request, exc)
 
     @app.middleware("http")
     async def html_timing_middleware(

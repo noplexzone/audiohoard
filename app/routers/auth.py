@@ -36,6 +36,13 @@ router = APIRouter()
 _setup_owner_lock = asyncio.Lock()
 
 
+def _safe_next_target(value: object) -> str:
+    target = str(value or "").strip()
+    if not target.startswith("/") or target.startswith("//") or "\\" in target:
+        return "/"
+    return target
+
+
 class Credentials(BaseModel):
     username: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
     password: str = Field(min_length=1, max_length=256)
@@ -120,7 +127,9 @@ async def login_page(
     if not await setup_complete(db):
         return RedirectResponse("/setup", status_code=307)
     templates: Jinja2Templates = request.app.state.templates
-    return templates.TemplateResponse(request, "login.html", {})
+    return templates.TemplateResponse(
+        request, "login.html", {"next_target": _safe_next_target(request.query_params.get("next"))}
+    )
 
 
 @router.post("/api/auth/setup", status_code=201)
@@ -169,6 +178,7 @@ async def login_form(
     if not await setup_complete(db):
         return RedirectResponse("/setup", status_code=307)
     form = await request.form()
+    next_target = _safe_next_target(form.get("next"))
     templates: Jinja2Templates = request.app.state.templates
     credentials = Credentials(
         username=str(form.get("username", "")), password=str(form.get("password", ""))
@@ -179,9 +189,12 @@ async def login_form(
         status_code = exc.status_code if exc.status_code == 429 else 200
         detail = exc.detail if isinstance(exc.detail, str) else "Login failed"
         return templates.TemplateResponse(
-            request, "login.html", {"error": detail}, status_code=status_code
+            request,
+            "login.html",
+            {"error": detail, "next_target": next_target},
+            status_code=status_code,
         )
-    response = RedirectResponse("/", status_code=303)
+    response = RedirectResponse(next_target, status_code=303)
     _set_auth_cookies(response, token, session, settings)
     return response
 
@@ -197,6 +210,21 @@ async def login(
     token, session, user = await _authenticate_login(payload, request, db, settings)
     _set_auth_cookies(response, token, session, settings)
     return {"username": user.username, "role": user.role.value, "csrf_token": session.csrf_token}
+
+
+@router.post("/logout", include_in_schema=False)
+async def logout_ui(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[AppUser, Depends(require_mutation)],
+) -> RedirectResponse:
+    del user
+    session: AuthSession = request.state.auth_session
+    await db.delete(session)
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie("session")
+    response.delete_cookie("csrf")
+    return response
 
 
 @router.post("/api/auth/logout", status_code=204)

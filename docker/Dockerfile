@@ -3,7 +3,7 @@ FROM python:3.12-slim
 LABEL org.opencontainers.image.title="Audiohoard" \
       org.opencontainers.image.description="Self-hosted music acquisition, metadata enrichment, and library naming" \
       org.opencontainers.image.source="https://github.com/noplexzone/audiohoard" \
-      org.opencontainers.image.version="0.5.0"
+      org.opencontainers.image.version="0.6.0"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg \
@@ -30,6 +30,6 @@ COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-  CMD curl -f http://localhost:8000/health || exit 1
+  CMD curl -f http://localhost:8000/health/ready || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]

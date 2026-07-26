@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import tempfile
+from pathlib import Path
 from typing import Annotated
+from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import require_admin, require_admin_read, require_mutation
@@ -15,7 +20,7 @@ from app.models.auth import AppUser
 from app.naming.convention import render_path
 from app.schemas.health import SourceStatus
 from app.schemas.settings import SettingField, SettingsSaveRequest, SettingsTestRequest
-from app.services.health_status import get_health_status_service
+from app.services.health_status import CachedProviderStatus, get_health_status_service
 from app.settings_service import (
     DEFAULT_METADATA_PROVIDERS,
     DEFAULT_SOURCE_PRIORITY,
@@ -122,6 +127,68 @@ def _naming_preview(template: str) -> str:
         return f"Template error: {exc}"
 
 
+def _path_diagnostic(path_value: str) -> str:
+    path = Path(path_value)
+    if not path.exists():
+        return "Missing"
+    if not path.is_dir():
+        return "Not a directory"
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".audiohoard-write-check-", dir=path):
+            pass
+    except OSError as exc:
+        return f"Not writable: {exc.strerror or 'permission denied'}"
+    return "Ready"
+
+
+async def _validate_provider_updates(
+    payload: SettingsSaveRequest, db: AsyncSession, env: Settings
+) -> dict[str, str]:
+    raw_db = await load_raw_db_values(db, env.secret_key)
+
+    def current(key: str) -> str:
+        return resolve_for_probe(key, "", env, raw_db)
+
+    submitted_fields = payload.model_fields_set
+
+    def changed(key: str, submitted: str | None, *, secret: bool = False) -> bool:
+        if key not in submitted_fields:
+            return False
+        if secret and not submitted:
+            return False
+        return (submitted or "") != current(key)
+
+    errors: dict[str, str] = {}
+    for provider, url_key, key_key, url_value, key_value in (
+        ("slskd", "slskd_url", "slskd_api_key", payload.slskd_url, payload.slskd_api_key),
+        (
+            "prowlarr",
+            "prowlarr_url",
+            "prowlarr_api_key",
+            payload.prowlarr_url,
+            payload.prowlarr_api_key,
+        ),
+        (
+            "sabnzbd",
+            "sabnzbd_url",
+            "sabnzbd_api_key",
+            payload.sabnzbd_url,
+            payload.sabnzbd_api_key,
+        ),
+    ):
+        if not (changed(url_key, url_value) or changed(key_key, key_value, secret=True)):
+            continue
+        effective_url = url_value if url_value is not None else current(url_key)
+        effective_key = key_value or current(key_key)
+        if not (effective_url and effective_key):
+            errors[provider] = "URL and API key are required together"
+            continue
+        status = await _probe_provider(provider, url=effective_url, key=effective_key, cookies="")
+        if not status.available:
+            errors[provider] = status.reason or "Connection failed"
+    return errors
+
+
 @router.get("/settings", response_class=HTMLResponse, include_in_schema=False)
 async def settings_page(
     request: Request,
@@ -151,6 +218,29 @@ async def settings_section_page(
     client_statuses = (
         get_health_status_service().snapshot() if section == "download-clients" else {}
     )
+    if section == "download-clients":
+        enabled_sources = {
+            str(item["name"]) for item in runtime.source_priority if item.get("enabled") is True
+        }
+        for provider in ("slskd", "prowlarr", "youtube", "tidal"):
+            if provider not in enabled_sources:
+                client_statuses[provider] = CachedProviderStatus(
+                    SourceStatus(available=False, reason="Disabled", details={})
+                )
+        if "prowlarr" not in enabled_sources:
+            client_statuses["sabnzbd"] = CachedProviderStatus(
+                SourceStatus(available=False, reason="Disabled", details={})
+            )
+    path_diagnostics: dict[str, str] = {}
+    if section == "library":
+        library_status, staging_status = await asyncio.gather(
+            asyncio.to_thread(_path_diagnostic, fields["library_root"].value),
+            asyncio.to_thread(_path_diagnostic, fields["staging_root"].value),
+        )
+        path_diagnostics = {
+            "library_root": library_status,
+            "staging_root": staging_status,
+        }
     return _get_templates(request).TemplateResponse(
         request,
         "settings.html",
@@ -161,11 +251,13 @@ async def settings_section_page(
             "default_metadata_providers": DEFAULT_METADATA_PROVIDERS,
             "saved": request.query_params.get("saved", ""),
             "test_result": request.query_params.get("test", ""),
+            "validation_error": request.query_params.get("error", ""),
             "section": section,
             "sections": SETTINGS_SECTIONS,
             "client_statuses": client_statuses,
             "provider_descriptions": PROVIDER_DESCRIPTIONS,
             "naming_preview": _naming_preview(fields["naming_template"].value),
+            "path_diagnostics": path_diagnostics,
             "app_version": request.app.version,
         },
     )
@@ -180,24 +272,57 @@ async def save_runtime_settings_page(
     form = await request.form()
     runtime = await get_runtime_settings(db)
     order = [str(v) for v in form.getlist("source_order")]
+    move_source = str(form.get("move_source", ""))
+    if ":" in move_source:
+        direction, source_name = move_source.split(":", 1)
+        if source_name in order:
+            index = order.index(source_name)
+            move_target_index = index - 1 if direction == "up" else index + 1
+            if direction in {"up", "down"} and 0 <= move_target_index < len(order):
+                order[index], order[move_target_index] = order[move_target_index], order[index]
     enabled = {str(v) for v in form.getlist("source_enabled")}
     source_priority = [{"name": name, "enabled": name in enabled} for name in order]
     metadata_order = [str(v) for v in form.getlist("metadata_order")]
     metadata_enabled = {str(v) for v in form.getlist("metadata_enabled")}
+    if metadata_order and not metadata_enabled:
+        return RedirectResponse(
+            "/settings/metadata?error=At+least+one+metadata+provider+must+remain+enabled",
+            status_code=303,
+        )
     metadata_providers = (
         [{"name": name, "enabled": name in metadata_enabled} for name in metadata_order]
         if metadata_order
         else runtime.metadata_providers
     )
-    limit = int(str(form.get("free_text_result_limit", runtime.free_text_result_limit)) or "10")
+    try:
+        limit = int(
+            str(form.get("free_text_result_limit", runtime.free_text_result_limit)) or "10"
+        )
+        refresh_hours = int(
+            str(form.get("discography_refresh_hours", runtime.discography_refresh_hours)) or "24"
+        )
+        source_budget = int(
+            str(form.get("source_search_budget_seconds", runtime.source_search_budget_seconds))
+            or "15"
+        )
+    except ValueError:
+        return RedirectResponse(
+            "/settings/behavior?error=Behavior+values+must+be+whole+numbers", status_code=303
+        )
+    if not (1 <= limit <= 100 and 1 <= refresh_hours <= 720 and 3 <= source_budget <= 60):
+        return RedirectResponse(
+            "/settings/behavior?error=Behavior+values+are+outside+the+allowed+range",
+            status_code=303,
+        )
     primary = str(form.get("primary_metadata_provider", runtime.primary_metadata_provider))
-    refresh_hours = int(
-        str(form.get("discography_refresh_hours", runtime.discography_refresh_hours)) or "24"
+    if metadata_order and primary not in metadata_enabled:
+        primary = next(name for name in metadata_order if name in metadata_enabled)
+    section = str(form.get("section", ""))
+    auto_download = (
+        str(form.get("auto_download_wanted", "")).lower() in {"1", "true", "yes", "on"}
+        if section == "behavior"
+        else runtime.auto_download_wanted
     )
-    source_budget = int(
-        str(form.get("source_search_budget_seconds", runtime.source_search_budget_seconds)) or "15"
-    )
-    auto_download = str(form.get("auto_download_wanted", "")).lower() in {"1", "true", "yes", "on"}
     await save_runtime_settings(
         db,
         source_priority or runtime.source_priority,
@@ -209,9 +334,8 @@ async def save_runtime_settings_page(
         source_budget,
     )
     await db.commit()
-    section = str(form.get("section", ""))
-    target = section if section in SETTINGS_SECTIONS else "download-sources"
-    return RedirectResponse(f"/settings/{target}?saved=1", status_code=303)
+    redirect_target = section if section in SETTINGS_SECTIONS else "download-sources"
+    return RedirectResponse(f"/settings/{redirect_target}?saved=1", status_code=303)
 
 
 @router.post("/settings/save", include_in_schema=False)
@@ -225,6 +349,27 @@ async def save_settings_page(
     section = str(form.get("section", "download-clients"))
     allowed = set(SettingsSaveRequest.model_fields)
     updates = {str(key): str(value) for key, value in form.items() if str(key) in allowed}
+    if "naming_template" in updates:
+        preview = _naming_preview(updates["naming_template"])
+        if preview.startswith("Template error:"):
+            return RedirectResponse(
+                f"/settings/library?error={quote_plus(preview)}", status_code=303
+            )
+    try:
+        payload = SettingsSaveRequest.model_validate(updates)
+    except ValidationError:
+        target = section if section in SETTINGS_SECTIONS else "download-clients"
+        return RedirectResponse(
+            f"/settings/{target}?error=Invalid+settings+value", status_code=303
+        )
+    validation_errors = await _validate_provider_updates(payload, db, env)
+    if validation_errors:
+        detail = "; ".join(
+            f"{provider}: {message}" for provider, message in validation_errors.items()
+        )
+        return RedirectResponse(
+            f"/settings/download-clients?error={quote_plus(detail)}", status_code=303
+        )
     await save_settings(db, updates, env)
     await db.commit()
     target = section if section in SETTINGS_SECTIONS else "download-clients"
@@ -258,7 +403,8 @@ async def test_provider_page(
     raw_db = await load_raw_db_values(db, env.secret_key)
 
     def _r(key: str) -> str:
-        return resolve_for_probe(key, "", env, raw_db)
+        submitted = str(form.get(key, ""))
+        return resolve_for_probe(key, submitted, env, raw_db)
 
     if provider == "tidal":
         cap = await TidalAdapter(
@@ -356,58 +502,7 @@ async def save_settings_api(
     db: Annotated[AsyncSession, Depends(get_db)],
     env: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, str]:
-    raw_db = await load_raw_db_values(db, env.secret_key)
-
-    def _current(key: str) -> str:
-        return resolve_for_probe(key, "", env, raw_db)
-
-    submitted_fields = payload.model_fields_set
-
-    def _changed(key: str, submitted: str | None, *, secret: bool = False) -> bool:
-        if key not in submitted_fields:
-            return False
-        if secret and not submitted:
-            return False
-        return (submitted or "") != _current(key)
-
-    validation_errors: dict[str, str] = {}
-
-    async def _backstop(
-        provider: str,
-        url_key: str,
-        key_key: str,
-        url_sub: str | None,
-        key_sub: str | None,
-    ) -> None:
-        if not (_changed(url_key, url_sub) or _changed(key_key, key_sub, secret=True)):
-            return
-        eff_url = url_sub if url_sub is not None else _current(url_key)
-        eff_key = key_sub or _current(key_key)
-        if not (eff_url and eff_key):
-            validation_errors[provider] = "URL and API key are required together"
-            return
-        status = await _probe_provider(provider, url=eff_url, key=eff_key, cookies="")
-        if not status.available:
-            validation_errors[provider] = status.reason or "Connection failed"
-
-    await _backstop(
-        "slskd", "slskd_url", "slskd_api_key", payload.slskd_url, payload.slskd_api_key
-    )
-    await _backstop(
-        "prowlarr",
-        "prowlarr_url",
-        "prowlarr_api_key",
-        payload.prowlarr_url,
-        payload.prowlarr_api_key,
-    )
-    await _backstop(
-        "sabnzbd",
-        "sabnzbd_url",
-        "sabnzbd_api_key",
-        payload.sabnzbd_url,
-        payload.sabnzbd_api_key,
-    )
-
+    validation_errors = await _validate_provider_updates(payload, db, env)
     if validation_errors:
         raise HTTPException(
             status_code=422,

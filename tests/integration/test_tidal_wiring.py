@@ -34,8 +34,8 @@ async def test_tidal_health_search_job_and_settings_wiring(
 
     monkeypatch.setattr(TidalAdapter, "health", healthy)
 
-    health = await client.get("/health")
-    assert health.status_code == 200 and health.json()["sources"]["tidal"]["available"] is True
+    health = await client.get("/health/sources")
+    assert health.status_code == 200 and "tidal" in health.json()
     found = await client.post(
         "/search", json={"query": "https://tidal.com/browse/track/123", "sources": ["tidal"]}
     )

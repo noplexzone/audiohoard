@@ -4,6 +4,7 @@
 <header class="page-header">
   <div><p class="eyebrow">Library pipeline</p><h1>Import review</h1><p>Review planned destinations, collisions, tag verification, and rollback state before files enter the library.</p></div>
 </header>
+{% if error_message %}<div class="alert error" role="alert">{{ error_message }}</div>{% endif %}
 
 <section class="panel import-section" aria-labelledby="releases-heading">
   <div class="section-heading"><div><h2 id="releases-heading">Staged releases</h2><p class="hint">Plan first, then import after reviewing the generated operations.</p></div></div>
@@ -19,8 +20,16 @@
         <td>{{ release.album_artist or "Unknown Artist" }}</td>
         <td><span class="badge {{ state_class }}">{{ state | replace('_', ' ') }}</span></td>
         <td class="action-cell">
-          <form method="post" action="/imports/ui/releases/{{ release.id }}/plan"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Plan</button></form>
-          <form method="post" action="/imports/ui/releases/{{ release.id }}/execute"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn" type="submit">Import</button></form>
+          {% set release_plans = plans | selectattr('release_id', 'equalto', release.id) | list %}
+          {% set gate = namespace(ready=(release_plans | length > 0)) %}
+          {% for plan in release_plans %}{% if plan.status.value != 'ready' %}{% set gate.ready = false %}{% endif %}{% endfor %}
+          <form method="post" action="/imports/ui/releases/{{ release.id }}/plan"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">{{ 'Re-plan' if release_plans else 'Plan' }}</button></form>
+          {% if gate.ready %}
+          <form method="post" action="/imports/ui/releases/{{ release.id }}/execute"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">{% for plan in release_plans %}<input type="hidden" name="confirmed_plan_id" value="{{ plan.id }}">{% endfor %}<label class="check-label"><input type="checkbox" name="confirm_import" value="yes" required> Import {{ release_plans | length }} reviewed file{{ '' if release_plans | length == 1 else 's' }}</label><button class="btn" type="submit">Import reviewed plan</button></form>
+          {% else %}
+          <button class="btn" type="button" disabled title="Generate and review a ready plan before importing">Import</button>
+          <span class="hint">Plan and review first</span>
+          {% endif %}
         </td>
       </tr>
     {% endfor %}

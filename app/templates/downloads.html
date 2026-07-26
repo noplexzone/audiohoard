@@ -2,17 +2,25 @@
 {% block title %}Downloads – Audiohoard{% endblock %}
 
 {% block content %}
-<div class="page-header" style="display:flex; justify-content:space-between; align-items:flex-start;">
+<header class="page-header">
   <div>
-    <h1>Acquisition Downloads</h1>
-    <p>Each download persists in SQLite. No external broker required.</p>
+    <p class="eyebrow">Acquisition queue</p>
+    <h1>Downloads</h1>
+    <p>Persistent jobs with live state, source fallback, errors, and recovery controls.</p>
   </div>
-</div>
+  <a class="btn secondary" href="/downloads{% if selected_status %}?status={{ selected_status }}{% endif %}">Refresh</a>
+</header>
+
+{% if selected_status %}<p class="alert info">Showing {{ selected_status }} jobs. <a href="/downloads">Clear filter</a></p>{% endif %}
+
+{% if notice %}<div class="alert {{ notice_type }}" role="status">{{ notice }}</div>{% endif %}
 
 <form method="post" action="/downloads/create" class="form-row" style="margin-bottom:1.5rem;">
   <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
-  <input type="text" name="query" placeholder="Track or album&hellip;" style="flex:1; min-width:220px;" required>
-  <select name="source">
+  <label class="sr-only" for="download-query">Track or album</label>
+  <input id="download-query" type="text" name="query" placeholder="Track or album&hellip;" style="flex:1; min-width:220px;" required>
+  <label class="sr-only" for="download-source">Download source</label>
+  <select id="download-source" name="source">
     <option value="priority">Priority with fallback</option>
     <option value="slskd">slskd</option>
     <option value="prowlarr">Prowlarr</option>
@@ -22,37 +30,60 @@
   <button type="submit" class="btn">Enqueue</button>
 </form>
 
+{% set queue = namespace(active=false) %}
 {% if downloads %}
-<div class="card" style="padding:0;">
+<div class="table-wrap">
   <table>
     <thead>
       <tr>
-        <th>#</th>
-        <th>Attempted → served</th>
-        <th>Query</th>
-        <th>Status</th>
-        <th>Created</th>
-        <th>Updated</th>
-        <th></th>
+        <th scope="col">Job</th>
+        <th scope="col">Attempted → served</th>
+        <th scope="col">Query</th>
+        <th scope="col">Status</th>
+        <th scope="col">Updated</th>
+        <th scope="col">Details</th>
+        <th scope="col">Actions</th>
       </tr>
     </thead>
     <tbody>
     {% for download in downloads %}
-      {% set sc = "ok" if download.status.value == "done" else ("warn" if download.status.value == "running" else ("error" if download.status.value == "failed" else "info")) %}
+      {% set status = download.status.value %}
+      {% set meta = download.result_json | from_json if download.result_json else {} %}
+      {% if status in ['pending', 'running'] %}{% set queue.active = true %}{% endif %}
+      {% set sc = "ok" if status == "done" else ("warn" if status in ["pending", "running", "partial"] else ("error" if status in ["failed", "cancelled"] else "info")) %}
       <tr>
-        <td><code>{{ download.id }}</code></td>
-        <td>{% set meta = download.result_json | from_json if download.result_json else {} %}{% if meta.attempted_sources %}<span class="hint">{{ meta.attempted_sources | join(" → ") }}</span> → <span class="badge info">{{ meta.served_source or download.source }}</span>{% else %}<span class="badge info">{{ download.source }}</span>{% endif %}</td>
-        <td style="max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{{ download.query }}</td>
-        <td><span class="badge {{ sc }}"><span class="dot"></span>{{ download.status.value }}</span></td>
-        <td style="color:var(--text-muted); font-size:0.8rem;">{{ download.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+        <td><code>#{{ download.id }}</code></td>
+        <td>{% if meta.attempted_sources %}<span class="hint">{{ meta.attempted_sources | join(" → ") }}</span> → <span class="badge info">{{ meta.served_source or download.source }}</span>{% else %}<span class="badge info">{{ download.source }}</span>{% endif %}</td>
+        <td style="max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{{ download.query | e }}">{{ download.query }}</td>
+        <td><span class="badge {{ sc }}"><span class="dot"></span>{{ status }}</span></td>
         <td style="color:var(--text-muted); font-size:0.8rem;">{{ download.updated_at.strftime("%Y-%m-%d %H:%M") }}</td>
-        <td><a href="/tracks?download_id={{ download.id }}" style="font-size:0.8rem;">tracks</a></td>
+        <td>
+          <details>
+            <summary>View</summary>
+            {% if meta.error %}<p class="alert error compact"><strong>{{ meta.error.code | default('error') }}</strong>{% if meta.error.detail %}: {{ meta.error.detail }}{% endif %}</p>{% endif %}
+            {% if meta.recovery %}<p class="alert compact">Recovered after {{ meta.recovery.code | replace('_', ' ') }}.</p>{% endif %}
+            {% if meta.tracks_created is defined %}<p class="hint">Tracks created: {{ meta.tracks_created }}</p>{% endif %}
+            {% if meta.missing_tracks %}<p class="hint">Missing: {{ meta.missing_tracks | join(', ') }}</p>{% endif %}
+            <a href="/tracks?download_id={{ download.id }}">View tracks</a>
+          </details>
+        </td>
+        <td class="action-cell">
+          {% if status in ['pending', 'running'] %}
+          <form method="post" action="/downloads/{{ download.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Cancel</button></form>
+          {% elif status in ['failed', 'partial', 'cancelled'] %}
+          <form method="post" action="/downloads/{{ download.id }}/retry"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Retry</button></form>
+          {% else %}—{% endif %}
+        </td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
 </div>
 {% else %}
-<p style="color:var(--text-muted);">No downloads yet. Use the form above to enqueue your first acquisition.</p>
+<div class="empty-state mini" role="status"><h3>No downloads yet</h3><p>Use the form above to enqueue your first acquisition.</p></div>
+{% endif %}
+{% if queue.active %}
+<p class="hint" role="status" aria-live="polite">Active jobs refresh every 4 seconds.</p>
+<script>window.setTimeout(() => { if (!document.hidden) window.location.reload(); }, 4000);</script>
 {% endif %}
 {% endblock %}

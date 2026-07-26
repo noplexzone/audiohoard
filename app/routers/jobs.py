@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, require_mutation
 from app.database import get_db
-from app.jobs.runner import run_job
+from app.jobs.dispatcher import JobNotFoundError, JobStateError, job_dispatcher
 from app.models.job import Job, JobStatus
 from app.schemas.job import JobCreate, JobRead, SelectedResultPayload
 
@@ -32,7 +32,6 @@ def _selected_json(payload: SelectedResultPayload | None) -> str | None:
 @router.post("/jobs", response_model=JobRead, status_code=201)
 async def create_job(
     payload: JobCreate,
-    background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> Job:
@@ -45,7 +44,7 @@ async def create_job(
     db.add(job)
     await db.commit()
     await db.refresh(job)
-    background_tasks.add_task(run_job, job.id)
+    await job_dispatcher.dispatch(job.id)
     return job
 
 
@@ -73,13 +72,33 @@ async def get_job(job_id: int, db: Annotated[AsyncSession, Depends(get_db)]) -> 
 
 @router.get("/downloads", response_class=HTMLResponse, include_in_schema=False)
 async def downloads_page(
-    request: Request, db: Annotated[AsyncSession, Depends(get_db)]
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    status: JobStatus | None = None,
 ) -> HTMLResponse:
     templates = _get_templates(request)
-    result = await db.execute(select(Job).order_by(Job.created_at.desc()).limit(100))
+    query = select(Job).order_by(Job.created_at.desc()).limit(100)
+    if status is not None:
+        query = query.where(Job.status == status)
+    result = await db.execute(query)
     downloads = list(result.scalars().all())
+    notices = {
+        "cancelled": ("Cancellation requested.", "info"),
+        "retried": ("Retry scheduled.", "info"),
+        "invalid_state": ("That job can no longer be changed.", "error"),
+        "not_found": ("Job not found.", "error"),
+    }
+    notice, notice_type = notices.get(request.query_params.get("notice", ""), (None, "info"))
     return templates.TemplateResponse(
-        request, "downloads.html", {"downloads": downloads, "jobs": downloads}
+        request,
+        "downloads.html",
+        {
+            "downloads": downloads,
+            "jobs": downloads,
+            "notice": notice,
+            "notice_type": notice_type,
+            "selected_status": status.value if status is not None else None,
+        },
     )
 
 
@@ -102,7 +121,6 @@ async def downloads_create_page() -> RedirectResponse:
 @router.post("/downloads/create", response_class=HTMLResponse, include_in_schema=False)
 async def create_job_ui(
     request: Request,
-    background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
@@ -131,5 +149,64 @@ async def create_job_ui(
     db.add(job)
     await db.commit()
     await db.refresh(job)
-    background_tasks.add_task(run_job, job.id)
+    await job_dispatcher.dispatch(job.id)
     return RedirectResponse("/downloads", status_code=303)
+
+
+@router.post("/jobs/{job_id}/cancel", status_code=202)
+async def cancel_job(
+    job_id: int,
+    _user: Annotated[object, Depends(require_mutation)],
+) -> dict[str, str]:
+    try:
+        await job_dispatcher.cancel_job(job_id)
+    except JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Job not found") from exc
+    except JobStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"status": "cancellation_requested"}
+
+
+@router.post("/jobs/{job_id}/retry", status_code=202)
+async def retry_job(
+    job_id: int,
+    _user: Annotated[object, Depends(require_mutation)],
+) -> dict[str, str]:
+    try:
+        await job_dispatcher.retry(job_id)
+    except JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Job not found") from exc
+    except JobStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"status": "retry_scheduled"}
+
+
+async def _job_action_redirect(action: str, job_id: int) -> RedirectResponse:
+    try:
+        if action == "cancel":
+            await job_dispatcher.cancel_job(job_id)
+            notice = "cancelled"
+        else:
+            await job_dispatcher.retry(job_id)
+            notice = "retried"
+    except JobNotFoundError:
+        notice = "not_found"
+    except JobStateError:
+        notice = "invalid_state"
+    return RedirectResponse(f"/downloads?notice={notice}", status_code=303)
+
+
+@router.post("/downloads/{job_id}/cancel", include_in_schema=False)
+async def cancel_job_ui(
+    job_id: int,
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    return await _job_action_redirect("cancel", job_id)
+
+
+@router.post("/downloads/{job_id}/retry", include_in_schema=False)
+async def retry_job_ui(
+    job_id: int,
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    return await _job_action_redirect("retry", job_id)
