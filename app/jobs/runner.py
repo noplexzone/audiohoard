@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import ParseResult, urlparse
@@ -381,10 +382,29 @@ async def _run_job_in_session(
             results = results[:1]
         tracks_created = 0
         failures: list[str] = []
-        releases: dict[tuple[str | None, str | None], Release] = {}
+        existing_releases = list(
+            (await db.scalars(select(Release).where(Release.job_id == job_id))).all()
+        )
+        releases: dict[tuple[str | None, str | None], Release] = {
+            (release.album_artist, release.title): release for release in existing_releases
+        }
+        existing_tracks = list(
+            (await db.scalars(select(Track).where(Track.job_id == job_id))).all()
+        )
         for result in results:
             catalog_track = _catalog_track_for_result(result, catalog_tracks, job.catalog_track_id)
-            track: Track | None = None
+            track_title = catalog_track.title if catalog_track is not None else result.title
+            track_album = catalog_album.title if catalog_album is not None else result.album
+            track = _existing_track_for_result(
+                existing_tracks,
+                result.source,
+                track_title,
+                track_album,
+                catalog_track,
+            )
+            if track is not None and track.acquisition_state == AcquisitionState.downloaded:
+                tracks_created += 1
+                continue
             try:
                 release_key = (
                     catalog_album.artist.name if catalog_album is not None else result.artist,
@@ -393,6 +413,8 @@ async def _run_job_in_session(
                     else result.album or result.title,
                 )
                 release = releases.get(release_key)
+                if release is None and track is not None and track.release_id is not None:
+                    release = await db.get(Release, track.release_id)
                 if release is None:
                     release = Release(
                         job_id=job_id,
@@ -417,42 +439,54 @@ async def _run_job_in_session(
                     await db.flush()
                     releases[release_key] = release
 
-                track = Track(
-                    job_id=job_id,
-                    release_id=release.id,
-                    catalog_album_id=catalog_album.id if catalog_album is not None else None,
-                    catalog_track_id=catalog_track.id if catalog_track is not None else None,
-                    title=catalog_track.title if catalog_track is not None else result.title,
-                    artist=catalog_album.artist.name
-                    if catalog_album is not None
-                    else result.artist,
-                    album_artist=catalog_album.artist.name
-                    if catalog_album is not None
-                    else result.artist,
-                    album=catalog_album.title if catalog_album is not None else result.album,
-                    year=catalog_album.year if catalog_album is not None else None,
-                    disc=catalog_track.disc if catalog_track is not None else None,
-                    track_no=catalog_track.position if catalog_track is not None else None,
-                    duration_sec=catalog_track.duration_sec if catalog_track is not None else None,
-                    mbid=catalog_track.recording_mbid if catalog_track is not None else None,
-                    identity_state=(
-                        IdentityResolutionState.resolved
-                        if catalog_track and catalog_track.recording_mbid
-                        else IdentityResolutionState.unresolved
-                    ),
-                    source_path=None,
-                    source=result.source,
-                    acquisition_state=AcquisitionState.acquiring,
-                    fingerprint_state=FingerprintState.pending,
-                )
-                db.add(track)
-                await db.flush()
+                if track is None:
+                    track = Track(
+                        job_id=job_id,
+                        release_id=release.id,
+                        catalog_album_id=catalog_album.id if catalog_album is not None else None,
+                        catalog_track_id=catalog_track.id if catalog_track is not None else None,
+                        title=track_title,
+                        artist=catalog_album.artist.name
+                        if catalog_album is not None
+                        else result.artist,
+                        album_artist=catalog_album.artist.name
+                        if catalog_album is not None
+                        else result.artist,
+                        album=track_album,
+                        year=catalog_album.year if catalog_album is not None else None,
+                        disc=catalog_track.disc if catalog_track is not None else None,
+                        track_no=catalog_track.position if catalog_track is not None else None,
+                        duration_sec=catalog_track.duration_sec
+                        if catalog_track is not None
+                        else None,
+                        mbid=catalog_track.recording_mbid if catalog_track is not None else None,
+                        identity_state=(
+                            IdentityResolutionState.resolved
+                            if catalog_track and catalog_track.recording_mbid
+                            else IdentityResolutionState.unresolved
+                        ),
+                        source_path=None,
+                        source=result.source,
+                        acquisition_state=AcquisitionState.acquiring,
+                        fingerprint_state=FingerprintState.pending,
+                    )
+                    db.add(track)
+                    await db.flush()
+                    existing_tracks.append(track)
                 if commit_progress:
                     job.updated_at = _now()
                     await db.commit()
 
-                source_job_id, source_status = await _prepare_acquisition(
-                    result, job.source, cfg, track
+                async def checkpoint() -> None:
+                    job.updated_at = _now()
+                    await db.commit()
+
+                source_job_id, source_status = await _call_prepare_acquisition(
+                    result,
+                    job.source,
+                    cfg,
+                    track,
+                    checkpoint=checkpoint if commit_progress else None,
                 )
                 track.source_job_id = source_job_id
                 track.source_status = source_status
@@ -562,6 +596,29 @@ def _catalog_track_for_result(
             if track.title.casefold().strip() == title:
                 return track
     return None
+
+
+def _existing_track_for_result(
+    tracks: list[Track],
+    source: str,
+    title: str | None,
+    album: str | None,
+    catalog_track: CatalogAlbumTrack | None,
+) -> Track | None:
+    if catalog_track is not None:
+        return next(
+            (track for track in tracks if track.catalog_track_id == catalog_track.id), None
+        )
+    return next(
+        (
+            track
+            for track in tracks
+            if track.source == source
+            and (track.title or "").casefold().strip() == (title or "").casefold().strip()
+            and (track.album or "").casefold().strip() == (album or "").casefold().strip()
+        ),
+        None,
+    )
 
 
 def _selected_result(job: Job) -> list[SearchResult] | None:
@@ -676,8 +733,29 @@ async def _fetch_results(
     )
 
 
+async def _call_prepare_acquisition(
+    result: SearchResult,
+    source: str,
+    cfg: Settings,
+    track: Track,
+    *,
+    checkpoint: Callable[[], Awaitable[None]] | None,
+) -> tuple[str | None, str | None]:
+    try:
+        return await _prepare_acquisition(result, source, cfg, track, checkpoint=checkpoint)
+    except TypeError as exc:
+        if "checkpoint" not in str(exc) or "unexpected keyword" not in str(exc):
+            raise
+        return await _prepare_acquisition(result, source, cfg, track)
+
+
 async def _prepare_acquisition(
-    result: SearchResult, source: str, cfg: Settings, track: Track | None = None
+    result: SearchResult,
+    source: str,
+    cfg: Settings,
+    track: Track | None = None,
+    *,
+    checkpoint: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[str | None, str | None]:
     if source in {"youtube", "tidal"}:
         if not result.url:
@@ -708,12 +786,22 @@ async def _prepare_acquisition(
         username = str(result.metadata.get("username") or "")
         filename = str(result.metadata.get("filename") or "")
         adapter = SlskdAdapter(cfg.slskd_url, cfg.slskd_api_key)
-        transfer_id = await adapter.enqueue(username, filename, result.size_bytes)
+        transfer_id = (
+            track.source_job_id
+            if track is not None and track.acquisition_state == AcquisitionState.acquiring
+            else None
+        )
+        if not transfer_id:
+            transfer_id = await adapter.enqueue(username, filename, result.size_bytes)
         if track is not None:
+            track.source_job_id = transfer_id
+            track.source_status = "acquiring"
             track.acquisition_state = AcquisitionState.acquiring
             track.acquisition_provenance_json = json.dumps(
                 {"source": "slskd", "username": username, "filename": filename}, sort_keys=True
             )
+        if checkpoint is not None:
+            await checkpoint()
         staged = await _poll_slskd_transfer(
             transfer_id,
             username,
@@ -741,9 +829,22 @@ async def _prepare_acquisition(
     nzb_url = _validated_nzb_url(result, cfg)
 
     sab = SabnzbdAdapter(cfg.sabnzbd_url, cfg.sabnzbd_api_key)
-    sab_job_id = await sab.enqueue(nzb_url, name=result.title)
+    sab_job_id = (
+        track.source_job_id
+        if track is not None and track.acquisition_state == AcquisitionState.acquiring
+        else None
+    )
+    if not sab_job_id:
+        sab_job_id = await sab.enqueue(nzb_url, name=result.title)
     if not sab_job_id:
         raise RuntimeError("SABnzbd enqueue returned no job id")
+    if track is not None:
+        track.source_job_id = sab_job_id
+        track.source_status = "acquiring"
+        track.acquisition_state = AcquisitionState.acquiring
+        track.acquisition_provenance_json = json.dumps({"source": "sabnzbd"}, sort_keys=True)
+    if checkpoint is not None:
+        await checkpoint()
     staged = await _poll_sab_job(
         sab_job_id,
         sab,

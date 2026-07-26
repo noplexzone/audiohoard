@@ -976,3 +976,139 @@ async def test_dispatcher_watchdog_durable_marker_survives_reload(
         assert loaded.status == JobStatus.failed
         data = json.loads(loaded.result_json or "{}")
         assert data.get("error", {}).get("code") == "dispatch_lost"
+
+
+async def test_restarted_job_reuses_downloaded_track_and_release(
+    db_session: AsyncSession,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artist = CatalogArtist(name="Artist")
+    album = CatalogAlbum(title="Album", track_count=1)
+    artist.albums.append(album)
+    catalog_track = CatalogAlbumTrack(position=1, disc=1, title="Song")
+    album.tracks.append(catalog_track)
+    db_session.add(artist)
+    await db_session.flush()
+    job = Job(
+        source="slskd",
+        query="Artist Album Song",
+        status=JobStatus.pending,
+        catalog_album_id=album.id,
+        catalog_track_id=catalog_track.id,
+    )
+    db_session.add(job)
+    await db_session.flush()
+    fetch_count = 0
+    acquisition_count = 0
+
+    async def fake_fetch(*args: object, **kwargs: object) -> Sequence[SearchResult]:
+        nonlocal fetch_count
+        fetch_count += 1
+        return [
+            SearchResult(
+                source="slskd",
+                title="Song" if fetch_count == 1 else "Provider renamed result",
+                artist="Artist",
+                album="Album",
+                metadata={"username": "peer", "filename": "song.flac"},
+            )
+        ]
+
+    async def fake_acquire(
+        result: SearchResult,
+        source: str,
+        cfg: Settings,
+        track: Track | None = None,
+        *,
+        checkpoint: object | None = None,
+    ) -> tuple[str, str]:
+        nonlocal acquisition_count
+        acquisition_count += 1
+        assert track is not None
+        track.acquisition_state = AcquisitionState.downloaded
+        return "transfer-1", "downloaded"
+
+    async def noop_track(track: Track, cfg: Settings) -> None:
+        return None
+
+    async def noop_preview(track: Track, db: AsyncSession, cfg: Settings) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(runner, "_prepare_acquisition", fake_acquire)
+    monkeypatch.setattr(runner, "_enrich_musicbrainz", noop_track)
+    monkeypatch.setattr(runner, "_enrich_deezer", noop_track)
+    monkeypatch.setattr(runner, "_run_fingerprint", noop_track)
+    monkeypatch.setattr(runner, "_compute_path_preview", noop_preview)
+
+    await runner.run_job(job.id, db_session, test_settings)
+    job.status = JobStatus.pending
+    await db_session.flush()
+    await runner.run_job(job.id, db_session, test_settings)
+
+    tracks = list((await db_session.scalars(select(Track).where(Track.job_id == job.id))).all())
+    releases = list(
+        (await db_session.scalars(select(Release).where(Release.job_id == job.id))).all()
+    )
+    assert job.status == JobStatus.done
+    assert acquisition_count == 1
+    assert len(tracks) == 1
+    assert len(releases) == 1
+    assert tracks[0].catalog_track_id == catalog_track.id
+
+
+async def test_background_enqueue_checkpoint_is_visible_before_poll(
+    bg_factory: async_sessionmaker,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with bg_factory() as s:
+        job = Job(source="slskd", query="Artist Song", status=JobStatus.pending)
+        s.add(job)
+        await s.commit()
+        job_id = job.id
+        initial_updated_at = job.updated_at
+
+    poll_entered = asyncio.Event()
+
+    async def fake_fetch(j: Job, cfg: Settings, db: AsyncSession) -> list[SearchResult]:
+        return [
+            SearchResult(
+                source="slskd",
+                title="Song",
+                artist="Artist",
+                metadata={"username": "peer", "filename": "song.flac"},
+            )
+        ]
+
+    class FakeSlskd:
+        def __init__(self, url: str, key: str) -> None:
+            pass
+
+        async def enqueue(self, username: str, filename: str, size: int | None = None) -> str:
+            return "durable-transfer"
+
+    async def blocked_poll(*args: object, **kwargs: object) -> None:
+        poll_entered.set()
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(runner, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(runner, "SlskdAdapter", FakeSlskd)
+    monkeypatch.setattr(runner, "_poll_slskd_transfer", blocked_poll)
+
+    run_task = asyncio.create_task(runner.run_job(job_id, settings=test_settings))
+    await asyncio.wait_for(poll_entered.wait(), timeout=5.0)
+
+    async with bg_factory() as s:
+        loaded_job = await s.get(Job, job_id)
+        track = (await s.scalars(select(Track).where(Track.job_id == job_id))).one()
+        assert loaded_job is not None
+        assert loaded_job.updated_at != initial_updated_at
+        assert track.source_job_id == "durable-transfer"
+        assert track.source_status == "acquiring"
+        assert track.acquisition_provenance_json is not None
+
+    run_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run_task
