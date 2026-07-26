@@ -133,6 +133,7 @@ async def get_current_user(
         await db.commit()
         raise HTTPException(status_code=401, detail="Session expired")
     request.state.auth_session = session
+    request.state.current_username = user.username
     return user
 
 

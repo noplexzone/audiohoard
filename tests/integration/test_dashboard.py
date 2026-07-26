@@ -75,6 +75,7 @@ async def test_dashboard_shows_real_aggregates_and_activity(
     assert 'data-job-status="running">1<' in body
     assert 'data-job-status="failed">1<' in body
     assert 'data-job-status="partial">1<' in body
+    assert 'href="/downloads?status=partial"' in body
     assert 'data-job-status="cancelled">1<' in body
     assert "Real Track One" in body
     assert "Real Track Two" in body
@@ -106,6 +107,7 @@ async def test_shared_shell_has_accessible_active_navigation(client: AsyncClient
     assert "<span>Imports</span>" in body
     assert 'action="/logout"' in body
     assert "Sign out" in body
+    assert "Signed in as <strong>test-owner</strong>" in body
     assert "v0.6.0" in body
     assert "fonts.googleapis.com" not in body
     assert "fonts.gstatic.com" not in body

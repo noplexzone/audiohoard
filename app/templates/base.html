@@ -42,6 +42,7 @@
     <nav class="utility-nav" aria-label="Utilities">
       <a href="/settings" {% if path.startswith("/settings") or path.startswith("/changelog") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-settings"/></svg><span>Settings</span></a>
       <a href="/api/docs"><span class="nav-symbol" aria-hidden="true">{ }</span><span>API docs</span></a>
+      {% if request.state.current_username is defined %}<p class="account-name">Signed in as <strong>{{ request.state.current_username }}</strong></p>{% endif %}
       <form class="nav-logout" method="post" action="/logout">
         <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
         <button type="submit"><svg><use href="#i-logout"/></svg><span>Sign out</span></button>

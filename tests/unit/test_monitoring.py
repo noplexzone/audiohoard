@@ -212,9 +212,9 @@ async def test_upgrade_rejects_stale_candidate_artifact(db_session, tmp_path: Pa
 async def test_upgrade_uses_only_candidate_bound_artifact(db_session, tmp_path: Path) -> None:
     job = Job(source="slskd", query="album", status=JobStatus.done)
     release = Release(job=job, source="slskd", title="Album", album_artist="Artist", year="2000")
-    unrelated = tmp_path / "retained-unrelated.wav"
+    unrelated = tmp_path / "retained-unrelated.flac"
     unrelated.write_bytes(b"unrelated retained bytes")
-    artifact = tmp_path / "approved-candidate.wav"
+    artifact = tmp_path / "approved-candidate.flac"
     artifact.write_bytes(b"approved candidate bytes")
     track = Track(
         job=job,
@@ -262,7 +262,7 @@ async def test_upgrade_uses_only_candidate_bound_artifact(db_session, tmp_path: 
     )
     db_session.add(record)
     await db_session.flush()
-    destination = tmp_path / "library" / "Artist" / "2000 - Album" / "01 - Song.wav"
+    destination = tmp_path / "library" / "Artist" / "2000 - Album" / "01 - Song.flac"
     destination.parent.mkdir(parents=True)
     destination.write_bytes(b"old preferred bytes")
 

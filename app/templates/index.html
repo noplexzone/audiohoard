@@ -36,13 +36,13 @@
       <div class="section-heading"><div><p class="eyebrow">Pipeline</p><h2 id="jobs-heading">Jobs</h2></div><a href="/jobs/ui/list">View all</a></div>
       <div class="status-strip" aria-label="Job state counts">
         {% for status in ['running', 'pending', 'partial', 'done', 'failed', 'cancelled'] %}
-        <div><span class="status-dot {{ status }}"></span><strong data-job-status="{{ status }}">{{ dashboard.job_counts[status] }}</strong><small>{{ status | title }}</small></div>
+        <a href="/downloads?status={{ status }}"><span class="status-dot {{ status }}"></span><strong data-job-status="{{ status }}">{{ dashboard.job_counts[status] }}</strong><small>{{ status | title }}</small></a>
         {% endfor %}
       </div>
       {% if dashboard.recent_jobs %}
       <ul class="job-list">
         {% for job in dashboard.recent_jobs[:4] %}
-        <li><span class="status-dot {{ job.status.value }}"></span><span><strong>{{ job.query }}</strong><small>{{ job.source }} · {{ job.status.value | title }}</small></span></li>
+        <li><a href="/downloads?status={{ job.status.value }}"><span class="status-dot {{ job.status.value }}"></span><span><strong>{{ job.query }}</strong><small>{{ job.source }} · {{ job.status.value | title }}</small></span></a></li>
         {% endfor %}
       </ul>
       {% else %}

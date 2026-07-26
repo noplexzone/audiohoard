@@ -38,6 +38,13 @@ async def test_downloads_show_state_details_and_valid_actions(client: AsyncClien
     assert f'action="/downloads/{partial_id}/retry"' in response.text
     assert 'aria-live="polite"' in response.text
 
+    filtered = await client.get("/downloads?status=partial")
+    assert filtered.status_code == 200
+    assert "incomplete" in filtered.text
+    assert f"/downloads/{running_id}/cancel" not in filtered.text
+    assert f"/downloads/{failed_id}/retry" not in filtered.text
+    assert "Showing partial jobs" in filtered.text
+
 
 async def test_download_job_controls_redirect_with_feedback(
     client: AsyncClient, monkeypatch

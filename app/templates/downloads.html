@@ -8,8 +8,10 @@
     <h1>Downloads</h1>
     <p>Persistent jobs with live state, source fallback, errors, and recovery controls.</p>
   </div>
-  <a class="btn secondary" href="/downloads">Refresh</a>
+  <a class="btn secondary" href="/downloads{% if selected_status %}?status={{ selected_status }}{% endif %}">Refresh</a>
 </header>
+
+{% if selected_status %}<p class="alert info">Showing {{ selected_status }} jobs. <a href="/downloads">Clear filter</a></p>{% endif %}
 
 {% if notice %}<div class="alert {{ notice_type }}" role="status">{{ notice }}</div>{% endif %}
 

@@ -6,7 +6,6 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from importlib.metadata import version as package_version
 from importlib.resources import files
 from pathlib import Path
 from typing import Annotated
@@ -32,6 +31,7 @@ from app.services.artist_monitoring import DiscographyRefreshScheduler
 from app.services.dashboard import get_dashboard_data
 from app.services.health_status import get_health_status_service
 from app.settings_service import effective_settings_dep
+from app.version import APP_VERSION
 
 _TEMPLATES_DIR = files("app") / "templates"
 _STATIC_DIR = files("app") / "static"
@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app_version = package_version("audiohoard")
+    app_version = APP_VERSION
 
     logging.basicConfig(
         level=getattr(logging, settings.log_level),

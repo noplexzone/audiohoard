@@ -11,10 +11,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Added terminal-state polling and artifact verification for slskd and SABnzbd acquisitions.
 - Added download queue details, live refresh, actionable errors, and browser retry/cancel controls.
 - Added visible account logout controls and direct Artists/Imports navigation on mobile.
+- Added filterable dashboard and download status links, source-priority reordering controls, and library/staging path diagnostics.
 
 ### Changed
 - Prowlarr album search results are handled as alternative release candidates instead of individual tracks.
 - Audio discovery and import now share one verified format contract for FLAC, MP3, M4A/MP4, Ogg Vorbis, and Opus.
+- Browser settings validation now tests entered provider credentials before saving and reports Ready, Degraded, and Disabled states consistently.
+- Search and settings screens now use clearer labels, table semantics, contrast, and accessible target sizes.
+- The release workflow can publish the moving `develop` image on demand without creating a version tag.
 
 ### Fixed
 - Prevented external acquisitions from completing before a usable staged artifact exists.
@@ -26,6 +30,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Import execution now requires a persisted, reviewed ready plan instead of silently planning and importing in one action.
 - Dashboard status counts include partial jobs and remain responsive with all six terminal/active states.
 - Runtime version labels, README examples, Compose image tags, and health checks now match v0.6.0.
+- Login redirects now preserve safe deep links, show the signed-in username, and reject open redirects.
+- Import and settings form failures now redirect with browser-readable errors instead of returning server errors.
+- Invalid behavior, metadata, and naming values are rejected without partially saving settings.
 
 ## [0.6.0] - 2026-07-22
 

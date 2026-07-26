@@ -2,63 +2,49 @@
 
 ## What this project is
 
-A private, self-hosted FastAPI application (Audiohoard) that coordinates music acquisition from multiple sources, enriches tracks with metadata, fingerprints audio, and enforces strict library naming conventions.
+A private, self-hosted FastAPI application that coordinates music acquisition, metadata enrichment, fingerprinting, reviewed library imports, and monitored artist catalogs.
 
 ## Hard constraints
 
 ### Sources
-- **slskd**, **Prowlarr+SABnzbd**, and **YouTube** are the only acquisition sources in scope for v0.1.0.
-- **TIDAL support is delegated to an operator-installed, authenticated Tidal-DL backend.** Audiohoard must never stub, mock, simulate, or synthesize TIDAL results; the TIDAL source reports `unavailable` with a clear reason until the backend is configured and passes a live health check. The operator is responsible for the rights/subscription required by their downloader.
-- New sources must implement the `SourceAdapter` protocol and declare their capability state; capability states are surfaced to the UI without hiding failures.
+- Supported acquisition paths are slskd, Prowlarr with SABnzbd, YouTube through yt-dlp, and direct TIDAL track URLs through an operator-authenticated tidal-dl profile.
+- Never stub, synthesize, or hide provider results. Adapters implement `SourceAdapter` and report truthful capability and failure states.
+- External downloads do not complete until the client reaches a terminal success state and a usable staged artifact exists.
 
-### Metadata
-- **MusicBrainz** is the canonical identity provider (MBIDs). All library records must carry a MBID or be marked unresolved.
-- **Deezer** provides supplementary metadata (BPM, gain, preview URL). It does not replace MusicBrainz.
-- External API calls must be rate-limited and retried with exponential backoff.
+### Metadata and identity
+- MusicBrainz is canonical for MBIDs. Tracks without a recording identity remain explicitly unresolved.
+- Deezer and iTunes provide supplemental metadata and artwork. AcoustID lookup is optional.
+- External API calls are bounded, rate-limited where required, and retried only when safe.
 
-### Fingerprinting
-- Local fingerprinting uses `fpcalc` (Chromaprint). If the binary is absent the fingerprint step is skipped with a warning; it must never block acquisition.
-- AcoustID cloud lookup is optional and requires `ACOUSTID_API_KEY` to be set.
+### Naming and file operations
+- The default naming template is `{album_artist}/{year} - {album}/{disc_track} - {title}.{ext}`. One-disc releases use `TT`; multi-disc releases use `D-TT`.
+- Library writes occur only through a persisted, reviewed import plan.
+- Import execution must enforce staging/library containment, collision policy, metadata write/readback verification, atomic replacement, and filesystem rollback.
+- The library mount must be writable when imports are enabled. Never delete or reorganize unrelated library files.
 
-### Naming & file operations
-- The universal naming convention template is exactly `{album_artist}/{year} - {album}/{disc_track} - {title}.{ext}`. One-disc releases use `TT`; multi-disc releases use `D-TT`. Track numbers are two digits.
-- In v0.1.0, **compute and persist path previews only — never move, copy, rename, or delete library files**.
-- Any code that performs filesystem writes to the library root is out of scope for v0.1.0 and must not be written.
+### Data and jobs
+- Use SQLAlchemy 2.x async with SQLite via `aiosqlite`.
+- All schema changes go through Alembic; never use `create_all()` in production paths.
+- The SQLite-backed in-process dispatcher owns job execution, duplicate suppression, startup recovery, retry, and cancellation. No external broker is required.
 
-### Data layer
-- SQLAlchemy 2.x async with SQLite via `aiosqlite`.
-- All schema changes go through Alembic migrations; never use `create_all()` in production paths.
-- Job records persist in SQLite. No external broker (Redis, RabbitMQ, Celery) in v0.1.0.
+### Health contracts
+- `/health/live` is a cheap public process-liveness check.
+- `/health/ready` checks database readiness and returns HTTP 503 when unavailable.
+- Provider diagnostics use cached state and require authentication; public health requests must not trigger provider network probes or expose configuration details.
 
-### Contracts
-- Health endpoints must perform real dependency checks (slskd reachable, DB writable). No fake `{"status": "ok"}`.
-- Search endpoints must proxy to real source APIs. No canned or hardcoded results.
-
-### Testing
-- Follow TDD: write the test before the implementation.
-- Unit tests mock external HTTP; integration tests hit real (or docker-compose) services.
-- No production code path should be reachable only through mocks.
-
-### Security
-- No secrets in source control. All secrets via environment variables loaded from `.env` (never `.env.example`).
-- Validate and sanitise all user-supplied naming tokens before constructing file paths. Prevent path traversal.
-- SQL queries through SQLAlchemy ORM only; no raw string interpolation into queries.
+### Testing and security
+- Write discriminating regression tests for behavior changes. Unit tests mock external HTTP; disposable integration instances may use real services.
+- No secrets in source control. Environment and database-backed secrets remain masked in UI/API responses.
+- Validate naming tokens, paths, selected-result payloads, and redirects. Prevent traversal, open redirects, CSRF, and SQL interpolation.
 
 ### Docker
-- The application and all dependencies run under Docker Compose.
-- The `fpcalc` binary must be installed in the application image.
-- Mount `LIBRARY_ROOT` as a read-only volume in v0.1.0.
+- The application and dependencies run under Docker Compose.
+- The image includes `fpcalc`; absence at runtime degrades fingerprinting without blocking acquisition.
+- Persist application data and TIDAL profiles. Mount staging and library paths according to configured import behavior.
 
 ## Style
-- Python 3.12. Use `from __future__ import annotations` for forward refs.
-- Prefer `async`/`await` throughout; avoid synchronous I/O on the event loop.
-- Type-annotate all public functions and methods.
-- Ruff for linting and formatting; mypy in strict mode.
-- No commented-out code. No TODOs committed to main.
-
-## Out of scope for v0.1.0
-- File moves or library reorganisation
-- In-process TIDAL credential handling or simulated TIDAL acquisition
-- External task broker
-- Front-end JavaScript framework (Jinja2 templates only)
-- Multi-user authentication
+- Python 3.12+. Use `from __future__ import annotations`.
+- Prefer async I/O and move unavoidable filesystem probes to a worker thread.
+- Type-annotate public functions. Use Ruff, Ruff format, mypy, and pytest.
+- The web UI is server-rendered Jinja; small progressive-enhancement scripts are acceptable when native behavior remains usable.
+- No commented-out code or unresolved TODOs on release branches.

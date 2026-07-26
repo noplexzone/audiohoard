@@ -7,6 +7,8 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.version import APP_VERSION
+
 logger = logging.getLogger(__name__)
 
 
@@ -55,7 +57,7 @@ class Settings(BaseSettings):
 
     # MusicBrainz
     musicbrainz_app_name: str = "audiohoard"
-    musicbrainz_app_version: str = "0.5.0"
+    musicbrainz_app_version: str = APP_VERSION
     musicbrainz_contact: str = ""
 
     # Deezer

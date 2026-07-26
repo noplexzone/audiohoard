@@ -72,10 +72,15 @@ async def get_job(job_id: int, db: Annotated[AsyncSession, Depends(get_db)]) -> 
 
 @router.get("/downloads", response_class=HTMLResponse, include_in_schema=False)
 async def downloads_page(
-    request: Request, db: Annotated[AsyncSession, Depends(get_db)]
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    status: JobStatus | None = None,
 ) -> HTMLResponse:
     templates = _get_templates(request)
-    result = await db.execute(select(Job).order_by(Job.created_at.desc()).limit(100))
+    query = select(Job).order_by(Job.created_at.desc()).limit(100)
+    if status is not None:
+        query = query.where(Job.status == status)
+    result = await db.execute(query)
     downloads = list(result.scalars().all())
     notices = {
         "cancelled": ("Cancellation requested.", "info"),
@@ -92,6 +97,7 @@ async def downloads_page(
             "jobs": downloads,
             "notice": notice,
             "notice_type": notice_type,
+            "selected_status": status.value if status is not None else None,
         },
     )
 

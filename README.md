@@ -2,7 +2,7 @@
 
 **Private, self-hosted music acquisition and library management — v0.6.0**
 
-A FastAPI application that coordinates multiple acquisition sources, enriches tracks with metadata, fingerprints audio, and enforces strict library naming conventions. Designed to run entirely on-premises; no data leaves the host.
+A FastAPI application that coordinates multiple acquisition sources, enriches tracks with metadata, fingerprints audio, and enforces strict library naming conventions. Application state remains self-hosted; configured metadata and acquisition providers receive the requests required to perform their work.
 
 ## Acquisition Sources
 
@@ -46,7 +46,7 @@ Files are renamed according to a strict, configurable template:
 <AlbumArtist>/<Year> - <Album>/<DiscTrack> - <Title>.<ext>
 ```
 
-Path previews and safe staging/import workflow state are computed and stored. Actual library mutation remains isolated behind future verified import execution; staging paths live under `STAGING_ROOT` and must not escape it.
+Path previews and staging/import workflow state are persisted for review. Import execution writes verified metadata, atomically moves files into `LIBRARY_ROOT`, and rolls filesystem changes back if the transaction fails. Staging paths live under `STAGING_ROOT` and must not escape it.
 
 Extension tokens are sanitized with the same filesystem safety rules as other naming tokens, then capped at 32 characters. The final filename component is capped at 200 characters while preserving a dot plus the bounded sanitized extension.
 
@@ -63,7 +63,7 @@ Extension tokens are sanitized with the same filesystem safety rules as other na
 - `fpcalc` binary (Chromaprint) available in container for fingerprinting
 - slskd instance reachable on the local network
 - Prowlarr + SABnzbd instances reachable on the local network
-- Valid API keys for AcoustID (optional) and Deezer
+- Valid AcoustID API key for cloud fingerprint lookup (optional); Deezer's public metadata API requires no key
 
 ## Quick Start
 
@@ -76,6 +76,16 @@ docker compose up -d
 ```
 
 The admin UI is served at `http://localhost:8000`. Acquisition records are shown under Downloads, and runtime source priority/result-cap settings are under Settings.
+
+Jobs persist in SQLite and are recovered after restart. Downloads support cancellation and retry; slskd and SABnzbd jobs remain active until their external transfer reaches a terminal state and an artifact is verified.
+
+## Health endpoints
+
+| Endpoint | Authentication | Meaning |
+|---|---|---|
+| `/health/live` | Public | Cheap process-liveness response |
+| `/health/ready` | Public | Database readiness; returns HTTP 503 when unavailable |
+| `/health/sources` | Required | Cached provider diagnostics; does not probe providers during the GET |
 
 For this direct LAN HTTP setup, keep `AUTH_COOKIE_SECURE=false` as shown in
 `.env.example`; otherwise browsers will not return the session and CSRF cookies over
@@ -94,7 +104,3 @@ docker pull noplexzone/audiohoard:0.6.0
 ## Continuous integration
 
 Pull requests and pushes to `main` run pytest, Ruff lint and formatting checks, mypy, Python package build, and a Docker image build. Version tags run the same quality gate before publishing the Docker image.
-
-## Version
-
-v0.6.0 — monitored artist catalogs, Wanted acquisition, server-rendered management UI, and durable acquisition/import workflows

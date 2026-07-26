@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import func, select
 
@@ -66,3 +67,37 @@ async def test_browser_logout_clears_session_and_redirects(client: AsyncClient) 
     factory = get_session_factory()
     async with factory() as db:
         assert await db.scalar(select(func.count(AuthSession.id))) == 0
+
+
+async def test_login_returns_to_valid_local_deep_link(client: AsyncClient) -> None:
+    await client.post("/logout")
+    page = await client.get("/login?next=/imports/ui/review")
+    assert 'name="next" value="/imports/ui/review"' in page.text
+
+    response = await client.post(
+        "/login",
+        data={
+            "username": "test-owner",
+            "password": "Test-Owner-Password-42",
+            "next": "/imports/ui/review",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/imports/ui/review"
+
+
+@pytest.mark.parametrize("target", ["//evil.example", "https://evil.example", "\\evil"])
+async def test_login_rejects_external_return_targets(client: AsyncClient, target: str) -> None:
+    await client.post("/logout")
+    response = await client.post(
+        "/login",
+        data={
+            "username": "test-owner",
+            "password": "Test-Owner-Password-42",
+            "next": target,
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
