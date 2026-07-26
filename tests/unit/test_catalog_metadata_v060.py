@@ -15,6 +15,8 @@ from app.services.catalog_metadata import (
     _norm_title,
     enrich_catalog_artist,
     reconcile_duplicate_catalog_albums,
+    reconcile_duplicate_catalog_artists,
+    upsert_catalog_artist,
 )
 
 
@@ -142,3 +144,128 @@ async def test_enrichment_resolves_mbid_from_conservative_discography_overlap(
     assert outcome["status"] == "ok"
     assert artist.mbid == "artist-mbid"
     assert json.loads(artist.provenance_json or "{}")["mbid"] == "musicbrainz"
+
+
+async def test_upsert_reuses_normalized_unresolved_artist_for_resolved_mbid(db_session) -> None:
+    existing = CatalogArtist(name="Juice  WRLD")
+    db_session.add(existing)
+    await db_session.flush()
+
+    result = await upsert_catalog_artist(
+        db_session,
+        ArtistDetail(
+            provider="musicbrainz",
+            provider_id="juice-mbid",
+            name="Juice WRLD",
+            mbid="juice-mbid",
+        ),
+    )
+
+    assert result.id == existing.id
+    assert result.mbid == "juice-mbid"
+    assert len(list((await db_session.scalars(select(CatalogArtist))).all())) == 1
+
+
+async def test_enrichment_merges_artist_before_assigning_colliding_mbid(
+    db_session, monkeypatch, test_settings: Settings
+) -> None:
+    owner = CatalogArtist(name="Juice WRLD", mbid="artist-mbid", artwork_url="owner.jpg")
+    duplicate = CatalogArtist(name="Juice Wrld", deezer_id="123", monitored=True)
+    db_session.add_all([owner, duplicate])
+    await db_session.flush()
+    db_session.add(
+        CatalogAlbum(
+            artist_id=duplicate.id,
+            title="Known Album",
+            year="2024",
+            release_type="Album",
+        )
+    )
+    await db_session.flush()
+    await db_session.refresh(duplicate, ["albums"])
+
+    monkeypatch.setattr(
+        catalog_metadata,
+        "build_metadata_provider",
+        lambda name, settings: FakeMusicBrainzProvider() if name == "musicbrainz" else None,
+    )
+    outcome = await enrich_catalog_artist(db_session, test_settings, duplicate, ["musicbrainz"])
+    await db_session.commit()
+
+    artists = list((await db_session.scalars(select(CatalogArtist))).all())
+    assert len(artists) == 1
+    assert artists[0].id == owner.id
+    assert artists[0].monitored is True
+    assert outcome["artist_id"] == owner.id
+    assert (await db_session.scalars(select(CatalogAlbum.artist_id))).one() == owner.id
+
+
+async def test_repair_merges_exact_juice_wrld_fixture_and_success_clears_error(
+    db_session, test_settings: Settings
+) -> None:
+    owner = CatalogArtist(name="Juice WRLD", mbid="juice-mbid", monitor_policy="albums_only")
+    duplicate = CatalogArtist(
+        name="Juice  WRLD",
+        monitored=True,
+        monitor_policy="none_new",
+        provenance_json=json.dumps(
+            {"last_enrichment_error": {"at": "2026-01-01", "message": "IntegrityError: old"}}
+        ),
+    )
+    db_session.add_all([owner, duplicate])
+    await db_session.flush()
+    owner_album = CatalogAlbum(
+        artist_id=owner.id,
+        title="Death Race for Love",
+        year="2019",
+        release_type="Album",
+        mbid="death-race",
+    )
+    duplicate_same_album = CatalogAlbum(
+        artist_id=duplicate.id,
+        title="Death Race for Love",
+        year="2019",
+        release_type="album",
+        deezer_id="1234",
+        monitored=True,
+    )
+    duplicate_unique_album = CatalogAlbum(
+        artist_id=duplicate.id,
+        title="Legends Never Die",
+        year="2020",
+        release_type="Album",
+    )
+    db_session.add_all([owner_album, duplicate_same_album, duplicate_unique_album])
+    await db_session.flush()
+    job = Job(
+        source="priority",
+        query="Juice WRLD Death Race for Love",
+        status=JobStatus.pending,
+        catalog_album_id=duplicate_same_album.id,
+    )
+    db_session.add(job)
+    await db_session.flush()
+
+    assert await reconcile_duplicate_catalog_artists(db_session) == 1
+    await db_session.commit()
+
+    artists = list((await db_session.scalars(select(CatalogArtist))).all())
+    assert len(artists) == 1
+    survivor = artists[0]
+    assert survivor.id == owner.id
+    assert survivor.monitored is True
+    assert survivor.monitor_policy == "albums_only"
+    assert "last_enrichment_error" in json.loads(survivor.provenance_json or "{}")
+    albums = list((await db_session.scalars(select(CatalogAlbum))).all())
+    assert {album.title for album in albums} == {"Death Race for Love", "Legends Never Die"}
+    assert all(album.artist_id == survivor.id for album in albums)
+    kept_duplicate = next(album for album in albums if album.title == "Death Race for Love")
+    assert kept_duplicate.mbid == "death-race"
+    assert kept_duplicate.deezer_id == "1234"
+    assert (await db_session.scalars(select(Job.catalog_album_id))).one() == kept_duplicate.id
+    assert await reconcile_duplicate_catalog_artists(db_session) == 0
+
+    await db_session.refresh(survivor, ["albums"])
+    outcome = await enrich_catalog_artist(db_session, test_settings, survivor, ["musicbrainz"])
+    assert outcome["status"] == "ok"
+    assert "last_enrichment_error" not in json.loads(survivor.provenance_json or "{}")
