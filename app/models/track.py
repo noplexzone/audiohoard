@@ -106,5 +106,8 @@ class Track(Base):
         "ReleaseCandidate", back_populates="track", cascade="all, delete-orphan"
     )
     import_plans: Mapped[list[ImportPlan]] = relationship(
-        "ImportPlan", back_populates="track", cascade="all, delete-orphan"
+        "ImportPlan",
+        back_populates="track",
+        cascade="all, delete-orphan",
+        order_by="ImportPlan.id",
     )

@@ -18,6 +18,55 @@ _SEARCH_TIMEOUT_SEC = 60
 _HTTP_TIMEOUT = httpx.Timeout(10.0)
 
 
+def _error_detail(response: httpx.Response) -> str:
+    try:
+        data = response.json()
+    except ValueError:
+        return response.text.strip()[:500]
+    if not isinstance(data, dict):
+        return str(data)[:500]
+    parts: list[str] = []
+    for key in ("title", "detail", "message"):
+        value = data.get(key)
+        if value:
+            parts.append(str(value))
+    errors = data.get("errors")
+    if isinstance(errors, dict):
+        for field, messages in errors.items():
+            if isinstance(messages, list):
+                parts.extend(f"{field}: {message}" for message in messages)
+            elif messages:
+                parts.append(f"{field}: {messages}")
+    return "; ".join(parts)[:500]
+
+
+def _flatten_downloads(data: object) -> list[dict[str, object]]:
+    if isinstance(data, dict) and "downloads" in data:
+        data = data["downloads"]
+    roots = data if isinstance(data, list) else [data]
+    flattened: list[dict[str, object]] = []
+
+    def visit(value: object, inherited: dict[str, object]) -> None:
+        if not isinstance(value, dict):
+            return
+        context = dict(inherited)
+        for key in ("username", "directory"):
+            if value.get(key) is not None:
+                context[key] = value[key]
+        if value.get("filename") is not None:
+            flattened.append({**value, **context})
+            return
+        for key in ("directories", "files", "downloads"):
+            children = value.get(key)
+            if isinstance(children, list):
+                for child in children:
+                    visit(child, context)
+
+    for root in roots:
+        visit(root, {})
+    return flattened
+
+
 class SlskdAdapter:
     name = "slskd"
 
@@ -128,19 +177,28 @@ class SlskdAdapter:
             payload["size"] = size
         async with self._client() as client:
             resp = await request_with_retry(
-                client, "POST", f"/api/v0/transfers/downloads/{username}", json=payload
+                client, "POST", f"/api/v0/transfers/downloads/{username}", json=[payload]
             )
-            resp.raise_for_status()
+            if resp.is_error:
+                detail = _error_detail(resp)
+                message = f"slskd rejected download queue request (HTTP {resp.status_code})"
+                if detail:
+                    message = f"{message}: {detail}"
+                raise ProviderError(
+                    f"slskd_http_{resp.status_code}", message, "acquire", resp.status_code >= 500
+                )
         data = resp.json() if resp.content else {}
-        transfer_id = str(data.get("id") or data.get("transferId") or f"{username}:{filename}")
+        response_id = (
+            (data.get("id") or data.get("transferId")) if isinstance(data, dict) else None
+        )
+        transfer_id = str(response_id or f"{username}:{filename}")
         return transfer_id
 
     async def downloads(self) -> list[dict[str, object]]:
         async with self._client() as client:
             resp = await request_with_retry(client, "GET", "/api/v0/transfers/downloads")
             resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, list) else list(data.get("downloads", []))
+        return _flatten_downloads(resp.json())
 
     async def status(self, transfer_id: str) -> CapabilityState:
         for item in await self.downloads():

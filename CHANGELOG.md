@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- Consolidated Artists into one filterable watchlist with artwork and release-type counts.
+- Library views now include only successfully downloaded files and display their paths and metadata.
+- Replaced user-facing monitoring terminology with watchlist terminology and restored a conventional settings gear icon.
+
+### Fixed
+- Corrected slskd download enqueue payloads to use the required request array, preserved validation details, and handled nested transfer responses.
+
 ## [0.6.1] - 2026-07-26
 
 ### Added

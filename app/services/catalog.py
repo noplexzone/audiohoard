@@ -4,11 +4,15 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.models.catalog_entities import CatalogArtist
+from app.models.import_plan import ImportPlan
 from app.models.track import Track
+from app.models.workflow import AcquisitionState, ImportWorkflowState
 
 UNKNOWN = "Unknown"
 _DEFAULT_PAGE_SIZE = 50
@@ -16,6 +20,7 @@ _MAX_PAGE_SIZE = 200
 
 _VALID_LIBRARY_SORTS = frozenset({"title", "artist", "album", "year", "source", "added"})
 _VALID_ARTIST_SORTS = frozenset({"name", "tracks", "albums", "duration"})
+_VALID_WATCHLIST_SORTS = frozenset({"name", "releases", "albums", "singles", "compilations"})
 
 
 def _artist_expr() -> Any:
@@ -73,6 +78,7 @@ class TrackRow:
     year: str | None
     source: str
     source_path: str | None
+    file_path: str
     acquisition_state: str
     import_state: str
     duration_sec: int | None
@@ -108,6 +114,18 @@ class Page[T]:
     @property
     def has_next(self) -> bool:
         return self.page < self.total_pages
+
+
+@dataclass
+class WatchlistedArtistRow:
+    id: int
+    name: str
+    artwork_url: str | None
+    album_count: int
+    single_ep_count: int
+    compilation_count: int
+    total_releases: int
+    watchlisted: bool = True
 
 
 @dataclass
@@ -159,6 +177,18 @@ def _normalize_album(t: Track) -> str:
     return t.album or UNKNOWN
 
 
+def _track_file_path(t: Track) -> str:
+    if "import_plans" not in sa_inspect(t).unloaded:
+        imported_destinations = [
+            plan.destination_path.strip()
+            for plan in t.import_plans
+            if plan.status == ImportWorkflowState.imported and plan.destination_path.strip()
+        ]
+        if imported_destinations:
+            return imported_destinations[-1]
+    return (t.source_path or "").strip()
+
+
 def to_track_row(t: Track) -> TrackRow:
     return TrackRow(
         id=t.id,
@@ -168,6 +198,7 @@ def to_track_row(t: Track) -> TrackRow:
         year=t.year,
         source=t.source,
         source_path=t.source_path,
+        file_path=_track_file_path(t),
         acquisition_state=str(t.acquisition_state),
         import_state=str(t.import_state),
         duration_sec=t.duration_sec,
@@ -199,6 +230,26 @@ def _clamp_page(page: int, total: int, per_page: int) -> int:
     return min(page, last)
 
 
+def _non_empty(column: Any) -> Any:
+    return and_(column.is_not(None), func.length(func.trim(column)) > 0)
+
+
+def _library_artifact_filter() -> Any:
+    imported_destination = exists(
+        select(ImportPlan.id).where(
+            ImportPlan.track_id == Track.id,
+            ImportPlan.status == ImportWorkflowState.imported,
+            _non_empty(ImportPlan.destination_path),
+        )
+    )
+    return and_(
+        Track.acquisition_state == AcquisitionState.downloaded,
+        Track.file_size_bytes.is_not(None),
+        Track.file_size_bytes > 0,
+        or_(_non_empty(Track.source_path), imported_destination),
+    )
+
+
 async def get_library_stats(db: AsyncSession) -> LibraryStats:
     artist_expr = _artist_expr()
     agg = await db.execute(
@@ -206,13 +257,14 @@ async def get_library_stats(db: AsyncSession) -> LibraryStats:
             func.count(Track.id).label("track_count"),
             func.count(func.distinct(artist_expr)).label("artist_count"),
             func.coalesce(func.sum(Track.duration_sec), 0).label("total_duration_sec"),
-        )
+        ).where(_library_artifact_filter())
     )
     row = agg.one()
-    album_count = await _count_album_groups(db)
+    album_count = await _count_album_groups(db, _library_artifact_filter())
 
     src_rows = await db.execute(
         select(Track.source, func.count(Track.id).label("cnt"))
+        .where(_library_artifact_filter())
         .group_by(Track.source)
         .order_by(func.count(Track.id).desc())
     )
@@ -220,14 +272,21 @@ async def get_library_stats(db: AsyncSession) -> LibraryStats:
 
     fmt_rows = await db.execute(
         select(Track.file_format, func.count(Track.id).label("cnt"))
-        .where(Track.file_format.is_not(None))
+        .where(_library_artifact_filter(), Track.file_format.is_not(None))
         .group_by(Track.file_format)
         .order_by(func.count(Track.id).desc())
     )
     format_breakdown: dict[str, int] = {str(r.file_format): int(r.cnt) for r in fmt_rows}
 
     total_bytes = int(
-        (await db.scalar(select(func.coalesce(func.sum(Track.file_size_bytes), 0)))) or 0
+        (
+            await db.scalar(
+                select(func.coalesce(func.sum(Track.file_size_bytes), 0)).where(
+                    _library_artifact_filter()
+                )
+            )
+        )
+        or 0
     )
 
     return LibraryStats(
@@ -249,7 +308,7 @@ def _build_library_filters(
     fmt: str,
 ) -> list[Any]:
     artist_expr = _artist_expr()
-    filters: list[Any] = []
+    filters: list[Any] = [_library_artifact_filter()]
     if q:
         pattern = f"%{q}%"
         filters.append(
@@ -296,7 +355,7 @@ async def list_library_tracks(
 
     page = _clamp_page(page, total, per_page)
 
-    data_stmt = select(Track)
+    data_stmt = select(Track).options(selectinload(Track.import_plans))
     if filters:
         data_stmt = data_stmt.where(and_(*filters))
 
@@ -326,7 +385,14 @@ async def list_library_tracks(
 
 
 async def list_distinct_sources(db: AsyncSession) -> list[str]:
-    rows = (await db.execute(select(Track.source).distinct().order_by(Track.source))).scalars()
+    rows = (
+        await db.execute(
+            select(Track.source)
+            .where(_library_artifact_filter())
+            .distinct()
+            .order_by(Track.source)
+        )
+    ).scalars()
     return sorted({str(s) for s in rows})
 
 
@@ -334,12 +400,71 @@ async def list_distinct_formats(db: AsyncSession) -> list[str]:
     rows = (
         await db.execute(
             select(Track.file_format)
-            .where(Track.file_format.is_not(None))
+            .where(_library_artifact_filter(), Track.file_format.is_not(None))
             .distinct()
             .order_by(Track.file_format)
         )
     ).scalars()
     return sorted({str(s) for s in rows})
+
+
+async def get_watchlisted_artists_page(
+    db: AsyncSession,
+    *,
+    q: str = "",
+    sort: str = "name",
+    page: int = 1,
+    per_page: int = _DEFAULT_PAGE_SIZE,
+) -> Page[WatchlistedArtistRow]:
+    per_page = _clamp_per_page(per_page)
+    page = max(1, page)
+    stmt = (
+        select(CatalogArtist)
+        .where(CatalogArtist.monitored.is_(True))
+        .options(selectinload(CatalogArtist.albums))
+    )
+    if q:
+        stmt = stmt.where(CatalogArtist.name.ilike(f"%{q}%"))
+    catalog_artists = list((await db.execute(stmt)).scalars().all())
+    items: list[WatchlistedArtistRow] = []
+    for artist in catalog_artists:
+        albums = singles_eps = compilations = 0
+        for release in artist.albums:
+            release_type = (release.release_type or "album").casefold()
+            if release_type in {"single", "ep"}:
+                singles_eps += 1
+            elif "compilation" in release_type:
+                compilations += 1
+            else:
+                albums += 1
+        items.append(
+            WatchlistedArtistRow(
+                id=artist.id,
+                name=artist.name,
+                artwork_url=artist.artwork_url,
+                album_count=albums,
+                single_ep_count=singles_eps,
+                compilation_count=compilations,
+                total_releases=albums + singles_eps + compilations,
+            )
+        )
+
+    valid_sort = sort if sort in _VALID_WATCHLIST_SORTS else "name"
+    if valid_sort == "releases":
+        items.sort(key=lambda item: (-item.total_releases, item.name.casefold(), item.id))
+    elif valid_sort == "albums":
+        items.sort(key=lambda item: (-item.album_count, item.name.casefold(), item.id))
+    elif valid_sort == "singles":
+        items.sort(key=lambda item: (-item.single_ep_count, item.name.casefold(), item.id))
+    elif valid_sort == "compilations":
+        items.sort(key=lambda item: (-item.compilation_count, item.name.casefold(), item.id))
+    else:
+        items.sort(key=lambda item: (item.name.casefold(), item.id))
+
+    total = len(items)
+    page = _clamp_page(page, total, per_page)
+    start = _page_offset(page, per_page)
+    return Page(items=items[start : start + per_page], total=total, page=page, per_page=per_page)
 
 
 async def get_artists_page(
@@ -490,7 +615,7 @@ async def get_artist_detail(
 
     stmt = (
         select(Track)
-        .options(selectinload(Track.release))
+        .options(selectinload(Track.release), selectinload(Track.import_plans))
         .where(artist_expr == artist_name)
         .order_by(Track.year, Track.album, Track.disc, Track.track_no, Track.title, Track.id)
         .offset(_page_offset(page, per_page))

@@ -3,87 +3,56 @@
 {% block content %}
 <div class="page-header">
   <h1>Artists</h1>
-  <p>{{ artists.total }} artist{% if artists.total != 1 %}s{% endif %} in library</p>
+  <p>{{ artists.total }} watchlisted artist{% if artists.total != 1 %}s{% endif %}</p>
 </div>
-<nav class="tabs" style="display:flex; gap:.5rem; margin-bottom:1rem;"><a class="btn" href="/artists">Library</a><a class="btn secondary" href="/artists/monitored">Monitored ({{ monitored_count | default(0) }})</a><a class="btn secondary" href="/wanted">Wanted</a></nav>
-
-<form method="get" action="/artists" class="filter-bar" role="search" aria-label="Filter artists">
+<form method="get" action="/artists" class="filter-bar" role="search" aria-label="Filter watchlisted artists">
   <label class="sr-only" for="art-q">Search</label>
-  <input id="art-q" type="search" name="q" value="{{ q }}" placeholder="Search artists…" aria-label="Search artists">
+  <input id="art-q" type="search" name="q" value="{{ q }}" placeholder="Search watchlisted artists…" aria-label="Search watchlisted artists">
   <label class="sr-only" for="art-sort">Sort</label>
   <select id="art-sort" name="sort" aria-label="Sort order">
-    <option value="name"     {% if sort == "name"     %}selected{% endif %}>Name</option>
-    <option value="tracks"   {% if sort == "tracks"   %}selected{% endif %}>Most tracks</option>
-    <option value="albums"   {% if sort == "albums"   %}selected{% endif %}>Most albums</option>
-    <option value="duration" {% if sort == "duration" %}selected{% endif %}>Longest</option>
+    <option value="name" {% if sort == "name" %}selected{% endif %}>Name</option>
+    <option value="releases" {% if sort == "releases" %}selected{% endif %}>Most releases</option>
+    <option value="albums" {% if sort == "albums" %}selected{% endif %}>Most albums</option>
+    <option value="singles" {% if sort == "singles" %}selected{% endif %}>Most singles/EPs</option>
+    <option value="compilations" {% if sort == "compilations" %}selected{% endif %}>Most compilations</option>
   </select>
   <button type="submit" class="btn">Filter</button>
-  {% if q %}
-  <a href="/artists" class="btn secondary">Clear</a>
-  {% endif %}
+  {% if q %}<a href="/artists" class="btn secondary">Clear</a>{% endif %}
 </form>
-
 {% if artists.items %}
-<div class="artist-grid" role="list" aria-label="Artist list">
+<div class="artist-grid" role="list" aria-label="Watchlisted artists">
   {% for artist in artists.items %}
   <article class="artist-card" role="listitem">
-    <div class="artist-avatar avatar-{{ loop.index % 4 }}" aria-hidden="true">{{ artist.display_name[:1] | upper }}</div>
-    <h2><a href="/artists/detail?name={{ artist.display_name | urlencode }}">{{ artist.display_name }}</a></h2>
-    <dl class="artist-meta">
-      <dt>Tracks</dt><dd>{{ artist.track_count }}</dd>
-      <dt>Albums</dt><dd>{{ artist.album_count }}</dd>
-      {% if artist.total_duration_sec %}
-      <dt>Duration</dt>
-      <dd>
-        {% set h = (artist.total_duration_sec // 3600) %}
-        {% set m = ((artist.total_duration_sec % 3600) // 60) %}
-        {% if h > 0 %}{{ h }}h {{ m }}m{% else %}{{ m }}m{% endif %}
-      </dd>
-      {% endif %}
-      {% if artist.min_year %}
-      <dt>Years</dt>
-      <dd>
-        {% if artist.min_year == artist.max_year %}
-        {{ artist.min_year }}
+    <a href="/artists/catalog/{{ artist.id }}" aria-label="Open {{ artist.name }}">
+      <div class="artist-avatar avatar-{{ loop.index % 4 }}">
+        {% if artist.artwork_url %}
+          <img loading="lazy" src="{{ artist.artwork_url | e }}" alt="{{ artist.name | e }} artwork">
         {% else %}
-        {{ artist.min_year }}–{{ artist.max_year }}
+          <span role="img" aria-label="No artwork available for {{ artist.name | e }}">{{ artist.name[:2] | upper }}</span>
         {% endif %}
-      </dd>
-      {% endif %}
-      {% if artist.formats %}
-      <dt>Formats</dt>
-      <dd>
-        {% for f in artist.formats %}<span class="badge info">{{ f }}</span> {% endfor %}
-      </dd>
-      {% endif %}
+      </div>
+    </a>
+    <h2><a href="/artists/catalog/{{ artist.id }}">{{ artist.name }}</a></h2>
+    <p><span class="badge ok">Watchlisted ✓</span></p>
+    <dl class="artist-meta">
+      <dt>Albums</dt><dd>{{ artist.album_count }}</dd>
+      <dt>Singles/EPs</dt><dd>{{ artist.single_ep_count }}</dd>
+      <dt>Compilations</dt><dd>{{ artist.compilation_count }}</dd>
+      <dt>Total releases</dt><dd>{{ artist.total_releases }}</dd>
     </dl>
+    <p class="sr-only">{{ artist.album_count }} album{% if artist.album_count != 1 %}s{% endif %}, {{ artist.single_ep_count }} single/EP{% if artist.single_ep_count != 1 %}s{% endif %}, {{ artist.compilation_count }} compilation{% if artist.compilation_count != 1 %}s{% endif %}, {{ artist.total_releases }} releases</p>
   </article>
   {% endfor %}
 </div>
-
 <nav class="pagination" aria-label="Artist list pagination">
-  {% if artists.has_prev %}
-  <a href="/artists?{{ filter_qs }}&page={{ artists.page - 1 }}" class="btn secondary" aria-label="Previous page">← Prev</a>
-  {% else %}
-  <span class="btn secondary disabled" aria-disabled="true">← Prev</span>
-  {% endif %}
+  {% if artists.has_prev %}<a href="/artists?{{ filter_qs }}&page={{ artists.page - 1 }}" class="btn secondary">← Prev</a>{% else %}<span class="btn secondary disabled" aria-disabled="true">← Prev</span>{% endif %}
   <span class="pagination-info">Page {{ artists.page }} of {{ artists.total_pages }} ({{ artists.total }} artists)</span>
-  {% if artists.has_next %}
-  <a href="/artists?{{ filter_qs }}&page={{ artists.page + 1 }}" class="btn secondary" aria-label="Next page">Next →</a>
-  {% else %}
-  <span class="btn secondary disabled" aria-disabled="true">Next →</span>
-  {% endif %}
+  {% if artists.has_next %}<a href="/artists?{{ filter_qs }}&page={{ artists.page + 1 }}" class="btn secondary">Next →</a>{% else %}<span class="btn secondary disabled" aria-disabled="true">Next →</span>{% endif %}
 </nav>
-
 {% else %}
 <div class="empty-state" role="status">
-  {% if q %}
-  <p>No artists match <strong>{{ q }}</strong>.</p>
-  <a href="/artists" class="btn secondary">Clear search</a>
-  {% else %}
-  <p>No artists in library yet.</p>
-  <p>Acquire music via <a href="/search">Search</a> or <a href="/jobs/ui/list">Jobs</a>.</p>
-  {% endif %}
+  {% if q %}<p>No watchlisted artists match <strong>{{ q }}</strong>.</p><a href="/artists" class="btn secondary">Clear search</a>
+  {% else %}<p>Your artist watchlist is empty.</p><p>Use <a href="/search">Search</a> to add an artist to your watchlist.</p>{% endif %}
 </div>
 {% endif %}
 {% endblock %}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import asdict, dataclass
@@ -320,15 +321,15 @@ async def execute_quality_upgrade(
 
 def map_slskd_transfer_state(state: _CapabilityState) -> _AcquisitionState:
     """Map slskd transfer API state into the acquisition workflow enum."""
-    value = (state.reason or "").casefold()
+    tokens = set(re.findall(r"[a-z]+", (state.reason or "").casefold()))
     if not state.available:
         return _AcquisitionState.failed
-    if value in {"completed", "complete", "succeeded", "downloaded"}:
-        return _AcquisitionState.downloaded
-    if value in {"queued", "initializing"}:
-        return _AcquisitionState.queued
-    if value in {"cancelled", "canceled"}:
-        return _AcquisitionState.cancelled
-    if value in {"failed", "errored", "error"}:
+    if tokens & {"failed", "errored", "error"}:
         return _AcquisitionState.failed
+    if tokens & {"cancelled", "canceled"}:
+        return _AcquisitionState.cancelled
+    if tokens & {"completed", "complete", "succeeded", "downloaded"}:
+        return _AcquisitionState.downloaded
+    if tokens & {"queued", "initializing"}:
+        return _AcquisitionState.queued
     return _AcquisitionState.acquiring

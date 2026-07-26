@@ -4,6 +4,7 @@ import pytest_asyncio
 from httpx import AsyncClient
 
 import app.database as db_module
+from app.models.catalog_entities import CatalogAlbum, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import FingerprintState, IdentityResolutionState, Track
@@ -119,6 +120,15 @@ async def seeded_client(client: AsyncClient) -> AsyncClient:
             ),
         ]
         session.add_all(tracks)
+        catalog_artist_a = CatalogArtist(
+            name="Album Artist A",
+            monitored=True,
+            artwork_url="https://images.example/artist-a.jpg",
+        )
+        catalog_artist_a.albums.append(CatalogAlbum(title="Great Album", release_type="Album"))
+        catalog_artist_b = CatalogArtist(name="Artist B", monitored=True)
+        catalog_artist_b.albums.append(CatalogAlbum(title="Solo Work", release_type="Album"))
+        session.add_all([catalog_artist_a, catalog_artist_b])
         await session.commit()
 
     return client
@@ -164,6 +174,51 @@ async def test_artists_empty_db_returns_200(client: AsyncClient) -> None:
     assert "Artists" in resp.text
 
 
+async def test_artists_lists_only_watchlisted_catalog_artists(client: AsyncClient) -> None:
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        watched = CatalogArtist(
+            name="Watchlisted Artist",
+            monitored=True,
+            artwork_url="https://images.example/watchlisted.jpg",
+        )
+        watched.albums.extend(
+            [
+                CatalogAlbum(title="Record", release_type="Album"),
+                CatalogAlbum(title="Short", release_type="EP"),
+                CatalogAlbum(title="Collection", release_type="Compilation"),
+            ]
+        )
+        session.add_all([watched, CatalogArtist(name="Hidden Artist", monitored=False)])
+        await session.commit()
+        watched_id = watched.id
+    resp = await client.get("/artists")
+    assert resp.status_code == 200
+    assert "Watchlisted Artist" in resp.text
+    assert "Hidden Artist" not in resp.text
+    assert f'href="/artists/catalog/{watched_id}"' in resp.text
+    assert 'src="https://images.example/watchlisted.jpg"' in resp.text
+    assert "1 album" in resp.text
+    assert "1 single/EP" in resp.text
+    assert "1 compilation" in resp.text
+    assert "3 releases" in resp.text
+    assert "Monitored" not in resp.text
+    assert "Monitoring" not in resp.text
+
+
+async def test_legacy_artist_routes_redirect_to_artists(client: AsyncClient) -> None:
+    for path in ("/artists/monitored", "/wanted"):
+        resp = await client.get(path, follow_redirects=False)
+        assert resp.status_code in (302, 303, 307, 308)
+        assert resp.headers["location"] == "/artists"
+
+
+async def test_settings_icon_is_a_conventional_gear(client: AsyncClient) -> None:
+    resp = await client.get("/library")
+    assert '<symbol id="i-settings"' in resp.text
+    assert "M19.14,12.94" in resp.text
+
+
 async def test_artist_detail_unknown_returns_200_empty(client: AsyncClient) -> None:
     resp = await client.get("/artists/detail?name=Nobody")
     assert resp.status_code == 200
@@ -204,10 +259,10 @@ async def test_library_shows_year(seeded_client: AsyncClient) -> None:
     assert "2020" in resp.text
 
 
-# ── Fallback artist grouping ──────────────────────────────────────────────────
+# ── Watchlisted artists and legacy library detail ─────────────────────────────
 
 
-async def test_artists_fallback_grouping(seeded_client: AsyncClient) -> None:
+async def test_artists_uses_watchlisted_catalog_artists(seeded_client: AsyncClient) -> None:
     resp = await seeded_client.get("/artists")
     assert resp.status_code == 200
     body = resp.text

@@ -46,7 +46,7 @@
         {% if artist_hit.artwork_url %}<img src="{{ artist_hit.artwork_url | e }}" alt="" style="width:100%; aspect-ratio:1; object-fit:cover; border-radius:0.5rem;">{% endif %}
         <h3>{{ artist_hit.name }}</h3>
         <p><span class="badge info">{{ display_name(artist_hit.provider) }}</span>{% if artist_hit.disambiguation %} {{ artist_hit.disambiguation }}{% endif %}</p>
-        <div class="form-row"><a class="btn secondary" href="/artists/catalog/open?provider={{ artist_hit.provider | urlencode }}&provider_id={{ artist_hit.provider_id | urlencode }}">Open discography</a><form method="post" action="/artists/catalog/open"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><input type="hidden" name="provider" value="{{ artist_hit.provider | e }}"><input type="hidden" name="provider_id" value="{{ artist_hit.provider_id | e }}"><input type="hidden" name="monitor" value="true"><button class="btn" type="submit">Monitor</button></form></div>
+        <div class="form-row"><a class="btn secondary" href="/artists/catalog/open?provider={{ artist_hit.provider | urlencode }}&provider_id={{ artist_hit.provider_id | urlencode }}">Open discography</a><form method="post" action="/artists/catalog/open"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><input type="hidden" name="provider" value="{{ artist_hit.provider | e }}"><input type="hidden" name="provider_id" value="{{ artist_hit.provider_id | e }}"><input type="hidden" name="monitor" value="true"><button class="btn" type="submit">Add to watchlist</button></form></div>
       </article>
       {% endfor %}
     {% endfor %}

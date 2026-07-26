@@ -39,7 +39,7 @@
       <form method="post" action="/artists/catalog/{{ artist.id }}/monitor">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="quick" value="1">
-        <button class="btn" type="submit">{% if artist.monitored %}Monitoring ✓{% else %}Monitor{% endif %}</button>
+        <button class="btn" type="submit">{% if artist.monitored %}Watchlisted ✓{% else %}Add to watchlist{% endif %}</button>
       </form>
       <form method="post" action="/artists/catalog/{{ artist.id }}/enrich">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -49,7 +49,7 @@
       {% if artist.monitored %}
       <form method="post" action="/artists/catalog/{{ artist.id }}/download-monitored">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button class="btn secondary" type="submit">Download all monitored</button>
+        <button class="btn secondary" type="submit">Download watchlisted releases</button>
       </form>
       {% endif %}
     </div>
@@ -57,10 +57,10 @@
 </section>
 
 <details class="card monitoring-options">
-  <summary>Monitoring options</summary>
+  <summary>Watchlist options</summary>
   <form id="monitor-form" method="post" action="/artists/catalog/{{ artist.id }}/monitor">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label class="check-label switch-label"><input type="checkbox" name="monitored" value="true" {% if artist.monitored %}checked{% endif %}> <span>Monitor artist</span></label>
+    <label class="check-label switch-label"><input type="checkbox" name="monitored" value="true" {% if artist.monitored %}checked{% endif %}> <span>Watchlist artist</span></label>
     <label>New release policy
       <select name="monitor_policy">
         <option value="all" {% if artist.monitor_policy == "all" %}selected{% endif %}>All</option>
@@ -73,7 +73,7 @@
       <button class="btn secondary" name="bulk" value="albums_only">Albums only</button>
       <button class="btn secondary" name="bulk" value="singles_off">Singles/EPs off</button>
       <button class="btn secondary" name="bulk" value="none">None</button>
-      <button class="btn" type="submit">Save monitoring</button>
+      <button class="btn" type="submit">Save watchlist</button>
     </div>
   </form>
 </details>
@@ -103,7 +103,7 @@
               </p>
               {% if album.providers_json %}<p class="provider-badges">{% for provider in album.providers_json | from_json %}<span class="badge info">{{ display_name(provider) }}</span>{% endfor %}</p>{% endif %}
               <div class="album-card-actions">
-                {% if artist.monitored %}<label class="check-label compact-check"><input type="checkbox" name="album_monitored" form="monitor-form" value="{{ album.id }}" {% if album.monitored %}checked{% endif %}> <span>Monitor</span></label>{% endif %}
+                {% if artist.monitored %}<label class="check-label compact-check"><input type="checkbox" name="album_monitored" form="monitor-form" value="{{ album.id }}" {% if album.monitored %}checked{% endif %}> <span>Watchlist</span></label>{% endif %}
                 <form method="post" action="/albums/{{ album.id }}/download">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                   <button type="submit" class="btn secondary album-download" aria-label="Download album">Download<span class="sr-only"> album</span></button>

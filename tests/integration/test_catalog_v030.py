@@ -164,7 +164,7 @@ async def test_search_card_monitor_opens_artist_as_monitored(
         assert artist.monitor_policy == "all"
 
 
-async def test_artists_tabs_render(client: AsyncClient) -> None:
+async def test_artists_is_single_watchlist_page(client: AsyncClient) -> None:
     artist_id = await _seed_catalog()
     await client.post(
         f"/artists/catalog/{artist_id}/monitor",
@@ -172,14 +172,14 @@ async def test_artists_tabs_render(client: AsyncClient) -> None:
     )
 
     artists = await client.get("/artists")
-    monitored = await client.get("/artists/monitored")
-    wanted = await client.get("/wanted")
+    monitored = await client.get("/artists/monitored", follow_redirects=False)
+    wanted = await client.get("/wanted", follow_redirects=False)
 
     assert artists.status_code == 200
-    assert monitored.status_code == 200
-    assert wanted.status_code == 200
-    assert "Library" in artists.text
-    assert "Monitored (" in artists.text
-    assert "Wanted" in artists.text
-    assert "Daft Punk" in monitored.text
-    assert "Discovery" in wanted.text
+    assert "Daft Punk" in artists.text
+    assert "Watchlisted" in artists.text
+    assert "Monitored (" not in artists.text
+    assert "Wanted" not in artists.text
+    for legacy in (monitored, wanted):
+        assert legacy.status_code == 303
+        assert legacy.headers["location"] == "/artists"
