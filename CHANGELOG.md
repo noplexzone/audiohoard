@@ -33,7 +33,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Expired browser sessions are deleted and HTML requests redirect to login while API clients retain JSON 401 responses.
 - Import execution now requires a persisted, reviewed ready plan instead of silently planning and importing in one action.
 - Dashboard status counts include partial jobs and remain responsive with all six terminal/active states.
-- Runtime version labels, README examples, Compose image tags, and health checks now match v0.6.0.
+- Runtime version labels, README examples, Compose image tags, and health checks now match v0.6.1.
 - Login redirects now preserve safe deep links, show the signed-in username, and reject open redirects.
 - Import and settings form failures now redirect with browser-readable errors instead of returning server errors.
 - Invalid behavior, metadata, and naming values are rejected without partially saving settings.
