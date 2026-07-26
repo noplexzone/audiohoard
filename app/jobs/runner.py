@@ -236,26 +236,104 @@ async def _poll_sab_job(
 async def run_job(
     job_id: int, db: AsyncSession | None = None, settings: Settings | None = None
 ) -> None:
-    if db is None:
-        factory = get_session_factory()
-        async with factory() as session:
-            cfg = settings or await build_effective_settings(session, get_settings())
-            try:
-                await _run_job_in_session(job_id, session, cfg)
-                await session.commit()
-            except asyncio.CancelledError:
-                await session.commit()
-                raise
-            except Exception:
-                await session.rollback()
-                raise
+    if db is not None:
+        cfg = settings or await build_effective_settings(db, get_settings())
+        await _run_job_in_session(job_id, db, cfg)
         return
 
-    cfg = settings or await build_effective_settings(db, get_settings())
-    await _run_job_in_session(job_id, db, cfg)
+    # Background path: short independent sessions with committed checkpoints.
+    factory = get_session_factory()
+
+    # Phase 1: guarded initial lookup and effective-settings load.
+    cfg_built: Settings | None = None
+    _phase1_error: str | None = None
+    try:
+        async with factory() as s:
+            try:
+                job = await s.get(Job, job_id)
+            except Exception:
+                _phase1_error = "init_error"
+                raise
+            if job is None:
+                logger.error("Job %d not found", job_id)
+                return
+            try:
+                cfg_built = settings or await build_effective_settings(s, get_settings())
+            except Exception:
+                _phase1_error = "settings_error"
+                raise
+    except Exception:
+        logger.exception("Job %d phase-1 failed", job_id)
+        if _phase1_error is not None:
+            with contextlib.suppress(Exception):
+                async with factory() as s:
+                    j = await s.get(Job, job_id)
+                    if j is not None:
+                        j.status = JobStatus.failed
+                        j.result_json = json.dumps(
+                            {
+                                "error": {
+                                    "code": _phase1_error,
+                                    "operation": "init",
+                                    "retryable": False,
+                                }
+                            }
+                        )
+                        j.updated_at = _now()
+                        await s.commit()
+        return
+
+    cfg = cfg_built
+
+    # Phase 2: commit pending->running before any provider work so observers see it.
+    async with factory() as s:
+        job = await s.get(Job, job_id)
+        if job is None:
+            return
+        job.status = JobStatus.running
+        job.updated_at = _now()
+        await s.commit()
+
+    # Phase 3: execute with per-result progress commits; terminal state persisted on failure.
+    try:
+        async with factory() as s:
+            await _run_job_in_session(job_id, s, cfg, commit_progress=True)
+            await s.commit()
+    except asyncio.CancelledError:
+        async with factory() as s:
+            job = await s.get(Job, job_id)
+            if job is not None:
+                job.status = JobStatus.cancelled
+                tracks = (await s.execute(select(Track).where(Track.job_id == job_id))).scalars()
+                for track in tracks:
+                    if track.acquisition_state in {
+                        AcquisitionState.queued,
+                        AcquisitionState.searching,
+                        AcquisitionState.acquiring,
+                    }:
+                        track.acquisition_state = AcquisitionState.cancelled
+                job.result_json = json.dumps(
+                    {"error": {"code": "cancelled", "operation": "job", "retryable": True}}
+                )
+                job.updated_at = _now()
+                await s.commit()
+        raise
+    except Exception:
+        logger.exception("Job %d failed", job_id)
+        async with factory() as s:
+            job = await s.get(Job, job_id)
+            if job is not None:
+                job.status = JobStatus.failed
+                job.result_json = json.dumps(
+                    {"error": {"code": "job_failed", "operation": "job", "retryable": True}}
+                )
+                job.updated_at = _now()
+                await s.commit()
 
 
-async def _run_job_in_session(job_id: int, db: AsyncSession, cfg: Settings) -> None:
+async def _run_job_in_session(
+    job_id: int, db: AsyncSession, cfg: Settings, *, commit_progress: bool = False
+) -> None:
     job = await db.get(Job, job_id)
     if job is None:
         logger.error("Job %d not found", job_id)
@@ -347,6 +425,9 @@ async def _run_job_in_session(job_id: int, db: AsyncSession, cfg: Settings) -> N
                 )
                 db.add(track)
                 await db.flush()
+                if commit_progress:
+                    job.updated_at = _now()
+                    await db.commit()
 
                 source_job_id, source_status = await _prepare_acquisition(
                     result, job.source, cfg, track
@@ -372,6 +453,9 @@ async def _run_job_in_session(job_id: int, db: AsyncSession, cfg: Settings) -> N
                     track.acquisition_state = AcquisitionState.failed
                 logger.warning("Result processing failed")
                 failures.append("result_processing_failed")
+            if commit_progress:
+                job.updated_at = _now()
+                await db.commit()
 
         if failures and tracks_created:
             job.status = JobStatus.partial
@@ -422,7 +506,7 @@ async def _run_job_in_session(job_id: int, db: AsyncSession, cfg: Settings) -> N
         await db.flush()
         raise
     except Exception:
-        logger.error("Job %d failed", job_id)
+        logger.exception("Job %d failed", job_id)
         job.status = JobStatus.failed
         job.result_json = json.dumps(
             {"error": {"code": "job_failed", "operation": "job", "retryable": True}}

@@ -52,6 +52,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if n:
             logger.info("Reconciled %d duplicate catalog artist(s) at startup", n)
     await job_dispatcher.recover()
+    settings = get_settings()
+    await job_dispatcher.start_watchdog(
+        threshold_seconds=settings.job_watchdog_threshold_seconds,
+        interval_seconds=settings.job_watchdog_interval_seconds,
+    )
     await scheduler.start()
     await health_status.start()
     try:

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+import contextlib
+import json
+from collections.abc import AsyncGenerator, Sequence
+from datetime import UTC, datetime, timedelta
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+import app.database as _db_module
 from app.config import Settings
+from app.database import Base
 from app.jobs import runner
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
@@ -523,3 +529,414 @@ def test_catalog_track_matching_never_falls_back_to_result_position() -> None:
     matched = runner._catalog_track_for_result(result, [first, second], None)
 
     assert matched is None
+
+
+# ---------------------------------------------------------------------------
+# Background-path transaction/failure slice tests
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def bg_factory(test_settings: Settings) -> AsyncGenerator[async_sessionmaker, None]:
+    """In-memory DB wired as the global session factory for background-path tests."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    _db_module._session_factory = factory
+    yield factory
+    _db_module._session_factory = None
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    await engine.dispose()
+
+
+async def test_background_run_second_session_observes_running_while_provider_blocked(
+    bg_factory: async_sessionmaker,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with bg_factory() as s:
+        job = Job(source="youtube", query="test", status=JobStatus.pending)
+        s.add(job)
+        await s.commit()
+        job_id = job.id
+
+    provider_entered = asyncio.Event()
+
+    async def slow_fetch(j: Job, cfg: Settings, db: AsyncSession) -> list[SearchResult]:
+        provider_entered.set()
+        await asyncio.sleep(60)
+        return []
+
+    monkeypatch.setattr(runner, "_fetch_results", slow_fetch)
+
+    run_task = asyncio.create_task(runner.run_job(job_id, settings=test_settings))
+
+    await asyncio.wait_for(provider_entered.wait(), timeout=5.0)
+
+    observed_status: JobStatus | None = None
+    async with bg_factory() as s:
+        loaded = await s.get(Job, job_id)
+        if loaded is not None:
+            observed_status = loaded.status
+
+    run_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run_task
+
+    assert observed_status == JobStatus.running
+
+
+async def test_background_settings_exception_persists_failed_not_pending(
+    bg_factory: async_sessionmaker,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with bg_factory() as s:
+        job = Job(source="youtube", query="test", status=JobStatus.pending)
+        s.add(job)
+        await s.commit()
+        job_id = job.id
+
+    async def boom(db: AsyncSession, env: Settings) -> Settings:
+        raise RuntimeError("settings DB exploded")
+
+    monkeypatch.setattr(runner, "build_effective_settings", boom)
+
+    await runner.run_job(job_id, settings=None)
+
+    async with bg_factory() as s:
+        loaded = await s.get(Job, job_id)
+        assert loaded is not None
+        assert loaded.status == JobStatus.failed
+        assert loaded.result_json is not None
+        assert "settings_error" in loaded.result_json
+
+
+async def test_background_unexpected_exception_persists_failed_not_pending(
+    bg_factory: async_sessionmaker,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with bg_factory() as s:
+        job = Job(source="youtube", query="test", status=JobStatus.pending)
+        s.add(job)
+        await s.commit()
+        job_id = job.id
+
+    async def explode(j: Job, cfg: Settings, db: AsyncSession) -> list[SearchResult]:
+        raise RuntimeError("completely unexpected")
+
+    monkeypatch.setattr(runner, "_fetch_results", explode)
+
+    await runner.run_job(job_id, settings=test_settings)
+
+    async with bg_factory() as s:
+        loaded = await s.get(Job, job_id)
+        assert loaded is not None
+        assert loaded.status == JobStatus.failed
+        assert loaded.result_json is not None
+        assert "job_failed" in loaded.result_json
+
+
+async def test_background_init_get_raises_persists_failed(
+    bg_factory: async_sessionmaker,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with bg_factory() as s:
+        job = Job(source="youtube", query="test", status=JobStatus.pending)
+        s.add(job)
+        await s.commit()
+        job_id = job.id
+
+    call_count = 0
+    _orig_get = AsyncSession.get
+
+    async def failing_first_get(self: AsyncSession, *args: object, **kwargs: object) -> object:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("DB read failed")
+        return await _orig_get(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "get", failing_first_get)
+
+    await runner.run_job(job_id, settings=None)
+
+    async with bg_factory() as s:
+        loaded = await s.get(Job, job_id)
+        assert loaded is not None
+        assert loaded.status == JobStatus.failed
+        assert loaded.result_json is not None
+        assert "init_error" in loaded.result_json
+
+
+async def test_background_second_session_sees_running_and_acquiring_track_during_prepare(
+    bg_factory: async_sessionmaker,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with bg_factory() as s:
+        job = Job(source="youtube", query="test", status=JobStatus.pending)
+        s.add(job)
+        await s.commit()
+        job_id = job.id
+
+    prepare_entered = asyncio.Event()
+
+    async def slow_prepare(
+        result: SearchResult,
+        source: str,
+        cfg: Settings,
+        track: Track | None = None,
+    ) -> tuple[None, None]:
+        prepare_entered.set()
+        await asyncio.sleep(60)
+        return None, None
+
+    async def fake_fetch(j: Job, cfg: Settings, db: AsyncSession) -> list[SearchResult]:
+        return [
+            SearchResult(source="youtube", title="Song", artist="Artist", url="/tmp/song.flac")
+        ]
+
+    async def noop_enrich(track: Track, cfg: Settings) -> None:
+        return None
+
+    async def noop_preview(track: Track, db: AsyncSession, cfg: Settings) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(runner, "_prepare_acquisition", slow_prepare)
+    monkeypatch.setattr(runner, "_enrich_musicbrainz", noop_enrich)
+    monkeypatch.setattr(runner, "_enrich_deezer", noop_enrich)
+    monkeypatch.setattr(runner, "_run_fingerprint", noop_enrich)
+    monkeypatch.setattr(runner, "_compute_path_preview", noop_preview)
+
+    run_task = asyncio.create_task(runner.run_job(job_id, settings=test_settings))
+    await asyncio.wait_for(prepare_entered.wait(), timeout=5.0)
+
+    observed_status: JobStatus | None = None
+    observed_acq_state: AcquisitionState | None = None
+    async with bg_factory() as s:
+        loaded = await s.get(Job, job_id)
+        if loaded is not None:
+            observed_status = loaded.status
+        track_rows = list((await s.scalars(select(Track).where(Track.job_id == job_id))).all())
+        if track_rows:
+            observed_acq_state = track_rows[0].acquisition_state
+
+    run_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run_task
+
+    assert observed_status == JobStatus.running
+    assert len(track_rows) == 1
+    assert observed_acq_state == AcquisitionState.acquiring
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher robustness / watchdog tests
+# ---------------------------------------------------------------------------
+
+
+async def test_dispatcher_done_callback_logs_error_on_exception(
+    bg_factory: async_sessionmaker,
+    test_settings: Settings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from app.jobs.dispatcher import JobDispatcher
+
+    async with bg_factory() as s:
+        job = Job(source="youtube", query="test", status=JobStatus.pending)
+        s.add(job)
+        await s.commit()
+        job_id = job.id
+
+    async def boom(jid: int) -> None:
+        raise RuntimeError("dispatcher-boom")
+
+    dispatcher = JobDispatcher(runner=boom, session_factory=bg_factory)
+    task = await dispatcher.dispatch(job_id)
+    with contextlib.suppress(Exception):
+        await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)  # let callbacks fire
+
+    assert any(str(job_id) in r.message and r.levelname == "ERROR" for r in caplog.records), (
+        f"Expected ERROR log for job {job_id}; got: {[r.message for r in caplog.records]}"
+    )
+
+
+async def test_dispatcher_watchdog_first_redispatch_pending(
+    bg_factory: async_sessionmaker,
+    test_settings: Settings,
+) -> None:
+    from app.jobs.dispatcher import JobDispatcher
+
+    dispatched: list[int] = []
+
+    async def noop(jid: int) -> None:
+        dispatched.append(jid)
+
+    async with bg_factory() as s:
+        job = Job(source="youtube", query="test", status=JobStatus.pending)
+        job.updated_at = datetime.now(UTC) - timedelta(seconds=600)
+        s.add(job)
+        await s.commit()
+        job_id = job.id
+
+    dispatcher = JobDispatcher(runner=noop, session_factory=bg_factory)
+    await dispatcher._watchdog_tick(threshold_seconds=300)
+    await asyncio.sleep(0)  # let dispatched task run
+
+    assert job_id in dispatched
+
+    async with bg_factory() as s:
+        loaded = await s.get(Job, job_id)
+        assert loaded is not None
+        assert loaded.result_json is not None
+        data = json.loads(loaded.result_json)
+        assert "watchdog_recovery" in data
+        assert data["watchdog_recovery"]["attempt"] == 1
+
+
+async def test_dispatcher_watchdog_first_redispatch_running(
+    bg_factory: async_sessionmaker,
+    test_settings: Settings,
+) -> None:
+    from app.jobs.dispatcher import JobDispatcher
+
+    dispatched: list[int] = []
+
+    async def noop(jid: int) -> None:
+        dispatched.append(jid)
+
+    async with bg_factory() as s:
+        job = Job(source="youtube", query="test", status=JobStatus.running)
+        job.updated_at = datetime.now(UTC) - timedelta(seconds=600)
+        s.add(job)
+        await s.commit()
+        job_id = job.id
+
+    dispatcher = JobDispatcher(runner=noop, session_factory=bg_factory)
+    await dispatcher._watchdog_tick(threshold_seconds=300)
+    await asyncio.sleep(0)  # let dispatched task run
+
+    assert job_id in dispatched
+
+    async with bg_factory() as s:
+        loaded = await s.get(Job, job_id)
+        assert loaded is not None
+        assert loaded.status == JobStatus.pending
+        data = json.loads(loaded.result_json or "{}")
+        assert "watchdog_recovery" in data
+
+
+async def test_dispatcher_watchdog_recurrence_marks_failed(
+    bg_factory: async_sessionmaker,
+    test_settings: Settings,
+) -> None:
+    from app.jobs.dispatcher import JobDispatcher
+
+    dispatched: list[int] = []
+
+    async def noop(jid: int) -> None:
+        dispatched.append(jid)
+
+    async with bg_factory() as s:
+        job = Job(source="youtube", query="test", status=JobStatus.pending)
+        job.updated_at = datetime.now(UTC) - timedelta(seconds=600)
+        job.result_json = json.dumps({"watchdog_recovery": {"attempt": 1}})
+        s.add(job)
+        await s.commit()
+        job_id = job.id
+
+    dispatcher = JobDispatcher(runner=noop, session_factory=bg_factory)
+    await dispatcher._watchdog_tick(threshold_seconds=300)
+
+    assert job_id not in dispatched
+
+    async with bg_factory() as s:
+        loaded = await s.get(Job, job_id)
+        assert loaded is not None
+        assert loaded.status == JobStatus.failed
+        data = json.loads(loaded.result_json or "{}")
+        assert data.get("error", {}).get("code") == "dispatch_lost"
+
+
+async def test_dispatcher_watchdog_active_task_untouched(
+    bg_factory: async_sessionmaker,
+    test_settings: Settings,
+) -> None:
+    from app.jobs.dispatcher import JobDispatcher
+
+    dispatched: list[int] = []
+    gate = asyncio.Event()
+
+    async def hold(jid: int) -> None:
+        dispatched.append(jid)
+        await gate.wait()
+
+    async with bg_factory() as s:
+        job = Job(source="youtube", query="test", status=JobStatus.running)
+        job.updated_at = datetime.now(UTC) - timedelta(seconds=600)
+        s.add(job)
+        await s.commit()
+        job_id = job.id
+
+    dispatcher = JobDispatcher(runner=hold, session_factory=bg_factory)
+    task = await dispatcher.dispatch(job_id)
+    await asyncio.sleep(0)
+
+    dispatched.clear()
+    await dispatcher._watchdog_tick(threshold_seconds=300)
+
+    gate.set()
+    await task
+
+    assert job_id not in dispatched
+
+    async with bg_factory() as s:
+        loaded = await s.get(Job, job_id)
+        assert loaded is not None
+        assert loaded.result_json is None or "watchdog_recovery" not in (loaded.result_json or "")
+
+
+async def test_dispatcher_watchdog_durable_marker_survives_reload(
+    bg_factory: async_sessionmaker,
+    test_settings: Settings,
+) -> None:
+    from app.jobs.dispatcher import JobDispatcher
+
+    async with bg_factory() as s:
+        job = Job(source="youtube", query="test", status=JobStatus.pending)
+        job.updated_at = datetime.now(UTC) - timedelta(seconds=600)
+        s.add(job)
+        await s.commit()
+        job_id = job.id
+
+    async def noop(jid: int) -> None:
+        pass
+
+    dispatcher = JobDispatcher(runner=noop, session_factory=bg_factory)
+    await dispatcher._watchdog_tick(threshold_seconds=300)
+
+    # Simulate a new dispatcher instance (process restart scenario)
+    dispatcher2 = JobDispatcher(runner=noop, session_factory=bg_factory)
+
+    async with bg_factory() as s:
+        loaded = await s.get(Job, job_id)
+        assert loaded is not None
+        # Simulate the job becoming stale again
+        loaded.updated_at = datetime.now(UTC) - timedelta(seconds=600)
+        await s.commit()
+
+    await dispatcher2._watchdog_tick(threshold_seconds=300)
+
+    async with bg_factory() as s:
+        loaded = await s.get(Job, job_id)
+        assert loaded is not None
+        assert loaded.status == JobStatus.failed
+        data = json.loads(loaded.result_json or "{}")
+        assert data.get("error", {}).get("code") == "dispatch_lost"

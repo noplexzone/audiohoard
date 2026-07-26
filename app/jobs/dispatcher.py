@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import logging
 from collections.abc import Callable, Coroutine
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -11,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database import get_session_factory
 from app.models.job import Job, JobStatus
+
+logger = logging.getLogger(__name__)
 
 
 class JobNotFoundError(LookupError):
@@ -47,6 +51,7 @@ class JobDispatcher:
         )
         self._session_factory = session_factory
         self._tasks: dict[int, asyncio.Task[None]] = {}
+        self._watchdog_task: asyncio.Task[None] | None = None
 
     def _factory(self) -> async_sessionmaker[AsyncSession]:
         return self._session_factory or get_session_factory()
@@ -62,7 +67,15 @@ class JobDispatcher:
             if self._tasks.get(job_id) is done_task:
                 del self._tasks[job_id]
 
+        def _log_exception(done_task: asyncio.Task[None]) -> None:
+            if done_task.cancelled():
+                return
+            exc = done_task.exception()
+            if exc is not None:
+                logger.error("Job %d task raised unhandled exception: %s", job_id, exc)
+
         task.add_done_callback(_remove)
+        task.add_done_callback(_log_exception)
         self._tasks[job_id] = task
         return task
 
@@ -123,21 +136,101 @@ class JobDispatcher:
             for job in jobs:
                 if job.status == JobStatus.running:
                     job.status = JobStatus.pending
-                    job.result_json = json.dumps(
-                        {
-                            "recovery": {
-                                "code": "interrupted_by_restart",
-                                "retryable": True,
-                            }
-                        }
-                    )
+                    try:
+                        payload = json.loads(job.result_json) if job.result_json else {}
+                    except (json.JSONDecodeError, TypeError):
+                        payload = {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    payload["recovery"] = {
+                        "code": "interrupted_by_restart",
+                        "retryable": True,
+                    }
+                    job.result_json = json.dumps(payload)
                     job.updated_at = datetime.now(UTC)
             await db.commit()
         for job in jobs:
             await self.dispatch(job.id)
         return [job.id for job in jobs]
 
+    async def _watchdog_tick(self, threshold_seconds: int) -> None:
+        threshold_dt = datetime.now(UTC) - timedelta(seconds=threshold_seconds)
+        to_dispatch: list[int] = []
+        async with self._factory()() as db:
+            result = await db.execute(
+                select(Job).where(
+                    Job.status.in_([JobStatus.pending, JobStatus.running]),
+                    Job.updated_at < threshold_dt,
+                )
+            )
+            jobs = list(result.scalars().all())
+            for job in jobs:
+                live = self._tasks.get(job.id)
+                if live is not None and not live.done():
+                    continue
+                try:
+                    current: dict[str, Any] = (
+                        json.loads(job.result_json) if job.result_json else {}
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    current = {}
+                if "watchdog_recovery" in current:
+                    job.status = JobStatus.failed
+                    job.result_json = json.dumps(
+                        {
+                            "error": {
+                                "code": "dispatch_lost",
+                                "operation": "watchdog",
+                                "retryable": False,
+                            }
+                        }
+                    )
+                    job.updated_at = datetime.now(UTC)
+                    logger.error(
+                        "Job %d lost after watchdog recovery attempt; marking dispatch_lost",
+                        job.id,
+                    )
+                else:
+                    if job.status == JobStatus.running:
+                        job.status = JobStatus.pending
+                    current["watchdog_recovery"] = {"attempt": 1}
+                    job.result_json = json.dumps(current)
+                    job.updated_at = datetime.now(UTC)
+                    to_dispatch.append(job.id)
+                    logger.warning(
+                        "Job %d stale with no live task; dispatching watchdog recovery", job.id
+                    )
+            await db.commit()
+        for job_id in to_dispatch:
+            await self.dispatch(job_id)
+
+    async def _watchdog_loop(self, threshold_seconds: int, interval_seconds: int) -> None:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await self._watchdog_tick(threshold_seconds)
+            except Exception:
+                logger.exception("Watchdog tick failed")
+
+    async def start_watchdog(
+        self, threshold_seconds: int = 300, interval_seconds: int = 60
+    ) -> None:
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            return
+        self._watchdog_task = asyncio.create_task(
+            self._watchdog_loop(threshold_seconds, interval_seconds),
+            name="job-watchdog",
+        )
+
+    async def stop_watchdog(self) -> None:
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._watchdog_task
+        self._watchdog_task = None
+
     async def shutdown(self) -> None:
+        await self.stop_watchdog()
         tasks = list(self._tasks.values())
         for task in tasks:
             if not task.done():
