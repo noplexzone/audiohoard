@@ -15,7 +15,11 @@ from app.database import Base
 from app.models.catalog_entities import CatalogAlbum, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.services import artist_monitoring
-from app.services.artist_monitoring import DiscographyRefreshScheduler, refresh_monitored_artist
+from app.services.artist_monitoring import (
+    DiscographyRefreshScheduler,
+    apply_monitor_policy,
+    refresh_monitored_artist,
+)
 
 
 @pytest_asyncio.fixture
@@ -147,3 +151,46 @@ async def test_scheduler_can_restart_after_stop(monkeypatch: pytest.MonkeyPatch)
     assert scheduler._task is not None
     assert not scheduler._stop.is_set()
     await scheduler.stop()
+
+
+def test_albums_only_policy_excludes_case_and_format_variants() -> None:
+    artist = CatalogArtist(
+        name="Variants",
+        monitored=True,
+        monitor_policy="albums_only",
+        watchlist_provider="itunes",
+    )
+    albums = [
+        CatalogAlbum(title="Album", release_type="ALBUM", providers_json='["itunes"]'),
+        CatalogAlbum(title="Single", release_type="single / ep", providers_json='["itunes"]'),
+        CatalogAlbum(title="EP", release_type="E.P.", providers_json='["itunes"]'),
+        CatalogAlbum(title="Other provider", release_type="Album", providers_json='["deezer"]'),
+    ]
+
+    apply_monitor_policy(artist, albums)
+
+    assert [album.monitored for album in albums] == [True, False, False, False]
+
+
+async def test_refresh_uses_watchlist_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    artist = CatalogArtist(
+        name="Selected",
+        monitored=True,
+        watchlist_provider="deezer",
+        albums=[],
+    )
+    observed: list[str | None] = []
+
+    async def fake_fetch(db, settings, artist, provider_name=None):
+        observed.append(provider_name)
+        return []
+
+    monkeypatch.setattr(artist_monitoring, "fetch_and_store_discography", fake_fetch)
+    db = AsyncMock()
+    db.scalars = AsyncMock(return_value=SimpleNamespace(first=lambda: None))
+    db.refresh = AsyncMock()
+    db.flush = AsyncMock()
+
+    await refresh_monitored_artist(db, Settings(secret_key="test"), artist)
+
+    assert observed == ["deezer"]

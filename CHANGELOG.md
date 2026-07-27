@@ -6,12 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Added provider-native artist identities and discography snapshots, with per-artist watchlist-provider selection and MusicBrainz, Deezer, and iTunes discography switching.
+
 ### Changed
 - Consolidated Artists into one filterable watchlist with artwork and release-type counts.
 - Library views now include only successfully downloaded files and display their paths and metadata.
 - Replaced user-facing monitoring terminology with watchlist terminology and restored a conventional settings gear icon.
 
 ### Fixed
+- Provider-specific release kinds no longer contaminate one another, and Albums-only views and watchlist policies now exclude Singles and EPs, including iTunes `- Single` and `- EP` releases.
 - Corrected slskd download enqueue payloads to use the required request array, preserved validation details, and handled nested transfer responses.
 
 ## [0.6.1] - 2026-07-26

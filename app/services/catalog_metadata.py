@@ -19,7 +19,13 @@ from app.metadata.base import AlbumDetail, AlbumHit, ArtistDetail, ArtistHit, Me
 from app.metadata.deezer import DeezerClient
 from app.metadata.itunes import ITunesClient
 from app.metadata.musicbrainz import MusicBrainzClient
-from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
+from app.models.catalog_entities import (
+    CatalogAlbum,
+    CatalogAlbumProvider,
+    CatalogAlbumTrack,
+    CatalogArtist,
+    CatalogArtistIdentity,
+)
 from app.models.job import Job
 from app.models.track import Track
 from app.sources.base import CapabilityState
@@ -143,7 +149,49 @@ async def _upsert_catalog_artist(db: AsyncSession, hit: ArtistHit | ArtistDetail
     artist.deezer_id = artist.deezer_id or ids["deezer_id"]
     artist.itunes_id = artist.itunes_id or ids["itunes_id"]
     await db.flush()
+    await upsert_artist_identity(db, artist, hit)
     return artist
+
+
+async def upsert_artist_identity(
+    db: AsyncSession, artist: CatalogArtist, hit: ArtistHit | ArtistDetail
+) -> CatalogArtistIdentity:
+    if hit.provider not in VALID_METADATA_PROVIDERS or not hit.provider_id:
+        raise ValueError("Invalid provider identity")
+    identity = (
+        await db.scalars(
+            select(CatalogArtistIdentity).where(
+                CatalogArtistIdentity.provider == hit.provider,
+                CatalogArtistIdentity.provider_artist_id == hit.provider_id,
+            )
+        )
+    ).first()
+    if identity is None:
+        identity = (
+            await db.scalars(
+                select(CatalogArtistIdentity).where(
+                    CatalogArtistIdentity.artist_id == artist.id,
+                    CatalogArtistIdentity.provider == hit.provider,
+                )
+            )
+        ).first()
+    if identity is None:
+        identity = CatalogArtistIdentity(
+            artist_id=artist.id,
+            provider=hit.provider,
+            provider_artist_id=hit.provider_id,
+            name=hit.name or artist.name,
+        )
+        db.add(identity)
+    else:
+        identity.artist_id = artist.id
+        identity.provider_artist_id = hit.provider_id
+    identity.name = hit.name or identity.name
+    identity.artwork_url = hit.artwork_url or identity.artwork_url
+    identity.metadata_json = json.dumps({"source": "provider", "complete": True}, sort_keys=True)
+    identity.last_enriched_at = datetime.now(tz=UTC)
+    await db.flush()
+    return identity
 
 
 async def open_catalog_artist(
@@ -156,13 +204,21 @@ async def open_catalog_artist(
     return await upsert_catalog_artist(db, detail)
 
 
+def artist_provider_id(artist: CatalogArtist, provider_name: str) -> str | None:
+    if provider_name == "musicbrainz":
+        return artist.mbid
+    if provider_name == "deezer":
+        return artist.deezer_id
+    if provider_name == "itunes":
+        return artist.itunes_id
+    return None
+
+
 def _artist_provider_ref(artist: CatalogArtist) -> tuple[str, str] | None:
-    if artist.mbid:
-        return "musicbrainz", artist.mbid
-    if artist.deezer_id:
-        return "deezer", artist.deezer_id
-    if artist.itunes_id:
-        return "itunes", artist.itunes_id
+    for provider_name in ("musicbrainz", "deezer", "itunes"):
+        provider_id = artist_provider_id(artist, provider_name)
+        if provider_id:
+            return provider_name, provider_id
     return None
 
 
@@ -177,24 +233,93 @@ def _album_provider_ref(album: CatalogAlbum) -> tuple[str, str] | None:
 
 
 async def fetch_and_store_discography(
-    db: AsyncSession, settings: Settings, artist: CatalogArtist
-) -> list[CatalogAlbum]:
-    ref = _artist_provider_ref(artist)
-    if ref is None:
+    db: AsyncSession,
+    settings: Settings,
+    artist: CatalogArtist,
+    provider_name: str,
+) -> list[CatalogAlbumProvider]:
+    if provider_name not in VALID_METADATA_PROVIDERS:
         return []
-    provider_name, provider_id = ref
+    identity = (
+        await db.scalars(
+            select(CatalogArtistIdentity).where(
+                CatalogArtistIdentity.artist_id == artist.id,
+                CatalogArtistIdentity.provider == provider_name,
+            )
+        )
+    ).first()
+    if identity is None:
+        provider_id = artist_provider_id(artist, provider_name)
+        if not provider_id:
+            return []
+        identity = CatalogArtistIdentity(
+            artist_id=artist.id,
+            provider=provider_name,
+            provider_artist_id=provider_id,
+            name=artist.name,
+            artwork_url=artist.artwork_url,
+            provenance_json=json.dumps({"source": "legacy_fixed_id"}),
+        )
+        db.add(identity)
+        await db.flush()
     provider = build_metadata_provider(provider_name, settings)
     if provider is None:
         return []
-    albums = await provider.get_discography(provider_id)
-    stored: list[CatalogAlbum] = []
-    for hit in albums:
-        stored.append(await upsert_catalog_album(db, artist, hit))
-    return stored
+    albums = await provider.get_discography(identity.provider_artist_id)
+    releases = [await upsert_provider_release(db, artist, identity, hit) for hit in albums]
+    identity.last_discography_at = datetime.now(tz=UTC)
+    await db.flush()
+    return releases
+
+
+def normalize_release_kind(hit: AlbumHit | AlbumDetail) -> str:
+    if hit.release_kind in {"album", "single", "ep", "compilation", "other"}:
+        return hit.release_kind
+    raw = hit.release_type_raw or hit.release_type
+    bucket = release_bucket(raw)
+    return {"album": "album", "single_ep": "single", "compilation": "compilation"}[bucket]
+
+
+async def upsert_provider_release(
+    db: AsyncSession,
+    artist: CatalogArtist,
+    identity: CatalogArtistIdentity,
+    hit: AlbumHit | AlbumDetail,
+) -> CatalogAlbumProvider:
+    release = (
+        await db.scalars(
+            select(CatalogAlbumProvider).where(
+                CatalogAlbumProvider.artist_identity_id == identity.id,
+                CatalogAlbumProvider.provider_album_id == hit.provider_id,
+            )
+        )
+    ).first()
+    canonical = await upsert_catalog_album(db, artist, hit, match_release_type=False)
+    if release is None:
+        release = CatalogAlbumProvider(
+            artist_identity_id=identity.id,
+            provider_album_id=hit.provider_id,
+            title=hit.title,
+        )
+        db.add(release)
+    release.catalog_album_id = canonical.id
+    release.title = hit.title
+    release.year = hit.year
+    release.artwork_url = hit.artwork_url
+    release.track_count = hit.track_count
+    release.release_kind = normalize_release_kind(hit)
+    release.release_type_raw = hit.release_type_raw or hit.release_type
+    release.metadata_json = json.dumps({"source": "provider", "complete": True}, sort_keys=True)
+    await db.flush()
+    return release
 
 
 async def upsert_catalog_album(
-    db: AsyncSession, artist: CatalogArtist, hit: AlbumHit | AlbumDetail
+    db: AsyncSession,
+    artist: CatalogArtist,
+    hit: AlbumHit | AlbumDetail,
+    *,
+    match_release_type: bool = True,
 ) -> CatalogAlbum:
     ids = provider_ids_for_hit(hit)
     filters = []
@@ -213,9 +338,8 @@ async def upsert_catalog_album(
                 await db.scalars(select(CatalogAlbum).where(CatalogAlbum.artist_id == artist.id))
             ).all()
         )
-        album = next(
-            (candidate for candidate in candidates if _album_keys_match(candidate, hit)), None
-        )
+        matcher = _album_keys_match if match_release_type else _canonical_album_keys_match
+        album = next((candidate for candidate in candidates if matcher(candidate, hit)), None)
     if album is None:
         album = CatalogAlbum(artist_id=artist.id, title=hit.title)
         db.add(album)
@@ -232,15 +356,19 @@ def _apply_album_hit(
 ) -> None:
     ids = ids or provider_ids_for_hit(hit)
     album.artist_id = artist.id
-    album.title = hit.title or album.title
+    album.title = album.title or hit.title
     album.year = hit.year or album.year
-    album.release_type = hit.release_type or album.release_type
+    album.release_type = album.release_type or hit.release_type
     album.artwork_url = hit.artwork_url or album.artwork_url
     if hit.track_count and album.track_count is None:
         album.track_count = hit.track_count
-    album.mbid = ids["mbid"] or album.mbid
-    album.deezer_id = ids["deezer_id"] or album.deezer_id
-    album.itunes_id = ids["itunes_id"] or album.itunes_id
+    album.itunes_id = album.itunes_id or ids["itunes_id"]
+    album.mbid = album.mbid or ids["mbid"]
+    album.deezer_id = album.deezer_id or ids["deezer_id"]
+    if hit.provider in VALID_METADATA_PROVIDERS:
+        album.providers_json = _merge_provider_json(
+            album.providers_json, json.dumps([hit.provider])
+        )
 
 
 async def fetch_and_store_album(
@@ -338,6 +466,23 @@ async def merge_catalog_artists(
     with db.no_autoflush:
         await db.refresh(survivor, ["albums"])
         await db.refresh(duplicate, ["albums"])
+        identities = list(
+            (
+                await db.scalars(
+                    select(CatalogArtistIdentity)
+                    .where(CatalogArtistIdentity.artist_id.in_((survivor.id, duplicate.id)))
+                    .options(selectinload(CatalogArtistIdentity.releases))
+                )
+            ).all()
+        )
+        survivor_identities = {
+            identity.provider: identity
+            for identity in identities
+            if identity.artist_id == survivor.id
+        }
+        duplicate_identities = [
+            identity for identity in identities if identity.artist_id == duplicate.id
+        ]
         duplicate_ids = {
             "mbid": duplicate.mbid,
             "deezer_id": duplicate.deezer_id,
@@ -349,6 +494,7 @@ async def merge_catalog_artists(
         await db.flush()
 
         survivor.monitored = bool(survivor.monitored or duplicate.monitored)
+        survivor.watchlist_provider = survivor.watchlist_provider or duplicate.watchlist_provider
         if not survivor.monitor_policy:
             survivor.monitor_policy = duplicate.monitor_policy
         survivor.name = survivor.name or duplicate.name
@@ -364,6 +510,40 @@ async def merge_catalog_artists(
 
         for album in list(duplicate.albums):
             album.artist = survivor
+        for duplicate_identity in duplicate_identities:
+            survivor_identity = survivor_identities.get(duplicate_identity.provider)
+            if survivor_identity is None:
+                duplicate_identity.artist = survivor
+                survivor_identities[duplicate_identity.provider] = duplicate_identity
+                continue
+            existing_releases = {
+                release.provider_album_id: release for release in survivor_identity.releases
+            }
+            for release in list(duplicate_identity.releases):
+                existing_release = existing_releases.get(release.provider_album_id)
+                if existing_release is None:
+                    release.artist_identity = survivor_identity
+                    existing_releases[release.provider_album_id] = release
+                    continue
+                existing_release.catalog_album_id = (
+                    existing_release.catalog_album_id or release.catalog_album_id
+                )
+                existing_release.monitored = bool(existing_release.monitored or release.monitored)
+                existing_release.title = existing_release.title or release.title
+                existing_release.year = existing_release.year or release.year
+                existing_release.artwork_url = existing_release.artwork_url or release.artwork_url
+                existing_release.track_count = existing_release.track_count or release.track_count
+                await db.delete(release)
+            survivor_identity.name = survivor_identity.name or duplicate_identity.name
+            survivor_identity.artwork_url = (
+                survivor_identity.artwork_url or duplicate_identity.artwork_url
+            )
+            survivor_identity.last_enriched_at = (
+                survivor_identity.last_enriched_at or duplicate_identity.last_enriched_at
+            )
+            survivor_identity.last_discography_at = (
+                survivor_identity.last_discography_at or duplicate_identity.last_discography_at
+            )
         await db.flush()
         await db.delete(duplicate)
         await db.flush()
@@ -436,13 +616,122 @@ async def reconcile_duplicate_catalog_artists(db: AsyncSession) -> int:
     return merged
 
 
-def _norm_release_type(value: str | None) -> str:
+def release_bucket(value: str | None) -> str:
+    """Return the stable UI/policy bucket for provider-specific release type variants."""
     normalized = _norm_title(value or "album")
-    if normalized in {"ep", "single"}:
+    tokens = set(normalized.split())
+    if "single" in tokens or "ep" in tokens or ({"e", "p"} <= tokens):
         return "single_ep"
-    if normalized in {"compilation", "compilations"}:
+    if "compilation" in tokens or "compilations" in tokens:
         return "compilation"
-    return normalized or "album"
+    return "album"
+
+
+def _norm_release_type(value: str | None) -> str:
+    return release_bucket(value)
+
+
+def album_providers(album: CatalogAlbum) -> set[str]:
+    providers: set[str] = set()
+    if album.providers_json:
+        try:
+            parsed = json.loads(album.providers_json)
+        except (json.JSONDecodeError, TypeError):
+            parsed = []
+        if isinstance(parsed, list):
+            providers.update(str(item) for item in parsed if item in VALID_METADATA_PROVIDERS)
+    if album.mbid:
+        providers.add("musicbrainz")
+    if album.deezer_id:
+        providers.add("deezer")
+    if album.itunes_id:
+        providers.add("itunes")
+    return providers
+
+
+def album_has_provider(album: CatalogAlbum, provider_name: str) -> bool:
+    return provider_name in VALID_METADATA_PROVIDERS and provider_name in album_providers(album)
+
+
+def available_artist_providers(artist: CatalogArtist) -> list[str]:
+    available = {identity.provider for identity in artist.identities}
+    available.update(
+        provider for provider in VALID_METADATA_PROVIDERS if artist_provider_id(artist, provider)
+    )
+    return [name for name in ("musicbrainz", "deezer", "itunes") if name in available]
+
+
+async def ensure_legacy_provider_snapshots(db: AsyncSession, artist: CatalogArtist) -> None:
+    """Repair canonical-only rows left by old databases or direct test fixtures."""
+    identities = {
+        identity.provider: identity
+        for identity in (
+            await db.scalars(
+                select(CatalogArtistIdentity)
+                .where(CatalogArtistIdentity.artist_id == artist.id)
+                .options(selectinload(CatalogArtistIdentity.releases))
+            )
+        ).all()
+    }
+    for provider in ("musicbrainz", "deezer", "itunes"):
+        provider_id = artist_provider_id(artist, provider)
+        if not provider_id or provider in identities:
+            continue
+        identity = CatalogArtistIdentity(
+            artist_id=artist.id,
+            provider=provider,
+            provider_artist_id=provider_id,
+            name=artist.name,
+            artwork_url=artist.artwork_url,
+            provenance_json=json.dumps({"source": "legacy_runtime_repair"}),
+        )
+        db.add(identity)
+        await db.flush()
+        identities[provider] = identity
+
+    for album in artist.albums:
+        for provider in album_providers(album):
+            legacy_identity = identities.get(provider)
+            if legacy_identity is None:
+                continue
+            provider_album_id = {
+                "musicbrainz": album.mbid,
+                "deezer": album.deezer_id,
+                "itunes": album.itunes_id,
+            }[provider] or f"legacy:album:{album.id}:{provider}"
+            existing = (
+                await db.scalars(
+                    select(CatalogAlbumProvider).where(
+                        CatalogAlbumProvider.artist_identity_id == legacy_identity.id,
+                        CatalogAlbumProvider.provider_album_id == provider_album_id,
+                    )
+                )
+            ).first()
+            if existing is not None:
+                continue
+            bucket = release_bucket(album.release_type)
+            db.add(
+                CatalogAlbumProvider(
+                    artist_identity_id=legacy_identity.id,
+                    catalog_album_id=album.id,
+                    provider_album_id=provider_album_id,
+                    title=album.title,
+                    year=album.year,
+                    artwork_url=album.artwork_url,
+                    track_count=album.track_count,
+                    release_kind={
+                        "album": "album",
+                        "single_ep": "single",
+                        "compilation": "compilation",
+                    }[bucket],
+                    release_type_raw=album.release_type,
+                    metadata_json=json.dumps(
+                        {"legacy_runtime_repair": True, "lossy": True}, sort_keys=True
+                    ),
+                    monitored=bool(album.monitored and artist.watchlist_provider == provider),
+                )
+            )
+    await db.flush()
 
 
 def _edition_marker(value: str) -> str:
@@ -466,6 +755,12 @@ def _album_keys_match(left: Any, right: Any) -> bool:
     if (lt, le, lr) != (rt, re_, rr):
         return False
     return ly == ry or ly is None or ry is None
+
+
+def _canonical_album_keys_match(left: Any, right: Any) -> bool:
+    lt, ly, le, _ = _album_key(left)
+    rt, ry, re_, _ = _album_key(right)
+    return (lt, le) == (rt, re_) and (ly == ry or ly is None or ry is None)
 
 
 def _merge_provider_json(*values: str | None) -> str | None:
@@ -511,88 +806,139 @@ async def enrich_catalog_artist(
     *,
     choices: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    """Best-effort conservative cross-provider enrichment.
-
-    Returns {status: ok|ambiguous, candidates?: [...]} and never clobbers an existing mbid.
-    """
+    """Best-effort enrichment across every enabled provider without clobbering IDs."""
     choices = choices or {}
-    known_provider = _artist_provider_ref(artist)
-    skip = {known_provider[0]} if known_provider else set()
-    provenance: dict[str, object] = (
-        json.loads(artist.provenance_json or "{}") if artist.provenance_json else {}
-    )
-    existing_albums = list(artist.albums)
-    ambiguous: list[dict[str, object]] = []
-    for provider_name in [
-        p for p in enabled_providers if p in VALID_METADATA_PROVIDERS and p not in skip
-    ]:
+    provenance = _load_provenance(artist.provenance_json)
+    failures: dict[str, dict[str, str]] = {}
+    ambiguities: list[dict[str, object]] = []
+    outcomes: dict[str, str] = {}
+
+    for provider_name in dict.fromkeys(enabled_providers):
+        if provider_name not in VALID_METADATA_PROVIDERS:
+            continue
         provider = build_metadata_provider(provider_name, settings)
         if provider is None:
+            failures[provider_name] = {"error": "UnavailableProvider"}
+            outcomes[provider_name] = "failed"
             continue
-        hits = await provider.search_artists(artist.name)
-        scored: list[tuple[float, ArtistHit]] = []
-        for hit in hits[:5]:
-            score = _name_similarity(artist.name, hit.name)
-            try:
-                detail = await provider.get_artist(hit.provider_id)
-                albums = await provider.get_discography(hit.provider_id)
-                overlap = sum(
-                    1
-                    for candidate in albums
-                    if any(_album_keys_match(candidate, existing) for existing in existing_albums)
+        try:
+            known_identity = (
+                await db.scalars(
+                    select(CatalogArtistIdentity).where(
+                        CatalogArtistIdentity.artist_id == artist.id,
+                        CatalogArtistIdentity.provider == provider_name,
+                    )
                 )
-                score += min(overlap / max(len(existing_albums), 1), 1.0)
-            except Exception:
-                detail = None
-            scored.append((score, hit))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        if not scored or scored[0][0] < 0.82:
-            continue
-        if (
-            len(scored) > 1
-            and scored[0][0] - scored[1][0] < 0.15
-            and choices.get(provider_name) != scored[0][1].provider_id
-        ):
-            ambiguous.append(
-                {"provider": provider_name, "candidates": [h.__dict__ for _, h in scored[:3]]}
+            ).first()
+            provider_id = (
+                known_identity.provider_artist_id
+                if known_identity is not None
+                else artist_provider_id(artist, provider_name)
             )
-            continue
-        chosen = choices.get(provider_name, scored[0][1].provider_id)
-        detail = await provider.get_artist(chosen)
-        ids = provider_ids_for_hit(detail)
-        artist = await _merge_artist_id_collisions(db, artist, ids)
-        existing_albums = list(artist.albums)
-        if not artist.mbid and ids.get("mbid"):
-            artist.mbid = ids["mbid"]
-            provenance["mbid"] = provider_name
-        if not artist.deezer_id and ids.get("deezer_id"):
-            artist.deezer_id = ids["deezer_id"]
-            provenance["deezer_id"] = provider_name
-        if not artist.itunes_id and ids.get("itunes_id"):
-            artist.itunes_id = ids["itunes_id"]
-            provenance["itunes_id"] = provider_name
-        if detail.artwork_url and not artist.artwork_url:
-            artist.artwork_url = detail.artwork_url
-            provenance["artwork_url"] = provider_name
-        for album_hit in await provider.get_discography(chosen):
-            album = next((a for a in artist.albums if _album_keys_match(a, album_hit)), None)
-            if album is None:
-                album = await upsert_catalog_album(db, artist, album_hit)
-                artist.albums.append(album)
-            else:
-                _apply_album_hit(album, artist, album_hit)
-            providers = (
-                set(json.loads(album.providers_json or "[]")) if album.providers_json else set()
-            )
-            providers.add(provider_name)
-            album.providers_json = json.dumps(sorted(providers))
+            if provider_id is None:
+                hits = await provider.search_artists(artist.name)
+                existing_albums = list(artist.albums)
+                scored: list[tuple[float, ArtistHit]] = []
+                for hit in hits[:5]:
+                    score = _name_similarity(artist.name, hit.name)
+                    try:
+                        candidate_albums = await provider.get_discography(hit.provider_id)
+                        overlap = sum(
+                            1
+                            for candidate in candidate_albums
+                            if any(
+                                _album_keys_match(candidate, existing)
+                                for existing in existing_albums
+                            )
+                        )
+                        score += min(overlap / max(len(existing_albums), 1), 1.0)
+                    except Exception:
+                        pass
+                    scored.append((score, hit))
+                scored.sort(key=lambda item: item[0], reverse=True)
+                selected_choice = choices.get(provider_name)
+                selected_hit = next(
+                    (hit for _, hit in scored if hit.provider_id == selected_choice), None
+                )
+                if selected_hit is not None:
+                    provider_id = selected_hit.provider_id
+                elif not scored or scored[0][0] < 0.82:
+                    ambiguities.append({"provider": provider_name, "reason": "no_confident_match"})
+                    outcomes[provider_name] = "ambiguous"
+                    continue
+                elif len(scored) > 1 and scored[0][0] - scored[1][0] < 0.15:
+                    ambiguities.append(
+                        {
+                            "provider": provider_name,
+                            "reason": "multiple_matches",
+                            "candidates": [
+                                {"provider_id": hit.provider_id, "name": hit.name}
+                                for _, hit in scored[:3]
+                            ],
+                        }
+                    )
+                    outcomes[provider_name] = "ambiguous"
+                    continue
+                else:
+                    provider_id = scored[0][1].provider_id
+
+            detail = await provider.get_artist(provider_id)
+            discography = await provider.get_discography(provider_id)
+            async with db.begin_nested():
+                ids = provider_ids_for_hit(detail)
+                artist = await _merge_artist_id_collisions(db, artist, ids)
+                for field in ("mbid", "deezer_id", "itunes_id"):
+                    if not getattr(artist, field) and ids[field]:
+                        setattr(artist, field, ids[field])
+                        provenance[field] = provider_name
+                if detail.artwork_url and not artist.artwork_url:
+                    artist.artwork_url = detail.artwork_url
+                    provenance["artwork_url"] = provider_name
+                identity = await upsert_artist_identity(db, artist, detail)
+                for album_hit in discography:
+                    await upsert_provider_release(db, artist, identity, album_hit)
+                identity.last_discography_at = datetime.now(tz=UTC)
+            outcomes[provider_name] = "ok"
+        except Exception as exc:
+            failures[provider_name] = {"error": type(exc).__name__}
+            outcomes[provider_name] = "failed"
+
+    if failures:
+        provenance["provider_failures"] = failures
+    else:
+        provenance.pop("provider_failures", None)
+    if ambiguities:
+        provenance["provider_ambiguities"] = ambiguities
+    else:
+        provenance.pop("provider_ambiguities", None)
     provenance.pop("last_enrichment_error", None)
     artist.provenance_json = json.dumps(provenance, sort_keys=True)
     artist.last_enriched_at = datetime.now(tz=UTC)
+    if artist.monitored and artist.watchlist_provider:
+        from app.services.artist_monitoring import apply_monitor_policy
+
+        selected_identity = (
+            await db.scalars(
+                select(CatalogArtistIdentity)
+                .where(
+                    CatalogArtistIdentity.artist_id == artist.id,
+                    CatalogArtistIdentity.provider == artist.watchlist_provider,
+                )
+                .options(selectinload(CatalogArtistIdentity.releases))
+            )
+        ).first()
+        if selected_identity is not None:
+            apply_monitor_policy(artist, selected_identity.releases)
     await db.flush()
-    if ambiguous:
-        return {"status": "ambiguous", "candidates": ambiguous, "artist_id": artist.id}
-    return {"status": "ok", "artist_id": artist.id}
+    status = "partial" if failures else "ambiguous" if ambiguities else "ok"
+    result: dict[str, object] = {
+        "status": status,
+        "artist_id": artist.id,
+        "providers": outcomes,
+    }
+    if ambiguities:
+        result["candidates"] = ambiguities
+    return result
 
 
 async def reconcile_duplicate_catalog_albums(
@@ -657,6 +1003,9 @@ async def reconcile_duplicate_catalog_albums(
                 .where(Track.catalog_album_id == loser.id)
                 .values(catalog_album_id=winner.id)
             )
+            await db.refresh(loser, ["provider_releases"])
+            for provider_release in list(loser.provider_releases):
+                provider_release.catalog_album = winner
             await db.delete(loser)
             consumed.add(loser.id)
             merged += 1

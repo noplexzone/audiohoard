@@ -225,6 +225,14 @@ def _parse_album_hit(data: dict[str, object], artist_id: str | None) -> AlbumHit
     if isinstance(artist_obj, dict):
         artist_name = str(artist_obj.get("name") or "") or None
         artist_id = artist_id or str(artist_obj.get("id") or "") or None
+    raw_type = str(data.get("record_type") or "") or None
+    release_kind = {
+        "album": "album",
+        "single": "single",
+        "ep": "ep",
+        "compile": "compilation",
+        "compilation": "compilation",
+    }.get((raw_type or "").casefold(), "unknown")
     return AlbumHit(
         provider="deezer",
         provider_id=did,
@@ -233,7 +241,9 @@ def _parse_album_hit(data: dict[str, object], artist_id: str | None) -> AlbumHit
         artist_name=artist_name,
         artist_provider_id=artist_id,
         year=_year(data.get("release_date")),
-        release_type=str(data.get("record_type") or "") or None,
+        release_type=raw_type,
+        release_kind=release_kind,
+        release_type_raw=raw_type,
         artwork_url=str(
             data.get("cover_xl")
             or data.get("cover_big")

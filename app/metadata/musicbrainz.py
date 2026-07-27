@@ -152,10 +152,10 @@ class MusicBrainzClient:
             return list(cast(list[AlbumHit], cached))
         resp = await self._get_with_retry(
             "/release-group",
-            {"artist": id, "type": "album|ep", "limit": "100", "fmt": "json"},
+            {"artist": id, "type": "album|ep|single", "limit": "100", "fmt": "json"},
         )
         resp.raise_for_status()
-        allowed = {"album", "ep"}
+        allowed = {"album", "ep", "single"}
         seen: set[str] = set()
         albums: list[AlbumHit] = []
         for item in resp.json().get("release-groups", []):
@@ -360,13 +360,25 @@ def _parse_artist_detail(data: dict[str, object]) -> ArtistDetail:
 
 def _parse_release_group_hit(data: dict[str, object], artist_id: str | None) -> AlbumHit:
     mbid = str(data.get("id") or "")
+    primary = str(data.get("primary-type") or "")
+    secondary_raw = data.get("secondary-types") or []
+    secondary = [str(value) for value in secondary_raw] if isinstance(secondary_raw, list) else []
+    if any(value.casefold() == "compilation" for value in secondary):
+        release_kind = "compilation"
+    else:
+        release_kind = {"album": "album", "single": "single", "ep": "ep"}.get(
+            primary.casefold(), "unknown"
+        )
+    raw_type = " + ".join([primary, *secondary]) or None
     return AlbumHit(
         provider="musicbrainz",
         provider_id=mbid,
         title=str(data.get("title") or ""),
         artist_provider_id=artist_id,
         year=_year_from_date(data.get("first-release-date")),
-        release_type=str(data.get("primary-type") or "") or None,
+        release_type=raw_type,
+        release_kind=release_kind,
+        release_type_raw=raw_type,
         mbid=mbid or None,
         artwork_url=f"https://coverartarchive.org/release-group/{mbid}/front-250"
         if mbid

@@ -17,7 +17,7 @@ from app.auth import get_current_user, require_mutation
 from app.config import Settings
 from app.database import get_db
 from app.jobs.dispatcher import job_dispatcher
-from app.models.catalog_entities import CatalogAlbum, CatalogArtist
+from app.models.catalog_entities import CatalogAlbum, CatalogArtist, CatalogArtistIdentity
 from app.models.job import Job, JobStatus
 from app.services.catalog import (
     get_artist_detail,
@@ -28,16 +28,54 @@ from app.services.catalog import (
     list_library_tracks,
 )
 from app.services.catalog_metadata import (
+    VALID_METADATA_PROVIDERS,
+    available_artist_providers,
     enrich_catalog_artist,
+    ensure_legacy_provider_snapshots,
     fetch_and_store_album,
     fetch_and_store_discography,
     open_catalog_artist,
-    reconcile_duplicate_catalog_albums,
 )
 from app.settings_service import effective_settings_dep, get_runtime_settings
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 logger = logging.getLogger(__name__)
+
+
+def _selected_provider(
+    requested: str,
+    available: list[str],
+    primary: str,
+    watchlist_provider: str | None,
+) -> str:
+    if requested in VALID_METADATA_PROVIDERS and requested in available:
+        return requested
+    if primary in available:
+        return primary
+    if watchlist_provider in available:
+        return watchlist_provider
+    return available[0] if available else primary
+
+
+def _artist_page_url(
+    artist_id: int,
+    *,
+    provider: str = "",
+    release_type: str = "",
+    sort: str = "desc",
+    enrichment: str = "",
+) -> str:
+    params: dict[str, str] = {}
+    if provider in VALID_METADATA_PROVIDERS:
+        params["provider"] = provider
+    if release_type in {"Album", "single_ep", "Compilation"}:
+        params["release_type"] = release_type
+    if sort in {"asc", "desc"}:
+        params["sort"] = sort
+    if enrichment in {"ok", "ambiguous", "partial", "failed"}:
+        params["enrichment"] = enrichment
+    query = urlencode(params)
+    return f"/artists/catalog/{artist_id}" + (f"?{query}" if query else "")
 
 
 def _sanitize_error_class(exc: BaseException) -> str:
@@ -211,10 +249,17 @@ async def open_catalog_artist_page(
     monitor: bool = False,
 ) -> RedirectResponse:
     artist = await open_catalog_artist(db, settings, provider, provider_id)
+    runtime = await get_runtime_settings(db)
     if monitor:
         artist.monitored = True
         artist.monitor_policy = "all"
-    runtime = await get_runtime_settings(db)
+        available = [provider] if provider in VALID_METADATA_PROVIDERS else []
+        artist.watchlist_provider = _selected_provider(
+            runtime.primary_metadata_provider,
+            available,
+            runtime.primary_metadata_provider,
+            provider,
+        )
     await db.commit()
     background_tasks.add_task(_enrich_artist_task, artist.id, runtime.enabled_metadata_providers)
     return RedirectResponse(f"/artists/catalog/{artist.id}", status_code=303)
@@ -247,77 +292,106 @@ async def catalog_artist_page(
     background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(effective_settings_dep)],
+    provider: str = "",
     release_type: str = "",
     sort: str = "desc",
     enrichment: str = "",
 ) -> HTMLResponse:
+    load = selectinload(CatalogArtist.identities).selectinload(CatalogArtistIdentity.releases)
     result = await db.execute(
-        select(CatalogArtist)
-        .where(CatalogArtist.id == artist_id)
-        .options(selectinload(CatalogArtist.albums))
+        select(CatalogArtist).where(CatalogArtist.id == artist_id).options(load)
     )
     artist = result.scalar_one_or_none()
     if artist is None:
         raise HTTPException(status_code=404, detail="Catalog artist not found")
     runtime = await get_runtime_settings(db)
-    if artist.last_enriched_at is None and not artist.mbid:
+    await ensure_legacy_provider_snapshots(db, artist)
+    await db.commit()
+    artist = (
+        await db.execute(
+            select(CatalogArtist)
+            .where(CatalogArtist.id == artist_id)
+            .options(load)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    if artist.last_enriched_at is None:
         background_tasks.add_task(
             _enrich_artist_task, artist.id, runtime.enabled_metadata_providers
         )
+    available_providers = available_artist_providers(artist)
+    selected_provider = _selected_provider(
+        provider, available_providers, runtime.primary_metadata_provider, artist.watchlist_provider
+    )
+    selected_identity = next(
+        (identity for identity in artist.identities if identity.provider == selected_provider),
+        None,
+    )
     try:
-        if not artist.albums:
-            await fetch_and_store_discography(db, settings, artist)
-        await reconcile_duplicate_catalog_albums(db, artist.id)
-        await db.commit()
+        if selected_identity is not None and not selected_identity.releases:
+            await fetch_and_store_discography(
+                db, settings, artist, provider_name=selected_provider
+            )
+            await db.commit()
     except Exception:
         logger.exception("Catalog artist discography refresh failed for artist %s", artist_id)
         await db.rollback()
-    result = await db.execute(
-        select(CatalogArtist)
-        .where(CatalogArtist.id == artist_id)
-        .options(selectinload(CatalogArtist.albums))
+    artist = (
+        await db.execute(
+            select(CatalogArtist)
+            .where(CatalogArtist.id == artist_id)
+            .options(load)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    available_providers = available_artist_providers(artist)
+    selected_provider = _selected_provider(
+        provider, available_providers, runtime.primary_metadata_provider, artist.watchlist_provider
     )
-    artist = result.scalar_one()
+    selected_identity = next(
+        (identity for identity in artist.identities if identity.provider == selected_provider),
+        None,
+    )
+    provider_albums = list(selected_identity.releases) if selected_identity is not None else []
     albums = sorted(
-        artist.albums,
-        key=lambda album: (album.year or "0000", album.title.casefold()),
+        provider_albums,
+        key=lambda release: (release.year or "0000", release.title.casefold()),
         reverse=sort != "asc",
     )
-    if release_type:
-        if release_type == "single_ep":
-            albums = [a for a in albums if (a.release_type or "").casefold() in {"single", "ep"}]
-        else:
-            albums = [
-                a for a in albums if (a.release_type or "").casefold() == release_type.casefold()
-            ]
-    release_types = sorted({a.release_type for a in artist.albums if a.release_type})
-    counts_by_type: dict[str, int] = {"albums": 0, "singles_eps": 0, "compilations": 0}
-    for album in artist.albums:
-        rt = (album.release_type or "album").casefold()
-        if rt in {"single", "ep"}:
+    requested_kinds = {
+        "Album": {"album"},
+        "single_ep": {"single", "ep"},
+        "Compilation": {"compilation"},
+    }.get(release_type)
+    if requested_kinds:
+        albums = [release for release in albums if release.release_kind in requested_kinds]
+    else:
+        release_type = ""
+    release_types = sorted(
+        {release.release_type_raw for release in provider_albums if release.release_type_raw}
+    )
+    counts_by_type = {"albums": 0, "singles_eps": 0, "compilations": 0}
+    for release in provider_albums:
+        if release.release_kind in {"single", "ep"}:
             counts_by_type["singles_eps"] += 1
-        elif "compilation" in rt:
+        elif release.release_kind == "compilation":
             counts_by_type["compilations"] += 1
         else:
             counts_by_type["albums"] += 1
     grouped_albums = (
         [
-            (
-                "Albums",
-                [
-                    a
-                    for a in albums
-                    if (a.release_type or "album").casefold()
-                    not in {"single", "ep", "compilation"}
-                ],
-            ),
+            ("Albums", [release for release in albums if release.release_kind == "album"]),
             (
                 "Singles & EPs",
-                [a for a in albums if (a.release_type or "").casefold() in {"single", "ep"}],
+                [release for release in albums if release.release_kind in {"single", "ep"}],
             ),
             (
                 "Compilations",
-                [a for a in albums if "compilation" in (a.release_type or "").casefold()],
+                [release for release in albums if release.release_kind == "compilation"],
+            ),
+            (
+                "Other",
+                [release for release in albums if release.release_kind in {"other", "unknown"}],
             ),
         ]
         if not release_type
@@ -329,11 +403,33 @@ async def catalog_artist_page(
         ("single_ep", "Singles & EPs"),
         ("Compilation", "Compilations"),
     ]
+    provider_links = [
+        (
+            name,
+            _artist_page_url(artist.id, provider=name, release_type=release_type, sort=sort),
+        )
+        for name in available_providers
+    ]
+    filter_links = [
+        (
+            value,
+            label,
+            _artist_page_url(artist.id, provider=selected_provider, release_type=value, sort=sort),
+        )
+        for value, label in filter_options
+    ]
+    sort_url = _artist_page_url(
+        artist.id,
+        provider=selected_provider,
+        release_type=release_type,
+        sort="asc" if sort != "asc" else "desc",
+    )
     return _templates(request).TemplateResponse(
         request,
         "catalog_artist.html",
         {
             "artist": artist,
+            "display_identity": selected_identity,
             "albums": albums,
             "grouped_albums": grouped_albums,
             "release_types": release_types,
@@ -341,6 +437,11 @@ async def catalog_artist_page(
             "sort": sort,
             "counts_by_type": counts_by_type,
             "filter_options": filter_options,
+            "filter_links": filter_links,
+            "provider_links": provider_links,
+            "available_providers": available_providers,
+            "selected_provider": selected_provider,
+            "sort_url": sort_url,
             "enrichment": enrichment,
         },
     )
@@ -349,6 +450,7 @@ async def catalog_artist_page(
 @router.post("/artists/catalog/{artist_id}/enrich", include_in_schema=False)
 async def enrich_catalog_artist_page(
     artist_id: int,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     _user: Annotated[object, Depends(require_mutation)],
@@ -362,6 +464,10 @@ async def enrich_catalog_artist_page(
     if artist is None:
         raise HTTPException(status_code=404, detail="Catalog artist not found")
     runtime = await get_runtime_settings(db)
+    form = await request.form()
+    requested_provider = str(form.get("provider", ""))
+    release_type = str(form.get("release_type", ""))
+    sort = str(form.get("sort", "desc"))
     try:
         outcome = await enrich_catalog_artist(
             db, settings, artist, runtime.enabled_metadata_providers
@@ -378,9 +484,7 @@ async def enrich_catalog_artist_page(
         survivor.provenance_json = json.dumps(provenance, sort_keys=True)
         await db.commit()
         artist_id = redirect_artist_id
-        suffix = (
-            "?enrichment=ambiguous" if outcome.get("status") == "ambiguous" else "?enrichment=ok"
-        )
+        enrichment_status = str(outcome.get("status", "ok"))
     except Exception as exc:
         logger.error(
             "Manual catalog artist enrichment failed for artist %s", artist_id, exc_info=True
@@ -395,8 +499,33 @@ async def enrich_catalog_artist_page(
             }
             fresh.provenance_json = json.dumps(provenance, sort_keys=True)
         await db.commit()
-        suffix = "?enrichment=failed"
-    return RedirectResponse(f"/artists/catalog/{artist_id}{suffix}", status_code=303)
+        enrichment_status = "failed"
+    fresh_artist = (
+        await db.execute(
+            select(CatalogArtist)
+            .where(CatalogArtist.id == artist_id)
+            .options(selectinload(CatalogArtist.identities))
+        )
+    ).scalar_one_or_none()
+    available = available_artist_providers(fresh_artist) if fresh_artist is not None else []
+    selected_provider = _selected_provider(
+        requested_provider,
+        available,
+        runtime.primary_metadata_provider,
+        fresh_artist.watchlist_provider
+        if fresh_artist is not None
+        else runtime.primary_metadata_provider,
+    )
+    return RedirectResponse(
+        _artist_page_url(
+            artist_id,
+            provider=selected_provider,
+            release_type=release_type,
+            sort=sort,
+            enrichment=enrichment_status,
+        ),
+        status_code=303,
+    )
 
 
 @router.post("/artists/catalog/{artist_id}/monitor", include_in_schema=False)
@@ -406,41 +535,102 @@ async def monitor_catalog_artist_page(
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
-    result = await db.execute(
-        select(CatalogArtist)
-        .where(CatalogArtist.id == artist_id)
-        .options(selectinload(CatalogArtist.albums))
-    )
-    artist = result.scalar_one_or_none()
+    load = selectinload(CatalogArtist.identities).selectinload(CatalogArtistIdentity.releases)
+    artist = (
+        await db.execute(
+            select(CatalogArtist)
+            .where(CatalogArtist.id == artist_id)
+            .options(load)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if artist is None:
         raise HTTPException(status_code=404, detail="Catalog artist not found")
-    form = await request.form()
-    if str(form.get("quick", "")).lower() in {"1", "true", "on", "yes"}:
-        enabled = not artist.monitored
-        artist.monitored = enabled
-        artist.monitor_policy = "all"
-        for album in artist.albums:
-            album.monitored = enabled
-        await db.commit()
-        return RedirectResponse(f"/artists/catalog/{artist.id}", status_code=303)
-    artist.monitored = str(form.get("monitored", "")).lower() in {"1", "true", "on", "yes"}
-    policy = str(form.get("monitor_policy", artist.monitor_policy or "all"))
-    artist.monitor_policy = policy if policy in {"all", "albums_only", "none_new"} else "all"
-    album_ids = {int(str(v)) for v in form.getlist("album_monitored") if str(v).isdigit()}
-    bulk = str(form.get("bulk", ""))
-    for album in artist.albums:
-        if bulk == "all":
-            album.monitored = True
-        elif bulk == "none":
-            album.monitored = False
-        elif bulk == "albums_only":
-            album.monitored = (album.release_type or "album").casefold() == "album"
-        elif bulk == "singles_off":
-            album.monitored = (album.release_type or "").casefold() not in {"single", "ep"}
-        else:
-            album.monitored = album.id in album_ids
+    await ensure_legacy_provider_snapshots(db, artist)
     await db.commit()
-    return RedirectResponse(f"/artists/catalog/{artist.id}", status_code=303)
+    artist = (
+        await db.execute(
+            select(CatalogArtist)
+            .where(CatalogArtist.id == artist_id)
+            .options(load)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    form = await request.form()
+    runtime = await get_runtime_settings(db)
+    available = available_artist_providers(artist)
+    requested_view_provider = str(form.get("provider", ""))
+    submitted_release_provider = (
+        requested_view_provider if requested_view_provider in available else None
+    )
+    view_provider = _selected_provider(
+        requested_view_provider,
+        available,
+        runtime.primary_metadata_provider,
+        artist.watchlist_provider,
+    )
+    release_type = str(form.get("release_type", ""))
+    sort = str(form.get("sort", "desc"))
+
+    quick = str(form.get("quick", "")).lower() in {"1", "true", "on", "yes"}
+    if quick:
+        artist.monitored = not artist.monitored
+        artist.monitor_policy = "all"
+        if artist.monitored:
+            artist.watchlist_provider = _selected_provider(
+                runtime.primary_metadata_provider,
+                available,
+                runtime.primary_metadata_provider,
+                artist.watchlist_provider,
+            )
+    else:
+        artist.monitored = str(form.get("monitored", "")).lower() in {"1", "true", "on", "yes"}
+        policy = str(form.get("monitor_policy", artist.monitor_policy or "all"))
+        artist.monitor_policy = policy if policy in {"all", "albums_only", "none_new"} else "all"
+        requested_watchlist = str(form.get("watchlist_provider", ""))
+        artist.watchlist_provider = _selected_provider(
+            requested_watchlist,
+            available,
+            runtime.primary_metadata_provider,
+            artist.watchlist_provider,
+        )
+
+    selected_identity = next(
+        (
+            identity
+            for identity in artist.identities
+            if identity.provider == artist.watchlist_provider
+        ),
+        None,
+    )
+    selected_ids = {
+        int(str(value)) for value in form.getlist("album_monitored") if str(value).isdigit()
+    }
+    bulk = "all" if quick and artist.monitored else "none" if quick else str(form.get("bulk", ""))
+    if selected_identity is not None:
+        for release in selected_identity.releases:
+            if not artist.monitored or bulk == "none":
+                release.monitored = False
+            elif bulk == "all":
+                release.monitored = True
+            elif bulk == "albums_only":
+                release.monitored = release.release_kind == "album"
+            elif bulk == "singles_off":
+                release.monitored = release.release_kind not in {"single", "ep"}
+            elif submitted_release_provider == artist.watchlist_provider:
+                release.monitored = release.id in selected_ids
+
+    for album in artist.albums:
+        album.monitored = False
+    if artist.monitored and selected_identity is not None:
+        for release in selected_identity.releases:
+            if release.monitored and release.catalog_album is not None:
+                release.catalog_album.monitored = True
+    await db.commit()
+    return RedirectResponse(
+        _artist_page_url(artist.id, provider=view_provider, release_type=release_type, sort=sort),
+        status_code=303,
+    )
 
 
 @router.get("/artists/monitored", include_in_schema=False)
@@ -488,21 +678,34 @@ async def download_monitored_catalog_albums(
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
-    result = await db.execute(
-        select(CatalogArtist)
-        .where(CatalogArtist.id == artist_id)
-        .options(selectinload(CatalogArtist.albums))
-    )
-    artist = result.scalar_one_or_none()
+    load = selectinload(CatalogArtist.identities).selectinload(CatalogArtistIdentity.releases)
+    artist = (
+        await db.execute(
+            select(CatalogArtist)
+            .where(CatalogArtist.id == artist_id)
+            .options(load)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if artist is None:
         raise HTTPException(status_code=404, detail="Catalog artist not found")
+    identity = next(
+        (item for item in artist.identities if item.provider == artist.watchlist_provider),
+        None,
+    )
+    canonical: dict[int, CatalogAlbum] = {}
+    if identity is not None:
+        for release in identity.releases:
+            album = release.catalog_album
+            if release.monitored and album is not None and not album.in_library:
+                canonical[album.id] = album
     job_ids: list[int] = []
-    for album in artist.albums:
-        if not album.monitored or album.in_library:
-            continue
-        query = f"{artist.name} {album.title}".strip()
+    for album in canonical.values():
         job = Job(
-            source="priority", query=query, status=JobStatus.pending, catalog_album_id=album.id
+            source="priority",
+            query=f"{artist.name} {album.title}".strip(),
+            status=JobStatus.pending,
+            catalog_album_id=album.id,
         )
         db.add(job)
         await db.flush()

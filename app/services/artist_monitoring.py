@@ -12,29 +12,72 @@ from sqlalchemy.orm import selectinload
 from app.config import Settings, get_settings
 from app.database import get_session_factory
 from app.jobs.dispatcher import job_dispatcher
-from app.models.catalog_entities import CatalogAlbum, CatalogArtist
+from app.models.catalog_entities import (
+    CatalogAlbum,
+    CatalogAlbumProvider,
+    CatalogArtist,
+    CatalogArtistIdentity,
+)
 from app.models.job import Job, JobStatus
-from app.services.catalog_metadata import fetch_and_store_discography
+from app.services.catalog_metadata import (
+    album_has_provider,
+    fetch_and_store_discography,
+    release_bucket,
+)
 from app.settings_service import build_effective_settings, get_runtime_settings
 
 logger = logging.getLogger(__name__)
 _ACTIVE_JOB_STATES = {JobStatus.pending, JobStatus.running}
 
 
-def apply_monitor_policy(artist: CatalogArtist, new_albums: list[CatalogAlbum]) -> None:
+def apply_monitor_policy(
+    artist: CatalogArtist, releases: list[CatalogAlbumProvider] | list[CatalogAlbum]
+) -> None:
+    """Apply the artist policy to releases from the selected provider only."""
+    if not artist.monitored:
+        for release in releases:
+            release.monitored = False
+        return
+    for release in releases:
+        if isinstance(release, CatalogAlbum):
+            if (
+                not album_has_provider(release, artist.watchlist_provider or "")
+                or artist.monitor_policy == "none_new"
+            ):
+                release.monitored = False
+            elif artist.monitor_policy == "albums_only":
+                release.monitored = release_bucket(release.release_type) == "album"
+            else:
+                release.monitored = True
+            continue
+        if artist.monitor_policy == "none_new":
+            release.monitored = False
+        elif artist.monitor_policy == "albums_only":
+            release.monitored = release.release_kind == "album"
+        else:
+            release.monitored = True
+
+
+def _sync_canonical_monitoring(
+    artist: CatalogArtist, releases: list[CatalogAlbumProvider]
+) -> None:
+    for album in artist.albums:
+        album.monitored = False
     if not artist.monitored:
         return
-    for album in new_albums:
-        if artist.monitor_policy == "none_new":
-            album.monitored = False
-        elif artist.monitor_policy == "albums_only":
-            album.monitored = (album.release_type or "album").casefold() == "album"
-        else:
-            album.monitored = True
+    for release in releases:
+        if release.monitored and release.catalog_album is not None:
+            release.catalog_album.monitored = True
 
 
-def wanted_albums(artist: CatalogArtist) -> list[CatalogAlbum]:
-    return [album for album in artist.albums if album.monitored and not album.in_library]
+def wanted_releases(releases: list[CatalogAlbumProvider]) -> list[CatalogAlbumProvider]:
+    return [
+        release
+        for release in releases
+        if release.monitored
+        and release.catalog_album is not None
+        and not release.catalog_album.in_library
+    ]
 
 
 async def refresh_monitored_artist(
@@ -43,18 +86,86 @@ async def refresh_monitored_artist(
     artist: CatalogArtist,
     *,
     auto_download: bool = False,
-) -> tuple[list[CatalogAlbum], list[int]]:
-    before = {album.id for album in artist.albums}
-    await fetch_and_store_discography(db, settings, artist)
-    await db.refresh(artist, ["albums"])
-    new = [album for album in artist.albums if album.id not in before]
+) -> tuple[list[CatalogAlbumProvider], list[int]]:
+    provider = artist.watchlist_provider
+    identity = None
+    if provider:
+        identity = (
+            await db.scalars(
+                select(CatalogArtistIdentity)
+                .where(
+                    CatalogArtistIdentity.artist_id == artist.id,
+                    CatalogArtistIdentity.provider == provider,
+                )
+                .options(selectinload(CatalogArtistIdentity.releases))
+            )
+        ).first()
+    before = {release.id for release in identity.releases} if identity is not None else set()
+    if provider:
+        await fetch_and_store_discography(db, settings, artist, provider_name=provider)
+        identity = (
+            await db.scalars(
+                select(CatalogArtistIdentity)
+                .where(
+                    CatalogArtistIdentity.artist_id == artist.id,
+                    CatalogArtistIdentity.provider == provider,
+                )
+                .options(
+                    selectinload(CatalogArtistIdentity.releases).selectinload(
+                        CatalogAlbumProvider.catalog_album
+                    )
+                )
+            )
+        ).first()
+    releases = list(identity.releases) if identity is not None else []
+    if identity is None:
+        # Compatibility for direct fixtures and pre-0012 rows. Production migration
+        # creates provider snapshots before the scheduler starts.
+        new_albums = [album for album in artist.albums if album.id not in before]
+        if provider:
+            apply_monitor_policy(artist, new_albums)
+        legacy_wanted = [
+            album for album in artist.albums if album.monitored and not album.in_library
+        ]
+        job_ids: list[int] = []
+        if auto_download:
+            active_ids = {
+                album_id
+                for album_id in (
+                    await db.scalars(
+                        select(Job.catalog_album_id).where(
+                            Job.catalog_album_id.in_([album.id for album in legacy_wanted]),
+                            Job.status.in_(_ACTIVE_JOB_STATES),
+                        )
+                    )
+                ).all()
+                if album_id is not None
+            }
+            for album in legacy_wanted:
+                if album.id in active_ids:
+                    continue
+                job = Job(
+                    source="priority",
+                    query=f"{artist.name} {album.title}",
+                    status=JobStatus.pending,
+                    catalog_album_id=album.id,
+                )
+                db.add(job)
+                await db.flush()
+                job_ids.append(job.id)
+                active_ids.add(album.id)
+        artist.last_refreshed_at = datetime.now(tz=UTC)
+        await db.flush()
+        return [], job_ids
+    new = [release for release in releases if release.id not in before]
     apply_monitor_policy(artist, new)
+    _sync_canonical_monitoring(artist, releases)
     artist.last_refreshed_at = datetime.now(tz=UTC)
 
-    job_ids: list[int] = []
+    normalized_job_ids: list[int] = []
     if auto_download:
-        wanted = wanted_albums(artist)
-        wanted_ids = [album.id for album in wanted]
+        wanted = wanted_releases(releases)
+        wanted_ids = [release.catalog_album_id for release in wanted if release.catalog_album_id]
         active_album_ids: set[int] = set()
         if wanted_ids:
             result = await db.execute(
@@ -64,21 +175,22 @@ async def refresh_monitored_artist(
                 )
             )
             active_album_ids = {album_id for album_id in result.scalars() if album_id is not None}
-        for album in wanted:
-            if album.id in active_album_ids:
+        for release in wanted:
+            canonical_album = release.catalog_album
+            if canonical_album is None or canonical_album.id in active_album_ids:
                 continue
             job = Job(
                 source="priority",
-                query=f"{artist.name} {album.title}",
+                query=f"{artist.name} {canonical_album.title}",
                 status=JobStatus.pending,
-                catalog_album_id=album.id,
+                catalog_album_id=canonical_album.id,
             )
             db.add(job)
             await db.flush()
-            job_ids.append(job.id)
-            active_album_ids.add(album.id)
+            normalized_job_ids.append(job.id)
+            active_album_ids.add(canonical_album.id)
     await db.flush()
-    return new, job_ids
+    return new, normalized_job_ids
 
 
 class DiscographyRefreshScheduler:
@@ -116,7 +228,12 @@ class DiscographyRefreshScheduler:
                     artist_result = await db.execute(
                         select(CatalogArtist)
                         .where(CatalogArtist.id == artist_id)
-                        .options(selectinload(CatalogArtist.albums))
+                        .options(
+                            selectinload(CatalogArtist.albums),
+                            selectinload(CatalogArtist.identities).selectinload(
+                                CatalogArtistIdentity.releases
+                            ),
+                        )
                     )
                     artist = artist_result.scalar_one_or_none()
                     if artist is None or not artist.monitored:
