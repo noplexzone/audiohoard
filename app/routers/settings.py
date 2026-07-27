@@ -22,6 +22,7 @@ from app.schemas.health import SourceStatus
 from app.schemas.settings import SettingField, SettingsSaveRequest, SettingsTestRequest
 from app.services.health_status import CachedProviderStatus, get_health_status_service
 from app.settings_service import (
+    ALLOWED_MIN_MP3_BITRATES,
     DEFAULT_FORMAT_PREFERENCE,
     DEFAULT_METADATA_PROVIDERS,
     DEFAULT_SOURCE_PRIORITY,
@@ -342,6 +343,13 @@ async def save_runtime_settings_page(
     )
     if section == "quality":
         fmt_order = [str(v) for v in form.getlist("format_order")]
+        if len(fmt_order) != len(DEFAULT_FORMAT_PREFERENCE) or set(fmt_order) != set(
+            DEFAULT_FORMAT_PREFERENCE
+        ):
+            return RedirectResponse(
+                "/settings/quality?error=Format+order+must+contain+each+supported+format+once",
+                status_code=303,
+            )
         move_fmt = str(form.get("move_format", ""))
         if ":" in move_fmt:
             direction, fmt_name = move_fmt.split(":", 1)
@@ -355,7 +363,12 @@ async def save_runtime_settings_page(
                 str(form.get("min_mp3_bitrate", runtime.quality_profile.min_mp3_bitrate))
             )
         except ValueError:
-            min_mp3 = runtime.quality_profile.min_mp3_bitrate
+            return RedirectResponse("/settings/quality?error=Invalid+MP3+bitrate", status_code=303)
+        if min_mp3 not in ALLOWED_MIN_MP3_BITRATES:
+            return RedirectResponse(
+                "/settings/quality?error=MP3+bitrate+must+be+192%2C+256%2C+or+320+kbps",
+                status_code=303,
+            )
         allow_fallback = str(form.get("allow_lower_quality_fallback", "")).lower() in {
             "1",
             "true",
@@ -365,13 +378,20 @@ async def save_runtime_settings_page(
         try:
             max_partial = int(str(form.get("max_partial_attempts", runtime.max_partial_attempts)))
         except ValueError:
-            max_partial = runtime.max_partial_attempts
+            return RedirectResponse(
+                "/settings/quality?error=Invalid+partial+attempt+limit", status_code=303
+            )
+        if not 1 <= max_partial <= 10:
+            return RedirectResponse(
+                "/settings/quality?error=Partial+attempt+limit+must+be+between+1+and+10",
+                status_code=303,
+            )
         quality_profile = QualityProfile(
             format_preference=fmt_order or list(DEFAULT_FORMAT_PREFERENCE),
-            min_mp3_bitrate=max(64, min(min_mp3, 320)),
+            min_mp3_bitrate=min_mp3,
             allow_lower_quality_fallback=allow_fallback,
         )
-        max_partial_val: int = max(1, min(max_partial, 10))
+        max_partial_val: int = max_partial
     else:
         quality_profile = runtime.quality_profile
         max_partial_val = runtime.max_partial_attempts

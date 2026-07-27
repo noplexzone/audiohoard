@@ -41,8 +41,10 @@ DEFAULT_PRIMARY_METADATA_PROVIDER = "musicbrainz"
 DEFAULT_DISCOGRAPHY_REFRESH_HOURS = 24
 DEFAULT_AUTO_DOWNLOAD_WANTED = False
 DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS = 15
-DEFAULT_FORMAT_PREFERENCE: list[str] = ["flac", "mp3", "m4a", "aac", "ogg", "opus"]
-DEFAULT_MIN_MP3_BITRATE = 192
+SUPPORTED_FORMAT_PREFERENCES: tuple[str, ...] = ("flac", "mp3", "m4a/aac", "ogg", "opus")
+DEFAULT_FORMAT_PREFERENCE: list[str] = list(SUPPORTED_FORMAT_PREFERENCES)
+ALLOWED_MIN_MP3_BITRATES: frozenset[int] = frozenset({192, 256, 320})
+DEFAULT_MIN_MP3_BITRATE = 320
 DEFAULT_ALLOW_LOWER_QUALITY_FALLBACK = True
 DEFAULT_MAX_PARTIAL_ATTEMPTS = 3
 DEFAULT_ACOUSTID_ACCEPTANCE_THRESHOLD = 0.90
@@ -55,6 +57,22 @@ class QualityProfile:
     format_preference: list[str]
     min_mp3_bitrate: int
     allow_lower_quality_fallback: bool
+
+
+def normalize_format_preference(raw: object) -> list[str]:
+    """Return a complete canonical preference order, including the m4a/aac family."""
+    normalized: list[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            value = str(item).strip().casefold()
+            if value in {"m4a", "aac", "m4a/aac"}:
+                value = "m4a/aac"
+            if value in SUPPORTED_FORMAT_PREFERENCES and value not in normalized:
+                normalized.append(value)
+    for value in SUPPORTED_FORMAT_PREFERENCES:
+        if value not in normalized:
+            normalized.append(value)
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -170,12 +188,14 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
         quality_raw = json.loads(values.get("quality_profile", "{}"))
     except json.JSONDecodeError:
         quality_raw = {}
-    fmt_pref = quality_raw.get("format_preference", DEFAULT_FORMAT_PREFERENCE)
-    if not isinstance(fmt_pref, list) or not fmt_pref:
-        fmt_pref = list(DEFAULT_FORMAT_PREFERENCE)
+    if not isinstance(quality_raw, dict):
+        quality_raw = {}
+    fmt_pref = normalize_format_preference(quality_raw.get("format_preference"))
     try:
         min_mp3 = int(quality_raw.get("min_mp3_bitrate", DEFAULT_MIN_MP3_BITRATE))
     except (TypeError, ValueError):
+        min_mp3 = DEFAULT_MIN_MP3_BITRATE
+    if min_mp3 not in ALLOWED_MIN_MP3_BITRATES:
         min_mp3 = DEFAULT_MIN_MP3_BITRATE
     allow_fallback = bool(
         quality_raw.get("allow_lower_quality_fallback", DEFAULT_ALLOW_LOWER_QUALITY_FALLBACK)
@@ -207,8 +227,8 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
         auto_download,
         max(3, min(source_budget, 60)),
         quality_profile=QualityProfile(
-            format_preference=[str(f).casefold() for f in fmt_pref],
-            min_mp3_bitrate=max(64, min(min_mp3, 320)),
+            format_preference=fmt_pref,
+            min_mp3_bitrate=min_mp3,
             allow_lower_quality_fallback=allow_fallback,
         ),
         max_partial_attempts=max(1, min(max_partial, 10)),
@@ -252,6 +272,8 @@ async def save_runtime_settings(
         min_mp3_bitrate=DEFAULT_MIN_MP3_BITRATE,
         allow_lower_quality_fallback=DEFAULT_ALLOW_LOWER_QUALITY_FALLBACK,
     )
+    if qp.min_mp3_bitrate not in ALLOWED_MIN_MP3_BITRATES:
+        raise ValueError("Minimum MP3 bitrate must be 192, 256, or 320 kbps")
     payloads = {
         "source_priority": json.dumps(normalized),
         "free_text_result_limit": str(max(1, min(free_text_result_limit, 100))),
@@ -264,8 +286,8 @@ async def save_runtime_settings(
         ),
         "quality_profile": json.dumps(
             {
-                "format_preference": [f.casefold() for f in qp.format_preference],
-                "min_mp3_bitrate": max(64, min(qp.min_mp3_bitrate, 320)),
+                "format_preference": normalize_format_preference(qp.format_preference),
+                "min_mp3_bitrate": qp.min_mp3_bitrate,
                 "allow_lower_quality_fallback": qp.allow_lower_quality_fallback,
             }
         ),

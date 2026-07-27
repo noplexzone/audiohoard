@@ -83,9 +83,26 @@ def test_quality_profile_prefers_complete_flac_over_complete_mp3() -> None:
     assert selected.audio_format == "flac"
 
 
-def test_quality_profile_can_forbid_lower_quality_fallback() -> None:
+def test_quality_profile_accepts_second_ranked_format_without_global_fallback() -> None:
     folders = group_slskd_files_into_folders(
         [_folder_response("mp3", "Artist\\Album", "mp3", 15, 320)]
+    )
+    selected = select_best_folder(
+        folders,
+        catalog_track_count=15,
+        catalog_artist="Artist",
+        catalog_album="Album",
+        format_preference=["flac", "mp3"],
+        min_mp3_bitrate=320,
+        allow_lower_quality_fallback=False,
+    )
+    assert selected is not None
+    assert selected.audio_format == "mp3"
+
+
+def test_quality_profile_rejects_below_threshold_mp3_without_fallback() -> None:
+    folders = group_slskd_files_into_folders(
+        [_folder_response("mp3", "Artist\\Album", "mp3", 15, 256)]
     )
     assert (
         select_best_folder(
@@ -93,12 +110,29 @@ def test_quality_profile_can_forbid_lower_quality_fallback() -> None:
             catalog_track_count=15,
             catalog_artist="Artist",
             catalog_album="Album",
-            format_preference=["flac", "mp3"],
+            format_preference=["flac", "mp3", "m4a/aac", "ogg", "opus"],
             min_mp3_bitrate=320,
             allow_lower_quality_fallback=False,
         )
         is None
     )
+
+
+def test_quality_profile_treats_m4a_and_aac_as_one_ranked_family() -> None:
+    folders = group_slskd_files_into_folders(
+        [_folder_response("m4a", "Artist\\Album", "m4a", 15, 256)]
+    )
+    selected = select_best_folder(
+        folders,
+        catalog_track_count=15,
+        catalog_artist="Artist",
+        catalog_album="Album",
+        format_preference=["flac", "mp3", "m4a/aac", "ogg", "opus"],
+        min_mp3_bitrate=320,
+        allow_lower_quality_fallback=False,
+    )
+    assert selected is not None
+    assert selected.audio_format == "m4a"
 
 
 def test_catalog_matching_normalizes_track_prefixes_and_skit_descriptors() -> None:
