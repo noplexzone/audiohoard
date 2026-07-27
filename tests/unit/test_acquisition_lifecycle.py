@@ -109,6 +109,59 @@ def test_resolve_staged_path_rejects_dotdot_path(staging_root: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def test_slskd_retry_adopts_existing_completed_transfer(
+    fast_settings: Settings,
+    staging_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filename = "Music\\Artist\\Album\\01 Song.flac"
+    staged = staging_root / "01 Song.flac"
+    staged.write_bytes(b"flacdata")
+    enqueue_calls: list[tuple[str, str, int | None]] = []
+
+    class ExistingTransferAdapter:
+        def __init__(self, base_url: str, api_key: str) -> None:
+            pass
+
+        async def status(self, transfer_id: str) -> CapabilityState:
+            assert transfer_id == f"peer1:{filename}"
+            return CapabilityState(True, "Completed, Succeeded")
+
+        async def enqueue(self, username: str, name: str, size: int | None = None) -> str:
+            enqueue_calls.append((username, name, size))
+            return "duplicate"
+
+        async def cancel(self, username: str, name: str) -> None:
+            pass
+
+    monkeypatch.setattr(runner, "SlskdAdapter", ExistingTransferAdapter)
+    track = runner.Track(
+        job_id=1,
+        source="slskd",
+        source_job_id=f"peer1:{filename}",
+        acquisition_state=runner.AcquisitionState.failed,
+    )
+    result = runner.SearchResult(
+        source="slskd",
+        title="Song",
+        size_bytes=123,
+        metadata={"username": "peer1", "filename": filename},
+    )
+
+    transfer_id, status = await runner._prepare_acquisition(
+        result,
+        "slskd",
+        fast_settings,
+        track,
+    )
+
+    assert enqueue_calls == []
+    assert transfer_id == f"peer1:{filename}"
+    assert status == "downloaded"
+    assert track.acquisition_state == runner.AcquisitionState.downloaded
+    assert track.source_path == str(staged.resolve())
+
+
 async def test_slskd_success_waits_for_completed_state(staging_root: Path) -> None:
     filename = "music\\Artist\\Album\\01 Song.flac"
     staged = staging_root / "01 Song.flac"

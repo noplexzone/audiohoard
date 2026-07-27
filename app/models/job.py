@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text, false, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -44,6 +44,9 @@ class Job(Base):
     )
     result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     selected_result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    queue_hidden: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     catalog_album_id: Mapped[int | None] = mapped_column(
         ForeignKey("catalog_albums.id", ondelete="SET NULL"), nullable=True
     )

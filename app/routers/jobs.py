@@ -58,7 +58,13 @@ async def list_jobs(
     limit: int = 50,
     offset: int = 0,
 ) -> list[Job]:
-    q = select(Job).order_by(Job.created_at.desc()).offset(offset).limit(limit)
+    q = (
+        select(Job)
+        .where(Job.queue_hidden.is_(False))
+        .order_by(Job.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
     if status is not None:
         q = q.where(Job.status == status)
     result = await db.execute(q)
@@ -81,7 +87,11 @@ async def downloads_page(
 ) -> HTMLResponse:
     templates = _get_templates(request)
     query = (
-        select(Job).options(selectinload(Job.tracks)).order_by(Job.created_at.desc()).limit(100)
+        select(Job)
+        .where(Job.queue_hidden.is_(False))
+        .options(selectinload(Job.tracks))
+        .order_by(Job.created_at.desc())
+        .limit(100)
     )
     if status is not None:
         query = query.where(Job.status == status)
@@ -92,8 +102,16 @@ async def downloads_page(
         "retried": ("Retry scheduled.", "info"),
         "invalid_state": ("That job can no longer be changed.", "error"),
         "not_found": ("Job not found.", "error"),
+        "removed": ("Download removed from the queue.", "info"),
     }
-    notice, notice_type = notices.get(request.query_params.get("notice", ""), (None, "info"))
+    notice_key = request.query_params.get("notice", "")
+    notice, notice_type = notices.get(notice_key, (None, "info"))
+    if notice_key == "cleared":
+        try:
+            count = max(0, int(request.query_params.get("count", "0")))
+        except ValueError:
+            count = 0
+        notice = f"Cleared {count} download{'s' if count != 1 else ''} from the queue."
     now = dt.now(UTC)
     return templates.TemplateResponse(
         request,
@@ -217,3 +235,41 @@ async def retry_job_ui(
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
     return await _job_action_redirect("retry", job_id)
+
+
+@router.post("/downloads/{job_id}/remove", include_in_schema=False)
+async def remove_job_ui(
+    job_id: int,
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    try:
+        await job_dispatcher.remove(job_id)
+        notice = "removed"
+    except JobNotFoundError:
+        notice = "not_found"
+    except JobStateError:
+        notice = "invalid_state"
+    return RedirectResponse(f"/downloads?notice={notice}", status_code=303)
+
+
+@router.post("/downloads/clear", include_in_schema=False)
+async def clear_jobs_ui(
+    request: Request,
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    form = await request.form()
+    scope = str(form.get("scope", ""))
+    scopes = {
+        "failed": {JobStatus.failed},
+        "finished": {
+            JobStatus.done,
+            JobStatus.failed,
+            JobStatus.partial,
+            JobStatus.cancelled,
+        },
+    }
+    statuses = scopes.get(scope)
+    if statuses is None:
+        return RedirectResponse("/downloads?notice=invalid_state", status_code=303)
+    count = await job_dispatcher.clear(statuses)
+    return RedirectResponse(f"/downloads?notice=cleared&count={count}", status_code=303)

@@ -786,11 +786,15 @@ async def _prepare_acquisition(
         username = str(result.metadata.get("username") or "")
         filename = str(result.metadata.get("filename") or "")
         adapter = SlskdAdapter(cfg.slskd_url, cfg.slskd_api_key)
-        transfer_id = (
-            track.source_job_id
-            if track is not None and track.acquisition_state == AcquisitionState.acquiring
-            else None
-        )
+        transfer_id: str | None = None
+        if track is not None and track.source_job_id:
+            if track.acquisition_state == AcquisitionState.acquiring:
+                transfer_id = track.source_job_id
+            else:
+                existing = await adapter.status(track.source_job_id)
+                existing_state = map_slskd_transfer_state(existing)
+                if existing_state not in {AcquisitionState.failed, AcquisitionState.cancelled}:
+                    transfer_id = track.source_job_id
         if not transfer_id:
             transfer_id = await adapter.enqueue(username, filename, result.size_bytes)
         if track is not None:
