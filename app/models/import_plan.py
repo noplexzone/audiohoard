@@ -61,6 +61,9 @@ class ImportPlan(Base):
         default=ImportWorkflowState.discovered,
     )
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cleanup_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     rollback_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

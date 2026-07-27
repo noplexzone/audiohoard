@@ -4,7 +4,9 @@ import pytest_asyncio
 from httpx import AsyncClient
 
 import app.database as db_module
+from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
+from app.models.release import Release
 from app.models.track import FingerprintState, IdentityResolutionState, Track
 from app.models.workflow import AcquisitionState, ImportWorkflowState
 
@@ -22,37 +24,47 @@ async def dashboard_client(client: AsyncClient) -> AsyncClient:
         ]
         session.add_all(jobs)
         await session.flush()
-        session.add_all(
-            [
-                Track(
-                    job_id=jobs[0].id,
-                    title="Real Track One",
-                    artist="Artist One",
-                    album="Album One",
-                    source="slskd",
-                    source_path="/music/Artist One/Album One/Real Track One.flac",
-                    acquisition_state=AcquisitionState.downloaded,
-                    import_state=ImportWorkflowState.imported,
-                    fingerprint_state=FingerprintState.done,
-                    identity_state=IdentityResolutionState.resolved,
-                    duration_sec=180,
-                    file_size_bytes=10_000,
-                ),
-                Track(
-                    job_id=jobs[1].id,
-                    title="Real Track Two",
-                    artist="Artist Two",
-                    album="Album Two",
-                    source="youtube",
-                    source_path="/music/Artist Two/Album Two/Real Track Two.mp3",
-                    acquisition_state=AcquisitionState.downloaded,
-                    import_state=ImportWorkflowState.staged,
-                    fingerprint_state=FingerprintState.pending,
-                    identity_state=IdentityResolutionState.pending,
-                    duration_sec=240,
-                    file_size_bytes=20_000,
-                ),
-            ]
+        imported_release = Release(
+            job=jobs[0], source="slskd", title="Album One", album_artist="Artist One"
+        )
+        imported_track = Track(
+            job_id=jobs[0].id,
+            release=imported_release,
+            title="Real Track One",
+            artist="Artist One",
+            album="Album One",
+            source="slskd",
+            source_path="/staging/Real Track One.flac",
+            acquisition_state=AcquisitionState.downloaded,
+            import_state=ImportWorkflowState.imported,
+            fingerprint_state=FingerprintState.done,
+            identity_state=IdentityResolutionState.resolved,
+            duration_sec=180,
+            file_size_bytes=10_000,
+        )
+        staged_track = Track(
+            job_id=jobs[1].id,
+            title="Real Track Two",
+            artist="Artist Two",
+            album="Album Two",
+            source="youtube",
+            source_path="/staging/Real Track Two.mp3",
+            acquisition_state=AcquisitionState.downloaded,
+            import_state=ImportWorkflowState.staged,
+            fingerprint_state=FingerprintState.pending,
+            identity_state=IdentityResolutionState.pending,
+            duration_sec=240,
+            file_size_bytes=20_000,
+        )
+        session.add_all([imported_track, staged_track])
+        session.add(
+            ImportPlan(
+                release=imported_release,
+                track=imported_track,
+                source_path="/staging/Real Track One.flac",
+                destination_path="/music/Artist One/Album One/Real Track One.flac",
+                status=ImportWorkflowState.imported,
+            )
         )
         await session.commit()
     return client
@@ -70,9 +82,9 @@ async def test_dashboard_shows_real_aggregates_and_activity(
     response = await dashboard_client.get("/")
     assert response.status_code == 200
     body = response.text
-    assert 'data-stat="tracks">2<' in body
-    assert 'data-stat="artists">2<' in body
-    assert 'data-stat="albums">2<' in body
+    assert 'data-stat="tracks">1<' in body
+    assert 'data-stat="artists">1<' in body
+    assert 'data-stat="albums">1<' in body
     assert 'data-job-status="done">1<' in body
     assert 'data-job-status="running">1<' in body
     assert 'data-job-status="failed">1<' in body
@@ -80,7 +92,7 @@ async def test_dashboard_shows_real_aggregates_and_activity(
     assert 'href="/downloads?status=partial"' in body
     assert 'data-job-status="cancelled">1<' in body
     assert "Real Track One" in body
-    assert "Real Track Two" in body
+    assert "Real Track Two" not in body
     assert "partial album" in body
     assert "cancelled request" in body
 

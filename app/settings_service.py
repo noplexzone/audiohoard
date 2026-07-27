@@ -45,6 +45,8 @@ DEFAULT_FORMAT_PREFERENCE: list[str] = ["flac", "mp3", "m4a", "aac", "ogg", "opu
 DEFAULT_MIN_MP3_BITRATE = 192
 DEFAULT_ALLOW_LOWER_QUALITY_FALLBACK = True
 DEFAULT_MAX_PARTIAL_ATTEMPTS = 3
+DEFAULT_ACOUSTID_ACCEPTANCE_THRESHOLD = 0.90
+DEFAULT_SLSKD_DOWNLOAD_TIMEOUT_SECONDS = 1800
 _cache: dict[str, str] | None = None
 
 
@@ -72,6 +74,8 @@ class RuntimeSettings:
         )
     )
     max_partial_attempts: int = DEFAULT_MAX_PARTIAL_ATTEMPTS
+    acoustid_acceptance_threshold: float = DEFAULT_ACOUSTID_ACCEPTANCE_THRESHOLD
+    slskd_download_timeout_seconds: int = DEFAULT_SLSKD_DOWNLOAD_TIMEOUT_SECONDS
 
     @property
     def enabled_sources(self) -> list[str]:
@@ -180,6 +184,20 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
         max_partial = int(values.get("max_partial_attempts", str(DEFAULT_MAX_PARTIAL_ATTEMPTS)))
     except ValueError:
         max_partial = DEFAULT_MAX_PARTIAL_ATTEMPTS
+    try:
+        acoustid_threshold = float(
+            values.get("acoustid_acceptance_threshold", str(DEFAULT_ACOUSTID_ACCEPTANCE_THRESHOLD))
+        )
+    except ValueError:
+        acoustid_threshold = DEFAULT_ACOUSTID_ACCEPTANCE_THRESHOLD
+    try:
+        slskd_timeout = int(
+            values.get(
+                "slskd_download_timeout_seconds", str(DEFAULT_SLSKD_DOWNLOAD_TIMEOUT_SECONDS)
+            )
+        )
+    except ValueError:
+        slskd_timeout = DEFAULT_SLSKD_DOWNLOAD_TIMEOUT_SECONDS
     return RuntimeSettings(
         _normalize_priority(priority_raw),
         max(1, min(limit, 100)),
@@ -194,6 +212,8 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
             allow_lower_quality_fallback=allow_fallback,
         ),
         max_partial_attempts=max(1, min(max_partial, 10)),
+        acoustid_acceptance_threshold=max(0.5, min(acoustid_threshold, 0.9999)),
+        slskd_download_timeout_seconds=max(10, min(slskd_timeout, 86_400)),
     )
 
 
@@ -208,6 +228,8 @@ async def save_runtime_settings(
     source_search_budget_seconds: int | None = None,
     quality_profile: QualityProfile | None = None,
     max_partial_attempts: int | None = None,
+    acoustid_acceptance_threshold: float | None = None,
+    slskd_download_timeout_seconds: int | None = None,
 ) -> None:
     global _cache
     normalized = _normalize_priority(source_priority)
@@ -249,6 +271,26 @@ async def save_runtime_settings(
         ),
         "max_partial_attempts": str(
             max(1, min(max_partial_attempts or DEFAULT_MAX_PARTIAL_ATTEMPTS, 10))
+        ),
+        "acoustid_acceptance_threshold": str(
+            max(
+                0.5,
+                min(
+                    acoustid_acceptance_threshold
+                    if acoustid_acceptance_threshold is not None
+                    else DEFAULT_ACOUSTID_ACCEPTANCE_THRESHOLD,
+                    0.9999,
+                ),
+            )
+        ),
+        "slskd_download_timeout_seconds": str(
+            max(
+                10,
+                min(
+                    slskd_download_timeout_seconds or DEFAULT_SLSKD_DOWNLOAD_TIMEOUT_SECONDS,
+                    86_400,
+                ),
+            )
         ),
     }
     for key, value in payloads.items():

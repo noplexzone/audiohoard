@@ -159,3 +159,19 @@ def strip_non_identity_descriptors(title: str) -> str:
     t = _FEAT_RE.sub("", t)
     t = _PROD_RE.sub("", t)
     return t.strip()
+
+
+def parsed_position_evidence(filename: str) -> dict[str, int]:
+    """Preserve disc/track prefixes before display-title parsing removes them."""
+    stem = _EXT_RE.sub("", _tail(filename))
+    compound = re.match(
+        r"^(?:cd\s*)?(\d{1,2})\s*[-_.]\s*(\d{1,2})(?:\s*[-_.:]|\s+-\s|\s+)", stem, re.I
+    )
+    if compound:
+        return {"disc": int(compound.group(1)), "track_no": int(compound.group(2))}
+    simple = re.match(
+        r"^(?:cd\s*(\d{1,2})\s*[-_.]?\s*)?(\d{1,2})(?:\s*[-_.:]|\s+-\s|\s+)", stem, re.I
+    )
+    if simple:
+        return {"disc": int(simple.group(1) or 1), "track_no": int(simple.group(2))}
+    return {}

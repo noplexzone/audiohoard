@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.catalog_entities import CatalogAlbum, CatalogArtist
@@ -126,10 +127,23 @@ async def test_library_only_counts_downloaded_tracks_with_a_file_path(
         ]
     )
     await db_session.flush()
+    downloaded = await db_session.scalar(select(Track).where(Track.title == "Downloaded"))
+    imported_release = Release(job=job, source="slskd", title="Imported")
+    downloaded.import_state = ImportWorkflowState.imported
+    db_session.add(
+        ImportPlan(
+            release=imported_release,
+            track=downloaded,
+            source_path="/staging/downloaded.flac",
+            destination_path="/music/downloaded.flac",
+            status=ImportWorkflowState.imported,
+        )
+    )
+    await db_session.flush()
     page = await list_library_tracks(db_session)
     stats = await get_library_stats(db_session)
     assert [item.title for item in page.items] == ["Downloaded"]
-    assert page.items[0].file_path == "/staging/downloaded.flac"
+    assert page.items[0].file_path == "/music/downloaded.flac"
     assert (stats.track_count, stats.total_duration_sec, stats.total_bytes) == (1, 60, 100)
     assert stats.format_breakdown == {"flac": 1}
     assert await list_distinct_sources(db_session) == ["slskd"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -149,6 +150,11 @@ async def test_execute_import_copies_to_destination_temp_writes_verified_tags_an
     assert readback["title"] == "Song 1"
     assert readback["musicbrainz_trackid"] == "recording-1"
     assert plans[0].planned_operations_json is not None
+
+    await db_session.commit()
+    await asyncio.sleep(0)
+    assert not source.exists()  # noqa: ASYNC240
+    assert destination.exists()  # noqa: ASYNC240
 
 
 async def test_execute_import_rejects_source_symlink_swap_after_planning(

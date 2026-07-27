@@ -5,6 +5,7 @@ from httpx import AsyncClient
 
 import app.database as db_module
 from app.models.catalog_entities import CatalogAlbum, CatalogArtist
+from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import FingerprintState, IdentityResolutionState, Track
@@ -26,7 +27,7 @@ def _make_track(
     file_size_bytes: int | None = None,
     release_id: int | None = None,
 ) -> Track:
-    return Track(
+    track = Track(
         job_id=job_id,
         title=title,
         artist=artist,
@@ -34,9 +35,9 @@ def _make_track(
         album=album,
         year=year,
         source=source,
-        source_path=source_path,
+        source_path=f"/staging/{title}.flac",
         acquisition_state=AcquisitionState.downloaded,
-        import_state=ImportWorkflowState.discovered,
+        import_state=ImportWorkflowState.imported,
         fingerprint_state=FingerprintState.pending,
         identity_state=IdentityResolutionState.pending,
         duration_sec=duration_sec,
@@ -44,6 +45,15 @@ def _make_track(
         file_size_bytes=file_size_bytes,
         release_id=release_id,
     )
+    track.import_plans.append(
+        ImportPlan(
+            release_id=release_id or 1,
+            source_path=f"/staging/{title}.flac",
+            destination_path=source_path or f"/music/{title}.flac",
+            status=ImportWorkflowState.imported,
+        )
+    )
+    return track
 
 
 @pytest_asyncio.fixture

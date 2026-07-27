@@ -7,7 +7,11 @@ from typing import TYPE_CHECKING
 import httpx
 
 from app.http import request_with_retry
-from app.metadata.filename_parse import compose_search_query, parse_filename
+from app.metadata.filename_parse import (
+    compose_search_query,
+    parse_filename,
+    parsed_position_evidence,
+)
 from app.schemas.search import SearchRequest, SearchResult
 from app.sources.base import CapabilityState
 from app.sources.youtube import ProviderError
@@ -223,6 +227,7 @@ class SlskdAdapter:
                                 "parse_hints": list(guess.hints),
                                 "bit_rate": f.get("bitRate"),
                                 "sample_rate": f.get("sampleRate"),
+                                **parsed_position_evidence(filename),
                             },
                         )
                     )
@@ -278,4 +283,5 @@ class SlskdAdapter:
                 f"/api/v0/transfers/downloads/{username}",
                 json={"filename": filename},
             )
-            resp.raise_for_status()
+            if resp.status_code != 404:
+                resp.raise_for_status()
