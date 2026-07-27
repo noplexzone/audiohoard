@@ -308,11 +308,25 @@ async def save_runtime_settings_page(
             str(form.get("source_search_budget_seconds", runtime.source_search_budget_seconds))
             or "15"
         )
+        slskd_timeout = int(
+            str(form.get("slskd_download_timeout_seconds", runtime.slskd_download_timeout_seconds))
+            or "1800"
+        )
+        acoustid_threshold = float(
+            str(form.get("acoustid_acceptance_threshold", runtime.acoustid_acceptance_threshold))
+            or "0.90"
+        )
     except ValueError:
         return RedirectResponse(
             "/settings/behavior?error=Behavior+values+must+be+whole+numbers", status_code=303
         )
-    if not (1 <= limit <= 100 and 1 <= refresh_hours <= 720 and 3 <= source_budget <= 60):
+    if not (
+        1 <= limit <= 100
+        and 1 <= refresh_hours <= 720
+        and 3 <= source_budget <= 60
+        and 10 <= slskd_timeout <= 86400
+        and 0.5 <= acoustid_threshold <= 0.9999
+    ):
         return RedirectResponse(
             "/settings/behavior?error=Behavior+values+are+outside+the+allowed+range",
             status_code=303,
@@ -372,6 +386,8 @@ async def save_runtime_settings_page(
         source_budget,
         quality_profile=quality_profile,
         max_partial_attempts=max_partial_val,
+        acoustid_acceptance_threshold=acoustid_threshold,
+        slskd_download_timeout_seconds=slskd_timeout,
     )
     await db.commit()
     redirect_target = section if section in SETTINGS_SECTIONS else "download-sources"

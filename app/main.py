@@ -27,11 +27,16 @@ from app.jobs.dispatcher import job_dispatcher
 from app.routers import auth, health, imports, jobs, naming, search, staging, tracks
 from app.routers import catalog as catalog_router
 from app.routers import settings as settings_router
+from app.services.acquisition_cleanup import (
+    cleanup_imported_sources,
+    pending_imported_source_cleanups,
+)
+from app.services.acquisition_recovery import recover_approved_downloads
 from app.services.artist_monitoring import DiscographyRefreshScheduler
 from app.services.catalog_metadata import reconcile_duplicate_catalog_artists
 from app.services.dashboard import get_dashboard_data
 from app.services.health_status import get_health_status_service
-from app.settings_service import effective_settings_dep
+from app.settings_service import build_effective_settings, effective_settings_dep
 from app.version import APP_VERSION
 
 _TEMPLATES_DIR = files("app") / "templates"
@@ -47,10 +52,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.discography_scheduler = scheduler
     app.state.health_status_service = health_status
     async with get_session_factory()() as db:
+        pending_cleanups = await pending_imported_source_cleanups(db)
         n = await reconcile_duplicate_catalog_artists(db)
         await db.commit()
         if n:
             logger.info("Reconciled %d duplicate catalog artist(s) at startup", n)
+        repaired = await recover_approved_downloads(
+            db, await build_effective_settings(db, get_settings())
+        )
+        await db.commit()
+        if repaired:
+            logger.info("Recovered and imported %d approved release(s) at startup", repaired)
+    await cleanup_imported_sources(pending_cleanups)
     await job_dispatcher.recover()
     settings = get_settings()
     await job_dispatcher.start_watchdog(

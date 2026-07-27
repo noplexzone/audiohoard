@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Added configurable AcoustID auto-acceptance and slskd timeout controls, plus a durable timed-out candidate blocklist and alternate-source retries.
 - Added source-independent quality profiles, coherent slskd album-folder scoring, bounded missing-track continuation, AcoustID verification, and authenticated staged-audio review controls.
 - Added non-destructive queue controls to hide individual terminal downloads, clear failed downloads, or clear all finished downloads while preserving library metadata.
 - Added provider-native artist identities and discography snapshots, with per-artist watchlist-provider selection and MusicBrainz, Deezer, and iTunes discography switching.
@@ -19,6 +20,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Replaced user-facing monitoring terminology with watchlist terminology and restored a conventional settings gear icon.
 
 ### Fixed
+- Approved legacy albums now reconcile catalog tracks and resume transactional import; committed imports remove staging inputs and completed slskd transfers.
+- Library and dashboard projections now exclude staging-only downloads and require committed import destinations.
 - Album acquisitions no longer flatten coherent slskd folders into a ten-file cap, and normalized catalog matching now reports only genuinely missing tracks.
 - Reconciled slskd transfers by peer and filename when enqueue responses omit the provider UUID, and restored compatibility with the legacy staging mount when the new default path is absent.
 - Provider-specific release kinds no longer contaminate one another, and Albums-only views and watchlist policies now exclude Singles and EPs, including iTunes `- Single` and `- EP` releases.

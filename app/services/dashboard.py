@@ -10,8 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.models.job import Job, JobStatus
-from app.models.track import Track
-from app.services.catalog import LibraryStats, TrackRow, get_library_stats, to_track_row
+from app.services.catalog import LibraryStats, TrackRow, get_library_stats, list_library_tracks
 from app.sources.base import CapabilityState
 from app.sources.tidal import TidalAdapter
 from app.sources.youtube import YouTubeAdapter
@@ -113,12 +112,12 @@ async def get_dashboard_data(db: AsyncSession, settings: Settings) -> DashboardD
         .order_by(Job.created_at.desc(), Job.id.desc())
         .limit(_RECENT_LIMIT)
     )
-    tracks_result = await db.execute(select(Track).order_by(Track.id.desc()).limit(_RECENT_LIMIT))
+    recent_library = await list_library_tracks(db, sort="added", per_page=_RECENT_LIMIT)
 
     return DashboardData(
         library=library,
         job_counts=job_counts,
         recent_jobs=list(jobs_result.scalars().all()),
-        recent_tracks=[to_track_row(track) for track in tracks_result.scalars().all()],
+        recent_tracks=recent_library.items,
         providers=await _provider_readiness(settings),
     )

@@ -6,6 +6,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.metadata.filename_parse import normalize_for_catalog_match, strip_non_identity_descriptors
 from app.models.staging_review import StagingReviewItem
 from app.models.track import IdentityResolutionState, Track
 from app.models.workflow import AcoustIDVerificationState, ReviewDecision
@@ -28,9 +29,11 @@ def _best_acoustid_score(acoustid_results: list[dict[str, object]]) -> float:
     return best
 
 
-def _extract_mbids(acoustid_results: list[dict[str, object]]) -> list[str]:
-    """Extract all recording MBIDs from AcoustID raw results, sorted by score descending."""
-    pairs: list[tuple[float, str]] = []
+def _extract_mbid_scores(
+    acoustid_results: list[dict[str, object]], *, min_confidence: float
+) -> dict[str, float]:
+    """Return each observed recording MBID with its own highest result score."""
+    scores: dict[str, float] = {}
     for result in acoustid_results:
         raw_score = result.get("score", 0.0)
         try:
@@ -38,16 +41,50 @@ def _extract_mbids(acoustid_results: list[dict[str, object]]) -> list[str]:
         except ValueError:
             score = 0.0
         recordings = result.get("recordings")
-        if not isinstance(recordings, list):
+        if score < min_confidence or not isinstance(recordings, list):
             continue
         for recording in recordings:
             if not isinstance(recording, dict):
                 continue
             rid = recording.get("id")
-            if rid and score >= _MIN_CONFIDENCE:
-                pairs.append((score, str(rid)))
-    pairs.sort(key=lambda x: x[0], reverse=True)
-    return list(dict.fromkeys(mbid for _, mbid in pairs))
+            if rid:
+                mbid = str(rid)
+                scores[mbid] = max(score, scores.get(mbid, 0.0))
+    return dict(sorted(scores.items(), key=lambda item: item[1], reverse=True))
+
+
+def _recording_title_matches_track(
+    acoustid_results: list[dict[str, object]],
+    recording_mbid: str,
+    track_title: str | None,
+    acceptance_threshold: float,
+) -> bool:
+    expected_title = normalize_for_catalog_match(strip_non_identity_descriptors(track_title or ""))
+    if not expected_title:
+        return False
+    for result in acoustid_results:
+        raw_score = result.get("score")
+        if not isinstance(raw_score, (int, float, str)):
+            continue
+        try:
+            result_score = float(raw_score)
+        except ValueError:
+            continue
+        if result_score <= acceptance_threshold:
+            continue
+        recordings = result.get("recordings")
+        if not isinstance(recordings, list):
+            continue
+        for recording in recordings:
+            if not isinstance(recording, dict) or str(recording.get("id") or "") != recording_mbid:
+                continue
+            observed_title = recording.get("title")
+            if isinstance(observed_title, str) and (
+                normalize_for_catalog_match(strip_non_identity_descriptors(observed_title))
+                == expected_title
+            ):
+                return True
+    return False
 
 
 async def run_acoustid_verification(
@@ -56,6 +93,7 @@ async def run_acoustid_verification(
     acoustid_raw_results: list[dict[str, object]],
     fingerprint_duration_sec: int | None,
     db: AsyncSession,
+    acceptance_threshold: float = 0.90,
 ) -> AcoustIDVerificationState:
     """Compare AcoustID lookup results against the track's expected recording MBID.
 
@@ -63,8 +101,13 @@ async def run_acoustid_verification(
     Creates a StagingReviewItem when human review is required.
     Returns the resulting verification state.
     """
-    observed_mbids = _extract_mbids(acoustid_raw_results)
+    mbid_scores = _extract_mbid_scores(
+        acoustid_raw_results,
+        min_confidence=min(_MIN_CONFIDENCE, acceptance_threshold),
+    )
+    observed_mbids = list(mbid_scores)
     best_score = _best_acoustid_score(acoustid_raw_results)
+    best_recording_score = max(mbid_scores.values(), default=0.0)
 
     track.acoustid_evidence_json = json.dumps(
         {
@@ -78,14 +121,22 @@ async def run_acoustid_verification(
     expected_mbid = track.mbid
 
     if observed_mbids and expected_mbid:
-        if expected_mbid in observed_mbids and len(observed_mbids) == 1:
+        if (
+            expected_mbid in observed_mbids
+            and len(observed_mbids) == 1
+            and mbid_scores.get(expected_mbid, 0.0) > acceptance_threshold
+        ):
             track.acoustid_verification_state = AcoustIDVerificationState.verified
             return AcoustIDVerificationState.verified
-        reason = "ambiguous" if expected_mbid in observed_mbids else "mismatch"
+        reason = (
+            "low_confidence"
+            if expected_mbid in observed_mbids and len(observed_mbids) == 1
+            else ("ambiguous" if expected_mbid in observed_mbids else "mismatch")
+        )
         state = (
-            AcoustIDVerificationState.unavailable
-            if reason == "ambiguous"
-            else AcoustIDVerificationState.mismatch
+            AcoustIDVerificationState.mismatch
+            if reason == "mismatch"
+            else AcoustIDVerificationState.unavailable
         )
         track.acoustid_verification_state = state
         await _create_review_item(
@@ -126,7 +177,21 @@ async def run_acoustid_verification(
             )
             return AcoustIDVerificationState.unavailable
 
-    # observed_mbids present but no expected MBID — cannot confirm identity.
+    # Without an expected MBID, a strict high-confidence fingerprint can verify a
+    # catalog-selected track, but never a title-only/unbound download.
+    if (
+        best_recording_score > acceptance_threshold
+        and len(observed_mbids) == 1
+        and track.catalog_track_id is not None
+        and _recording_title_matches_track(
+            acoustid_raw_results,
+            observed_mbids[0],
+            track.title,
+            acceptance_threshold,
+        )
+    ):
+        track.acoustid_verification_state = AcoustIDVerificationState.verified
+        return AcoustIDVerificationState.verified
     track.acoustid_verification_state = AcoustIDVerificationState.unavailable
     await _create_review_item(
         track,

@@ -27,6 +27,10 @@ from app.models.release import Release
 from app.models.track import Track
 from app.models.workflow import ImportWorkflowState
 from app.naming.convention import NamingError, render_path
+from app.services.acquisition_cleanup import (
+    ImportedSourceCleanup,
+    schedule_imported_source_cleanup,
+)
 from app.services.pinned_destination import PinnedDestination
 
 logger = logging.getLogger(__name__)
@@ -351,7 +355,8 @@ async def plan_release_import(
             "recheck-destination",
             "atomic-rename",
             "fsync-destination-directory",
-            "retain-staged-source",
+            "remove-staged-source-after-commit",
+            "remove-completed-provider-entry-after-commit",
         ]
 
         try:
@@ -594,6 +599,14 @@ async def execute_release_import(
         await _reconcile_catalog_ownership(db, release)
         await db.flush()
 
+        cleanup_items = tuple(
+            ImportedSourceCleanup(
+                plan.id,
+                Path(plan.staging_path or plan.source_path),
+                plan.track.acquisition_provenance_json if plan.track else None,
+            )
+            for plan in plans
+        )
         committed_destinations = tuple(created_destinations)
         committed_backups = tuple(backup_paths)
         pending_temps = tuple(temp_paths)
@@ -608,6 +621,7 @@ async def execute_release_import(
                         continue
             finally:
                 _close_pinned_destinations(list(committed_handles))
+            schedule_imported_source_cleanup(cleanup_items)
 
         def rollback_filesystem_commit() -> None:
             try:

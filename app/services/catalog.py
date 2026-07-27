@@ -244,9 +244,10 @@ def _library_artifact_filter() -> Any:
     )
     return and_(
         Track.acquisition_state == AcquisitionState.downloaded,
+        Track.import_state == ImportWorkflowState.imported,
         Track.file_size_bytes.is_not(None),
         Track.file_size_bytes > 0,
-        or_(_non_empty(Track.source_path), imported_destination),
+        imported_destination,
     )
 
 
@@ -480,13 +481,17 @@ async def get_artists_page(
     artist_expr = _artist_expr()
     artist_label = artist_expr.label("display_name")
 
-    track_stats_stmt = select(
-        artist_label,
-        func.count(Track.id).label("track_count"),
-        func.coalesce(func.sum(Track.duration_sec), 0).label("total_duration_sec"),
-        func.min(Track.year).label("min_year"),
-        func.max(Track.year).label("max_year"),
-    ).group_by(artist_expr)
+    track_stats_stmt = (
+        select(
+            artist_label,
+            func.count(Track.id).label("track_count"),
+            func.coalesce(func.sum(Track.duration_sec), 0).label("total_duration_sec"),
+            func.min(Track.year).label("min_year"),
+            func.max(Track.year).label("max_year"),
+        )
+        .where(_library_artifact_filter())
+        .group_by(artist_expr)
+    )
     if q:
         track_stats_stmt = track_stats_stmt.where(artist_expr.ilike(f"%{q}%"))
     track_stats = track_stats_stmt.subquery()
@@ -496,7 +501,7 @@ async def get_artists_page(
             artist_expr.label("display_name"),
             func.count(func.distinct(Track.release_id)).label("release_count"),
         )
-        .where(Track.release_id.is_not(None))
+        .where(Track.release_id.is_not(None), _library_artifact_filter())
         .group_by(artist_expr)
         .subquery()
     )
@@ -506,7 +511,7 @@ async def get_artists_page(
             _album_expr().label("album"),
             _year_expr().label("year"),
         )
-        .where(Track.release_id.is_(None))
+        .where(Track.release_id.is_(None), _library_artifact_filter())
         .group_by(artist_expr, _album_expr(), _year_expr())
         .subquery()
     )
@@ -581,6 +586,7 @@ async def get_artists_page(
                 and_(
                     artist_expr.in_(display_names),
                     Track.file_format.is_not(None),
+                    _library_artifact_filter(),
                 )
             )
             .distinct()
@@ -608,7 +614,9 @@ async def get_artist_detail(
     page = max(1, page)
     artist_expr = _artist_expr()
 
-    count_stmt = select(func.count(Track.id)).where(artist_expr == artist_name)
+    count_stmt = select(func.count(Track.id)).where(
+        artist_expr == artist_name, _library_artifact_filter()
+    )
     total_tracks = int((await db.scalar(count_stmt)) or 0)
 
     page = _clamp_page(page, total_tracks, per_page)
@@ -616,7 +624,7 @@ async def get_artist_detail(
     stmt = (
         select(Track)
         .options(selectinload(Track.release), selectinload(Track.import_plans))
-        .where(artist_expr == artist_name)
+        .where(artist_expr == artist_name, _library_artifact_filter())
         .order_by(Track.year, Track.album, Track.disc, Track.track_no, Track.title, Track.id)
         .offset(_page_offset(page, per_page))
         .limit(per_page)
@@ -624,11 +632,13 @@ async def get_artist_detail(
     tracks = list((await db.execute(stmt)).scalars().all())
 
     total_duration_stmt = select(func.coalesce(func.sum(Track.duration_sec), 0)).where(
-        artist_expr == artist_name
+        artist_expr == artist_name, _library_artifact_filter()
     )
     total_duration = int((await db.scalar(total_duration_stmt)) or 0)
 
-    album_count = await _count_album_groups(db, artist_expr == artist_name)
+    album_count = await _count_album_groups(
+        db, artist_expr == artist_name, _library_artifact_filter()
+    )
 
     album_map: dict[tuple[int | None, str | None, str | None], AlbumGroup] = {}
     for t in tracks:

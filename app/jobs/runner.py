@@ -22,6 +22,7 @@ from app.metadata.deezer import DeezerClient
 from app.metadata.filename_parse import (
     normalize_for_catalog_match,
     parse_filename,
+    parsed_position_evidence,
     strip_non_identity_descriptors,
 )
 from app.metadata.musicbrainz import MusicBrainzClient
@@ -29,6 +30,7 @@ from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
 from app.models.job import Job, JobStatus
 from app.models.path_preview import PathPreview
 from app.models.release import Release
+from app.models.source_candidate_block import SourceCandidateBlock
 from app.models.track import FingerprintState, IdentityResolutionState, Track
 from app.models.workflow import AcquisitionState
 from app.naming.convention import NamingError, render_path
@@ -382,7 +384,14 @@ async def _run_job_in_session(
     await db.flush()
 
     try:
-        results = _selected_result(job) or await _call_fetch_results(job, cfg, db)
+        runtime_settings = await get_runtime_settings(db)
+        cfg = cfg.model_copy(
+            update={"slskd_poll_timeout": float(runtime_settings.slskd_download_timeout_seconds)}
+        )
+        selected_results = _selected_result(job)
+        if selected_results:
+            selected_results = await _without_blocked_slskd_results(selected_results, db)
+        results = selected_results or await _call_fetch_results(job, cfg, db)
         catalog_album = await _load_catalog_album(db, job.catalog_album_id)
         catalog_tracks = list(catalog_album.tracks) if catalog_album is not None else []
         if job.catalog_track_id is not None:
@@ -526,6 +535,29 @@ async def _run_job_in_session(
                 if track is not None:
                     track.acquisition_state = AcquisitionState.failed
                     track.source_status = exc.code
+                if exc.code == "transfer_timeout" and result.source == "slskd":
+                    peer = str(result.metadata.get("username") or "")
+                    filename = str(result.metadata.get("filename") or "")
+                    if peer and filename:
+                        existing_block = await db.scalar(
+                            select(SourceCandidateBlock.id).where(
+                                SourceCandidateBlock.provider == "slskd",
+                                SourceCandidateBlock.peer == peer,
+                                SourceCandidateBlock.filename == filename,
+                            )
+                        )
+                        if existing_block is None:
+                            db.add(
+                                SourceCandidateBlock(
+                                    provider="slskd",
+                                    peer=peer,
+                                    filename=filename,
+                                    reason="timeout",
+                                )
+                            )
+                        await db.flush()
+                        if commit_progress:
+                            await db.commit()
                 logger.warning("Provider result processing failed with code %s", exc.code)
                 failures.append(json.dumps(exc.details(), sort_keys=True))
             except Exception:
@@ -768,6 +800,32 @@ def _selected_result(job: Job) -> list[SearchResult] | None:
     return [SearchResult.model_validate(json.loads(job.selected_result_json))]
 
 
+async def _without_blocked_slskd_results(
+    results: list[SearchResult], db: AsyncSession
+) -> list[SearchResult]:
+    if not any(result.source == "slskd" for result in results):
+        return results
+    blocked = set(
+        (
+            await db.execute(
+                select(SourceCandidateBlock.peer, SourceCandidateBlock.filename).where(
+                    SourceCandidateBlock.provider == "slskd"
+                )
+            )
+        ).all()
+    )
+    return [
+        result
+        for result in results
+        if result.source != "slskd"
+        or (
+            str(result.metadata.get("username") or ""),
+            str(result.metadata.get("filename") or ""),
+        )
+        not in blocked
+    ]
+
+
 async def _call_fetch_results(job: Job, cfg: Settings, db: AsyncSession) -> list[SearchResult]:
     try:
         return await _fetch_results(job, cfg, db)
@@ -862,8 +920,9 @@ async def _fetch_results(
                     adapter, req, job, _scoring_album, runtime, db
                 )
             else:
-                results = (await adapter.search(req))[:limit]
+                results = await adapter.search(req)
 
+            results = (await _without_blocked_slskd_results(results, db))[:limit]
             if not results:
                 attempted.append({"source": source, "status": "empty", "reason": "zero results"})
                 _set_acquisition_provenance(job, attempted)
@@ -909,6 +968,24 @@ async def _fetch_slskd_album_results(
     from app.services.slskd_scoring import select_best_folder
 
     folders, _raw = await adapter.search_album_folders(req)
+    if not folders:
+        return []
+    blocked = set(
+        (
+            await db.execute(
+                select(SourceCandidateBlock.peer, SourceCandidateBlock.filename).where(
+                    SourceCandidateBlock.provider == "slskd"
+                )
+            )
+        ).all()
+    )
+    # Reject an entire folder if any member is blocked; selecting the remainder
+    # would turn a coherent album into an incomplete candidate.
+    folders = [
+        folder
+        for folder in folders
+        if not any((folder.username, item.filename) in blocked for item in folder.files)
+    ]
     if not folders:
         return []
 
@@ -957,6 +1034,7 @@ async def _fetch_slskd_album_results(
                     "sample_rate": slskd_file.sample_rate,
                     "folder_score": best.score,
                     "parent_dir": best.parent_dir,
+                    **parsed_position_evidence(filename),
                 },
             )
         )
@@ -1234,11 +1312,13 @@ async def _run_fingerprint_and_verify(track: Track, cfg: Settings, db: AsyncSess
 
     from app.services.acoustid_verification import run_acoustid_verification
 
+    runtime = await get_runtime_settings(db)
     await run_acoustid_verification(
         track,
         acoustid_raw_results=raw_results,
         fingerprint_duration_sec=duration,
         db=db,
+        acceptance_threshold=runtime.acoustid_acceptance_threshold,
     )
 
 

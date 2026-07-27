@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import FingerprintState, IdentityResolutionState, Track
@@ -35,7 +36,7 @@ def _make_track(
     file_size_bytes: int | None = 1024,
     release_id: int | None = None,
 ) -> Track:
-    return Track(
+    track = Track(
         job_id=job_id,
         title=title,
         artist=artist,
@@ -45,7 +46,7 @@ def _make_track(
         source=source,
         source_path=source_path,
         acquisition_state=AcquisitionState.downloaded,
-        import_state=ImportWorkflowState.discovered,
+        import_state=ImportWorkflowState.imported,
         fingerprint_state=FingerprintState.pending,
         identity_state=IdentityResolutionState.pending,
         duration_sec=duration_sec,
@@ -53,6 +54,15 @@ def _make_track(
         file_size_bytes=file_size_bytes,
         release_id=release_id,
     )
+    plan = ImportPlan(
+        release_id=release_id or 1,
+        track=track,
+        source_path=source_path or "/staging/source.flac",
+        destination_path=source_path or "/music/track.flac",
+        status=ImportWorkflowState.imported,
+    )
+    track.import_plans.append(plan)
+    return track
 
 
 @pytest.fixture

@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     slskd_url: str = ""
     slskd_api_key: str = ""
     slskd_poll_interval: float = Field(default=5.0, ge=0.1)
-    slskd_poll_timeout: float = Field(default=1800.0, ge=10.0)
+    slskd_poll_timeout: float = Field(default=1800.0, ge=10.0, le=86_400.0)
 
     # Prowlarr
     prowlarr_url: str = ""
