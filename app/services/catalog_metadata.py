@@ -381,9 +381,20 @@ async def fetch_and_store_album(
     provider = build_metadata_provider(provider_name, settings)
     if provider is None:
         return album
+    known_track_count = album.track_count or 0
+    artist = await db.get(CatalogArtist, album.artist_id)
+    if artist is None:
+        raise RuntimeError(f"Catalog artist {album.artist_id} not found for album {album.id}")
     detail = await provider.get_album(provider_id)
-    album = await upsert_catalog_album(db, album.artist, detail)
-    for existing in list(album.tracks):
+    album = await upsert_catalog_album(db, artist, detail)
+    existing_tracks = list(
+        (
+            await db.scalars(
+                select(CatalogAlbumTrack).where(CatalogAlbumTrack.album_id == album.id)
+            )
+        ).all()
+    )
+    for existing in existing_tracks:
         await db.delete(existing)
     await db.flush()
     for track in detail.tracks:
@@ -397,7 +408,8 @@ async def fetch_and_store_album(
                 recording_mbid=track.recording_mbid,
             )
         )
-    album.track_count = len(detail.tracks) or album.track_count
+    hydrated_track_count = max(detail.track_count or 0, len(detail.tracks))
+    album.track_count = max(known_track_count, hydrated_track_count) or None
     await db.flush()
     await db.refresh(album, ["tracks"])
     return album
