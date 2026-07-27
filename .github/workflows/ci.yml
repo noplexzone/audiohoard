@@ -4,10 +4,11 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ["v*"]
 
 jobs:
   quality:
-    name: Quality checks
+    name: CI / Full suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +37,7 @@ jobs:
         run: uv build
 
   docker:
-    name: Docker build
+    name: CI / Docker build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

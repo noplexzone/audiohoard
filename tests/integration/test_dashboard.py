@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from html.parser import HTMLParser
+
 import pytest_asyncio
 from httpx import AsyncClient
 
@@ -107,6 +109,36 @@ async def test_dashboard_empty_state_is_truthful(client: AsyncClient) -> None:
     assert "Recent activity" in body
 
 
+class _NavAnchorCollector(HTMLParser):
+    """Collects <a> elements found inside named <nav> elements."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._active: str | None = None
+        self._depth: int = 0
+        self.anchors: dict[str, list[dict[str, str | None]]] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr = dict(attrs)
+        if tag == "nav":
+            if self._active is None:
+                label = attr.get("aria-label")
+                if label in {"Primary navigation", "Mobile navigation"}:
+                    self._active = label
+                    self._depth = 1
+                    self.anchors.setdefault(label, [])
+            else:
+                self._depth += 1
+        elif tag == "a" and self._active is not None:
+            self.anchors[self._active].append(attr)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._active is not None and tag == "nav":
+            self._depth -= 1
+            if self._depth == 0:
+                self._active = None
+
+
 async def test_shared_shell_has_accessible_active_navigation(client: AsyncClient) -> None:
     response = await client.get("/library")
     assert response.status_code == 200
@@ -125,6 +157,20 @@ async def test_shared_shell_has_accessible_active_navigation(client: AsyncClient
     assert "v0.6.2" in body
     assert "fonts.googleapis.com" not in body
     assert "fonts.gstatic.com" not in body
+
+    collector = _NavAnchorCollector()
+    collector.feed(body)
+    for nav_label in ("Primary navigation", "Mobile navigation"):
+        assert nav_label in collector.anchors, f"{nav_label!r} nav not found in document"
+        active_library = [
+            a
+            for a in collector.anchors[nav_label]
+            if a.get("href") == "/library" and a.get("aria-current") == "page"
+        ]
+        assert len(active_library) == 1, (
+            f"{nav_label!r}: expected exactly 1 /library anchor with aria-current='page', "
+            f"found {len(active_library)}"
+        )
 
 
 async def test_dashboard_provider_readiness_uses_local_configuration(

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 os.environ.setdefault("SECRET_KEY", "test-secret")
 
+import app.models  # noqa: F401  register all ORM models before any Base.metadata use
 from app.config import Settings, override_settings
 from app.database import Base, reset_engine
 from app.main import create_app
