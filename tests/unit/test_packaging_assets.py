@@ -70,29 +70,30 @@ def test_branding_sources_are_the_requested_artwork() -> None:
 def test_generated_png_icons_use_the_requested_artwork() -> None:
     from PIL import Image, ImageChops
 
-    source = Image.open("app/static/branding/source-app-icon.png").convert("RGBA")
-    for name, size in (
-        ("favicon-16.png", 16),
-        ("favicon-32.png", 32),
-        ("icon-32.png", 32),
-        ("apple-touch-icon.png", 180),
-        ("icon-192.png", 192),
-        ("icon-512.png", 512),
+    branding = Path("app/static/branding")
+    for name, size, source_name in (
+        ("favicon-16.png", 16, "source-favicon.png"),
+        ("favicon-32.png", 32, "source-favicon.png"),
+        ("icon-32.png", 32, "source-app-icon.png"),
+        ("apple-touch-icon.png", 180, "source-app-icon.png"),
+        ("icon-192.png", 192, "source-app-icon.png"),
+        ("icon-512.png", 512, "source-app-icon.png"),
     ):
-        actual = Image.open(f"app/static/branding/{name}").convert("RGBA")
+        source = Image.open(branding / source_name).convert("RGBA")
+        actual = Image.open(branding / name).convert("RGBA")
         expected = source.resize((size, size), Image.Resampling.LANCZOS)
         assert ImageChops.difference(actual, expected).getbbox() is None
 
 
-def test_favicon_ico_uses_the_requested_artwork() -> None:
+def test_favicon_ico_uses_the_requested_artwork_at_every_size() -> None:
     from PIL import Image, ImageChops
 
     source = Image.open("app/static/branding/source-favicon.png").convert("RGBA")
     ico = Image.open("app/static/branding/favicon.ico")
-    for index in range(getattr(ico, "n_frames", 1)):
-        ico.seek(index)
-        actual = ico.convert("RGBA")
-        expected = source.resize(actual.size, Image.Resampling.LANCZOS)
+    assert ico.ico.sizes() == {(16, 16), (32, 32), (48, 48)}
+    for size in ico.ico.sizes():
+        actual = ico.ico.getimage(size).convert("RGBA")
+        expected = source.resize(size, Image.Resampling.LANCZOS)
         assert ImageChops.difference(actual, expected).getbbox() is None
 
 
