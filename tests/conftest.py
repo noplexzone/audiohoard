@@ -25,6 +25,7 @@ def test_settings(tmp_path: Path) -> Settings:
         secret_key="test-secret",
         auth_cookie_secure=False,
         library_root=tmp_path / "library",
+        staging_root=tmp_path / "staging",
         slskd_url="",
         slskd_api_key="",
         prowlarr_url="",

@@ -1112,3 +1112,84 @@ async def test_background_enqueue_checkpoint_is_visible_before_poll(
     run_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await run_task
+
+
+async def test_first_complete_album_run_is_done_not_partial(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: newly created Release must be in root_release_ids so acquired_ids
+    counts all downloaded tracks and the job is marked done, not partial."""
+    artist = CatalogArtist(name="The Artist")
+    album = CatalogAlbum(artist=artist, title="The Album", track_count=2, year=2024)
+    cat_tracks = [
+        CatalogAlbumTrack(album=album, position=1, disc=1, title="Track One"),
+        CatalogAlbumTrack(album=album, position=2, disc=1, title="Track Two"),
+    ]
+    job = Job(
+        source="slskd",
+        query="The Artist The Album",
+        status=JobStatus.pending,
+        catalog_album=album,
+    )
+    db_session.add_all([artist, album, *cat_tracks, job])
+    await db_session.flush()
+
+    async def fake_fetch_results(j: Job, cfg: Settings, db: AsyncSession) -> list[SearchResult]:
+        return [
+            SearchResult(
+                source="slskd",
+                title=t.title,
+                artist="The Artist",
+                album="The Album",
+                url=f"slskd://user/{i:02d} {t.title}.flac",
+                metadata={"username": "user", "filename": f"The Album/{i:02d} {t.title}.flac"},
+            )
+            for i, t in enumerate(cat_tracks, start=1)
+        ]
+
+    async def fake_prepare(
+        result: SearchResult,
+        source: str,
+        cfg: Settings,
+        track: Track | None = None,
+        *,
+        checkpoint=None,
+    ) -> tuple[None, str]:
+        if track is not None:
+            track.source_path = "/staging/track.flac"
+            track.staging_path = track.source_path
+            track.acquisition_state = AcquisitionState.downloaded
+        return None, "downloaded"
+
+    async def noop_mb(track: Track, cfg: Settings) -> None:
+        pass
+
+    async def noop_deezer(track: Track, cfg: Settings) -> None:
+        pass
+
+    async def noop_fingerprint_verify(track: Track, cfg: Settings, db: AsyncSession) -> None:
+        pass
+
+    async def noop_preview(track: Track, db: AsyncSession, cfg: Settings) -> None:
+        pass
+
+    async def noop_auto_import(release: Release, db: AsyncSession, cfg: Settings) -> None:
+        pass
+
+    monkeypatch.setattr(runner, "_fetch_results", fake_fetch_results)
+    monkeypatch.setattr(runner, "_prepare_acquisition", fake_prepare)
+    monkeypatch.setattr(runner, "_enrich_musicbrainz", noop_mb)
+    monkeypatch.setattr(runner, "_enrich_deezer", noop_deezer)
+    monkeypatch.setattr(runner, "_run_fingerprint_and_verify", noop_fingerprint_verify)
+    monkeypatch.setattr(runner, "_compute_path_preview", noop_preview)
+    monkeypatch.setattr(runner, "_try_auto_import", noop_auto_import)
+
+    await runner.run_job(job.id, db_session, test_settings)
+
+    assert job.status == JobStatus.done, (
+        f"expected done but got {job.status}; result_json={job.result_json}"
+    )
+    continuation_jobs = list(
+        (await db_session.scalars(select(Job).where(Job.parent_job_id == job.id))).all()
+    )
+    assert len(continuation_jobs) == 0, "complete first run must not spawn continuation jobs"

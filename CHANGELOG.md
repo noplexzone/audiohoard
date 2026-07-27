@@ -7,16 +7,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Added source-independent quality profiles, coherent slskd album-folder scoring, bounded missing-track continuation, AcoustID verification, and authenticated staged-audio review controls.
 - Added non-destructive queue controls to hide individual terminal downloads, clear failed downloads, or clear all finished downloads while preserving library metadata.
 - Added provider-native artist identities and discography snapshots, with per-artist watchlist-provider selection and MusicBrainz, Deezer, and iTunes discography switching.
 
 ### Changed
+- Replaced the manual Import tab with automatic transactional import after catalog completeness and fingerprint verification gates pass.
 - Replaced every application icon and favicon with the new Audiohoard artwork.
 - Consolidated Artists into one filterable watchlist with artwork and release-type counts.
 - Library views now include only successfully downloaded files and display their paths and metadata.
 - Replaced user-facing monitoring terminology with watchlist terminology and restored a conventional settings gear icon.
 
 ### Fixed
+- Album acquisitions no longer flatten coherent slskd folders into a ten-file cap, and normalized catalog matching now reports only genuinely missing tracks.
 - Reconciled slskd transfers by peer and filename when enqueue responses omit the provider UUID, and restored compatibility with the legacy staging mount when the new default path is absent.
 - Provider-specific release kinds no longer contaminate one another, and Albums-only views and watchlist policies now exclude Singles and EPs, including iTunes `- Single` and `- EP` releases.
 - Corrected slskd download enqueue payloads to use the required request array, preserved validation details, and handled nested transfer responses.

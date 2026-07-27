@@ -38,6 +38,12 @@ The web app never starts an interactive login. Missing or expired authentication
 - **AcoustID** — acoustic fingerprinting via `fpcalc` (optional; degrades gracefully when binary absent)
 - **AcoustID Lookup** — matches fingerprint against the AcoustID database when a key is configured
 
+## Automated acquisition and import
+
+Album searches group slskd results by peer, folder, and format before selecting a coherent release according to the quality profile in Settings. Incomplete albums automatically schedule bounded, track-specific continuation searches without redownloading catalog tracks already acquired.
+
+Downloaded files are fingerprinted and compared with the expected MusicBrainz recording through AcoustID. Complete releases import transactionally without a manual Import step only when every catalog track is verified or explicitly approved. Mismatches and unavailable/ambiguous fingerprints remain staged under **Downloads → Pending review**, where authenticated users can listen and approve or deny them. Denial retains the staged file as evidence and schedules bounded reacquisition.
+
 ## Naming Convention
 
 Files are renamed according to a strict, configurable template:

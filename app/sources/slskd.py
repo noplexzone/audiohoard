@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -10,6 +11,9 @@ from app.metadata.filename_parse import compose_search_query, parse_filename
 from app.schemas.search import SearchRequest, SearchResult
 from app.sources.base import CapabilityState
 from app.sources.youtube import ProviderError
+
+if TYPE_CHECKING:
+    from app.services.slskd_scoring import AlbumFolder
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +100,63 @@ class SlskdAdapter:
         except Exception as exc:
             logger.warning("slskd health check failed: %s", exc)
             return CapabilityState(available=False, reason=str(exc))
+
+    async def search_album_folders(
+        self,
+        query: SearchRequest,
+    ) -> tuple[list[AlbumFolder], list[dict[str, object]]]:
+        """Search slskd and return (album_folders, raw_responses).
+
+        Raw responses are returned so the caller can inspect individual files for
+        per-track enqueueing.  Audio-only grouping is performed here; the caller
+        applies scoring and selection.
+        """
+        from app.services.slskd_scoring import group_slskd_files_into_folders
+
+        if not self._base_url or not self._api_key:
+            return [], []
+        async with self._client() as client:
+            resp = await request_with_retry(
+                client,
+                "POST",
+                "/api/v0/searches",
+                json={
+                    "searchText": compose_search_query(
+                        query.query, query.artist, query.album, query.track
+                    ),
+                    "fileLimit": 500,
+                },
+            )
+            resp.raise_for_status()
+            search_id = resp.json().get("id") or resp.json().get("searchId", "")
+            if not search_id:
+                raise ProviderError(
+                    "missing_search_id",
+                    "slskd create-search response did not include an id",
+                    "search",
+                )
+
+            elapsed = 0.0
+            while elapsed < self._search_timeout_sec:
+                await asyncio.sleep(_SEARCH_POLL_INTERVAL)
+                elapsed += _SEARCH_POLL_INTERVAL
+                state_resp = await request_with_retry(
+                    client, "GET", f"/api/v0/searches/{search_id}"
+                )
+                if state_resp.status_code == 200:
+                    state = state_resp.json()
+                    if state.get("state") in ("Completed", "Stopped", "TimedOut"):
+                        break
+
+            files_resp = await request_with_retry(
+                client, "GET", f"/api/v0/searches/{search_id}/responses"
+            )
+            if files_resp.status_code != 200:
+                return [], []
+
+            raw_responses: list[dict[str, object]] = files_resp.json()
+            folders = group_slskd_files_into_folders(raw_responses)
+            return folders, raw_responses
 
     async def search(self, query: SearchRequest) -> list[SearchResult]:
         if not self._base_url or not self._api_key:

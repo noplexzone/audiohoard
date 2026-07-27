@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text, false, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, false, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -47,6 +47,10 @@ class Job(Base):
     queue_hidden: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
+    parent_job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
+    )
+    partial_attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     catalog_album_id: Mapped[int | None] = mapped_column(
         ForeignKey("catalog_albums.id", ondelete="SET NULL"), nullable=True
     )
