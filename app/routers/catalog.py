@@ -17,7 +17,12 @@ from app.auth import get_current_user, require_mutation
 from app.config import Settings
 from app.database import get_db
 from app.jobs.dispatcher import job_dispatcher
-from app.models.catalog_entities import CatalogAlbum, CatalogArtist, CatalogArtistIdentity
+from app.models.catalog_entities import (
+    CatalogAlbum,
+    CatalogAlbumTrack,
+    CatalogArtist,
+    CatalogArtistIdentity,
+)
 from app.models.job import Job, JobStatus
 from app.services.catalog import (
     get_artist_detail,
@@ -40,6 +45,46 @@ from app.settings_service import effective_settings_dep, get_runtime_settings
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 logger = logging.getLogger(__name__)
+
+
+async def _ensure_catalog_tracks(
+    db: AsyncSession, settings: Settings, album: CatalogAlbum
+) -> None:
+    """Hydrate and persist CatalogAlbumTrack rows for *album* when absent but expected.
+
+    Called at dispatch time (direct download and bulk monitored download) so the job
+    runner always has a complete catalog manifest available for binding and gap-detection.
+    Raises on failure so callers can surface a 502 rather than silently dispatching a
+    job with an empty manifest.
+
+    Uses a COUNT query rather than accessing album.tracks directly to avoid triggering
+    a SQLAlchemy lazy-load on an uninitialized collection in async context.
+    """
+    from sqlalchemy import func
+
+    existing = int(
+        await db.scalar(
+            select(func.count(CatalogAlbumTrack.id)).where(CatalogAlbumTrack.album_id == album.id)
+        )
+        or 0
+    )
+    expected_before_hydration = album.track_count or 0
+    if existing and (not expected_before_hydration or existing >= expected_before_hydration):
+        return
+    await fetch_and_store_album(db, settings, album)
+    after = int(
+        await db.scalar(
+            select(func.count(CatalogAlbumTrack.id)).where(CatalogAlbumTrack.album_id == album.id)
+        )
+        or 0
+    )
+    expected = max(expected_before_hydration, album.track_count or 0)
+    album.track_count = expected or None
+    if not after or (expected and after < expected):
+        raise RuntimeError(
+            f"Catalog album {album.id} has track_count={album.track_count} "
+            f"but only {after} catalog tracks could be loaded"
+        )
 
 
 def _selected_provider(
@@ -676,6 +721,7 @@ async def catalog_album_page(
 async def download_monitored_catalog_albums(
     artist_id: int,
     db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
     load = selectinload(CatalogArtist.identities).selectinload(CatalogArtistIdentity.releases)
@@ -701,6 +747,40 @@ async def download_monitored_catalog_albums(
                 canonical[album.id] = album
     job_ids: list[int] = []
     for album in canonical.values():
+        album_id = album.id
+        album_title = album.title
+        album_query = f"{artist.name} {album_title}".strip()
+        # Hydrate catalog tracks before dispatching so the runner has a complete
+        # manifest. A failed hydration is retained as an actionable failed job
+        # instead of silently disappearing from the bulk request.
+        try:
+            await _ensure_catalog_tracks(db, settings, album)
+        except Exception:
+            await db.rollback()
+            logger.warning(
+                "Pre-dispatch bulk hydration failed for album %d (%s)",
+                album_id,
+                album_title,
+            )
+            failed_job = Job(
+                source="priority",
+                query=album_query,
+                status=JobStatus.failed,
+                catalog_album_id=album_id,
+                result_json=json.dumps(
+                    {
+                        "error": {
+                            "code": "catalog_tracks_incomplete",
+                            "operation": "hydrate",
+                            "retryable": True,
+                        }
+                    },
+                    sort_keys=True,
+                ),
+            )
+            db.add(failed_job)
+            await db.commit()
+            continue
         job = Job(
             source="priority",
             query=f"{artist.name} {album.title}".strip(),
@@ -708,9 +788,8 @@ async def download_monitored_catalog_albums(
             catalog_album_id=album.id,
         )
         db.add(job)
-        await db.flush()
+        await db.commit()
         job_ids.append(job.id)
-    await db.commit()
     for job_id in job_ids:
         await job_dispatcher.dispatch(job_id)
     return RedirectResponse("/downloads", status_code=303)
@@ -720,16 +799,25 @@ async def download_monitored_catalog_albums(
 async def download_catalog_album(
     album_id: int,
     db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
     result = await db.execute(
         select(CatalogAlbum)
         .where(CatalogAlbum.id == album_id)
-        .options(selectinload(CatalogAlbum.artist))
+        .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
     )
     album = result.scalar_one_or_none()
     if album is None:
         raise HTTPException(status_code=404, detail="Catalog album not found")
+    try:
+        await _ensure_catalog_tracks(db, settings, album)
+    except Exception:
+        logger.warning("Pre-dispatch catalog hydration failed for album %d", album_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not load album tracklist from provider; download not started",
+        ) from None
     query = f"{album.artist.name} {album.title}".strip()
     job = Job(source="priority", query=query, status=JobStatus.pending, catalog_album_id=album.id)
     db.add(job)

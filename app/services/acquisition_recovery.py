@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from app.models.release import Release
 from app.models.track import IdentityResolutionState, Track
 from app.models.workflow import AcoustIDVerificationState, AcquisitionState, ImportWorkflowState
 from app.services.auto_import import try_auto_import_release
+
+logger = logging.getLogger(__name__)
 
 
 async def recover_approved_downloads(
@@ -57,6 +60,9 @@ async def recover_approved_downloads(
     recovered = 0
     for release in releases:
         release.recovery_attempted_at = datetime.now(UTC)
+        # Persist the attempt marker and any prior release's changes before provider
+        # HTTP so recovery never carries a SQLite write lock across network waits.
+        await db.commit()
         tracks = list(
             (
                 await db.scalars(
@@ -79,15 +85,51 @@ async def recover_approved_downloads(
             album = await db.scalar(
                 select(CatalogAlbum)
                 .where(CatalogAlbum.id == album_id)
-                .options(selectinload(CatalogAlbum.tracks))
+                .options(
+                    selectinload(CatalogAlbum.artist),
+                    selectinload(CatalogAlbum.tracks),
+                )
             )
         elif release.release_mbid:
             album = await db.scalar(
                 select(CatalogAlbum)
                 .where(CatalogAlbum.mbid == release.release_mbid)
-                .options(selectinload(CatalogAlbum.tracks))
+                .options(
+                    selectinload(CatalogAlbum.artist),
+                    selectinload(CatalogAlbum.tracks),
+                )
             )
+        # Hydrate absent and partial manifests. Legacy albums may not have their own
+        # track_count, so the release/download count is also valid evidence that a
+        # provider tracklist is expected.
+        expected_tracks = (
+            (album.track_count or release.track_count or len(tracks)) if album is not None else 0
+        )
+        if album is not None and len(album.tracks) < expected_tracks:
+            album_id_for_log = album.id
+            try:
+                from app.services.catalog_metadata import (
+                    fetch_and_store_album as _fetch_and_store_album,
+                )
+
+                album = await _fetch_and_store_album(db, settings, album)
+            except Exception:
+                await db.rollback()
+                logger.warning(
+                    "Catalog track hydration failed for album %d during recovery",
+                    album_id_for_log,
+                )
+                continue
         if album is None or (release.track_count and len(tracks) != release.track_count):
+            continue
+        expected_tracks = max(
+            expected_tracks,
+            album.track_count or 0,
+            release.track_count or 0,
+            len(tracks),
+        )
+        album.track_count = expected_tracks
+        if not album.tracks or len(album.tracks) < expected_tracks:
             continue
         unused = {cat.id: cat for cat in album.tracks}
         assignments: list[tuple[Track, CatalogAlbumTrack]] = []

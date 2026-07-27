@@ -382,6 +382,10 @@ async def _run_job_in_session(
     job.status = JobStatus.running
     job.updated_at = _now()
     await db.flush()
+    # Bug 5: release the SQLite write lock before long provider HTTP/search/polling so
+    # concurrent settings writes are not blocked during the acquisition wait.
+    if commit_progress:
+        await db.commit()
 
     try:
         runtime_settings = await get_runtime_settings(db)
@@ -398,6 +402,73 @@ async def _run_job_in_session(
             catalog_tracks = [
                 track for track in catalog_tracks if track.id == job.catalog_track_id
             ]
+
+        declared_track_count = catalog_album.track_count if catalog_album is not None else None
+        # Defensive hydration: an absent or partial catalog manifest cannot be used
+        # to decide album completeness. Otherwise a 16-track album with only 10
+        # persisted catalog rows can be falsely closed as a complete 10-track release.
+        if (
+            catalog_album is not None
+            and job.catalog_track_id is None
+            and (
+                not catalog_tracks
+                or (catalog_album.track_count and len(catalog_tracks) < catalog_album.track_count)
+            )
+        ):
+            try:
+                from app.services.catalog_metadata import (
+                    fetch_and_store_album as _fetch_and_store_album,
+                )
+
+                catalog_album = await _fetch_and_store_album(db, cfg, catalog_album)
+                if commit_progress:
+                    await db.commit()
+                catalog_album = await _load_catalog_album(db, job.catalog_album_id)
+                if catalog_album is not None:
+                    catalog_tracks = list(catalog_album.tracks)
+            except Exception:
+                logger.warning(
+                    "Catalog track hydration failed for album %d (job %d)",
+                    job.catalog_album_id,
+                    job_id,
+                )
+            expected_tracks = (
+                max(
+                    declared_track_count or 0,
+                    (catalog_album.track_count or 0) if catalog_album is not None else 0,
+                )
+                or None
+            )
+            if catalog_album is not None:
+                catalog_album.track_count = expected_tracks
+            manifest_incomplete = not catalog_tracks or bool(
+                expected_tracks and len(catalog_tracks) < expected_tracks
+            )
+            if catalog_album is not None and manifest_incomplete:
+                job.status = JobStatus.failed
+                job.result_json = json.dumps(
+                    {
+                        "error": {
+                            "code": (
+                                "catalog_tracks_empty"
+                                if not catalog_tracks
+                                else "catalog_tracks_incomplete"
+                            ),
+                            "operation": "hydrate",
+                            "retryable": True,
+                            "detail": (
+                                f"album_id={job.catalog_album_id} "
+                                f"track_count={expected_tracks} "
+                                f"catalog_tracks={len(catalog_tracks)} after hydration attempt"
+                            ),
+                        }
+                    },
+                    sort_keys=True,
+                )
+                job.updated_at = _now()
+                await db.flush()
+                return
+
         if (
             catalog_album is not None
             and job.catalog_track_id is None
