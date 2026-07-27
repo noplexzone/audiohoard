@@ -32,7 +32,9 @@ async def test_manual_enrich_failure_returns_303_not_500(client: AsyncClient) ->
     assert resp.status_code == 303
     location = resp.headers["location"]
     assert "sql:" not in location.lower()
-    assert location == f"/artists/catalog/{artist_id}?enrichment=failed"
+    assert location == (
+        f"/artists/catalog/{artist_id}?provider=musicbrainz&sort=desc&enrichment=failed"
+    )
 
 
 @pytest.mark.asyncio
@@ -83,7 +85,9 @@ async def test_manual_enrich_success_redirects_to_surviving_artist(client: Async
         resp = await client.post(f"/artists/catalog/{original_id}/enrich", follow_redirects=False)
 
     assert resp.status_code == 303
-    assert resp.headers["location"] == f"/artists/catalog/{survivor_id}?enrichment=ok"
+    assert resp.headers["location"] == (
+        f"/artists/catalog/{survivor_id}?provider=musicbrainz&sort=desc&enrichment=ok"
+    )
 
 
 @pytest.mark.asyncio

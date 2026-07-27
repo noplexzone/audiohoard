@@ -5,7 +5,7 @@ import re
 from pytest_httpx import HTTPXMock
 
 from app.metadata.deezer import DeezerClient
-from app.metadata.itunes import ITunesClient
+from app.metadata.itunes import ITunesClient, _parse_album_hit
 from app.metadata.musicbrainz import MusicBrainzClient
 
 UA = "test-app/0.3.0 (test@example.com)"
@@ -82,7 +82,10 @@ async def test_musicbrainz_catalog_artist_discography_album(httpx_mock: HTTPXMoc
     detail = await client.get_artist("artist-mbid")
     assert detail.name == "Björk"
     albums = await client.get_discography("artist-mbid")
-    assert [a.title for a in albums] == ["Homogenic"]
+    assert {(a.title, a.release_kind) for a in albums} == {
+        ("Homogenic", "album"),
+        ("Single", "single"),
+    }
     album = await client.get_album("rg-1")
     assert album.tracks[0].title == "Jóga"
     assert album.tracks[0].recording_mbid == "rec-1"
@@ -219,3 +222,22 @@ async def test_musicbrainz_discography_does_not_probe_cover_art_per_album(
     assert all(
         "coverartarchive.org" not in str(request.url) for request in httpx_mock.get_requests()
     )
+
+
+def test_itunes_album_collection_titles_classify_single_and_ep() -> None:
+    single = _parse_album_hit(
+        {"collectionId": 1, "collectionName": "A New Song - Single", "collectionType": "Album"},
+        artist_id="10",
+    )
+    ep = _parse_album_hit(
+        {"collectionId": 2, "collectionName": "A Short Record – EP", "collectionType": "Album"},
+        artist_id="10",
+    )
+    album = _parse_album_hit(
+        {"collectionId": 3, "collectionName": "A Full Record", "collectionType": "Album"},
+        artist_id="10",
+    )
+
+    assert single.release_type == "Single"
+    assert ep.release_type == "EP"
+    assert album.release_type == "Album"

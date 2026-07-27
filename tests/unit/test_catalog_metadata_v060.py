@@ -10,7 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from app.config import Settings
 from app.database import Base
 from app.metadata.base import AlbumHit, ArtistDetail, ArtistHit
-from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
+from app.models.catalog_entities import (
+    CatalogAlbum,
+    CatalogAlbumProvider,
+    CatalogAlbumTrack,
+    CatalogArtist,
+    CatalogArtistIdentity,
+)
 from app.models.job import Job, JobStatus
 from app.models.track import Track
 from app.services import catalog_metadata
@@ -18,6 +24,7 @@ from app.services.catalog_metadata import (
     _album_keys_match,
     _norm_title,
     enrich_catalog_artist,
+    fetch_and_store_discography,
     reconcile_duplicate_catalog_albums,
     reconcile_duplicate_catalog_artists,
     upsert_catalog_artist,
@@ -145,7 +152,7 @@ async def test_enrichment_resolves_mbid_from_conservative_discography_overlap(
     )
 
     outcome = await enrich_catalog_artist(db_session, test_settings, artist, ["musicbrainz"])
-    assert outcome["status"] == "ok"
+    assert outcome["status"] == "ok", outcome
     assert artist.mbid == "artist-mbid"
     assert json.loads(artist.provenance_json or "{}")["mbid"] == "musicbrainz"
 
@@ -205,13 +212,14 @@ async def test_enrichment_merges_artist_before_assigning_colliding_mbid(
 
 
 async def test_repair_merges_exact_juice_wrld_fixture_and_success_clears_error(
-    db_session, test_settings: Settings
+    db_session, monkeypatch, test_settings: Settings
 ) -> None:
     owner = CatalogArtist(name="Juice WRLD", mbid="juice-mbid", monitor_policy="albums_only")
     duplicate = CatalogArtist(
         name="Juice  WRLD",
         monitored=True,
         monitor_policy="none_new",
+        watchlist_provider="deezer",
         provenance_json=json.dumps(
             {"last_enrichment_error": {"at": "2026-01-01", "message": "IntegrityError: old"}}
         ),
@@ -241,6 +249,25 @@ async def test_repair_merges_exact_juice_wrld_fixture_and_success_clears_error(
     )
     db_session.add_all([owner_album, duplicate_same_album, duplicate_unique_album])
     await db_session.flush()
+    duplicate_identity = CatalogArtistIdentity(
+        artist_id=duplicate.id,
+        provider="deezer",
+        provider_artist_id="juice-deezer",
+        name="Juice WRLD",
+    )
+    db_session.add(duplicate_identity)
+    await db_session.flush()
+    db_session.add(
+        CatalogAlbumProvider(
+            artist_identity_id=duplicate_identity.id,
+            catalog_album_id=duplicate_same_album.id,
+            provider_album_id="1234",
+            title="Death Race for Love",
+            release_kind="album",
+            release_type_raw="album",
+            monitored=True,
+        )
+    )
     job = Job(
         source="priority",
         query="Juice WRLD Death Race for Love",
@@ -259,6 +286,7 @@ async def test_repair_merges_exact_juice_wrld_fixture_and_success_clears_error(
     assert survivor.id == owner.id
     assert survivor.monitored is True
     assert survivor.monitor_policy == "albums_only"
+    assert survivor.watchlist_provider == "deezer"
     assert "last_enrichment_error" in json.loads(survivor.provenance_json or "{}")
     albums = list((await db_session.scalars(select(CatalogAlbum))).all())
     assert {album.title for album in albums} == {"Death Race for Love", "Legends Never Die"}
@@ -267,12 +295,83 @@ async def test_repair_merges_exact_juice_wrld_fixture_and_success_clears_error(
     assert kept_duplicate.mbid == "death-race"
     assert kept_duplicate.deezer_id == "1234"
     assert (await db_session.scalars(select(Job.catalog_album_id))).one() == kept_duplicate.id
+    identity = (await db_session.scalars(select(CatalogArtistIdentity))).one()
+    provider_release = (await db_session.scalars(select(CatalogAlbumProvider))).one()
+    assert identity.artist_id == survivor.id
+    assert provider_release.artist_identity_id == identity.id
+    assert provider_release.catalog_album_id == kept_duplicate.id
+    assert provider_release.monitored is True
     assert await reconcile_duplicate_catalog_artists(db_session) == 0
 
     await db_session.refresh(survivor, ["albums"])
+    provider = DirectKnownProvider("musicbrainz")
+    monkeypatch.setattr(
+        catalog_metadata, "build_metadata_provider", lambda name, settings: provider
+    )
     outcome = await enrich_catalog_artist(db_session, test_settings, survivor, ["musicbrainz"])
-    assert outcome["status"] == "ok"
+    assert outcome["status"] == "ok", outcome
     assert "last_enrichment_error" not in json.loads(survivor.provenance_json or "{}")
+
+
+async def test_artist_merge_preserves_distinct_releases_from_same_provider(
+    db_session,
+) -> None:
+    owner = CatalogArtist(name="Same Provider", mbid="owner-mbid")
+    duplicate = CatalogArtist(
+        name="Same  Provider",
+        monitored=True,
+        watchlist_provider="deezer",
+    )
+    db_session.add_all([owner, duplicate])
+    await db_session.flush()
+    owner_identity = CatalogArtistIdentity(
+        artist_id=owner.id,
+        provider="deezer",
+        provider_artist_id="owner-deezer",
+        name="Same Provider",
+    )
+    duplicate_identity = CatalogArtistIdentity(
+        artist_id=duplicate.id,
+        provider="deezer",
+        provider_artist_id="duplicate-deezer",
+        name="Same Provider",
+    )
+    db_session.add_all([owner_identity, duplicate_identity])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            CatalogAlbumProvider(
+                artist_identity_id=owner_identity.id,
+                provider_album_id="owner-release",
+                title="Owner Release",
+                release_kind="album",
+            ),
+            CatalogAlbumProvider(
+                artist_identity_id=duplicate_identity.id,
+                provider_album_id="duplicate-release",
+                title="Duplicate Release",
+                release_kind="album",
+                monitored=True,
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    assert await reconcile_duplicate_catalog_artists(db_session) == 1
+    await db_session.commit()
+
+    artists = list((await db_session.scalars(select(CatalogArtist))).all())
+    identities = list((await db_session.scalars(select(CatalogArtistIdentity))).all())
+    releases = list((await db_session.scalars(select(CatalogAlbumProvider))).all())
+    assert len(artists) == 1
+    assert artists[0].watchlist_provider == "deezer"
+    assert len(identities) == 1
+    assert identities[0].artist_id == artists[0].id
+    assert {release.provider_album_id for release in releases} == {
+        "owner-release",
+        "duplicate-release",
+    }
+    assert all(release.artist_identity_id == identities[0].id for release in releases)
 
 
 @pytest.mark.asyncio
@@ -306,3 +405,92 @@ async def test_concurrent_upsert_both_sessions_complete_one_artist_survives(
     assert len(artists) == 1
     assert artists[0].mbid == "concurrent-mbid"
     await engine.dispose()
+
+
+class DirectKnownProvider:
+    def __init__(self, name: str, *, fail: bool = False) -> None:
+        self.name = name
+        self.fail = fail
+        self.search_calls = 0
+        self.discography_ids: list[str] = []
+
+    async def search_artists(self, query: str) -> list[ArtistHit]:
+        self.search_calls += 1
+        return []
+
+    async def get_artist(self, id: str) -> ArtistDetail:
+        if self.fail:
+            raise RuntimeError("secret provider detail")
+        values = {"mbid": None, "deezer_id": None, "itunes_id": None}
+        field = {"musicbrainz": "mbid", "deezer": "deezer_id", "itunes": "itunes_id"}[self.name]
+        values[field] = id
+        return ArtistDetail(provider=self.name, provider_id=id, name="Known Artist", **values)
+
+    async def get_discography(self, id: str) -> list[AlbumHit]:
+        self.discography_ids.append(id)
+        if self.fail:
+            raise RuntimeError("secret provider discography")
+        values = {"mbid": None, "deezer_id": None, "itunes_id": None}
+        field = {"musicbrainz": "mbid", "deezer": "deezer_id", "itunes": "itunes_id"}[self.name]
+        values[field] = f"{self.name}-album"
+        return [
+            AlbumHit(
+                provider=self.name,
+                provider_id=f"{self.name}-album",
+                title=f"{self.name.title()} Release",
+                release_type="Album",
+                **values,
+            )
+        ]
+
+
+async def test_fetch_discography_uses_explicit_provider_and_tags_membership(
+    db_session, monkeypatch, test_settings: Settings
+) -> None:
+    artist = CatalogArtist(name="Known Artist", mbid="mb-artist", deezer_id="dz-artist")
+    db_session.add(artist)
+    await db_session.flush()
+    deezer = DirectKnownProvider("deezer")
+    monkeypatch.setattr(catalog_metadata, "build_metadata_provider", lambda name, settings: deezer)
+
+    albums = await fetch_and_store_discography(
+        db_session, test_settings, artist, provider_name="deezer"
+    )
+
+    assert deezer.discography_ids == ["dz-artist"]
+    identity = (
+        await db_session.scalars(
+            select(CatalogArtistIdentity).where(CatalogArtistIdentity.provider == "deezer")
+        )
+    ).one()
+    assert albums[0].artist_identity_id == identity.id
+    assert albums[0].release_kind == "album"
+
+
+async def test_enrichment_attempts_known_provider_and_isolates_provider_failure(
+    db_session, monkeypatch, test_settings: Settings
+) -> None:
+    artist = CatalogArtist(name="Known Artist", mbid="mb-artist", deezer_id="dz-artist")
+    db_session.add(artist)
+    await db_session.flush()
+    await db_session.refresh(artist, ["albums"])
+    musicbrainz = DirectKnownProvider("musicbrainz")
+    deezer = DirectKnownProvider("deezer", fail=True)
+    monkeypatch.setattr(
+        catalog_metadata,
+        "build_metadata_provider",
+        lambda name, settings: {"musicbrainz": musicbrainz, "deezer": deezer}[name],
+    )
+
+    outcome = await enrich_catalog_artist(
+        db_session, test_settings, artist, ["musicbrainz", "deezer"]
+    )
+
+    assert outcome["status"] == "partial"
+    assert musicbrainz.search_calls == 0
+    assert musicbrainz.discography_ids == ["mb-artist"]
+    albums = list((await db_session.scalars(select(CatalogAlbum))).all())
+    assert json.loads(albums[0].providers_json or "[]") == ["musicbrainz"]
+    failures = json.loads(artist.provenance_json or "{}")["provider_failures"]
+    assert failures["deezer"]["error"] == "RuntimeError"
+    assert "secret" not in json.dumps(failures)

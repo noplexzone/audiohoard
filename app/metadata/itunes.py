@@ -141,15 +141,27 @@ def _parse_artist(data: dict[str, object]) -> ArtistHit:
 
 def _parse_album_hit(data: dict[str, object], artist_id: str | None) -> AlbumHit:
     iid = str(data.get("collectionId") or "")
+    title = str(data.get("collectionName") or "")
+    release_type = str(data.get("collectionType") or "Album") or "Album"
+    normalized_title = title.casefold().replace("–", "-").replace("—", "-").rstrip()
+    if normalized_title.endswith("- single"):
+        release_type = "Single"
+    elif normalized_title.endswith("- ep") or normalized_title.endswith("- e.p."):
+        release_type = "EP"
+    release_kind = {"single": "single", "ep": "ep", "album": "album"}.get(
+        release_type.casefold(), "unknown"
+    )
     return AlbumHit(
         provider="itunes",
         provider_id=iid,
         itunes_id=iid or None,
-        title=str(data.get("collectionName") or ""),
+        title=title,
         artist_name=str(data.get("artistName") or "") or None,
         artist_provider_id=artist_id,
         year=_year(data.get("releaseDate")),
-        release_type=str(data.get("collectionType") or "Album") or None,
+        release_type=release_type,
+        release_kind=release_kind,
+        release_type_raw=str(data.get("collectionType") or "") or None,
         artwork_url=_artwork(data.get("artworkUrl100")),
         track_count=_to_int(data.get("trackCount")),
     )

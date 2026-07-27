@@ -35,6 +35,8 @@ class AlbumHit:
     artist_provider_id: str | None = None
     year: str | None = None
     release_type: str | None = None
+    release_kind: str = "unknown"
+    release_type_raw: str | None = None
     mbid: str | None = None
     deezer_id: str | None = None
     itunes_id: str | None = None
