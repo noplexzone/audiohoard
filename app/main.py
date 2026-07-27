@@ -24,7 +24,7 @@ from app.config import Settings, get_settings
 from app.database import get_db, get_session_factory
 from app.display_names import display_name
 from app.jobs.dispatcher import job_dispatcher
-from app.routers import auth, health, imports, jobs, naming, search, tracks
+from app.routers import auth, health, imports, jobs, naming, search, staging, tracks
 from app.routers import catalog as catalog_router
 from app.routers import settings as settings_router
 from app.services.artist_monitoring import DiscographyRefreshScheduler
@@ -132,6 +132,7 @@ def create_app() -> FastAPI:
     app.include_router(tracks.router, tags=["tracks"])
     app.include_router(naming.router, tags=["naming"])
     app.include_router(imports.router, tags=["imports"])
+    app.include_router(staging.router, tags=["staging"])
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def dashboard(

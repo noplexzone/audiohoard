@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,10 +16,14 @@ from sqlalchemy.orm import selectinload
 
 from app.config import Settings, get_settings
 from app.database import get_session_factory
-from app.fingerprint.acoustid import fingerprint_file, lookup_acoustid
+from app.fingerprint.acoustid import fingerprint_file
 from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS
 from app.metadata.deezer import DeezerClient
-from app.metadata.filename_parse import parse_filename
+from app.metadata.filename_parse import (
+    normalize_for_catalog_match,
+    parse_filename,
+    strip_non_identity_descriptors,
+)
 from app.metadata.musicbrainz import MusicBrainzClient
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
 from app.models.job import Job, JobStatus
@@ -42,6 +47,16 @@ from app.sources.tidal import TidalAdapter
 from app.sources.youtube import ProviderError, YouTubeAdapter
 
 logger = logging.getLogger(__name__)
+
+# Compound disc-track prefix: "2-01 - Title", "cd2-01 - Title", "2.01. Title"
+_DISC_TRACK_PREFIX_RE = re.compile(
+    r"^(?:cd\s*)?(\d{1,2})\s*[-_.]\s*(\d{1,2})\s*(?:[-_.:]|\s-\s)\s*",
+    re.IGNORECASE,
+)
+# Simple single-number track prefix: "02 Title", "02. Title", "02 - Title"
+_SINGLE_TRACK_PREFIX_RE = re.compile(
+    r"^(?:cd\s*\d+\s*[-_.]?\s*)?(\d{1,2})\s*[-_. ]",
+)
 
 
 def _now() -> datetime:
@@ -370,6 +385,10 @@ async def _run_job_in_session(
         results = _selected_result(job) or await _call_fetch_results(job, cfg, db)
         catalog_album = await _load_catalog_album(db, job.catalog_album_id)
         catalog_tracks = list(catalog_album.tracks) if catalog_album is not None else []
+        if job.catalog_track_id is not None:
+            catalog_tracks = [
+                track for track in catalog_tracks if track.id == job.catalog_track_id
+            ]
         if (
             catalog_album is not None
             and job.catalog_track_id is None
@@ -382,15 +401,20 @@ async def _run_job_in_session(
             results = results[:1]
         tracks_created = 0
         failures: list[str] = []
+        root_job = await _root_job(job, db)
         existing_releases = list(
-            (await db.scalars(select(Release).where(Release.job_id == job_id))).all()
+            (await db.scalars(select(Release).where(Release.job_id == root_job.id))).all()
         )
         releases: dict[tuple[str | None, str | None], Release] = {
             (release.album_artist, release.title): release for release in existing_releases
         }
-        existing_tracks = list(
-            (await db.scalars(select(Track).where(Track.job_id == job_id))).all()
-        )
+        release_ids = [release.id for release in existing_releases]
+        track_query = select(Track).where(Track.job_id == job_id)
+        if release_ids:
+            track_query = select(Track).where(
+                (Track.job_id == job_id) | Track.release_id.in_(release_ids)
+            )
+        existing_tracks = list((await db.scalars(track_query)).all())
         for result in results:
             catalog_track = _catalog_track_for_result(result, catalog_tracks, job.catalog_track_id)
             track_title = catalog_track.title if catalog_track is not None else result.title
@@ -417,7 +441,7 @@ async def _run_job_in_session(
                     release = await db.get(Release, track.release_id)
                 if release is None:
                     release = Release(
-                        job_id=job_id,
+                        job_id=root_job.id,
                         source=result.source,
                         title=catalog_album.title
                         if catalog_album is not None
@@ -494,7 +518,7 @@ async def _run_job_in_session(
                 if track.identity_state != IdentityResolutionState.resolved:
                     await _enrich_musicbrainz(track, cfg)
                 await _enrich_deezer(track, cfg)
-                await _run_fingerprint(track, cfg)
+                await _run_fingerprint_and_verify(track, cfg, db)
                 await _compute_path_preview(track, db, cfg)
 
                 tracks_created += 1
@@ -513,7 +537,43 @@ async def _run_job_in_session(
                 job.updated_at = _now()
                 await db.commit()
 
-        if failures and tracks_created:
+        if catalog_tracks and catalog_album is not None:
+            # Use releases.values() — includes newly created releases from this run, not
+            # just the stale existing_releases snapshot captured before the loop.
+            root_release_ids = [r.id for r in releases.values() if r.id is not None]
+            acquired_ids = {
+                track.catalog_track_id
+                for track in (
+                    await db.scalars(
+                        select(Track).where(
+                            Track.release_id.in_(root_release_ids),
+                            Track.acquisition_state == AcquisitionState.downloaded,
+                        )
+                    )
+                ).all()
+                if track.catalog_track_id is not None
+            }
+            missing_catalog_ids = [
+                track.id for track in catalog_tracks if track.id not in acquired_ids
+            ]
+            payload = _job_payload(job)
+            payload.update(
+                {
+                    "tracks_created": tracks_created,
+                    "missing_tracks": [
+                        track.title for track in catalog_tracks if track.id not in acquired_ids
+                    ],
+                    "missing_catalog_track_ids": missing_catalog_ids,
+                }
+            )
+            if failures:
+                payload["errors"] = failures
+            job.status = JobStatus.partial if missing_catalog_ids else JobStatus.done
+            job.result_json = json.dumps(payload, sort_keys=True)
+            runtime = await get_runtime_settings(db)
+            if missing_catalog_ids and job.partial_attempt < runtime.max_partial_attempts:
+                await _spawn_continuation_jobs(job, missing_catalog_ids, catalog_album, db)
+        elif failures and tracks_created:
             job.status = JobStatus.partial
             payload = _job_payload(job)
             payload.update({"tracks_created": tracks_created, "errors": failures})
@@ -523,23 +583,26 @@ async def _run_job_in_session(
             payload = _job_payload(job)
             payload.update({"tracks_created": tracks_created, "errors": failures})
             job.result_json = json.dumps(payload, sort_keys=True)
-        elif catalog_tracks and tracks_created < len(catalog_tracks):
-            job.status = JobStatus.partial
-            acquired_ids = {
-                track.catalog_track_id
-                for track in (await db.scalars(select(Track).where(Track.job_id == job.id))).all()
-                if track.catalog_track_id is not None
-            }
-            missing = [track.title for track in catalog_tracks if track.id not in acquired_ids]
-            payload = _job_payload(job)
-            payload.update({"tracks_created": tracks_created, "missing_tracks": missing})
-            job.result_json = json.dumps(payload, sort_keys=True)
         else:
             job.status = JobStatus.done
             payload = _job_payload(job)
             payload.update({"tracks_created": tracks_created})
             job.result_json = json.dumps(payload, sort_keys=True)
         job.updated_at = _now()
+
+        # After completion, attempt automatic import for each release where all
+        # tracks are verified (or approved). Errors are logged and do not re-raise.
+        if job.status in {JobStatus.done, JobStatus.partial}:
+            all_releases = list(
+                (await db.scalars(select(Release).where(Release.job_id == root_job.id))).all()
+            )
+            for rel in all_releases:
+                try:
+                    await _try_auto_import(rel, db, cfg)
+                except Exception:
+                    logger.exception(
+                        "auto_import attempt failed for release %d (job %d)", rel.id, job_id
+                    )
     except ProviderError as exc:
         logger.warning("Job %d provider failure code %s", job_id, exc.code)
         job.status = JobStatus.failed
@@ -590,11 +653,89 @@ def _catalog_track_for_result(
 ) -> CatalogAlbumTrack | None:
     if selected_track_id is not None:
         return next((track for track in tracks if track.id == selected_track_id), None)
-    title = (result.title or "").casefold().strip()
-    if title:
+    raw_title = result.title or ""
+    if not raw_title:
+        return None
+
+    # 0. Disc+position match — evaluated before every title-only step so that
+    #    duplicate-title rows on the same disc (or across discs) bind to the
+    #    correct CatalogAlbumTrack.  Position is resolved from, in order:
+    #      a. Explicit track_no [+ disc] in result.metadata
+    #      b. Compound disc-track prefix: "2-01 - Title" → disc=2, pos=1
+    #      c. Simple numbered prefix:     "02 Title"     → pos=2, disc defaults to 1
+    #    Missing disc always defaults to 1 when a reliable position is available.
+    _disc_meta = result.metadata.get("disc") if result.metadata else None
+    _pos_meta = result.metadata.get("track_no") if result.metadata else None
+    _disc_num: int | None = None
+    _pos_num: int | None = None
+    _compound_prefix_seen = False
+
+    try:
+        if isinstance(_pos_meta, (int, str, float)):
+            _pos_num = int(_pos_meta)
+        if isinstance(_disc_meta, (int, str, float)):
+            _disc_num = int(_disc_meta)
+    except (ValueError, TypeError):
+        pass
+
+    if _pos_num is None:
+        _m_compound = _DISC_TRACK_PREFIX_RE.match(raw_title)
+        if _m_compound:
+            _disc_num = int(_m_compound.group(1))
+            _pos_num = int(_m_compound.group(2))
+            _compound_prefix_seen = True
+        else:
+            _m_single = _SINGLE_TRACK_PREFIX_RE.match(raw_title)
+            if _m_single:
+                _pos_num = int(_m_single.group(1))
+
+    if _pos_num is not None and _disc_num is None:
+        _disc_num = 1
+
+    if _pos_num is not None:
+        _matched0 = next(
+            (t for t in tracks if t.position == _pos_num and t.disc == _disc_num),
+            None,
+        )
+        if _matched0 is not None:
+            return _matched0
+
+    # 1. Exact casefolded match
+    title_cf = raw_title.casefold().strip()
+    for track in tracks:
+        if track.title.casefold().strip() == title_cf:
+            return track
+
+    # 2. Normalized match (strip track-number prefix + Unicode/apostrophe normalize)
+    title_norm = normalize_for_catalog_match(raw_title)
+    for track in tracks:
+        if normalize_for_catalog_match(track.title) == title_norm:
+            return track
+
+    # 3. Strip non-identity descriptors from catalog side and retry
+    for track in tracks:
+        catalog_stripped = normalize_for_catalog_match(strip_non_identity_descriptors(track.title))
+        if catalog_stripped == title_norm:
+            return track
+
+    # 4. Also strip descriptors from result side (e.g. result has "(skit)" but catalog doesn't)
+    title_stripped = normalize_for_catalog_match(strip_non_identity_descriptors(raw_title))
+    if title_stripped and title_stripped != title_norm:
         for track in tracks:
-            if track.title.casefold().strip() == title:
+            if normalize_for_catalog_match(track.title) == title_stripped:
                 return track
+        for track in tracks:
+            catalog_stripped = normalize_for_catalog_match(
+                strip_non_identity_descriptors(track.title)
+            )
+            if catalog_stripped == title_stripped:
+                return track
+
+    # 5. (No-op: position-based matching is now fully handled by step 0, which runs
+    #    before title steps.  Repeating it here after title steps fail would return
+    #    the same miss or, for compound prefixes, misread the disc digit as a track
+    #    number.)
+
     return None
 
 
@@ -687,6 +828,11 @@ async def _fetch_results(
         priority = ["slskd"]
 
     attempted: list[dict[str, object]] = []
+    # Load catalog album info for folder-based scoring when relevant.
+    _scoring_album = (
+        await _load_catalog_album(db, job.catalog_album_id) if job.catalog_album_id else None
+    )
+
     for source in priority:
         req = SearchRequest(query=job.query, sources=[source])
         try:
@@ -704,7 +850,20 @@ async def _fetch_results(
                     _set_acquisition_provenance(job, attempted)
                     await db.flush()
                     continue
-            results = (await adapter.search(req))[:limit]
+
+            # For slskd album downloads: group files by folder and select the best one.
+            if (
+                source == "slskd"
+                and _scoring_album is not None
+                and job.catalog_track_id is None
+                and isinstance(adapter, SlskdAdapter)
+            ):
+                results = await _fetch_slskd_album_results(
+                    adapter, req, job, _scoring_album, runtime, db
+                )
+            else:
+                results = (await adapter.search(req))[:limit]
+
             if not results:
                 attempted.append({"source": source, "status": "empty", "reason": "zero results"})
                 _set_acquisition_provenance(job, attempted)
@@ -731,6 +890,77 @@ async def _fetch_results(
         "search",
         True,
     )
+
+
+async def _fetch_slskd_album_results(
+    adapter: SlskdAdapter,
+    req: SearchRequest,
+    job: Job,
+    catalog_album: CatalogAlbum,
+    runtime: object,
+    db: AsyncSession,
+) -> list[SearchResult]:
+    """Fetch slskd results for an album job, grouped and scored by folder.
+
+    Selects the best coherent folder (same peer, same directory, same format)
+    and returns individual SearchResult items for each audio file in that folder.
+    Never applies a global file count cap.
+    """
+    from app.services.slskd_scoring import select_best_folder
+
+    folders, _raw = await adapter.search_album_folders(req)
+    if not folders:
+        return []
+
+    qp = getattr(runtime, "quality_profile", None)
+    format_pref = list(qp.format_preference) if qp else ["flac", "mp3"]
+    min_bitrate = int(qp.min_mp3_bitrate) if qp else 192
+    allow_fallback = bool(qp.allow_lower_quality_fallback) if qp else True
+
+    catalog_track_count = (
+        len(catalog_album.tracks) if catalog_album.tracks else catalog_album.track_count
+    )
+    catalog_artist = catalog_album.artist.name if catalog_album.artist else None
+
+    best = select_best_folder(
+        folders,
+        catalog_track_count=catalog_track_count,
+        catalog_artist=catalog_artist,
+        catalog_album=catalog_album.title,
+        format_preference=format_pref,
+        min_mp3_bitrate=min_bitrate,
+        allow_lower_quality_fallback=allow_fallback,
+    )
+    if best is None:
+        return []
+
+    results: list[SearchResult] = []
+    for slskd_file in best.files:
+        filename = slskd_file.filename
+        ext = best.audio_format
+        guess = parse_filename(filename)
+        results.append(
+            SearchResult(
+                source="slskd",
+                title=guess.title,
+                artist=guess.artist,
+                album=guess.album,
+                size_bytes=slskd_file.size_bytes,
+                format=ext,
+                url=f"slskd://{best.username}/{filename}",
+                metadata={
+                    "username": best.username,
+                    "filename": filename,
+                    "parse_confidence": guess.confidence,
+                    "parse_hints": list(guess.hints),
+                    "bit_rate": slskd_file.bit_rate,
+                    "sample_rate": slskd_file.sample_rate,
+                    "folder_score": best.score,
+                    "parent_dir": best.parent_dir,
+                },
+            )
+        )
+    return results
 
 
 async def _call_prepare_acquisition(
@@ -986,11 +1216,126 @@ async def _run_fingerprint(track: Track, cfg: Settings) -> None:
         track.duration_sec = duration
     track.fingerprint_state = FingerprintState.done
 
-    if cfg.acoustid_api_key and not track.mbid:
-        mbids = await lookup_acoustid(duration, fingerprint, cfg.acoustid_api_key)
-        if mbids:
-            track.mbid = mbids[0]
-            track.identity_state = IdentityResolutionState.resolved
+
+async def _run_fingerprint_and_verify(track: Track, cfg: Settings, db: AsyncSession) -> None:
+    """Fingerprint a download and require AcoustID confirmation or human review."""
+    await _run_fingerprint(track, cfg)
+    duration = track.duration_sec
+    fingerprint = track.acoustid
+    raw_results: list[dict[str, object]] = []
+    if (
+        cfg.acoustid_api_key
+        and track.fingerprint_state == FingerprintState.done
+        and duration is not None
+        and duration > 0
+        and fingerprint
+    ):
+        raw_results = await _lookup_acoustid_raw(duration, fingerprint, cfg.acoustid_api_key)
+
+    from app.services.acoustid_verification import run_acoustid_verification
+
+    await run_acoustid_verification(
+        track,
+        acoustid_raw_results=raw_results,
+        fingerprint_duration_sec=duration,
+        db=db,
+    )
+
+
+async def _lookup_acoustid_raw(
+    duration: int, fingerprint: str, api_key: str
+) -> list[dict[str, object]]:
+    """Return raw AcoustID result list (not just MBIDs) for verification comparison."""
+    import httpx
+
+    _ACOUSTID_API = "https://api.acoustid.org/v2/lookup"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            resp = await client.post(
+                _ACOUSTID_API,
+                data={
+                    "client": api_key,
+                    "duration": str(duration),
+                    "fingerprint": fingerprint,
+                    "meta": "recordings",
+                },
+            )
+            resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+        return results if isinstance(results, list) else []
+    except Exception as exc:
+        logger.warning("AcoustID raw lookup failed: %s", exc)
+        return []
+
+
+async def _try_auto_import(release: Release, db: AsyncSession, cfg: Settings) -> None:
+    """Trigger automatic import for a release when all downloaded tracks are verified."""
+    from app.services.auto_import import try_auto_import_release
+
+    await try_auto_import_release(
+        db,
+        release,
+        library_root=cfg.library_root,
+        naming_template=cfg.naming_template,
+    )
+
+
+async def _root_job(job: Job, db: AsyncSession) -> Job:
+    current = job
+    seen = {job.id}
+    while current.parent_job_id is not None and current.parent_job_id not in seen:
+        parent = await db.get(Job, current.parent_job_id)
+        if parent is None:
+            break
+        current = parent
+        seen.add(current.id)
+    return current
+
+
+async def _spawn_continuation_jobs(
+    parent_job: Job,
+    missing_catalog_track_ids: list[int],
+    catalog_album: CatalogAlbum,
+    db: AsyncSession,
+) -> None:
+    """Spawn idempotent follow-up jobs, one targeted search per missing track."""
+    from app.jobs.dispatcher import job_dispatcher
+
+    artist = catalog_album.artist.name if catalog_album.artist else ""
+    tracks_by_id = {track.id: track for track in catalog_album.tracks}
+    continuation_ids: list[int] = []
+    for track_id in missing_catalog_track_ids:
+        duplicate = await db.scalar(
+            select(Job.id).where(
+                Job.catalog_album_id == catalog_album.id,
+                Job.catalog_track_id == track_id,
+                Job.status.in_([JobStatus.pending, JobStatus.running]),
+            )
+        )
+        if duplicate is not None:
+            continue
+        catalog_track = tracks_by_id.get(track_id)
+        if catalog_track is None:
+            continue
+        continuation = Job(
+            source="priority",
+            query=" ".join(
+                part for part in (artist, catalog_album.title, catalog_track.title) if part
+            ),
+            status=JobStatus.pending,
+            catalog_album_id=catalog_album.id,
+            catalog_track_id=track_id,
+            parent_job_id=parent_job.id,
+            partial_attempt=parent_job.partial_attempt + 1,
+            result_json=json.dumps({"continuation_of": parent_job.id}, sort_keys=True),
+        )
+        db.add(continuation)
+        await db.flush()
+        continuation_ids.append(continuation.id)
+    await db.commit()
+    for continuation_id in continuation_ids:
+        await job_dispatcher.dispatch(continuation_id)
 
 
 async def _compute_path_preview(track: Track, db: AsyncSession, cfg: Settings) -> None:

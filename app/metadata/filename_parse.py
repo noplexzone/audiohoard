@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
 
@@ -102,3 +103,59 @@ def compose_search_query(
 ) -> str:
     parts = [p.strip() for p in (artist, album, track, query) if p and p.strip()]
     return " ".join(dict.fromkeys(parts))
+
+
+# Parenthetical/bracketed suffixes that are pure non-identity descriptors — they
+# do NOT change which recording a title refers to and may safely be stripped when
+# comparing a provider filename against a catalog title.
+# Space-separated track prefix: "01 Intro" (bare space, no dash/dot separator).
+# Applied as a secondary pass in normalize_for_catalog_match after _TRACK_PREFIX_RE.
+_SPACE_TRACK_PREFIX_RE = re.compile(r"^\d{1,2}\s+")
+
+_DESCRIPTOR_RE = re.compile(
+    r"\s*[\(\[]\s*(?:skit|interlude|intro|outro|transition|segue|reprise)"
+    r"(?:\s+[^\)\]]{0,40})?\s*[\)\]]",
+    re.I,
+)
+# "feat." annotations embedded in titles (common in rap/hip-hop catalogs)
+_FEAT_RE = re.compile(r"\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring)[^\)\]]*[\)\]]", re.I)
+# Producer tag e.g. "(prod. by Metro Boomin)"
+_PROD_RE = re.compile(r"\s*[\(\[]\s*prod\.?[^\)\]]*[\)\]]", re.I)
+# Fancy apostrophes / quotation marks
+_APOSTROPHE_RE = re.compile(r"[‘’ʼ`´]")
+_QUOTE_RE = re.compile(r"[“”«»‹›]")
+
+
+def normalize_for_catalog_match(title: str) -> str:
+    """Return a normalized form of *title* suitable for catalog matching.
+
+    Applies: strip leading track-number prefix, Unicode NFKD normalization,
+    apostrophe/punctuation normalization, casefold, and whitespace collapse.
+    Does NOT strip identity-changing descriptors like (live) or (acoustic).
+    """
+    t = _TRACK_PREFIX_RE.sub("", title)
+    # Strip bare-space-separated prefix that _TRACK_PREFIX_RE leaves ("01 Intro" → "Intro")
+    t = _SPACE_TRACK_PREFIX_RE.sub("", t)
+    # Fancy punctuation → ASCII equivalents
+    t = _APOSTROPHE_RE.sub("'", t)
+    t = _QUOTE_RE.sub('"', t)
+    # Unicode decomposition followed by ASCII-ification of combining chars
+    t = unicodedata.normalize("NFKD", t)
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    t = t.casefold()
+    # Collapse whitespace / leading-trailing noise
+    t = re.sub(r"\s+", " ", t).strip(" .-_\t")
+    return t
+
+
+def strip_non_identity_descriptors(title: str) -> str:
+    """Remove parenthetical descriptors that do not change recording identity.
+
+    Safe to use only for *fuzzy* catalog matching — do not use for display.
+    Does NOT remove (live), (acoustic), (demo), (instrumental) etc. which DO
+    indicate a different recording.
+    """
+    t = _DESCRIPTOR_RE.sub("", title)
+    t = _FEAT_RE.sub("", t)
+    t = _PROD_RE.sub("", t)
+    return t.strip()

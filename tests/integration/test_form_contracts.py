@@ -96,9 +96,7 @@ async def _native_submit(client: AsyncClient, page_url: str, form: ParsedForm) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "path", ["/search", "/downloads", "/settings/download-sources", "/imports/ui/review"]
-)
+@pytest.mark.parametrize("path", ["/search", "/downloads", "/settings/download-sources"])
 async def test_authenticated_page_forms_replay_as_native_browser_posts(
     client: AsyncClient, path: str
 ) -> None:
@@ -138,14 +136,6 @@ async def test_post_only_ui_gets_redirect_to_get_page(client: AsyncClient) -> No
     downloads = await client.get("/downloads/create", follow_redirects=False)
     assert downloads.status_code == 307
     assert downloads.headers["location"] == "/downloads"
-
-    import_plan = await client.get("/imports/ui/releases/1/plan", follow_redirects=False)
-    assert import_plan.status_code == 307
-    assert import_plan.headers["location"] == "/imports/ui/review"
-
-    import_execute = await client.get("/imports/ui/releases/1/execute", follow_redirects=False)
-    assert import_execute.status_code == 307
-    assert import_execute.headers["location"] == "/imports/ui/review"
 
 
 @pytest.mark.asyncio

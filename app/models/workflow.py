@@ -22,3 +22,18 @@ class ImportWorkflowState(StrEnum):
     imported = "imported"
     failed = "failed"
     rolled_back = "rolled_back"
+
+
+class AcoustIDVerificationState(StrEnum):
+    pending = "pending"
+    verified = "verified"
+    mismatch = "mismatch"
+    unavailable = "unavailable"
+    approved = "approved"
+    denied = "denied"
+
+
+class ReviewDecision(StrEnum):
+    pending = "pending"
+    approved = "approved"
+    denied = "denied"

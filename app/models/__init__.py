@@ -15,6 +15,7 @@ from app.models.path_preview import PathPreview
 from app.models.release import Release
 from app.models.release_candidate import MatchReviewState, ReleaseCandidate
 from app.models.settings import AppSetting, ProviderSetting
+from app.models.staging_review import StagingReviewItem
 from app.models.track import Track
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "Release",
     "MatchReviewState",
     "ReleaseCandidate",
+    "StagingReviewItem",
     "Track",
     "UserRole",
 ]

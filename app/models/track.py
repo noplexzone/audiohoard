@@ -8,7 +8,7 @@ from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, Integer, String, 
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
-from app.models.workflow import AcquisitionState, ImportWorkflowState
+from app.models.workflow import AcoustIDVerificationState, AcquisitionState, ImportWorkflowState
 
 if TYPE_CHECKING:
     from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
@@ -90,6 +90,12 @@ class Track(Base):
         nullable=False,
         default=FingerprintState.pending,
     )
+    acoustid_verification_state: Mapped[AcoustIDVerificationState] = mapped_column(
+        Enum(AcoustIDVerificationState, native_enum=False, create_constraint=True),
+        nullable=False,
+        default=AcoustIDVerificationState.pending,
+    )
+    acoustid_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     job: Mapped[Job] = relationship("Job", back_populates="tracks")
     release: Mapped[Release | None] = relationship("Release", back_populates="tracks")

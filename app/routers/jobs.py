@@ -17,6 +17,8 @@ from app.auth import get_current_user, require_mutation
 from app.database import get_db
 from app.jobs.dispatcher import JobNotFoundError, JobStateError, job_dispatcher
 from app.models.job import Job, JobStatus
+from app.models.staging_review import StagingReviewItem
+from app.models.workflow import ReviewDecision
 from app.schemas.job import JobCreate, JobRead, SelectedResultPayload
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -97,12 +99,21 @@ async def downloads_page(
         query = query.where(Job.status == status)
     result = await db.execute(query)
     downloads = list(result.scalars().all())
+    review_result = await db.execute(
+        select(StagingReviewItem)
+        .where(StagingReviewItem.review_state == ReviewDecision.pending)
+        .order_by(StagingReviewItem.created_at.asc())
+    )
+    pending_review_items = list(review_result.scalars().all())
     notices = {
         "cancelled": ("Cancellation requested.", "info"),
         "retried": ("Retry scheduled.", "info"),
         "invalid_state": ("That job can no longer be changed.", "error"),
         "not_found": ("Job not found.", "error"),
         "removed": ("Download removed from the queue.", "info"),
+        "approved": ("Track approved — import pipeline resumed.", "ok"),
+        "denied": ("Track denied — file remains staged and marked rejected.", "info"),
+        "already_reviewed": ("That item has already been reviewed.", "info"),
     }
     notice_key = request.query_params.get("notice", "")
     notice, notice_type = notices.get(notice_key, (None, "info"))
@@ -119,6 +130,7 @@ async def downloads_page(
         {
             "downloads": downloads,
             "jobs": downloads,
+            "pending_review_items": pending_review_items,
             "notice": notice,
             "notice_type": notice_type,
             "selected_status": status.value if status is not None else None,

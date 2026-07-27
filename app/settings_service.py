@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from dataclasses import field as dataclasses_field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -40,7 +41,18 @@ DEFAULT_PRIMARY_METADATA_PROVIDER = "musicbrainz"
 DEFAULT_DISCOGRAPHY_REFRESH_HOURS = 24
 DEFAULT_AUTO_DOWNLOAD_WANTED = False
 DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS = 15
+DEFAULT_FORMAT_PREFERENCE: list[str] = ["flac", "mp3", "m4a", "aac", "ogg", "opus"]
+DEFAULT_MIN_MP3_BITRATE = 192
+DEFAULT_ALLOW_LOWER_QUALITY_FALLBACK = True
+DEFAULT_MAX_PARTIAL_ATTEMPTS = 3
 _cache: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class QualityProfile:
+    format_preference: list[str]
+    min_mp3_bitrate: int
+    allow_lower_quality_fallback: bool
 
 
 @dataclass(frozen=True)
@@ -52,6 +64,14 @@ class RuntimeSettings:
     discography_refresh_hours: int
     auto_download_wanted: bool
     source_search_budget_seconds: int
+    quality_profile: QualityProfile = dataclasses_field(
+        default_factory=lambda: QualityProfile(
+            format_preference=list(DEFAULT_FORMAT_PREFERENCE),
+            min_mp3_bitrate=DEFAULT_MIN_MP3_BITRATE,
+            allow_lower_quality_fallback=DEFAULT_ALLOW_LOWER_QUALITY_FALLBACK,
+        )
+    )
+    max_partial_attempts: int = DEFAULT_MAX_PARTIAL_ATTEMPTS
 
     @property
     def enabled_sources(self) -> list[str]:
@@ -142,6 +162,24 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
         )
     except ValueError:
         source_budget = DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS
+    try:
+        quality_raw = json.loads(values.get("quality_profile", "{}"))
+    except json.JSONDecodeError:
+        quality_raw = {}
+    fmt_pref = quality_raw.get("format_preference", DEFAULT_FORMAT_PREFERENCE)
+    if not isinstance(fmt_pref, list) or not fmt_pref:
+        fmt_pref = list(DEFAULT_FORMAT_PREFERENCE)
+    try:
+        min_mp3 = int(quality_raw.get("min_mp3_bitrate", DEFAULT_MIN_MP3_BITRATE))
+    except (TypeError, ValueError):
+        min_mp3 = DEFAULT_MIN_MP3_BITRATE
+    allow_fallback = bool(
+        quality_raw.get("allow_lower_quality_fallback", DEFAULT_ALLOW_LOWER_QUALITY_FALLBACK)
+    )
+    try:
+        max_partial = int(values.get("max_partial_attempts", str(DEFAULT_MAX_PARTIAL_ATTEMPTS)))
+    except ValueError:
+        max_partial = DEFAULT_MAX_PARTIAL_ATTEMPTS
     return RuntimeSettings(
         _normalize_priority(priority_raw),
         max(1, min(limit, 100)),
@@ -150,6 +188,12 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
         max(1, min(refresh_hours, 24 * 30)),
         auto_download,
         max(3, min(source_budget, 60)),
+        quality_profile=QualityProfile(
+            format_preference=[str(f).casefold() for f in fmt_pref],
+            min_mp3_bitrate=max(64, min(min_mp3, 320)),
+            allow_lower_quality_fallback=allow_fallback,
+        ),
+        max_partial_attempts=max(1, min(max_partial, 10)),
     )
 
 
@@ -162,6 +206,8 @@ async def save_runtime_settings(
     discography_refresh_hours: int | None = None,
     auto_download_wanted: bool | None = None,
     source_search_budget_seconds: int | None = None,
+    quality_profile: QualityProfile | None = None,
+    max_partial_attempts: int | None = None,
 ) -> None:
     global _cache
     normalized = _normalize_priority(source_priority)
@@ -179,6 +225,11 @@ async def save_runtime_settings(
         if discography_refresh_hours is not None
         else DEFAULT_DISCOGRAPHY_REFRESH_HOURS
     )
+    qp = quality_profile or QualityProfile(
+        format_preference=list(DEFAULT_FORMAT_PREFERENCE),
+        min_mp3_bitrate=DEFAULT_MIN_MP3_BITRATE,
+        allow_lower_quality_fallback=DEFAULT_ALLOW_LOWER_QUALITY_FALLBACK,
+    )
     payloads = {
         "source_priority": json.dumps(normalized),
         "free_text_result_limit": str(max(1, min(free_text_result_limit, 100))),
@@ -188,6 +239,16 @@ async def save_runtime_settings(
         "auto_download_wanted": "true" if bool(auto_download_wanted) else "false",
         "source_search_budget_seconds": str(
             max(3, min(source_search_budget_seconds or DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS, 60))
+        ),
+        "quality_profile": json.dumps(
+            {
+                "format_preference": [f.casefold() for f in qp.format_preference],
+                "min_mp3_bitrate": max(64, min(qp.min_mp3_bitrate, 320)),
+                "allow_lower_quality_fallback": qp.allow_lower_quality_fallback,
+            }
+        ),
+        "max_partial_attempts": str(
+            max(1, min(max_partial_attempts or DEFAULT_MAX_PARTIAL_ATTEMPTS, 10))
         ),
     }
     for key, value in payloads.items():

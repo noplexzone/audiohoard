@@ -22,8 +22,10 @@ from app.schemas.health import SourceStatus
 from app.schemas.settings import SettingField, SettingsSaveRequest, SettingsTestRequest
 from app.services.health_status import CachedProviderStatus, get_health_status_service
 from app.settings_service import (
+    DEFAULT_FORMAT_PREFERENCE,
     DEFAULT_METADATA_PROVIDERS,
     DEFAULT_SOURCE_PRIORITY,
+    QualityProfile,
     get_all_effective,
     get_runtime_settings,
     load_raw_db_values,
@@ -73,6 +75,7 @@ SETTINGS_SECTIONS = {
     "metadata": "Metadata",
     "library": "Library",
     "behavior": "Behavior",
+    "quality": "Quality",
     "about": "About",
 }
 PROVIDER_DESCRIPTIONS = {
@@ -323,6 +326,41 @@ async def save_runtime_settings_page(
         if section == "behavior"
         else runtime.auto_download_wanted
     )
+    if section == "quality":
+        fmt_order = [str(v) for v in form.getlist("format_order")]
+        move_fmt = str(form.get("move_format", ""))
+        if ":" in move_fmt:
+            direction, fmt_name = move_fmt.split(":", 1)
+            if fmt_name in fmt_order:
+                idx = fmt_order.index(fmt_name)
+                move_idx = idx - 1 if direction == "up" else idx + 1
+                if direction in {"up", "down"} and 0 <= move_idx < len(fmt_order):
+                    fmt_order[idx], fmt_order[move_idx] = fmt_order[move_idx], fmt_order[idx]
+        try:
+            min_mp3 = int(
+                str(form.get("min_mp3_bitrate", runtime.quality_profile.min_mp3_bitrate))
+            )
+        except ValueError:
+            min_mp3 = runtime.quality_profile.min_mp3_bitrate
+        allow_fallback = str(form.get("allow_lower_quality_fallback", "")).lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        try:
+            max_partial = int(str(form.get("max_partial_attempts", runtime.max_partial_attempts)))
+        except ValueError:
+            max_partial = runtime.max_partial_attempts
+        quality_profile = QualityProfile(
+            format_preference=fmt_order or list(DEFAULT_FORMAT_PREFERENCE),
+            min_mp3_bitrate=max(64, min(min_mp3, 320)),
+            allow_lower_quality_fallback=allow_fallback,
+        )
+        max_partial_val: int = max(1, min(max_partial, 10))
+    else:
+        quality_profile = runtime.quality_profile
+        max_partial_val = runtime.max_partial_attempts
     await save_runtime_settings(
         db,
         source_priority or runtime.source_priority,
@@ -332,6 +370,8 @@ async def save_runtime_settings_page(
         refresh_hours,
         auto_download,
         source_budget,
+        quality_profile=quality_profile,
+        max_partial_attempts=max_partial_val,
     )
     await db.commit()
     redirect_target = section if section in SETTINGS_SECTIONS else "download-sources"
