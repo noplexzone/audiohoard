@@ -37,6 +37,7 @@ class Release(Base):
         Enum(ImportWorkflowState, native_enum=False, create_constraint=True),
         nullable=False,
         default=ImportWorkflowState.discovered,
+        server_default=ImportWorkflowState.discovered.value,
     )
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     rollback_detail: Mapped[str | None] = mapped_column(Text, nullable=True)

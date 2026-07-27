@@ -33,6 +33,17 @@ _ACOUSTID_ENUM = sa.Enum(
 
 
 def upgrade() -> None:
+    # 0014 stored this state as an unrestricted VARCHAR. Normalize legacy or
+    # hand-written values before adding the model CHECK constraint so SQLite's
+    # batch copy cannot fail halfway through and leave a temporary table behind.
+    op.execute(
+        sa.text(
+            "UPDATE tracks SET acoustid_verification_state = 'pending' "
+            "WHERE acoustid_verification_state NOT IN "
+            "('pending', 'verified', 'mismatch', 'unavailable', 'approved', 'denied')"
+        )
+    )
+
     inspector = sa.inspect(op.get_bind())
 
     # 1. Rename index on catalog_album_providers.artist_identity_id.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pprint
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
@@ -53,11 +54,14 @@ def test_model_registration_includes_all_tables() -> None:
     assert "import_plans" in registered
 
 
-def test_migration_parity(tmp_path: Path) -> None:
+def test_migration_parity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db_file = tmp_path / "parity.db"
     async_url = f"sqlite+aiosqlite:///{db_file}"
     sync_url = f"sqlite:///{db_file}"
 
+    # alembic/env.py gives DATABASE_URL precedence over alembic.ini. Never let
+    # this test migrate an ambient application database.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     cfg = Config("alembic.ini")
     cfg.set_main_option("sqlalchemy.url", async_url)
     command.upgrade(cfg, "head")
@@ -65,7 +69,7 @@ def test_migration_parity(tmp_path: Path) -> None:
     engine = sa.create_engine(sync_url)
     try:
         with engine.connect() as conn:
-            ctx = MigrationContext.configure(conn)
+            ctx = MigrationContext.configure(conn, opts={"compare_server_default": True})
             raw_diffs = compare_metadata(ctx, Base.metadata)
     finally:
         engine.dispose()
@@ -85,3 +89,43 @@ def test_migration_parity(tmp_path: Path) -> None:
         f"Schema drift detected between Alembic head and Base.metadata "
         f"({len(diffs)} difference(s)):\n{pprint.pformat(diffs)}"
     )
+
+
+def test_0016_normalizes_legacy_verification_state_before_sqlite_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_file = tmp_path / "legacy-state.db"
+    async_url = f"sqlite+aiosqlite:///{db_file}"
+    sync_url = f"sqlite:///{db_file}"
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", async_url)
+    command.upgrade(cfg, "0015")
+
+    engine = sa.create_engine(sync_url)
+    with engine.begin() as conn:
+        conn.execute(sa.text("INSERT INTO jobs (source, query) VALUES ('slskd', 'legacy')"))
+        conn.execute(
+            sa.text(
+                "INSERT INTO tracks (job_id, source, acoustid_verification_state) "
+                "VALUES (1, 'slskd', 'legacy_custom')"
+            )
+        )
+    engine.dispose()
+
+    command.upgrade(cfg, "head")
+
+    engine = sa.create_engine(sync_url)
+    try:
+        with engine.connect() as conn:
+            state = conn.scalar(sa.text("SELECT acoustid_verification_state FROM tracks"))
+            temporary = conn.scalar(
+                sa.text(
+                    "SELECT count(*) FROM sqlite_master "
+                    "WHERE type='table' AND name='_alembic_tmp_tracks'"
+                )
+            )
+    finally:
+        engine.dispose()
+    assert state == "pending"
+    assert temporary == 0

@@ -162,14 +162,14 @@ async def test_shared_shell_has_accessible_active_navigation(client: AsyncClient
     collector.feed(body)
     for nav_label in ("Primary navigation", "Mobile navigation"):
         assert nav_label in collector.anchors, f"{nav_label!r} nav not found in document"
-        active_library = [
-            a
-            for a in collector.anchors[nav_label]
-            if a.get("href") == "/library" and a.get("aria-current") == "page"
+        active_hrefs = [
+            anchor.get("href")
+            for anchor in collector.anchors[nav_label]
+            if anchor.get("aria-current") == "page"
         ]
-        assert len(active_library) == 1, (
-            f"{nav_label!r}: expected exactly 1 /library anchor with aria-current='page', "
-            f"found {len(active_library)}"
+        assert active_hrefs == ["/library"], (
+            f"{nav_label!r}: expected only /library to have aria-current='page', "
+            f"found {active_hrefs}"
         )
 
 

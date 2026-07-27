@@ -31,5 +31,7 @@ class ProviderSetting(Base):
     value_plain: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     value_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
     )

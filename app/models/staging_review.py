@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -30,9 +30,14 @@ class StagingReviewItem(Base):
     observed_acoustid_mbids_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     fingerprint_duration_sec: Mapped[int | None] = mapped_column(Integer, nullable=True)
     acoustid_score: Mapped[float | None] = mapped_column(Float, nullable=True)
-    verification_reason: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    verification_reason: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=text("''")
+    )
     review_state: Mapped[ReviewDecision] = mapped_column(
-        String(32), nullable=False, default=ReviewDecision.pending
+        String(32),
+        nullable=False,
+        default=ReviewDecision.pending,
+        server_default=ReviewDecision.pending.value,
     )
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

@@ -49,16 +49,19 @@ class ImportPlan(Base):
         Enum(CollisionState, native_enum=False, create_constraint=True),
         nullable=False,
         default=CollisionState.unchecked,
+        server_default=CollisionState.unchecked.value,
     )
     tag_verification_state: Mapped[TagVerificationState] = mapped_column(
         Enum(TagVerificationState, native_enum=False, create_constraint=True),
         nullable=False,
         default=TagVerificationState.pending,
+        server_default=TagVerificationState.pending.value,
     )
     status: Mapped[ImportWorkflowState] = mapped_column(
         Enum(ImportWorkflowState, native_enum=False, create_constraint=True),
         nullable=False,
         default=ImportWorkflowState.discovered,
+        server_default=ImportWorkflowState.discovered.value,
     )
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     cleanup_attempted_at: Mapped[datetime | None] = mapped_column(

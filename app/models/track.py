@@ -60,6 +60,7 @@ class Track(Base):
         Enum(IdentityResolutionState),
         nullable=False,
         default=IdentityResolutionState.pending,
+        server_default=IdentityResolutionState.pending.value,
     )
     acoustid: Mapped[str | None] = mapped_column(Text, nullable=True)
     deezer_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -71,11 +72,13 @@ class Track(Base):
         Enum(AcquisitionState, native_enum=False, create_constraint=True),
         nullable=False,
         default=AcquisitionState.queued,
+        server_default=AcquisitionState.queued.value,
     )
     import_state: Mapped[ImportWorkflowState] = mapped_column(
         Enum(ImportWorkflowState, native_enum=False, create_constraint=True),
         nullable=False,
         default=ImportWorkflowState.discovered,
+        server_default=ImportWorkflowState.discovered.value,
     )
     staging_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -89,11 +92,13 @@ class Track(Base):
         Enum(FingerprintState),
         nullable=False,
         default=FingerprintState.pending,
+        server_default=FingerprintState.pending.value,
     )
     acoustid_verification_state: Mapped[AcoustIDVerificationState] = mapped_column(
         Enum(AcoustIDVerificationState, native_enum=False, create_constraint=True),
         nullable=False,
         default=AcoustIDVerificationState.pending,
+        server_default=AcoustIDVerificationState.pending.value,
     )
     acoustid_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
