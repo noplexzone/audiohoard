@@ -3,9 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from httpx import AsyncClient
+from sqlalchemy import select
 
 from app.config import Settings
 from app.database import get_session_factory
+from app.models.import_plan import CollisionState, ImportPlan, TagVerificationState
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.staging_review import StagingReviewItem
@@ -13,8 +15,10 @@ from app.models.track import Track
 from app.models.workflow import (
     AcoustIDVerificationState,
     AcquisitionState,
+    ImportWorkflowState,
     ReviewDecision,
 )
+from app.settings_service import DEFAULT_MAX_PARTIAL_ATTEMPTS
 
 
 async def _review_fixture(settings: Settings, name: str) -> tuple[int, int, Path]:
@@ -30,6 +34,7 @@ async def _review_fixture(settings: Settings, name: str) -> tuple[int, int, Path
             release=release,
             source="slskd",
             title=name,
+            track_no=7,
             source_path=str(audio),
             staging_path=str(audio),
             acquisition_state=AcquisitionState.downloaded,
@@ -98,3 +103,230 @@ async def test_review_approve_resumes_import_and_deny_retains_staging(
         assert approved_row.acoustid_verification_state == AcoustIDVerificationState.approved
         assert denied_row.acoustid_verification_state == AcoustIDVerificationState.denied
         assert denied_row.acquisition_state == AcquisitionState.failed
+
+
+async def test_review_page_renders_release_reason_and_dismiss_retains_source(
+    client: AsyncClient, test_settings: Settings
+) -> None:
+    item_id, _, staged_path = await _review_fixture(test_settings, "reason")
+
+    page = await client.get("/downloads")
+    assert page.status_code == 200
+    assert "Artist — Album" in page.text
+    assert "AcoustID mismatch on track 7" in page.text
+    assert f"/staging/review/{item_id}/dismiss" in page.text
+
+    dismissed = await client.post(f"/staging/review/{item_id}/dismiss", follow_redirects=False)
+    assert dismissed.status_code == 303
+    assert dismissed.headers["location"] == "/downloads?notice=review_dismissed"
+    assert staged_path.exists()
+
+    factory = get_session_factory()
+    async with factory() as db:
+        assert await db.get(StagingReviewItem, item_id) is None
+
+
+async def test_missing_source_review_exposes_reacquire_and_queues_continuation(
+    client: AsyncClient, test_settings: Settings, monkeypatch
+) -> None:
+    missing = test_settings.staging_root / "gone.mp3"
+    retained = test_settings.staging_root / "retained.mp3"
+    retained.parent.mkdir(parents=True, exist_ok=True)
+    retained.write_bytes(b"keep me")  # noqa: ASYNC240
+    factory = get_session_factory()
+    async with factory() as db:
+        job = Job(source="slskd", query="Artist Album", status=JobStatus.done)
+        release = Release(
+            job=job,
+            source="slskd",
+            title="Missing Source Album",
+            album_artist="Artist",
+            import_state=ImportWorkflowState.needs_review,
+            error_detail=f"missing staged source: {missing}",
+        )
+        missing_track = Track(
+            job=job,
+            release=release,
+            source="slskd",
+            artist="Artist",
+            album="Missing Source Album",
+            title="Gone",
+            staging_path=str(missing),
+            acquisition_state=AcquisitionState.downloaded,
+            acoustid_verification_state=AcoustIDVerificationState.verified,
+        )
+        retained_track = Track(
+            job=job,
+            release=release,
+            source="slskd",
+            artist="Artist",
+            album="Missing Source Album",
+            title="Retained",
+            staging_path=str(retained),
+            acquisition_state=AcquisitionState.downloaded,
+            acoustid_verification_state=AcoustIDVerificationState.verified,
+        )
+        plan = ImportPlan(
+            release=release,
+            track=missing_track,
+            source_path=str(missing),
+            staging_path=str(missing),
+            destination_path=str(test_settings.library_root / "gone.mp3"),
+            collision_state=CollisionState.needs_review,
+            tag_verification_state=TagVerificationState.pending,
+            status=ImportWorkflowState.needs_review,
+            error_detail="source path is not a regular file",
+        )
+        db.add_all([job, release, missing_track, retained_track, plan])
+        db.add(Job(source="slskd", query="unrelated free text", status=JobStatus.pending))
+        await db.commit()
+        release_id = release.id
+        missing_track_id = missing_track.id
+
+    dispatched: list[int] = []
+
+    async def fake_dispatch(job_id: int):
+        dispatched.append(job_id)
+
+    monkeypatch.setattr("app.routers.staging.job_dispatcher.dispatch", fake_dispatch)
+
+    page = await client.get("/downloads")
+    assert f"missing staged source: {missing}" in page.text
+    assert f"/staging/release/{release_id}/reacquire" in page.text
+    assert ">Re-acquire<" in page.text
+
+    response = await client.post(
+        f"/staging/release/{release_id}/reacquire", follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/downloads?notice=reacquired"
+    assert retained.exists()
+    assert dispatched
+
+    async with factory() as db:
+        track = await db.get(Track, missing_track_id)
+        release = await db.get(Release, release_id)
+        assert track is not None and release is not None
+        assert track.staging_path is None
+        assert track.acquisition_state == AcquisitionState.failed
+        assert release.import_state == ImportWorkflowState.discovered
+        assert release.error_detail is None
+        continuation = await db.scalar(select(Job).where(Job.parent_job_id == release.job_id))
+        assert continuation is not None
+        assert continuation.query == "Artist Missing Source Album Gone"
+        assert continuation.catalog_album_id is None
+        assert continuation.catalog_track_id is None
+
+
+async def test_release_review_dismissal_preserves_audit_state_and_source(
+    client: AsyncClient, test_settings: Settings
+) -> None:
+    item_id, track_id, staged_path = await _review_fixture(test_settings, "release-dismiss")
+    factory = get_session_factory()
+    async with factory() as db:
+        item = await db.get(StagingReviewItem, item_id)
+        assert item is not None
+        release = await db.get(Release, item.release_id)
+        assert release is not None
+        release.import_state = ImportWorkflowState.rolled_back
+        release.error_detail = "import execution error: destination race"
+        release.rollback_detail = "rollback evidence"
+        plan = ImportPlan(
+            release_id=release.id,
+            track_id=track_id,
+            source_path=str(staged_path),
+            staging_path=str(staged_path),
+            destination_path=str(test_settings.library_root / "dismissed.mp3"),
+            status=ImportWorkflowState.rolled_back,
+            error_detail="destination race",
+            rollback_detail="rollback evidence",
+        )
+        db.add(plan)
+        await db.commit()
+        release_id = release.id
+        plan_id = plan.id
+
+    response = await client.post(f"/staging/release/{release_id}/dismiss", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/downloads?notice=review_dismissed"
+    assert staged_path.exists()
+
+    async with factory() as db:
+        release = await db.get(Release, release_id)
+        assert release is not None
+        assert release.import_state == ImportWorkflowState.rolled_back
+        assert release.error_detail == "import execution error: destination race"
+        assert release.rollback_detail == "rollback evidence"
+        assert release.review_dismissed_at is not None
+        assert await db.get(ImportPlan, plan_id) is not None
+        assert await db.get(StagingReviewItem, item_id) is not None
+
+    page = await client.get("/downloads")
+    assert "import execution error: destination race" not in page.text
+
+
+async def test_reacquire_stops_after_persisted_continuation_attempt_cap(
+    client: AsyncClient, test_settings: Settings, monkeypatch
+) -> None:
+    factory = get_session_factory()
+    query = "Artist Missing Source Album Gone"
+    async with factory() as db:
+        root = Job(source="slskd", query=query, status=JobStatus.done, partial_attempt=0)
+        release = Release(
+            job=root,
+            source="slskd",
+            title="Missing Source Album",
+            album_artist="Artist",
+            import_state=ImportWorkflowState.needs_review,
+            error_detail="missing staged source: gone.mp3",
+        )
+        track = Track(
+            job=root,
+            release=release,
+            source="slskd",
+            artist="Artist",
+            album="Missing Source Album",
+            title="Gone",
+            acquisition_state=AcquisitionState.failed,
+            acoustid_verification_state=AcoustIDVerificationState.pending,
+        )
+        db.add_all([root, release, track])
+        await db.flush()
+        for attempt in range(1, DEFAULT_MAX_PARTIAL_ATTEMPTS + 1):
+            db.add(
+                Job(
+                    source="priority",
+                    query=query,
+                    status=JobStatus.failed,
+                    parent_job_id=root.id,
+                    partial_attempt=attempt,
+                )
+            )
+        await db.commit()
+        release_id = release.id
+        root_id = root.id
+
+    dispatched: list[int] = []
+
+    async def fake_dispatch(job_id: int) -> None:
+        dispatched.append(job_id)
+
+    monkeypatch.setattr("app.routers.staging.job_dispatcher.dispatch", fake_dispatch)
+    response = await client.post(
+        f"/staging/release/{release_id}/reacquire", follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/downloads?notice=invalid_state"
+    assert not dispatched
+
+    async with factory() as db:
+        attempts = list(
+            (
+                await db.scalars(
+                    select(Job.partial_attempt)
+                    .where(Job.parent_job_id == root_id)
+                    .order_by(Job.partial_attempt)
+                )
+            ).all()
+        )
+        assert attempts == list(range(1, DEFAULT_MAX_PARTIAL_ATTEMPTS + 1))

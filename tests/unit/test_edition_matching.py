@@ -164,6 +164,7 @@ async def test_incomplete_acoustid_or_contradictory_evidence_needs_review(
     assert result.state == ImportWorkflowState.needs_review
     assert result.selected_candidate is None
     assert release.import_state == ImportWorkflowState.needs_review
+    assert release.error_detail == "release-match review: no unambiguous edition candidate"
     assert track.import_state == ImportWorkflowState.needs_review
     assert result.candidates[0].review_state == MatchReviewState.needs_review
     assert result.candidates[0].selected is False

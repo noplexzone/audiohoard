@@ -41,6 +41,9 @@ class Release(Base):
     )
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     rollback_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    review_dismissed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     recovery_attempted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

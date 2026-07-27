@@ -15,6 +15,7 @@ from app.models.track import IdentityResolutionState, Track
 from app.models.workflow import (
     AcoustIDVerificationState,
     AcquisitionState,
+    ImportWorkflowState,
     ReviewDecision,
 )
 from app.schemas.search import SearchResult
@@ -237,6 +238,8 @@ async def test_auto_import_requires_complete_verified_catalog_release(
     assert not await try_auto_import_release(
         db_session, release, library_root=tmp_path, naming_template="{title}.{ext}"
     )
+    assert release.import_state == ImportWorkflowState.needs_review
+    assert release.error_detail == "track-count mismatch: expected 2, found 1"
 
     second = Track(
         job=job,
