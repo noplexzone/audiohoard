@@ -280,6 +280,10 @@ async def resolve_release_match(
         for candidate in candidates:
             candidate.selected = False
             candidate.review_state = MatchReviewState.needs_review
+        release.error_detail = "release-match review: no unambiguous edition candidate"
+        release.review_dismissed_at = None
+    else:
+        release.error_detail = None
 
     release.import_state = state
     track.import_state = state

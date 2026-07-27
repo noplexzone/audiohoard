@@ -43,30 +43,34 @@
   </form>
 </div>
 
-{% if pending_review_items %}
-<section aria-label="Pending review" style="margin-bottom:2rem">
-  <h2 style="margin-bottom:.75rem">Pending review</h2>
-  <p class="hint">These tracks could not be automatically verified by AcoustID fingerprinting. Listen to confirm identity, then approve or deny.</p>
-  {% for item in pending_review_items %}
+{% if release_reviews %}
+<section aria-label="Import review" style="margin-bottom:2rem">
+  <h2 style="margin-bottom:.75rem">Import review</h2>
+  <p class="hint">Every blocked release includes the persisted reason. Dismiss and deny actions retain staged source files.</p>
+  {% for review in release_reviews %}
   <article class="card" style="margin-bottom:1rem">
-    <h3 style="margin:0 0 .5rem">{{ item.expected_title or "Unknown title" }}</h3>
-    <dl style="display:grid;grid-template-columns:max-content 1fr;gap:.25rem .75rem;font-size:.9em;margin-bottom:.75rem">
-      <dt>Expected MBID</dt><dd><code>{{ item.expected_recording_mbid or "—" }}</code></dd>
-      <dt>Observed MBIDs</dt><dd>{% if item.observed_acoustid_mbids %}{% for m in item.observed_acoustid_mbids %}<code>{{ m }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% else %}—{% endif %}</dd>
-      <dt>AcoustID score</dt><dd>{{ "%.3f"|format(item.acoustid_score) if item.acoustid_score is not none else "—" }}</dd>
-      <dt>Duration</dt><dd>{{ item.fingerprint_duration_sec ~ "s" if item.fingerprint_duration_sec is not none else "—" }}</dd>
-      <dt>Reason</dt><dd><code>{{ item.verification_reason }}</code></dd>
-    </dl>
-    <audio controls style="width:100%;margin-bottom:.75rem" src="/staging/audio/{{ item.id }}">Your browser does not support audio playback.</audio>
-    <div style="display:flex;gap:.5rem">
-      <form method="post" action="/staging/review/{{ item.id }}/approve">
-        <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
-        <button class="btn" type="submit">Approve — import</button>
-      </form>
-      <form method="post" action="/staging/review/{{ item.id }}/deny">
-        <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
-        <button class="btn secondary" type="submit">Deny — keep staged</button>
-      </form>
+    <h3 style="margin:0 0 .5rem">{{ review.release.album_artist or "Unknown artist" }} — {{ review.release.title or "Unknown release" }}</h3>
+    <p class="alert {% if review.missing_source %}error{% else %}warn{% endif %} compact"><strong>Reason:</strong> {{ review.reason }}</p>
+    {% for item in review.review_items %}
+    <div style="border-top:1px solid var(--border);padding-top:.75rem;margin-top:.75rem">
+      <h4 style="margin:0 0 .5rem">{{ item.expected_title or "Unknown title" }}</h4>
+      <dl style="display:grid;grid-template-columns:max-content 1fr;gap:.25rem .75rem;font-size:.9em;margin-bottom:.75rem">
+        <dt>Expected MBID</dt><dd><code>{{ item.expected_recording_mbid or "—" }}</code></dd>
+        <dt>Observed MBIDs</dt><dd>{% if item.observed_acoustid_mbids %}{% for m in item.observed_acoustid_mbids %}<code>{{ m }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% else %}—{% endif %}</dd>
+        <dt>AcoustID score</dt><dd>{{ "%.3f"|format(item.acoustid_score) if item.acoustid_score is not none else "—" }}</dd>
+        <dt>Duration</dt><dd>{{ item.fingerprint_duration_sec ~ "s" if item.fingerprint_duration_sec is not none else "—" }}</dd>
+      </dl>
+      <audio controls style="width:100%;margin-bottom:.75rem" src="/staging/audio/{{ item.id }}">Your browser does not support audio playback.</audio>
+      <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+        <form method="post" action="/staging/review/{{ item.id }}/approve"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn" type="submit">Approve — import</button></form>
+        <form method="post" action="/staging/review/{{ item.id }}/deny"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Deny — keep staged</button></form>
+        <form method="post" action="/staging/review/{{ item.id }}/dismiss"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Dismiss</button></form>
+      </div>
+    </div>
+    {% endfor %}
+    <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.75rem">
+      {% if review.missing_source %}<form method="post" action="/staging/release/{{ review.release.id }}/reacquire"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn" type="submit">Re-acquire</button></form>{% endif %}
+      <form method="post" action="/staging/release/{{ review.release.id }}/dismiss"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Dismiss release review</button></form>
     </div>
   </article>
   {% endfor %}

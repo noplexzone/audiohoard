@@ -531,6 +531,16 @@ def test_catalog_track_matching_never_falls_back_to_result_position() -> None:
     assert matched is None
 
 
+def test_catalogless_continuation_reuses_track_across_provider_fallback() -> None:
+    existing = Track(source="slskd", title="Recovered Song", album="Recovered Album")
+
+    matched = runner._existing_track_for_result(
+        [existing], "Recovered Song", "Recovered Album", None
+    )
+
+    assert matched is existing
+
+
 # ---------------------------------------------------------------------------
 # Background-path transaction/failure slice tests
 # ---------------------------------------------------------------------------

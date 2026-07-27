@@ -17,8 +17,9 @@ from app.auth import get_current_user, require_mutation
 from app.database import get_db
 from app.jobs.dispatcher import JobNotFoundError, JobStateError, job_dispatcher
 from app.models.job import Job, JobStatus
+from app.models.release import Release
 from app.models.staging_review import StagingReviewItem
-from app.models.workflow import ReviewDecision
+from app.models.workflow import ImportWorkflowState, ReviewDecision
 from app.schemas.job import JobCreate, JobRead, SelectedResultPayload
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -32,6 +33,13 @@ def _get_templates(request: Request) -> Jinja2Templates:
 
 def _selected_json(payload: SelectedResultPayload | None) -> str | None:
     return payload.model_dump_json() if payload is not None else None
+
+
+def _review_item_reason(item: StagingReviewItem) -> str:
+    track_label = item.track.track_no or item.track.id or "unknown"
+    if item.verification_reason == "mismatch":
+        return f"AcoustID mismatch on track {track_label}"
+    return f"AcoustID verification unavailable on track {track_label}"
 
 
 @router.post("/jobs", response_model=JobRead, status_code=201)
@@ -101,10 +109,59 @@ async def downloads_page(
     downloads = list(result.scalars().all())
     review_result = await db.execute(
         select(StagingReviewItem)
-        .where(StagingReviewItem.review_state == ReviewDecision.pending)
+        .where(
+            StagingReviewItem.review_state == ReviewDecision.pending,
+            StagingReviewItem.release.has(Release.review_dismissed_at.is_(None)),
+        )
+        .options(
+            selectinload(StagingReviewItem.track),
+            selectinload(StagingReviewItem.release),
+        )
         .order_by(StagingReviewItem.created_at.asc())
     )
     pending_review_items = list(review_result.scalars().all())
+    release_result = await db.execute(
+        select(Release)
+        .where(
+            Release.import_state.in_(
+                [
+                    ImportWorkflowState.needs_review,
+                    ImportWorkflowState.failed,
+                    ImportWorkflowState.rolled_back,
+                ]
+            ),
+            Release.review_dismissed_at.is_(None),
+        )
+        .options(
+            selectinload(Release.tracks),
+            selectinload(Release.import_plans),
+        )
+        .order_by(Release.created_at.asc())
+    )
+    releases_by_id = {release.id: release for release in release_result.scalars().all()}
+    items_by_release: dict[int, list[StagingReviewItem]] = {}
+    for item in pending_review_items:
+        items_by_release.setdefault(item.release_id, []).append(item)
+        releases_by_id.setdefault(item.release_id, item.release)
+    release_reviews: list[dict[str, object]] = []
+    for release in releases_by_id.values():
+        items = items_by_release.get(release.id, [])
+        plan_reason = next(
+            (plan.error_detail for plan in release.import_plans if plan.error_detail), None
+        )
+        reason = release.error_detail or release.rollback_detail or plan_reason
+        if not reason and items:
+            reason = _review_item_reason(items[0])
+        if not reason:
+            reason = "review required: no structured reason was recorded"
+        release_reviews.append(
+            {
+                "release": release,
+                "reason": reason,
+                "missing_source": str(reason).startswith("missing staged source:"),
+                "review_items": items,
+            }
+        )
     notices = {
         "cancelled": ("Cancellation requested.", "info"),
         "retried": ("Retry scheduled.", "info"),
@@ -114,6 +171,8 @@ async def downloads_page(
         "approved": ("Track approved — import pipeline resumed.", "ok"),
         "denied": ("Track denied — file remains staged and marked rejected.", "info"),
         "already_reviewed": ("That item has already been reviewed.", "info"),
+        "review_dismissed": ("Review entry dismissed; staged files were retained.", "info"),
+        "reacquired": ("Re-acquisition queued for the missing staged source.", "info"),
     }
     notice_key = request.query_params.get("notice", "")
     notice, notice_type = notices.get(notice_key, (None, "info"))
@@ -131,6 +190,7 @@ async def downloads_page(
             "downloads": downloads,
             "jobs": downloads,
             "pending_review_items": pending_review_items,
+            "release_reviews": release_reviews,
             "notice": notice,
             "notice_type": notice_type,
             "selected_status": status.value if status is not None else None,

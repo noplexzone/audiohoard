@@ -501,7 +501,6 @@ async def _run_job_in_session(
             track_album = catalog_album.title if catalog_album is not None else result.album
             track = _existing_track_for_result(
                 existing_tracks,
-                result.source,
                 track_title,
                 track_album,
                 catalog_track,
@@ -844,7 +843,6 @@ def _catalog_track_for_result(
 
 def _existing_track_for_result(
     tracks: list[Track],
-    source: str,
     title: str | None,
     album: str | None,
     catalog_track: CatalogAlbumTrack | None,
@@ -857,8 +855,7 @@ def _existing_track_for_result(
         (
             track
             for track in tracks
-            if track.source == source
-            and (track.title or "").casefold().strip() == (title or "").casefold().strip()
+            if (track.title or "").casefold().strip() == (title or "").casefold().strip()
             and (track.album or "").casefold().strip() == (album or "").casefold().strip()
         ),
         None,

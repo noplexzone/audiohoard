@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, require_mutation
@@ -15,10 +15,17 @@ from app.config import Settings
 from app.database import get_db
 from app.jobs.dispatcher import job_dispatcher
 from app.media_formats import IMPORTABLE_AUDIO_SUFFIXES
+from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
+from app.models.release import Release
 from app.models.staging_review import StagingReviewItem
 from app.models.track import Track
-from app.models.workflow import AcoustIDVerificationState, AcquisitionState, ReviewDecision
+from app.models.workflow import (
+    AcoustIDVerificationState,
+    AcquisitionState,
+    ImportWorkflowState,
+    ReviewDecision,
+)
 from app.settings_service import effective_settings_dep, get_runtime_settings
 
 router = APIRouter(prefix="/staging", dependencies=[Depends(get_current_user)])
@@ -166,8 +173,6 @@ async def approve_review_item(
     if track is not None:
         track.acoustid_verification_state = AcoustIDVerificationState.approved
 
-    from app.models.release import Release
-
     release = await db.get(Release, item.release_id)
     if release is not None:
         await db.flush()
@@ -207,6 +212,10 @@ async def deny_review_item(
     if track is not None:
         track.acoustid_verification_state = AcoustIDVerificationState.denied
         track.acquisition_state = AcquisitionState.failed
+        release = await db.get(Release, item.release_id)
+        if release is not None:
+            track_label = track.track_no or track.id or "unknown"
+            release.error_detail = f"AcoustID mismatch on track {track_label}"
         parent = await db.get(Job, track.job_id)
         runtime = await get_runtime_settings(db)
         if (
@@ -242,3 +251,128 @@ async def deny_review_item(
     if continuation_id is not None:
         await job_dispatcher.dispatch(continuation_id)
     return RedirectResponse("/downloads?notice=denied", status_code=303)
+
+
+@router.post("/review/{item_id}/dismiss", include_in_schema=False)
+async def dismiss_review_item(
+    item_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    """Remove a stale review record without touching its staged source file."""
+    item = await db.get(StagingReviewItem, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Review item not found")
+    await db.delete(item)
+    await db.commit()
+    return RedirectResponse("/downloads?notice=review_dismissed", status_code=303)
+
+
+@router.post("/release/{release_id}/dismiss", include_in_schema=False)
+async def dismiss_release_review(
+    release_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    """Dismiss a release-level review while retaining every source file."""
+    release = await db.get(Release, release_id)
+    if release is None:
+        raise HTTPException(status_code=404, detail="Release not found")
+    release.review_dismissed_at = datetime.now(UTC)
+    await db.commit()
+    return RedirectResponse("/downloads?notice=review_dismissed", status_code=303)
+
+
+@router.post("/release/{release_id}/reacquire", include_in_schema=False)
+async def reacquire_missing_release_sources(
+    release_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    """Queue bounded continuation jobs for tracks whose staged source disappeared."""
+    release = await db.get(Release, release_id)
+    if release is None:
+        raise HTTPException(status_code=404, detail="Release not found")
+    if not (release.error_detail or "").startswith("missing staged source:"):
+        return RedirectResponse("/downloads?notice=invalid_state", status_code=303)
+
+    parent = await db.get(Job, release.job_id)
+    runtime = await get_runtime_settings(db)
+    if parent is None or parent.partial_attempt >= runtime.max_partial_attempts:
+        return RedirectResponse("/downloads?notice=invalid_state", status_code=303)
+
+    missing_track_ids = {
+        plan.track_id
+        for plan in release.import_plans
+        if plan.error_detail
+        and (
+            plan.error_detail == "source path is not a regular file"
+            or "no staged source path" in plan.error_detail
+        )
+    }
+    if not missing_track_ids:
+        missing_track_ids = {track.id for track in release.tracks if not track.staging_path}
+
+    continuation_ids: list[int] = []
+    existing_continuation = False
+    for track in release.tracks:
+        if track.id not in missing_track_ids:
+            continue
+        continuation_query = " ".join(
+            part for part in (track.artist, track.album, track.title) if part
+        )
+        duplicate_query = select(Job.id).where(
+            Job.parent_job_id == parent.id,
+            Job.status.in_([JobStatus.pending, JobStatus.running]),
+        )
+        if track.catalog_track_id is not None:
+            duplicate_query = duplicate_query.where(
+                Job.catalog_album_id == track.catalog_album_id,
+                Job.catalog_track_id == track.catalog_track_id,
+            )
+        else:
+            duplicate_query = duplicate_query.where(Job.query == continuation_query)
+        history_query = select(func.max(Job.partial_attempt)).where(Job.parent_job_id == parent.id)
+        if track.catalog_track_id is not None:
+            history_query = history_query.where(
+                Job.catalog_album_id == track.catalog_album_id,
+                Job.catalog_track_id == track.catalog_track_id,
+            )
+        else:
+            history_query = history_query.where(Job.query == continuation_query)
+        previous_attempt = await db.scalar(history_query)
+        next_attempt = max(parent.partial_attempt, previous_attempt or 0) + 1
+        duplicate = await db.scalar(duplicate_query)
+        if duplicate is None and next_attempt > runtime.max_partial_attempts:
+            continue
+        track.acquisition_state = AcquisitionState.failed
+        track.import_state = ImportWorkflowState.discovered
+        track.acoustid_verification_state = AcoustIDVerificationState.pending
+        track.staging_path = None
+        if duplicate is not None:
+            existing_continuation = True
+            continue
+        continuation = Job(
+            source="priority",
+            query=continuation_query,
+            status=JobStatus.pending,
+            catalog_album_id=track.catalog_album_id,
+            catalog_track_id=track.catalog_track_id,
+            parent_job_id=parent.id,
+            partial_attempt=next_attempt,
+        )
+        db.add(continuation)
+        await db.flush()
+        continuation_ids.append(continuation.id)
+
+    if not continuation_ids and not existing_continuation:
+        return RedirectResponse("/downloads?notice=invalid_state", status_code=303)
+    await db.execute(delete(ImportPlan).where(ImportPlan.release_id == release_id))
+    release.import_state = ImportWorkflowState.discovered
+    release.error_detail = None
+    release.rollback_detail = None
+    release.review_dismissed_at = None
+    await db.commit()
+    for continuation_id in continuation_ids:
+        await job_dispatcher.dispatch(continuation_id)
+    return RedirectResponse("/downloads?notice=reacquired", status_code=303)

@@ -9,7 +9,7 @@ on:
 jobs:
   quality:
     if: github.event_name == 'push' || github.ref == 'refs/heads/main'
-    name: Quality checks
+    name: Release / Quality checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -621,3 +621,66 @@ async def test_invalid_provider_settings_form_redirects_with_error_instead_of_50
     )
     assert response.status_code == 303
     assert response.headers["location"].startswith("/settings/download-clients?error=")
+
+
+@pytest.mark.asyncio
+async def test_quality_profile_renders_shipped_defaults_and_supported_controls(
+    client: AsyncClient,
+) -> None:
+    response = await client.get("/settings/quality")
+    assert response.status_code == 200
+    body = response.text
+    assert "Quality profile" in body
+    for value in ("flac", "mp3", "m4a/aac", "ogg", "opus"):
+        assert f'name="format_order" value="{value}"' in body
+    assert '<option value="192"' in body
+    assert '<option value="256"' in body
+    assert '<option value="320" selected' in body
+    assert 'name="allow_lower_quality_fallback"' in body
+    assert "lyrics sidecars are always excluded" in body
+
+
+@pytest.mark.asyncio
+async def test_quality_profile_form_persists_order_bitrate_and_fallback(
+    client: AsyncClient,
+) -> None:
+    response = await client.post(
+        "/settings",
+        data={
+            "section": "quality",
+            "format_order": ["mp3", "flac", "m4a/aac", "ogg", "opus"],
+            "min_mp3_bitrate": "256",
+            "allow_lower_quality_fallback": "true",
+            "max_partial_attempts": "3",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/settings/quality?saved=1"
+
+    page = await client.get("/settings/quality")
+    assert page.text.index('value="mp3"') < page.text.index('value="flac"')
+    assert '<option value="256" selected' in page.text
+    assert 'name="allow_lower_quality_fallback" value="true" checked' in page.text
+
+
+@pytest.mark.asyncio
+async def test_quality_profile_rejects_invalid_bitrate_instead_of_clamping(
+    client: AsyncClient,
+) -> None:
+    response = await client.post(
+        "/settings",
+        data={
+            "section": "quality",
+            "format_order": ["flac", "mp3", "m4a/aac", "ogg", "opus"],
+            "min_mp3_bitrate": "255",
+            "max_partial_attempts": "3",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/settings/quality?error=")
+
+    page = await client.get("/settings/quality")
+    assert 'value="255"' not in page.text
+    assert all(f'<option value="{value}"' in page.text for value in (192, 256, 320))

@@ -197,7 +197,7 @@ class CatalogAlbumTrack(Base):
         ForeignKey("catalog_albums.id", ondelete="CASCADE"), nullable=False
     )
     position: Mapped[int] = mapped_column(Integer, nullable=False)
-    disc: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    disc: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     title: Mapped[str] = mapped_column(Text, nullable=False)
     duration_sec: Mapped[int | None] = mapped_column(Integer, nullable=True)
     recording_mbid: Mapped[str | None] = mapped_column(String(36), nullable=True)

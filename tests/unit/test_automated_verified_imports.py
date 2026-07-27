@@ -15,6 +15,7 @@ from app.models.track import IdentityResolutionState, Track
 from app.models.workflow import (
     AcoustIDVerificationState,
     AcquisitionState,
+    ImportWorkflowState,
     ReviewDecision,
 )
 from app.schemas.search import SearchResult
@@ -83,9 +84,26 @@ def test_quality_profile_prefers_complete_flac_over_complete_mp3() -> None:
     assert selected.audio_format == "flac"
 
 
-def test_quality_profile_can_forbid_lower_quality_fallback() -> None:
+def test_quality_profile_accepts_second_ranked_format_without_global_fallback() -> None:
     folders = group_slskd_files_into_folders(
         [_folder_response("mp3", "Artist\\Album", "mp3", 15, 320)]
+    )
+    selected = select_best_folder(
+        folders,
+        catalog_track_count=15,
+        catalog_artist="Artist",
+        catalog_album="Album",
+        format_preference=["flac", "mp3"],
+        min_mp3_bitrate=320,
+        allow_lower_quality_fallback=False,
+    )
+    assert selected is not None
+    assert selected.audio_format == "mp3"
+
+
+def test_quality_profile_rejects_below_threshold_mp3_without_fallback() -> None:
+    folders = group_slskd_files_into_folders(
+        [_folder_response("mp3", "Artist\\Album", "mp3", 15, 256)]
     )
     assert (
         select_best_folder(
@@ -93,12 +111,29 @@ def test_quality_profile_can_forbid_lower_quality_fallback() -> None:
             catalog_track_count=15,
             catalog_artist="Artist",
             catalog_album="Album",
-            format_preference=["flac", "mp3"],
+            format_preference=["flac", "mp3", "m4a/aac", "ogg", "opus"],
             min_mp3_bitrate=320,
             allow_lower_quality_fallback=False,
         )
         is None
     )
+
+
+def test_quality_profile_treats_m4a_and_aac_as_one_ranked_family() -> None:
+    folders = group_slskd_files_into_folders(
+        [_folder_response("m4a", "Artist\\Album", "m4a", 15, 256)]
+    )
+    selected = select_best_folder(
+        folders,
+        catalog_track_count=15,
+        catalog_artist="Artist",
+        catalog_album="Album",
+        format_preference=["flac", "mp3", "m4a/aac", "ogg", "opus"],
+        min_mp3_bitrate=320,
+        allow_lower_quality_fallback=False,
+    )
+    assert selected is not None
+    assert selected.audio_format == "m4a"
 
 
 def test_catalog_matching_normalizes_track_prefixes_and_skit_descriptors() -> None:
@@ -203,6 +238,8 @@ async def test_auto_import_requires_complete_verified_catalog_release(
     assert not await try_auto_import_release(
         db_session, release, library_root=tmp_path, naming_template="{title}.{ext}"
     )
+    assert release.import_state == ImportWorkflowState.needs_review
+    assert release.error_detail == "track-count mismatch: expected 2, found 1"
 
     second = Track(
         job=job,

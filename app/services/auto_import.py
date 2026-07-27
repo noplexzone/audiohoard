@@ -55,6 +55,12 @@ async def try_auto_import_release(
             len(catalog_ids),
             expected_count,
         )
+        release.import_state = ImportWorkflowState.needs_review
+        release.review_dismissed_at = None
+        release.error_detail = (
+            f"track-count mismatch: expected {expected_count}, found {len(catalog_ids)}"
+        )
+        await db.flush()
         return False
 
     unresolved = [
@@ -70,6 +76,13 @@ async def try_auto_import_release(
             len(unresolved),
         )
         release.import_state = ImportWorkflowState.needs_review
+        release.review_dismissed_at = None
+        first = unresolved[0]
+        track_label = first.track_no or first.id or "unknown"
+        if first.acoustid_verification_state == AcoustIDVerificationState.mismatch:
+            release.error_detail = f"AcoustID mismatch on track {track_label}"
+        else:
+            release.error_detail = f"AcoustID verification unavailable on track {track_label}"
         await db.flush()
         return False
 
@@ -85,7 +98,8 @@ async def try_auto_import_release(
     except (ImportPlanningError, OSError) as exc:
         logger.error("auto_import: planning failed for release %d: %s", release.id, exc)
         release.import_state = ImportWorkflowState.failed
-        release.error_detail = f"auto plan failed: {exc}"
+        release.review_dismissed_at = None
+        release.error_detail = f"import planning error: {exc}"
         await db.flush()
         return False
 
@@ -96,13 +110,27 @@ async def try_auto_import_release(
             release.id,
             len(not_ready),
         )
+        first_plan = not_ready[0]
+        detail = first_plan.error_detail or "import plan requires review"
+        if detail == "source path is not a regular file" or "no staged source path" in detail:
+            release.error_detail = f"missing staged source: {first_plan.source_path or detail}"
+        else:
+            release.error_detail = f"import planning error: {detail}"
+        release.import_state = ImportWorkflowState.needs_review
+        release.review_dismissed_at = None
+        await db.flush()
         return False
 
     logger.info("auto_import: executing import for release %d", release.id)
     try:
         await execute_release_import(db, release, library_root=library_root)
+        release.error_detail = None
+        release.rollback_detail = None
         logger.info("auto_import: release %d imported successfully", release.id)
         return True
     except ImportExecutionError as exc:
         logger.error("auto_import: execution failed for release %d: %s", release.id, exc)
+        release.error_detail = f"import execution error: {exc}"
+        release.review_dismissed_at = None
+        await db.flush()
         return False

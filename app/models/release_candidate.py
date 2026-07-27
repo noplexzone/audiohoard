@@ -5,7 +5,18 @@ from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    false,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -52,9 +63,12 @@ class ReleaseCandidate(Base):
         Enum(MatchReviewState, native_enum=False, create_constraint=True),
         nullable=False,
         default=MatchReviewState.pending,
+        server_default=MatchReviewState.pending.value,
     )
     review_audit_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    selected: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

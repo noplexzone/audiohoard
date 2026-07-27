@@ -99,6 +99,11 @@ _FORMAT_RANK: dict[str, int] = {
 _LOSSLESS_EXTS: frozenset[str] = frozenset({"flac", "alac", "wav", "aiff", "aif"})
 
 
+def _format_family(audio_format: str) -> str:
+    value = audio_format.casefold()
+    return "m4a/aac" if value in {"m4a", "aac"} else value
+
+
 def score_album_folder(
     folder: AlbumFolder,
     *,
@@ -142,7 +147,7 @@ def score_album_folder(
     fmt = folder.audio_format
     if format_preference:
         try:
-            pref_index = [p.casefold() for p in format_preference].index(fmt)
+            pref_index = [_format_family(p) for p in format_preference].index(_format_family(fmt))
             score += max(0.0, 20.0 - pref_index * 10.0)
         except ValueError:
             score -= 5.0
@@ -188,8 +193,9 @@ def select_best_folder(
 ) -> AlbumFolder | None:
     """Return the best-scoring folder, respecting quality profile.
 
-    If `allow_lower_quality_fallback` is False and no folder meets the top format
-    preference, return None only when a non-preferred format is the ONLY option.
+    Every listed format is acceptable in preference order. With fallback disabled,
+    candidates outside the list (or MP3s below the threshold) are rejected. With
+    fallback enabled they are used only when no profile-compliant candidate exists.
     """
     if not folders:
         return None
@@ -206,19 +212,18 @@ def select_best_folder(
 
     sorted_folders = sorted(folders, key=lambda f: f.score, reverse=True)
 
-    if not allow_lower_quality_fallback and format_preference:
-        preferred = format_preference[0].casefold()
-        preferred_candidates = [f for f in sorted_folders if f.audio_format == preferred]
-        if preferred == "mp3":
-            preferred_candidates = [
-                folder
-                for folder in preferred_candidates
-                if folder.files
-                and all(
-                    file.bit_rate is not None and file.bit_rate >= min_mp3_bitrate
-                    for file in folder.files
-                )
-            ]
-        return preferred_candidates[0] if preferred_candidates else None
+    preferred_families = {_format_family(value) for value in format_preference}
 
-    return sorted_folders[0]
+    def meets_profile(folder: AlbumFolder) -> bool:
+        if preferred_families and _format_family(folder.audio_format) not in preferred_families:
+            return False
+        if folder.audio_format != "mp3":
+            return True
+        return bool(folder.files) and all(
+            file.bit_rate is not None and file.bit_rate >= min_mp3_bitrate for file in folder.files
+        )
+
+    compliant = [folder for folder in sorted_folders if meets_profile(folder)]
+    if compliant:
+        return compliant[0]
+    return sorted_folders[0] if allow_lower_quality_fallback else None

@@ -31,7 +31,10 @@ class Job(Base):
     source: Mapped[str] = mapped_column(String(64), nullable=False)
     query: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[JobStatus] = mapped_column(
-        Enum(JobStatus), nullable=False, default=JobStatus.pending
+        Enum(JobStatus),
+        nullable=False,
+        default=JobStatus.pending,
+        server_default=JobStatus.pending.value,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -50,7 +53,9 @@ class Job(Base):
     parent_job_id: Mapped[int | None] = mapped_column(
         ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
     )
-    partial_attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    partial_attempt: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     catalog_album_id: Mapped[int | None] = mapped_column(
         ForeignKey("catalog_albums.id", ondelete="SET NULL"), nullable=True
     )

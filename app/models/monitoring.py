@@ -36,6 +36,7 @@ class MonitoringRecord(Base):
         Enum(MonitoringStatus, native_enum=False, create_constraint=True),
         nullable=False,
         default=MonitoringStatus.active,
+        server_default=MonitoringStatus.active.value,
     )
     desired_quality_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     history_json: Mapped[str | None] = mapped_column(Text, nullable=True)
