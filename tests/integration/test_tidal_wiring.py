@@ -32,7 +32,12 @@ async def test_tidal_health_search_job_and_settings_wiring(
             True, extra={"code": "ok", "version": "2022.10.31.1", "auth": "unprobed"}
         )
 
+    async def record_only_dispatch(job_id: int) -> None:
+        """Keep this wiring test from racing its shared SQLite fixture."""
+        assert job_id > 0
+
     monkeypatch.setattr(TidalAdapter, "health", healthy)
+    monkeypatch.setattr("app.routers.jobs.job_dispatcher.dispatch", record_only_dispatch)
 
     health = await client.get("/health/sources")
     assert health.status_code == 200 and "tidal" in health.json()
