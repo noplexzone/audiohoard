@@ -58,25 +58,42 @@ def test_settings_forms_are_native_and_not_double_submitted() -> None:
     assert '"tidal_config_path","tidal_session_path","tidal_quality"' in setup
 
 
-def test_favicon_png_has_transparent_corners_and_touch_icon_is_opaque() -> None:
-    from PIL import Image
+def test_branding_sources_are_the_requested_artwork() -> None:
+    import hashlib
 
-    favicon = Image.open("app/static/branding/favicon-32.png").convert("RGBA")
-    assert favicon.getpixel((0, 0))[3] == 0
-    assert favicon.getpixel((31, 31))[3] == 0
-
-    touch = Image.open("app/static/branding/apple-touch-icon.png").convert("RGBA")
-    assert touch.getpixel((0, 0))[3] == 255
+    expected_sha256 = "1fd2198b6b6dbf556eeb9b1e713332e21b9a53c32be13d400bc06c883cca8bb8"
+    branding = Path("app/static/branding")
+    for name in ("source-app-icon.png", "source-favicon.png"):
+        assert hashlib.sha256((branding / name).read_bytes()).hexdigest() == expected_sha256
 
 
-def test_favicon_ico_entries_carry_alpha() -> None:
-    from PIL import Image
+def test_generated_png_icons_use_the_requested_artwork() -> None:
+    from PIL import Image, ImageChops
 
+    source = Image.open("app/static/branding/source-app-icon.png").convert("RGBA")
+    for name, size in (
+        ("favicon-16.png", 16),
+        ("favicon-32.png", 32),
+        ("icon-32.png", 32),
+        ("apple-touch-icon.png", 180),
+        ("icon-192.png", 192),
+        ("icon-512.png", 512),
+    ):
+        actual = Image.open(f"app/static/branding/{name}").convert("RGBA")
+        expected = source.resize((size, size), Image.Resampling.LANCZOS)
+        assert ImageChops.difference(actual, expected).getbbox() is None
+
+
+def test_favicon_ico_uses_the_requested_artwork() -> None:
+    from PIL import Image, ImageChops
+
+    source = Image.open("app/static/branding/source-favicon.png").convert("RGBA")
     ico = Image.open("app/static/branding/favicon.ico")
     for index in range(getattr(ico, "n_frames", 1)):
         ico.seek(index)
-        image = ico.convert("RGBA")
-        assert image.getpixel((0, 0))[3] == 0
+        actual = ico.convert("RGBA")
+        expected = source.resize(actual.size, Image.Resampling.LANCZOS)
+        assert ImageChops.difference(actual, expected).getbbox() is None
 
 
 def test_dockerfile_version_and_healthcheck_match_current_runtime_contract() -> None:
