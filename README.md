@@ -1,6 +1,6 @@
 # Audiohoard
 
-**Private, self-hosted music acquisition and library management — v0.6.2**
+**Private, self-hosted music acquisition and library management — v0.7.0**
 
 A FastAPI application that coordinates multiple acquisition sources, enriches tracks with metadata, fingerprints audio, and enforces strict library naming conventions. Application state remains self-hosted; configured metadata and acquisition providers receive the requests required to perform their work.
 
@@ -101,10 +101,10 @@ HTTP. Set `AUTH_COOKIE_SECURE=true` whenever Audiohoard is served behind HTTPS.
 
 ## Container image
 
-The release workflow publishes tagged builds to `noplexzone/audiohoard` on Docker Hub after the quality gate passes. Pull v0.6.2 with:
+The release workflow publishes tagged builds to `noplexzone/audiohoard` on Docker Hub after the quality gate passes. Pull v0.7.0 with:
 
 ```bash
-docker pull noplexzone/audiohoard:0.6.2
+docker pull noplexzone/audiohoard:0.7.0
 ```
 
 ## Continuous integration
