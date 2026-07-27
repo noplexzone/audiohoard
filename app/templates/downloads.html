@@ -30,6 +30,19 @@
   <button type="submit" class="btn">Enqueue</button>
 </form>
 
+<div class="form-row" style="margin-bottom:1rem;">
+  <form method="post" action="/downloads/clear" onsubmit="return confirm('Clear every failed download from the queue?');">
+    <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+    <input type="hidden" name="scope" value="failed">
+    <button type="submit" class="btn secondary">Clear failed</button>
+  </form>
+  <form method="post" action="/downloads/clear" onsubmit="return confirm('Clear all finished, failed, partial, and cancelled downloads from the queue?');">
+    <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+    <input type="hidden" name="scope" value="finished">
+    <button type="submit" class="btn secondary">Clear finished</button>
+  </form>
+</div>
+
 {% set queue = namespace(active=false) %}
 {% if downloads %}
 <div class="table-wrap">
@@ -132,7 +145,10 @@
           <form method="post" action="/downloads/{{ download.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Cancel</button></form>
           {% elif status in ['failed', 'partial', 'cancelled'] %}
           <form method="post" action="/downloads/{{ download.id }}/retry"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Retry</button></form>
-          {% else %}—{% endif %}
+          {% endif %}
+          {% if status in ['done', 'failed', 'partial', 'cancelled'] %}
+          <form method="post" action="/downloads/{{ download.id }}/remove" onsubmit="return confirm('Remove this download from the queue?');"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Remove</button></form>
+          {% endif %}
         </td>
       </tr>
     {% endfor %}

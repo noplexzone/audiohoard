@@ -202,12 +202,9 @@ class SlskdAdapter:
 
     async def status(self, transfer_id: str) -> CapabilityState:
         for item in await self.downloads():
-            item_id = str(
-                item.get("id")
-                or item.get("transferId")
-                or f"{item.get('username')}:{item.get('filename')}"
-            )
-            if item_id == transfer_id:
+            provider_id = item.get("id") or item.get("transferId")
+            fallback_id = f"{item.get('username')}:{item.get('filename')}"
+            if transfer_id in {str(provider_id) if provider_id is not None else "", fallback_id}:
                 state = str(item.get("state") or item.get("status") or "queued").casefold()
                 return CapabilityState(True, state, dict(item))
         return CapabilityState(False, "transfer not found", {"transfer_id": transfer_id})

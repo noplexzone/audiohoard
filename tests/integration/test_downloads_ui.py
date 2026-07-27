@@ -73,6 +73,79 @@ async def test_download_job_controls_redirect_with_feedback(
     assert calls == [("cancel", 41), ("retry", 42)]
 
 
+async def test_downloads_remove_terminal_and_clear_failed_jobs(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        failed_one = Job(source="slskd", query="failed one", status=JobStatus.failed)
+        failed_two = Job(source="slskd", query="failed two", status=JobStatus.failed)
+        done = Job(source="slskd", query="done", status=JobStatus.done)
+        running = Job(source="slskd", query="running", status=JobStatus.running)
+        db.add_all([failed_one, failed_two, done, running])
+        await db.flush()
+        library_track = Track(
+            job_id=done.id,
+            source="slskd",
+            title="Preserved Track",
+            source_path="/music/Artist/Album/Track.flac",
+            acquisition_state=AcquisitionState.downloaded,
+        )
+        db.add(library_track)
+        await db.commit()
+        failed_one_id, failed_two_id = failed_one.id, failed_two.id
+        done_id, running_id = done.id, running.id
+        library_track_id = library_track.id
+
+    page = await client.get("/downloads")
+    assert page.status_code == 200
+    assert 'action="/downloads/clear"' in page.text
+    assert 'value="failed"' in page.text
+    assert 'value="finished"' in page.text
+    assert f'action="/downloads/{failed_one_id}/remove"' in page.text
+    assert f'action="/downloads/{done_id}/remove"' in page.text
+    assert f'action="/downloads/{running_id}/remove"' not in page.text
+
+    removed = await client.post(f"/downloads/{done_id}/remove", follow_redirects=False)
+    assert removed.status_code == 303
+    assert removed.headers["location"] == "/downloads?notice=removed"
+
+    cleared = await client.post(
+        "/downloads/clear", data={"scope": "failed"}, follow_redirects=False
+    )
+    assert cleared.status_code == 303
+    assert cleared.headers["location"] == "/downloads?notice=cleared&count=2"
+
+    async with factory() as db:
+        failed_one_row = await db.get(Job, failed_one_id)
+        failed_two_row = await db.get(Job, failed_two_id)
+        done_row = await db.get(Job, done_id)
+        assert failed_one_row is not None and failed_one_row.queue_hidden is True
+        assert failed_two_row is not None and failed_two_row.queue_hidden is True
+        assert done_row is not None and done_row.queue_hidden is True
+        assert await db.get(Track, library_track_id) is not None
+        assert await db.get(Job, running_id) is not None
+
+    hidden_page = await client.get("/downloads")
+    assert "failed one" not in hidden_page.text
+    assert "failed two" not in hidden_page.text
+    assert "Preserved Track" not in hidden_page.text
+
+
+async def test_downloads_refuses_to_remove_active_job(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        job = Job(source="slskd", query="running", status=JobStatus.running)
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+
+    response = await client.post(f"/downloads/{job_id}/remove", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/downloads?notice=invalid_state"
+    async with factory() as db:
+        assert await db.get(Job, job_id) is not None
+
+
 async def test_downloads_shows_elapsed_and_external_transfer_wait(client: AsyncClient) -> None:
     """Running job with an acquiring track shows elapsed time and external wait label."""
     factory = get_session_factory()

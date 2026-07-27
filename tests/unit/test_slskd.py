@@ -162,3 +162,34 @@ class TestSlskdTransfers:
         assert status.available is True
         assert status.reason == "inprogress"
         assert status.extra["username"] == "peer1"
+
+    async def test_status_matches_fallback_identity_when_item_has_uuid(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer1",
+                    "directories": [
+                        {
+                            "files": [
+                                {
+                                    "id": "4dd4add9-96ce-4ab2-80d4-5b171b324e3e",
+                                    "filename": "Music\\Artist\\Album\\01 Song.flac",
+                                    "state": "Completed, Succeeded",
+                                }
+                            ]
+                        }
+                    ],
+                }
+            ],
+        )
+
+        status = await SlskdAdapter("http://slskd.local", "key123").status(
+            "peer1:Music\\Artist\\Album\\01 Song.flac"
+        )
+
+        assert status.available is True
+        assert status.reason == "completed, succeeded"
+        assert status.extra["id"] == "4dd4add9-96ce-4ab2-80d4-5b171b324e3e"

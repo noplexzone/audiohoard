@@ -98,13 +98,20 @@ async def get_dashboard_data(db: AsyncSession, settings: Settings) -> DashboardD
     """Load dashboard aggregates and bounded recent activity from persisted data."""
     library = await get_library_stats(db)
 
-    status_rows = await db.execute(select(Job.status, func.count(Job.id)).group_by(Job.status))
+    status_rows = await db.execute(
+        select(Job.status, func.count(Job.id))
+        .where(Job.queue_hidden.is_(False))
+        .group_by(Job.status)
+    )
     job_counts = {status.value: 0 for status in JobStatus}
     for status, count in status_rows:
         job_counts[status.value] = int(count)
 
     jobs_result = await db.execute(
-        select(Job).order_by(Job.created_at.desc(), Job.id.desc()).limit(_RECENT_LIMIT)
+        select(Job)
+        .where(Job.queue_hidden.is_(False))
+        .order_by(Job.created_at.desc(), Job.id.desc())
+        .limit(_RECENT_LIMIT)
     )
     tracks_result = await db.execute(select(Track).order_by(Track.id.desc()).limit(_RECENT_LIMIT))
 

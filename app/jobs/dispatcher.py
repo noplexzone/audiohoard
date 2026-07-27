@@ -118,10 +118,46 @@ class JobDispatcher:
             }:
                 raise JobNotRetryableError(job_id, job.status)
             job.status = JobStatus.pending
+            job.queue_hidden = False
             job.result_json = None
             job.updated_at = datetime.now(UTC)
             await db.commit()
         return await self.dispatch(job_id)
+
+    async def remove(self, job_id: int) -> None:
+        async with self._factory()() as db:
+            job = await db.get(Job, job_id)
+            if job is None:
+                raise JobNotFoundError(job_id)
+            if job.status in {JobStatus.pending, JobStatus.running}:
+                raise JobStateError(job_id, job.status)
+            job.queue_hidden = True
+            await db.commit()
+
+    async def clear(self, statuses: set[JobStatus]) -> int:
+        terminal = {
+            JobStatus.done,
+            JobStatus.failed,
+            JobStatus.partial,
+            JobStatus.cancelled,
+        }
+        if not statuses or not statuses.issubset(terminal):
+            raise ValueError("Only terminal job states can be cleared")
+        async with self._factory()() as db:
+            jobs = list(
+                (
+                    await db.scalars(
+                        select(Job).where(
+                            Job.status.in_(statuses),
+                            Job.queue_hidden.is_(False),
+                        )
+                    )
+                ).all()
+            )
+            for job in jobs:
+                job.queue_hidden = True
+            await db.commit()
+            return len(jobs)
 
     async def recover(
         self,

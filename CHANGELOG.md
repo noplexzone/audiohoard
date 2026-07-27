@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Added non-destructive queue controls to hide individual terminal downloads, clear failed downloads, or clear all finished downloads while preserving library metadata.
 - Added provider-native artist identities and discography snapshots, with per-artist watchlist-provider selection and MusicBrainz, Deezer, and iTunes discography switching.
 
 ### Changed
@@ -16,6 +17,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Replaced user-facing monitoring terminology with watchlist terminology and restored a conventional settings gear icon.
 
 ### Fixed
+- Reconciled slskd transfers by peer and filename when enqueue responses omit the provider UUID, and restored compatibility with the legacy staging mount when the new default path is absent.
 - Provider-specific release kinds no longer contaminate one another, and Albums-only views and watchlist policies now exclude Singles and EPs, including iTunes `- Single` and `- EP` releases.
 - Corrected slskd download enqueue payloads to use the required request array, preserved validation details, and handled nested transfer responses.
 
