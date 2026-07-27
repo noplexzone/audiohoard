@@ -66,33 +66,6 @@ def _corner_background(img: Image.Image, tolerance: int = 10) -> tuple[int, int,
     return rgb
 
 
-def _within_tolerance(
-    pixel: tuple[int, int, int, int], bg: tuple[int, int, int], tolerance: int
-) -> bool:
-    return pixel[3] >= 250 and max(abs(pixel[i] - bg[i]) for i in range(3)) <= tolerance
-
-
-def _key_corner_background_to_alpha(img: Image.Image, tolerance: int = 14) -> Image.Image:
-    rgba = img.convert("RGBA")
-    bg = _corner_background(rgba, tolerance=tolerance)
-    if bg is None:
-        return rgba
-    pixels = rgba.load()
-    stack = [(0, 0), (rgba.width - 1, 0), (0, rgba.height - 1), (rgba.width - 1, rgba.height - 1)]
-    seen: set[tuple[int, int]] = set()
-    while stack:
-        x, y = stack.pop()
-        if (x, y) in seen or x < 0 or y < 0 or x >= rgba.width or y >= rgba.height:
-            continue
-        seen.add((x, y))
-        pixel = pixels[x, y]
-        if not _within_tolerance(pixel, bg, tolerance):
-            continue
-        pixels[x, y] = (pixel[0], pixel[1], pixel[2], 0)
-        stack.extend(((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)))
-    return rgba
-
-
 def _resize_square(img: Image.Image, size: int) -> Image.Image:
     return img.convert("RGBA").resize((size, size), Image.LANCZOS)
 
@@ -131,7 +104,7 @@ def main() -> None:
 
     icon_src = Image.open(SOURCE_ICON)
     favicon_src = Image.open(SOURCE_FAVICON)
-    favicon_transparent = _key_corner_background_to_alpha(favicon_src)
+    favicon_artwork = favicon_src.convert("RGBA")
 
     theme_color = _sample_theme_color(icon_src)
     detected_icon_bg = _corner_background(icon_src)
@@ -142,8 +115,8 @@ def main() -> None:
     )
 
     sizes: dict[str, tuple[Image.Image, int]] = {
-        "favicon-16.png": (favicon_transparent, 16),
-        "favicon-32.png": (favicon_transparent, 32),
+        "favicon-16.png": (favicon_artwork, 16),
+        "favicon-32.png": (favicon_artwork, 32),
         "icon-32.png": (icon_src, 32),
         "apple-touch-icon.png": (icon_src, 180),
         "icon-192.png": (icon_src, 192),
@@ -155,7 +128,7 @@ def main() -> None:
         _resize_square(src, size).save(out, format="PNG")
         print(f"  wrote {out}")
 
-    ico_images = [_resize_square(favicon_transparent, s) for s in (16, 32, 48)]
+    ico_images = [_resize_square(favicon_artwork, s) for s in (16, 32, 48)]
     ico_path = BRANDING / "favicon.ico"
     ico_path.write_bytes(_build_ico(ico_images))
     print(f"  wrote {ico_path}")
