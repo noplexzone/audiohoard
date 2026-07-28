@@ -1,0 +1,162 @@
+{% set queue = namespace(active=false) %}
+{% if download_groups %}
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Release / download</th>
+        <th scope="col">Artist</th>
+        <th scope="col">Source</th>
+        <th scope="col">Status</th>
+        <th scope="col">Elapsed</th>
+        <th scope="col">Last activity</th>
+        <th scope="col">Details</th>
+        <th scope="col">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for group in download_groups %}
+      {% set download = group.attempts[0].job %}
+      {% set status = group.status.value %}
+      {% if group.active %}{% set queue.active = true %}{% endif %}
+      {% set sc = "ok" if status == "done" else ("warn" if status in ["pending", "running", "partial"] else ("error" if status in ["failed", "cancelled"] else "info")) %}
+
+      {# Elapsed since created_at #}
+      {% set created = download.created_at %}
+      {% if created.tzinfo is none %}
+        {% set elapsed_sec = (now.replace(tzinfo=none) - created).total_seconds() | int %}
+      {% else %}
+        {% set elapsed_sec = (now - created).total_seconds() | int %}
+      {% endif %}
+      {% if elapsed_sec < 60 %}
+        {% set elapsed_str = elapsed_sec ~ "s" %}
+      {% elif elapsed_sec < 3600 %}
+        {% set elapsed_str = (elapsed_sec // 60) ~ "m " ~ (elapsed_sec % 60) ~ "s" %}
+      {% else %}
+        {% set elapsed_str = (elapsed_sec // 3600) ~ "h " ~ ((elapsed_sec % 3600) // 60) ~ "m" %}
+      {% endif %}
+
+      {# Last activity from updated_at #}
+      {% set updated = download.updated_at %}
+      {% if updated.tzinfo is none %}
+        {% set delta_sec = (now.replace(tzinfo=none) - updated).total_seconds() | int %}
+      {% else %}
+        {% set delta_sec = (now - updated).total_seconds() | int %}
+      {% endif %}
+      {% if delta_sec < 10 %}
+        {% set activity_str = "just now" %}
+      {% elif delta_sec < 60 %}
+        {% set activity_str = delta_sec ~ "s ago" %}
+      {% elif delta_sec < 3600 %}
+        {% set activity_str = (delta_sec // 60) ~ " min ago" %}
+      {% elif delta_sec < 86400 %}
+        {% set activity_str = (delta_sec // 3600) ~ "h ago" %}
+      {% else %}
+        {% set activity_str = (delta_sec // 86400) ~ "d ago" %}
+      {% endif %}
+
+      <tr data-download-group="{{ group.key }}">
+        <td>
+          <div class="download-release">
+            {% if group.artwork_url %}
+              {% if group.catalog_album_id %}
+                <a href="/albums/{{ group.catalog_album_id }}"><img class="download-thumb" src="/artwork?url={{ group.artwork_url | urlencode }}" width="48" height="48" loading="lazy" decoding="async" alt=""></a>
+              {% else %}
+                <img class="download-thumb" src="/artwork?url={{ group.artwork_url | urlencode }}" width="48" height="48" loading="lazy" decoding="async" alt="">
+              {% endif %}
+            {% else %}
+              {% set initials = (group.album_title or group.label)[:2] | upper %}
+              {% if group.catalog_album_id %}
+                <a href="/albums/{{ group.catalog_album_id }}"><div class="cover-tile download-thumb">{{ initials }}</div></a>
+              {% else %}
+                <div class="cover-tile download-thumb">{{ initials }}</div>
+              {% endif %}
+            {% endif %}
+            <div>
+              {% if group.catalog_album_id %}
+                <a href="/albums/{{ group.catalog_album_id }}"><strong>{{ group.album_title or group.label }}</strong></a>
+              {% else %}
+                <strong>{{ group.album_title or group.label }}</strong>
+              {% endif %}
+              {% if group.artist_name %}
+                <br><span class="hint">{{ group.artist_name }}</span>
+              {% endif %}
+              <br><span class="hint">{{ group.downloaded_track_count }} / {{ group.wanted_track_count }} downloaded · {{ group.attempts | length }} attempt{% if group.attempts | length != 1 %}s{% endif %}</span>
+            </div>
+          </div>
+        </td>
+        <td>
+          {% if group.artist_name %}
+            <a href="/library?q={{ group.artist_name | urlencode }}">{{ group.artist_name }}</a>
+          {% else %}
+            <span class="hint">—</span>
+          {% endif %}
+        </td>
+        <td><span class="badge info">{{ download.source }}</span></td>
+        <td>
+          <span class="badge {{ sc }}"><span class="dot"></span>{{ status }}</span>
+          {% if group.wanted_track_count > 0 %}
+            <progress class="queue-progress" value="{{ group.downloaded_track_count }}" max="{{ group.wanted_track_count }}">{{ group.downloaded_track_count }} / {{ group.wanted_track_count }}</progress>
+          {% endif %}
+        </td>
+        <td class="queue-time" title="started {{ download.created_at.strftime('%Y-%m-%d %H:%M') }}">{{ elapsed_str }}</td>
+        <td class="queue-time" title="{{ download.updated_at.strftime('%Y-%m-%d %H:%M:%S') }}">{{ activity_str }}<br><time class="hint">{{ download.updated_at.strftime("%Y-%m-%d %H:%M") }}</time></td>
+        <td>
+          <details>
+            <summary>View attempts</summary>
+            {% for attempt in group.attempts %}
+            {% set attempt_job = attempt.job %}
+            {% set meta = attempt.metadata %}
+            <section class="download-attempt" aria-label="Attempt {{ attempt_job.id }}">
+            <p><code>#{{ attempt_job.id }}</code> · <span class="badge info">{{ attempt_job.source }}</span> · <strong>{{ attempt_job.status.value }}</strong><br><span class="hint">{{ attempt_job.query }}</span></p>
+            {% if meta.error %}<p class="alert error compact"><strong>{{ meta.error.code | default('error') }}</strong>{% if meta.error.detail %}: {{ meta.error.detail }}{% endif %}</p>{% endif %}
+            {% if meta.errors %}{% for error_json in meta.errors %}{% set error = error_json | from_json %}<p class="alert error compact"><strong>{{ error.code | default('error') }}</strong>{% if error.detail %}: {{ error.detail }}{% endif %}</p>{% endfor %}{% endif %}
+            {% if meta.recovery %}<p class="alert compact">Recovered after {{ meta.recovery.code | replace('_', ' ') }}.</p>{% endif %}
+            {% if meta.tracks_created is defined %}<p class="hint">Tracks created: {{ meta.tracks_created }}</p>{% endif %}
+            {% if meta.missing_tracks %}<p class="hint">Missing: {{ meta.missing_tracks | join(', ') }}</p>{% endif %}
+            {% if attempt_job.tracks %}
+            <ul class="track-states">
+              {% for t in attempt_job.tracks %}
+              <li class="track-state">
+                <span>{{ t.title or "(unknown)" }}</span>
+                {% set ts = t.acquisition_state.value %}
+                {% if ts == "acquiring" %}
+                — <em class="hint">downloading via {{ t.source }}{% if t.source_status %} ({{ t.source_status }}){% endif %} — started {{ attempt_job.created_at.strftime("%H:%M") }}</em>
+                {% elif ts == "downloaded" %}
+                — <span class="badge ok queue-state-badge">done</span>
+                {% elif ts == "failed" %}
+                — <span class="badge error queue-state-badge">failed</span>
+                {% elif ts == "cancelled" %}
+                — <span class="badge warn queue-state-badge">cancelled</span>
+                {% elif ts == "searching" %}
+                — <span class="badge warn queue-state-badge">searching</span>
+                {% else %}
+                — <span class="hint">{{ ts }}</span>
+                {% endif %}
+              </li>
+              {% endfor %}
+            </ul>
+            {% endif %}
+            <a href="/tracks?download_id={{ attempt_job.id }}">View tracks</a>
+            </section>
+            {% endfor %}
+          </details>
+        </td>
+        <td class="action-cell">
+          {% if group.action_attempt and group.action_attempt.status.value in ['pending', 'running'] %}
+          <form method="post" action="/downloads/{{ group.action_attempt.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Cancel</button></form>
+          {% elif group.action_attempt and group.action_attempt.status.value in ['failed', 'partial', 'cancelled'] %}
+          <form method="post" action="/downloads/{{ group.action_attempt.id }}/retry"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Retry</button></form>
+          {% endif %}
+          {% if group.attempts | length == 1 and status in ['done', 'failed', 'partial', 'cancelled'] %}
+          <form method="post" action="/downloads/{{ download.id }}/remove" data-confirm="Remove this download from the queue?"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Remove</button></form>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="empty-state mini" role="status"><h3>No downloads yet</h3><p>Use the form above to enqueue your first acquisition.</p></div>
+{% endif %}

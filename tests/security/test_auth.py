@@ -203,3 +203,23 @@ async def test_concurrent_first_owner_setup_is_an_atomic_single_claim(
         login_statuses.append(login.status_code)
     assert login_statuses[winner_index] == 200
     assert login_statuses[1 - winner_index] == 401
+
+
+@pytest.mark.asyncio
+async def test_html_security_headers_and_docs_csp_exemption(client: AsyncClient) -> None:
+    client.cookies.clear()
+    login = await client.get("/login")
+
+    assert login.status_code == 200
+    assert login.headers["X-Frame-Options"] == "DENY"
+    assert login.headers["X-Content-Type-Options"] == "nosniff"
+    assert login.headers["Referrer-Policy"] == "no-referrer"
+    assert login.headers["Content-Security-Policy"] == (
+        "default-src 'self'; img-src 'self' data:; media-src 'self'; "
+        "script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'self'"
+    )
+
+    docs = await client.get("/api/docs")
+
+    assert docs.status_code == 200
+    assert "Content-Security-Policy" not in docs.headers

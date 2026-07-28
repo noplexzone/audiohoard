@@ -36,15 +36,17 @@ class Track(Base):
     __tablename__ = "tracks"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     release_id: Mapped[int | None] = mapped_column(
         ForeignKey("releases.id", ondelete="SET NULL"), nullable=True
     )
     catalog_album_id: Mapped[int | None] = mapped_column(
-        ForeignKey("catalog_albums.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("catalog_albums.id", ondelete="SET NULL"), nullable=True, index=True
     )
     catalog_track_id: Mapped[int | None] = mapped_column(
-        ForeignKey("catalog_album_tracks.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("catalog_album_tracks.id", ondelete="SET NULL"), nullable=True, index=True
     )
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
     artist: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -71,12 +73,14 @@ class Track(Base):
     acquisition_state: Mapped[AcquisitionState] = mapped_column(
         Enum(AcquisitionState, native_enum=False, create_constraint=True),
         nullable=False,
+        index=True,
         default=AcquisitionState.queued,
         server_default=AcquisitionState.queued.value,
     )
     import_state: Mapped[ImportWorkflowState] = mapped_column(
         Enum(ImportWorkflowState, native_enum=False, create_constraint=True),
         nullable=False,
+        index=True,
         default=ImportWorkflowState.discovered,
         server_default=ImportWorkflowState.discovered.value,
     )

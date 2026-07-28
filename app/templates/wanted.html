@@ -1,3 +1,53 @@
 {% extends "base.html" %}
-{% block title %}Artists — Audiohoard{% endblock %}
-{% block content %}<div class="empty-state"><h1>Artists moved</h1><p>Watchlisted artists now live on one page.</p><a class="btn" href="/artists">Open Artists</a></div>{% endblock %}
+{% block title %}Wanted — Audiohoard{% endblock %}
+{% block content %}
+{% set csrf_token = request.cookies.get('csrf', '') | e %}
+<div class="page-header">
+  <h1>Wanted</h1>
+  <p>{{ releases.total }} incomplete release{% if releases.total != 1 %}s{% endif %} from watchlisted artists</p>
+</div>
+<form method="get" action="/wanted" class="filter-bar" role="search" aria-label="Filter wanted releases">
+  <label class="sr-only" for="wanted-q">Search</label>
+  <input id="wanted-q" type="search" name="q" value="{{ q }}" placeholder="Search artists or releases…" aria-label="Search wanted releases">
+  <label class="sr-only" for="wanted-sort">Sort</label>
+  <select id="wanted-sort" name="sort" aria-label="Sort order">
+    <option value="year" {% if sort == "year" %}selected{% endif %}>Year</option>
+    <option value="artist" {% if sort == "artist" %}selected{% endif %}>Artist</option>
+    <option value="title" {% if sort == "title" %}selected{% endif %}>Title</option>
+  </select>
+  <button type="submit" class="btn">Filter</button>
+  {% if q %}<a href="/wanted" class="btn secondary">Clear</a>{% endif %}
+</form>
+{% if releases.items %}
+<div class="album-grid" role="list" aria-label="Wanted releases">
+  {% for release in releases.items %}
+  <article class="album-card" role="listitem">
+    <a class="album-art" href="/albums/{{ release.id }}" aria-label="Open {{ release.title }}">
+      {% if release.artwork_url %}<img loading="lazy" src="/artwork?url={{ release.artwork_url | urlencode }}" alt="">{% else %}<span>{{ release.title[:2] | upper }}</span>{% endif %}
+    </a>
+    <div class="album-card-body">
+      <h3><a href="/albums/{{ release.id }}" title="{{ release.title | e }}">{{ release.title }}</a></h3>
+      <p class="muted-line">{{ release.artist_name }}{% if release.year %} · {{ release.year }}{% endif %}</p>
+      <p class="release-progress">{{ release.downloaded_track_count }} / {{ release.wanted_track_count }} downloaded</p>
+      <div class="album-card-actions">
+        <form method="post" action="/albums/{{ release.id }}/download">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn secondary album-download">Download missing</button>
+        </form>
+      </div>
+    </div>
+  </article>
+  {% endfor %}
+</div>
+<nav class="pagination" aria-label="Wanted release pagination">
+  {% if releases.has_prev %}<a href="/wanted?{{ filter_qs }}&page={{ releases.page - 1 }}" class="btn secondary">← Prev</a>{% else %}<span class="btn secondary disabled" aria-disabled="true">← Prev</span>{% endif %}
+  <span class="pagination-info">Page {{ releases.page }} of {{ releases.total_pages }} ({{ releases.total }} releases)</span>
+  {% if releases.has_next %}<a href="/wanted?{{ filter_qs }}&page={{ releases.page + 1 }}" class="btn secondary">Next →</a>{% else %}<span class="btn secondary disabled" aria-disabled="true">Next →</span>{% endif %}
+</nav>
+{% else %}
+<div class="empty-state" role="status">
+  {% if q %}<p>No wanted releases match <strong>{{ q }}</strong>.</p><a href="/wanted" class="btn secondary">Clear search</a>
+  {% else %}<p>No incomplete releases from watchlisted artists.</p>{% endif %}
+</div>
+{% endif %}
+{% endblock %}

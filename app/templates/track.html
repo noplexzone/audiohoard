@@ -27,7 +27,7 @@
     <table>
       <tr><th>MBID</th><td><code>{{ track.mbid or "unresolved" }}</code></td></tr>
       <tr><th>Deezer ID</th><td><code>{{ track.deezer_id or "–" }}</code></td></tr>
-      <tr><th>AcoustID</th><td style="word-break:break-all;"><code>{{ (track.acoustid or "")[:40] ~ ("…" if track.acoustid and track.acoustid|length > 40 else "") or "–" }}</code></td></tr>
+      <tr><th>AcoustID</th><td class="break-all"><code>{{ (track.acoustid or "")[:40] ~ ("…" if track.acoustid and track.acoustid|length > 40 else "") or "–" }}</code></td></tr>
       <tr><th>Fingerprint</th>
         <td>
           {% set fs = track.fingerprint_state.value %}
@@ -42,34 +42,34 @@
     <h2>Source</h2>
     <table>
       <tr><th>Source</th><td><span class="badge info">{{ track.source }}</span></td></tr>
-      <tr><th>Source path</th><td style="word-break:break-all; font-size:0.8rem;">{{ track.source_path or "–" }}</td></tr>
+      <tr><th>Source path</th><td class="source-path-cell">{{ track.source_path or "–" }}</td></tr>
     </table>
   </div>
 </div>
 
 {% if track.path_previews %}
-<div class="card" style="margin-top:1.5rem;">
+<div class="card spaced-card">
   <h2>Path Previews</h2>
   {% for preview in track.path_previews %}
-  <div style="margin-bottom:1.25rem;">
-    <div style="color:var(--text-muted); font-size:0.78rem; margin-bottom:0.35rem;">
+  <div class="preview-item">
+    <div class="preview-template">
       Template: <code>{{ preview.naming_template }}</code>
     </div>
     <pre><code>{{ preview.rendered_path }}</code></pre>
-    <div style="color:var(--text-muted); font-size:0.75rem; margin-top:0.35rem;">
+    <div class="preview-computed">
       Computed {{ preview.computed_at.strftime("%Y-%m-%d %H:%M:%S UTC") }}
     </div>
   </div>
   {% endfor %}
 </div>
 {% else %}
-<div class="card" style="margin-top:1.5rem;">
+<div class="card spaced-card">
   <h2>Path Previews</h2>
-  <p style="color:var(--text-muted);">No path preview computed yet.</p>
+  <p class="preview-muted">No path preview computed yet.</p>
 </div>
 {% endif %}
 
-<div style="margin-top:1.5rem;">
-  <a href="/jobs/ui/list" class="btn secondary">&larr; Back to jobs</a>
+<div class="page-actions">
+  <a href="/downloads" class="btn secondary">&larr; Back to downloads</a>
 </div>
 {% endblock %}

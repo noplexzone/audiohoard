@@ -1,31 +1,83 @@
 {% extends "base.html" %}
 {% block title %}{{ album.title }} – Catalog{% endblock %}
 {% block content %}
-<header class="page-header">
-  <p class="eyebrow">Catalog album</p>
-  <h1>{{ album.artist.name }} — {{ album.title }}</h1>
-  <p>{{ album.year or 'Unknown year' }} · {{ album.release_type or 'release' }} {% if album.mbid %}<span class="badge ok">MBID resolved</span>{% else %}<span class="badge warn">Unresolved MBID</span>{% endif %}</p>
-  <p class="release-progress"><strong>{{ progress.downloaded_track_count }} / {{ progress.wanted_track_count }} downloaded</strong></p>
-  <form method="post" action="/albums/{{ album.id }}/download">
-    <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
-    <button type="submit" class="btn">Download album</button>
-  </form>
+<nav class="breadcrumb" aria-label="Breadcrumb">
+  <a href="/library">Library</a> / <a href="/artists/catalog/{{ album.artist.id }}">{{ album.artist.name }}</a> / {{ album.title }}
+</nav>
+<header class="album-detail-hero">
+  <div class="album-detail-art">
+    {% if album.artwork_url %}
+      <img src="/artwork?url={{ album.artwork_url | urlencode }}" alt="{{ album.title | e }} cover" width="240" height="240" loading="eager" decoding="async">
+    {% else %}
+      <span role="img" aria-label="No artwork available for {{ album.title | e }}">{{ album.title[:2] | upper }}</span>
+    {% endif %}
+  </div>
+  <div>
+    <a class="eyebrow" href="/artists/catalog/{{ album.artist.id }}">{{ album.artist.name }}</a>
+    <h1>{{ album.title }}</h1>
+    <p class="muted-line">
+      {{ album.year or 'Unknown year' }} · {{ album.release_type or 'Release' }} · {{ album.track_count or album.tracks | length }} track{% if (album.track_count or album.tracks | length) != 1 %}s{% endif %}
+      {% if total_runtime_sec %} · {{ total_runtime_sec // 3600 }}:{% if (total_runtime_sec % 3600) // 60 < 10 %}0{% endif %}{{ (total_runtime_sec % 3600) // 60 }}:{% if total_runtime_sec % 60 < 10 %}0{% endif %}{{ total_runtime_sec % 60 }}{% endif %}
+    </p>
+    <div class="release-progress">
+      {% if progress.wanted_track_count %}
+        <progress value="{{ progress.downloaded_track_count }}" max="{{ progress.wanted_track_count }}">{{ progress.downloaded_track_count }} of {{ progress.wanted_track_count }}</progress>
+      {% else %}
+        <progress value="0" max="1">0 of 0</progress>
+      {% endif %}
+      <span>{{ progress.downloaded_track_count }} of {{ progress.wanted_track_count }} in library</span>
+    </div>
+    <form method="post" action="/albums/{{ album.id }}/download">
+      <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+      <button type="submit" class="btn">Download missing</button>
+    </form>
+  </div>
 </header>
 {% if album.tracks %}
-<div class="table-wrap"><table><thead><tr><th>#</th><th>Title</th><th>Duration</th><th>Status</th><th>Action</th></tr></thead><tbody>
-{% for track in album.tracks %}
-<tr data-track-id="{{ track.id }}">
-  <td>{{ track.disc }}-{{ "%02d" % track.position }}</td>
-  <td>{{ track.title }}</td>
-  <td>{{ ("%d:%02d" % (track.duration_sec // 60, track.duration_sec % 60)) if track.duration_sec else "–" }}</td>
-  {% if track.id in progress.downloaded_catalog_track_ids %}
-  <td><span class="badge ok">Downloaded</span></td><td>–</td>
+  {% if album.tracks | length <= 3 %}
+  <ol class="album-track-list">
+    {% for track in album.tracks %}
+    <li data-track-id="{{ track.id }}">
+      <span class="track-no">{{ track.disc }}-{{ "%02d" % track.position }}</span>
+      <span>{{ track.title }}</span>
+      <span>{{ ("%d:%02d" % (track.duration_sec // 60, track.duration_sec % 60)) if track.duration_sec else "–" }}</span>
+      {% if track.id in progress.downloaded_catalog_track_ids %}
+        <span class="have-mark" aria-label="In library">✓</span><span>–</span>
+      {% else %}
+        <span aria-label="Not in library">–</span>
+        <form method="post" action="/albums/{{ album.id }}/tracks/{{ track.id }}/download"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary small" type="submit">Download</button></form>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ol>
   {% else %}
-  <td><span class="badge info">Wanted</span></td>
-  <td><form method="post" action="/albums/{{ album.id }}/tracks/{{ track.id }}/download" style="display:inline;"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit" style="padding:0.2rem 0.6rem; font-size:0.8rem;">Download</button></form></td>
+  <div class="table-wrap album-track-table"><table><thead><tr><th>#</th><th>Title</th><th>Length</th><th>Have</th><th>Format/Action</th></tr></thead><tbody>
+  {% for track in album.tracks %}
+  <tr data-track-id="{{ track.id }}">
+    <td>{{ track.disc }}-{{ "%02d" % track.position }}</td>
+    <td>{{ track.title }}</td>
+    <td>{{ ("%d:%02d" % (track.duration_sec // 60, track.duration_sec % 60)) if track.duration_sec else "–" }}</td>
+    {% if track.id in progress.downloaded_catalog_track_ids %}
+      <td><span class="have-mark" aria-label="In library">✓</span></td><td>–</td>
+    {% else %}
+      <td><span aria-label="Not in library">–</span></td>
+      <td><form method="post" action="/albums/{{ album.id }}/tracks/{{ track.id }}/download"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary small" type="submit">Download</button></form></td>
+    {% endif %}
+  </tr>
+  {% endfor %}
+  </tbody></table></div>
   {% endif %}
-</tr>
-{% endfor %}
-</tbody></table></div>
 {% else %}<div class="empty-state"><h3>No tracklist available</h3><p>This provider did not return track data yet.</p></div>{% endif %}
+{% if album.mbid or album.deezer_id or album.label or album.catalog_number or album.country or album.release_date %}
+<details class="card album-details"><summary>Details</summary>
+  <dl class="artist-meta">
+    {% if album.mbid %}<dt>MBID</dt><dd><code>{{ album.mbid }}</code></dd>{% endif %}
+    {% if album.deezer_id %}<dt>Deezer ID</dt><dd><code>{{ album.deezer_id }}</code></dd>{% endif %}
+    {% if album.label %}<dt>Label</dt><dd>{{ album.label }}</dd>{% endif %}
+    {% if album.catalog_number %}<dt>Catalog number</dt><dd>{{ album.catalog_number }}</dd>{% endif %}
+    {% if album.country %}<dt>Country</dt><dd>{{ album.country }}</dd>{% endif %}
+    {% if album.release_date %}<dt>Release date</dt><dd>{{ album.release_date }}</dd>{% endif %}
+  </dl>
+</details>
+{% endif %}
 {% endblock %}

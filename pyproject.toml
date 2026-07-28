@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audiohoard"
-version = "0.7.0"
+version = "0.7.1"
 description = "Self-hosted music acquisition, metadata enrichment, and library naming"
 requires-python = ">=3.12"
 dependencies = [
@@ -46,7 +46,7 @@ where = ["."]
 include = ["app*"]
 
 [tool.setuptools.package-data]
-app = ["templates/*.html", "static/css/*.css", "static/branding/*"]
+app = ["templates/*.html", "templates/partials/*.html", "static/css/*.css", "static/js/*.js", "static/branding/*"]
 
 [tool.setuptools.data-files]
 "." = ["CHANGELOG.md"]

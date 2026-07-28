@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -13,7 +14,9 @@ def test_setuptools_includes_web_assets_in_built_distributions() -> None:
     assert setuptools_config["include-package-data"] is True
     assert "app" in package_data
     assert "templates/*.html" in package_data["app"]
+    assert "templates/partials/*.html" in package_data["app"]
     assert "static/css/*.css" in package_data["app"]
+    assert "static/js/*.js" in package_data["app"]
     assert "static/branding/*" in package_data["app"]
     data_files = setuptools_config["data-files"]
     assert "." in data_files
@@ -48,6 +51,7 @@ def test_settings_forms_are_native_and_not_double_submitted() -> None:
     base = (templates / "base.html").read_text()
     setup = (templates / "setup.html").read_text()
     settings = (templates / "settings.html").read_text()
+    setup_js = Path("app/static/js/setup.js").read_text()
 
     assert 'document.addEventListener("submit"' not in base
     assert 'id="setup-form"' in setup and 'data-custom-submit="true"' in setup
@@ -55,7 +59,7 @@ def test_settings_forms_are_native_and_not_double_submitted() -> None:
     assert 'data-custom-submit="true"' not in settings
     assert 'headers: {"Content-Type": "application/json"' not in settings
     assert 'method="post" action="/settings/save"' in settings
-    assert '"tidal_config_path","tidal_session_path","tidal_quality"' in setup
+    assert '"tidal_config_path", "tidal_session_path", "tidal_quality"' in setup_js
 
 
 def test_branding_sources_are_the_requested_artwork() -> None:
@@ -99,7 +103,7 @@ def test_favicon_ico_uses_the_requested_artwork_at_every_size() -> None:
 
 def test_dockerfile_version_and_healthcheck_match_current_runtime_contract() -> None:
     dockerfile = Path("docker/Dockerfile").read_text(encoding="utf-8")
-    assert 'org.opencontainers.image.version="0.7.0"' in dockerfile
+    assert 'org.opencontainers.image.version="0.7.1"' in dockerfile
     assert "http://localhost:8000/health/ready" in dockerfile
 
 
@@ -107,3 +111,12 @@ def test_manual_develop_publish_is_restricted_to_main() -> None:
     workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
     assert "workflow_dispatch:" in workflow
     assert "if: github.event_name == 'push' || github.ref == 'refs/heads/main'" in workflow
+
+
+def test_templates_are_compatible_with_the_html_content_security_policy() -> None:
+    templates = Path("app/templates")
+    for template in templates.rglob("*.html"):
+        text = template.read_text(encoding="utf-8")
+        assert not re.search(r"\b(?:style|on[a-z]+)\s*=", text, re.IGNORECASE), template
+        for script in re.findall(r"<script\b[^>]*>", text, re.IGNORECASE):
+            assert re.search(r"\bsrc\s*=", script, re.IGNORECASE), (template, script)

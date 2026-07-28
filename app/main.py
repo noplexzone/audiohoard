@@ -16,6 +16,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import Response
 
@@ -24,7 +25,10 @@ from app.config import Settings, get_settings
 from app.database import get_db, get_session_factory
 from app.display_names import display_name
 from app.jobs.dispatcher import job_dispatcher
-from app.routers import auth, health, imports, jobs, naming, search, staging, tracks
+from app.models.release import Release
+from app.models.staging_review import StagingReviewItem
+from app.models.workflow import ReviewDecision
+from app.routers import artwork, auth, health, imports, jobs, naming, search, staging, tracks
 from app.routers import catalog as catalog_router
 from app.routers import settings as settings_router
 from app.services.acquisition_cleanup import (
@@ -115,6 +119,26 @@ def create_app() -> FastAPI:
     app.state.templates.env.globals["app_version"] = app_version
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
+    @app.middleware("http")
+    async def pending_review_count_middleware(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        request.state.pending_review_count = 0
+        if request.method == "GET" and not request.url.path.startswith(
+            ("/static/", "/api/", "/artwork")
+        ):
+            async with get_session_factory()() as db:
+                count = await db.scalar(
+                    select(func.count(StagingReviewItem.id))
+                    .join(Release, StagingReviewItem.release_id == Release.id)
+                    .where(
+                        StagingReviewItem.review_state == ReviewDecision.pending,
+                        Release.review_dismissed_at.is_(None),
+                    )
+                )
+            request.state.pending_review_count = int(count or 0)
+        return await call_next(request)
+
     @app.exception_handler(HTTPException)
     async def browser_auth_exception_handler(request: Request, exc: HTTPException) -> Response:
         accepts_html = "text/html" in request.headers.get("accept", "").casefold()
@@ -146,8 +170,26 @@ def create_app() -> FastAPI:
             )
         return response
 
+    @app.middleware("http")
+    async def html_security_headers_middleware(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        response = await call_next(request)
+        if "text/html" in response.headers.get("content-type", ""):
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            if not request.url.path.startswith(("/api/docs", "/api/redoc")):
+                response.headers["Content-Security-Policy"] = (
+                    "default-src 'self'; img-src 'self' data:; media-src 'self'; "
+                    "script-src 'self'; style-src 'self'; frame-ancestors 'none'; "
+                    "base-uri 'self'"
+                )
+        return response
+
     app.include_router(health.router, tags=["health"])
     app.include_router(auth.router, tags=["auth"])
+    app.include_router(artwork.router, tags=["artwork"])
     app.include_router(catalog_router.router, tags=["catalog"])
     app.include_router(search.router, tags=["search"])
     app.include_router(settings_router.router, tags=["settings"])

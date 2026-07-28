@@ -415,3 +415,29 @@ async def test_reacquire_stops_after_persisted_continuation_attempt_cap(
             ).all()
         )
         assert attempts == list(range(1, DEFAULT_MAX_PARTIAL_ATTEMPTS + 1))
+
+
+async def test_downloads_renders_review_rail_with_approve_action_unchanged(
+    client: AsyncClient, test_settings: Settings
+) -> None:
+    item_id, _, _ = await _review_fixture(test_settings, "rail")
+
+    response = await client.get("/downloads")
+
+    assert response.status_code == 200
+    assert 'class="review-rail" aria-label="Import review"' in response.text
+    assert f'<form method="post" action="/staging/review/{item_id}/approve">' in response.text
+
+
+async def test_pending_review_count_nav_badge_appears_only_when_needed(
+    client: AsyncClient, test_settings: Settings
+) -> None:
+    empty = await client.get("/downloads")
+    assert empty.status_code == 200
+    assert 'class="nav-badge"' not in empty.text
+
+    await _review_fixture(test_settings, "badge")
+    pending = await client.get("/downloads")
+
+    assert pending.status_code == 200
+    assert pending.text.count('class="nav-badge">1</span>') == 2

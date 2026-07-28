@@ -208,16 +208,77 @@ async def test_library_lists_only_eligible_catalog_artists(client: AsyncClient) 
     assert "Watchlisted Artist" in resp.text
     assert "Hidden Artist" not in resp.text
     assert f'href="/artists/catalog/{watched_id}"' in resp.text
-    assert 'src="https://images.example/watchlisted.jpg"' in resp.text
-    assert "Downloaded files" in resp.text
-    assert "Wanted releases" in resp.text
+    assert 'src="/artwork?url=https%3A//images.example/watchlisted.jpg"' in resp.text
+    assert "0 releases" in resp.text
+    assert "0 not in library" in resp.text
 
 
 async def test_legacy_artist_routes_redirect_to_library(client: AsyncClient) -> None:
-    for path in ("/artists/monitored", "/wanted"):
+    for path in ("/artists/monitored",):
         resp = await client.get(path, follow_redirects=False)
         assert resp.status_code in (302, 303, 307, 308)
         assert resp.headers["location"] == "/library"
+
+
+async def _seed_wanted_view_releases() -> None:
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        job = Job(source="slskd", query="wanted view", status=JobStatus.done)
+        release = Release(job=job, source="slskd", title="Complete Wanted Album")
+        watched = CatalogArtist(name="Wanted View Artist", monitored=True)
+        incomplete = CatalogAlbum(
+            title="Incomplete Wanted Album", year="2026", track_count=2, monitored=True
+        )
+        complete = CatalogAlbum(
+            title="Complete Wanted Album", year="2025", track_count=1, monitored=True
+        )
+        hidden_artist = CatalogArtist(name="Hidden Wanted Artist", monitored=False)
+        hidden = CatalogAlbum(title="Nonwatchlisted Missing Album", year="2024", track_count=2)
+        excluded = CatalogAlbum(
+            title="Explicitly Unwatched Album", year="2023", track_count=2, monitored=False
+        )
+        watched.albums.extend([incomplete, complete, excluded])
+        hidden_artist.albums.append(hidden)
+        complete_track = CatalogAlbumTrack(album=complete, position=1, disc=1, title="Complete")
+        session.add_all([job, release, watched, hidden_artist, complete_track])
+        await session.flush()
+        imported = _make_track(
+            job.id,
+            title="Complete",
+            artist=watched.name,
+            album=complete.title,
+            file_size_bytes=1024,
+            release_id=release.id,
+        )
+        imported.catalog_album_id = complete.id
+        imported.catalog_track_id = complete_track.id
+        session.add(imported)
+        await session.commit()
+
+
+async def test_wanted_lists_incomplete_release_of_watchlisted_artist(
+    client: AsyncClient,
+) -> None:
+    await _seed_wanted_view_releases()
+
+    response = await client.get("/wanted")
+
+    assert response.status_code == 200
+    assert "Incomplete Wanted Album" in response.text
+    assert "Wanted View Artist" in response.text
+
+
+async def test_wanted_excludes_complete_and_nonwatchlisted_releases(
+    client: AsyncClient,
+) -> None:
+    await _seed_wanted_view_releases()
+
+    response = await client.get("/wanted")
+
+    assert response.status_code == 200
+    assert "Complete Wanted Album" not in response.text
+    assert "Nonwatchlisted Missing Album" not in response.text
+    assert "Explicitly Unwatched Album" not in response.text
 
 
 async def test_settings_icon_is_a_conventional_gear(client: AsyncClient) -> None:
@@ -259,10 +320,9 @@ async def test_library_shows_track_artist(seeded_client: AsyncClient) -> None:
     assert "Album Artist A" in resp.text
 
 
-async def test_library_shows_file_and_wanted_counts(seeded_client: AsyncClient) -> None:
+async def test_library_shows_release_progress_counts(seeded_client: AsyncClient) -> None:
     resp = await seeded_client.get("/library")
-    assert "Downloaded files" in resp.text
-    assert "Wanted releases" in resp.text
+    assert "not in library" in resp.text
 
 
 async def test_library_uses_watchlisted_catalog_artists(seeded_client: AsyncClient) -> None:
@@ -366,6 +426,22 @@ async def test_library_html_has_artist_cards(seeded_client: AsyncClient) -> None
     assert "artist-card" in resp.text
 
 
+async def test_library_tracks_view_renders_track_table(seeded_client: AsyncClient) -> None:
+    resp = await seeded_client.get("/library?view=tracks")
+
+    assert resp.status_code == 200
+    assert 'aria-label="Track list"' in resp.text
+    assert "Song A" in resp.text
+
+
+async def test_library_default_view_still_renders_artist_grid(seeded_client: AsyncClient) -> None:
+    resp = await seeded_client.get("/library")
+
+    assert resp.status_code == 200
+    assert 'class="artist-grid"' in resp.text
+    assert 'aria-label="Track list"' not in resp.text
+
+
 async def test_library_html_has_filter_form(seeded_client: AsyncClient) -> None:
     resp = await seeded_client.get("/library")
     assert 'action="/library"' in resp.text
@@ -397,7 +473,7 @@ async def test_artist_detail_shows_album_section(seeded_client: AsyncClient) -> 
 
 async def test_nav_includes_only_combined_library(client: AsyncClient) -> None:
     resp = await client.get("/library")
-    assert resp.text.count('href="/library"') == 2
+    assert resp.text.count('href="/library"') == 3
     assert "<span>Artists</span>" not in resp.text
 
 
@@ -425,7 +501,7 @@ async def test_artists_redirects_to_library_preserving_query(client: AsyncClient
 async def test_library_nav_has_no_separate_artists_item(client: AsyncClient) -> None:
     response = await client.get("/library")
     assert response.status_code == 200
-    assert response.text.count('href="/library"') == 2
+    assert response.text.count('href="/library"') == 3
     assert "<span>Artists</span>" not in response.text
 
 
@@ -606,9 +682,49 @@ async def test_catalog_artist_unifies_release_progress_on_existing_cards(
     assert "1 / 3 downloaded" in response.text
     assert "1 / 1 downloaded" in response.text
     assert "0 / 4 downloaded" in response.text
-    assert "0 / 2 downloaded" in response.text
+    assert "0 / 2 downloaded" not in response.text
     assert "0 / 0 downloaded" not in response.text
     assert f'href="/albums/{partial_id}"' in response.text
+
+
+async def test_catalog_artist_enrich_queues_without_running_inline(
+    client: AsyncClient, monkeypatch
+) -> None:
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        artist = CatalogArtist(name="Queued Artist", last_enriched_at=datetime.now(tz=UTC))
+        session.add(artist)
+        await session.commit()
+        artist_id = artist.id
+
+    calls = 0
+
+    async def unexpected_enrichment(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+
+    queued_tasks = []
+
+    def capture_task(self, func, *args, **kwargs):
+        queued_tasks.append((func, args, kwargs))
+
+    monkeypatch.setattr("app.routers.catalog.enrich_catalog_artist", unexpected_enrichment)
+    monkeypatch.setattr("app.routers.catalog.BackgroundTasks.add_task", capture_task)
+    page = await client.get(f"/artists/catalog/{artist_id}")
+    csrf_token = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+
+    response = await client.post(
+        f"/artists/catalog/{artist_id}/enrich",
+        data={"csrf_token": csrf_token},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/library"
+    assert calls == 0
+    assert len(queued_tasks) == 1
+    assert queued_tasks[0][0].__name__ == "_enrich_artist_task"
+    assert queued_tasks[0][1][0] == artist_id
 
 
 async def test_release_progress_recognizes_current_library_folder_naming(
@@ -738,13 +854,14 @@ async def test_catalog_album_shows_total_and_per_track_downloaded_wanted_states(
 
     assert response.status_code == 200
     assert provider_fetches == 0
-    assert "1 / 3 downloaded" in response.text
+    assert "1 of 3 in library" in response.text
     imported_id = catalog_track_ids["partial imported"]
     missing_id = catalog_track_ids["partial missing"]
-    imported_row = response.text.split(f'data-track-id="{imported_id}"', 1)[1].split("</tr>", 1)[0]
-    missing_row = response.text.split(f'data-track-id="{missing_id}"', 1)[1].split("</tr>", 1)[0]
-    assert "Downloaded" in imported_row
+    imported_row = response.text.split(f'data-track-id="{imported_id}"', 1)[1].split("</li>", 1)[0]
+    missing_row = response.text.split(f'data-track-id="{missing_id}"', 1)[1].split("</li>", 1)[0]
+    assert 'aria-label="In library"' in imported_row
     assert "Wanted" not in imported_row
     assert f'action="/albums/{partial_id}/tracks/{imported_id}/download"' not in imported_row
-    assert "Wanted" in missing_row
+    assert 'aria-label="Not in library"' in missing_row
+    assert "Wanted" not in missing_row
     assert f'action="/albums/{partial_id}/tracks/{missing_id}/download"' in missing_row

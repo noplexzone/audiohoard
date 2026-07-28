@@ -15,10 +15,10 @@
 
 {% if notice %}<div class="alert {{ notice_type }}" role="status">{{ notice }}</div>{% endif %}
 
-<form method="post" action="/downloads/create" class="form-row" style="margin-bottom:1.5rem;">
+<form method="post" action="/downloads/create" class="form-row downloads-create-form">
   <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
   <label class="sr-only" for="download-query">Track or album</label>
-  <input id="download-query" type="text" name="query" placeholder="Track or album&hellip;" style="flex:1; min-width:220px;" required>
+  <input class="downloads-query" id="download-query" type="text" name="query" placeholder="Track or album&hellip;" required>
   <label class="sr-only" for="download-source">Download source</label>
   <select id="download-source" name="source">
     <option value="priority">Priority with fallback</option>
@@ -30,176 +30,24 @@
   <button type="submit" class="btn">Enqueue</button>
 </form>
 
-<div class="form-row" style="margin-bottom:1rem;">
-  <form method="post" action="/downloads/clear" onsubmit="return confirm('Clear every failed download from the queue?');">
+<div class="form-row downloads-controls">
+  <form method="post" action="/downloads/clear" data-confirm="Clear every failed download from the queue?">
     <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
     <input type="hidden" name="scope" value="failed">
     <button type="submit" class="btn secondary">Clear failed</button>
   </form>
-  <form method="post" action="/downloads/clear" onsubmit="return confirm('Clear all finished, failed, partial, and cancelled downloads from the queue?');">
+  <form method="post" action="/downloads/clear" data-confirm="Clear all finished, failed, partial, and cancelled downloads from the queue?">
     <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
     <input type="hidden" name="scope" value="finished">
     <button type="submit" class="btn secondary">Clear finished</button>
   </form>
 </div>
 
-{% if release_reviews %}
-<section aria-label="Import review" style="margin-bottom:2rem">
-  <h2 style="margin-bottom:.75rem">Import review</h2>
-  <p class="hint">Every blocked release includes the persisted reason. Approve imports the track; deny removes the staged file and review item.</p>
-  {% for review in release_reviews %}
-  <article class="card" style="margin-bottom:1rem">
-    <h3 style="margin:0 0 .5rem">{{ review.release.album_artist or "Unknown artist" }} — {{ review.release.title or "Unknown release" }}</h3>
-    <p class="alert {% if review.missing_source %}error{% else %}warn{% endif %} compact"><strong>Reason:</strong> {{ review.reason }}</p>
-    {% for item in review.review_items %}
-    <div style="border-top:1px solid var(--border);padding-top:.75rem;margin-top:.75rem">
-      <h4 style="margin:0 0 .5rem">{{ item.expected_title or "Unknown title" }}</h4>
-      <dl style="display:grid;grid-template-columns:max-content 1fr;gap:.25rem .75rem;font-size:.9em;margin-bottom:.75rem">
-        <dt>Expected MBID</dt><dd><code>{{ item.expected_recording_mbid or "—" }}</code></dd>
-        <dt>Observed MBIDs</dt><dd>{% if item.observed_acoustid_mbids %}{% for m in item.observed_acoustid_mbids %}<code>{{ m }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% else %}—{% endif %}</dd>
-        <dt>AcoustID score</dt><dd>{{ "%.3f"|format(item.acoustid_score) if item.acoustid_score is not none else "—" }}</dd>
-        <dt>Duration</dt><dd>{{ item.fingerprint_duration_sec ~ "s" if item.fingerprint_duration_sec is not none else "—" }}</dd>
-      </dl>
-      <audio controls style="width:100%;margin-bottom:.75rem" src="/staging/audio/{{ item.id }}">Your browser does not support audio playback.</audio>
-      <div style="display:flex;gap:.5rem;flex-wrap:wrap">
-        <form method="post" action="/staging/review/{{ item.id }}/approve"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn" type="submit">Approve — import</button></form>
-        <form method="post" action="/staging/review/{{ item.id }}/deny" onsubmit="return confirm('Remove this review item and delete its staged file?');"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Deny — remove</button></form>
-      </div>
-    </div>
-    {% endfor %}
-    <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.75rem">
-      {% if review.missing_source %}<form method="post" action="/staging/release/{{ review.release.id }}/reacquire"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn" type="submit">Re-acquire</button></form>{% endif %}
-    </div>
-  </article>
-  {% endfor %}
-</section>
-{% endif %}
-
-{% set queue = namespace(active=false) %}
-{% if download_groups %}
-<div class="table-wrap">
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">Release / download</th>
-        <th scope="col">Source</th>
-        <th scope="col">Query</th>
-        <th scope="col">Status</th>
-        <th scope="col">Elapsed</th>
-        <th scope="col">Last activity</th>
-        <th scope="col">Details</th>
-        <th scope="col">Actions</th>
-      </tr>
-    </thead>
-    <tbody>
-    {% for group in download_groups %}
-      {% set download = group.attempts[0].job %}
-      {% set status = group.status.value %}
-      {% if group.active %}{% set queue.active = true %}{% endif %}
-      {% set sc = "ok" if status == "done" else ("warn" if status in ["pending", "running", "partial"] else ("error" if status in ["failed", "cancelled"] else "info")) %}
-
-      {# Elapsed since created_at #}
-      {% set created = download.created_at %}
-      {% if created.tzinfo is none %}
-        {% set elapsed_sec = (now.replace(tzinfo=none) - created).total_seconds() | int %}
-      {% else %}
-        {% set elapsed_sec = (now - created).total_seconds() | int %}
-      {% endif %}
-      {% if elapsed_sec < 60 %}
-        {% set elapsed_str = elapsed_sec ~ "s" %}
-      {% elif elapsed_sec < 3600 %}
-        {% set elapsed_str = (elapsed_sec // 60) ~ "m " ~ (elapsed_sec % 60) ~ "s" %}
-      {% else %}
-        {% set elapsed_str = (elapsed_sec // 3600) ~ "h " ~ ((elapsed_sec % 3600) // 60) ~ "m" %}
-      {% endif %}
-
-      {# Last activity from updated_at #}
-      {% set updated = download.updated_at %}
-      {% if updated.tzinfo is none %}
-        {% set delta_sec = (now.replace(tzinfo=none) - updated).total_seconds() | int %}
-      {% else %}
-        {% set delta_sec = (now - updated).total_seconds() | int %}
-      {% endif %}
-      {% if delta_sec < 10 %}
-        {% set activity_str = "just now" %}
-      {% elif delta_sec < 60 %}
-        {% set activity_str = delta_sec ~ "s ago" %}
-      {% elif delta_sec < 3600 %}
-        {% set activity_str = (delta_sec // 60) ~ " min ago" %}
-      {% elif delta_sec < 86400 %}
-        {% set activity_str = (delta_sec // 3600) ~ "h ago" %}
-      {% else %}
-        {% set activity_str = (delta_sec // 86400) ~ "d ago" %}
-      {% endif %}
-
-      <tr data-download-group="{{ group.key }}">
-        <td><strong>{{ group.label }}</strong><br><span class="hint">{{ group.downloaded_track_count }} / {{ group.wanted_track_count }} downloaded · {{ group.attempts | length }} attempt{% if group.attempts | length != 1 %}s{% endif %}</span></td>
-        <td><span class="badge info">{{ download.source }}</span></td>
-        <td style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{{ group.label | e }}">{{ group.label }}</td>
-        <td><span class="badge {{ sc }}"><span class="dot"></span>{{ status }}</span></td>
-        <td style="color:var(--text-muted); font-size:0.8rem;" title="started {{ download.created_at.strftime('%Y-%m-%d %H:%M') }}">{{ elapsed_str }}</td>
-        <td style="color:var(--text-muted); font-size:0.8rem;" title="{{ download.updated_at.strftime('%Y-%m-%d %H:%M:%S') }}">{{ activity_str }}<br><time class="hint">{{ download.updated_at.strftime("%Y-%m-%d %H:%M") }}</time></td>
-        <td>
-          <details>
-            <summary>View attempts</summary>
-            {% for attempt in group.attempts %}
-            {% set attempt_job = attempt.job %}
-            {% set meta = attempt.metadata %}
-            <section class="download-attempt" aria-label="Attempt {{ attempt_job.id }}">
-            <p><code>#{{ attempt_job.id }}</code> · <span class="badge info">{{ attempt_job.source }}</span> · <strong>{{ attempt_job.status.value }}</strong><br><span class="hint">{{ attempt_job.query }}</span></p>
-            {% if meta.error %}<p class="alert error compact"><strong>{{ meta.error.code | default('error') }}</strong>{% if meta.error.detail %}: {{ meta.error.detail }}{% endif %}</p>{% endif %}
-            {% if meta.errors %}{% for error_json in meta.errors %}{% set error = error_json | from_json %}<p class="alert error compact"><strong>{{ error.code | default('error') }}</strong>{% if error.detail %}: {{ error.detail }}{% endif %}</p>{% endfor %}{% endif %}
-            {% if meta.recovery %}<p class="alert compact">Recovered after {{ meta.recovery.code | replace('_', ' ') }}.</p>{% endif %}
-            {% if meta.tracks_created is defined %}<p class="hint">Tracks created: {{ meta.tracks_created }}</p>{% endif %}
-            {% if meta.missing_tracks %}<p class="hint">Missing: {{ meta.missing_tracks | join(', ') }}</p>{% endif %}
-            {% if attempt_job.tracks %}
-            <ul class="track-states" style="margin:0.5rem 0 0.25rem; padding-left:1rem; font-size:0.8rem; list-style:none;">
-              {% for t in attempt_job.tracks %}
-              <li style="padding:0.15rem 0;">
-                <span>{{ t.title or "(unknown)" }}</span>
-                {% set ts = t.acquisition_state.value %}
-                {% if ts == "acquiring" %}
-                — <em class="hint">downloading via {{ t.source }}{% if t.source_status %} ({{ t.source_status }}){% endif %} — started {{ attempt_job.created_at.strftime("%H:%M") }}</em>
-                {% elif ts == "downloaded" %}
-                — <span class="badge ok" style="font-size:0.75rem;">done</span>
-                {% elif ts == "failed" %}
-                — <span class="badge error" style="font-size:0.75rem;">failed</span>
-                {% elif ts == "cancelled" %}
-                — <span class="badge warn" style="font-size:0.75rem;">cancelled</span>
-                {% elif ts == "searching" %}
-                — <span class="badge warn" style="font-size:0.75rem;">searching</span>
-                {% else %}
-                — <span class="hint">{{ ts }}</span>
-                {% endif %}
-              </li>
-              {% endfor %}
-            </ul>
-            {% endif %}
-            <a href="/tracks?download_id={{ attempt_job.id }}">View tracks</a>
-            </section>
-            {% endfor %}
-          </details>
-        </td>
-        <td class="action-cell">
-          {% if group.action_attempt and group.action_attempt.status.value in ['pending', 'running'] %}
-          <form method="post" action="/downloads/{{ group.action_attempt.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Cancel</button></form>
-          {% elif group.action_attempt and group.action_attempt.status.value in ['failed', 'partial', 'cancelled'] %}
-          <form method="post" action="/downloads/{{ group.action_attempt.id }}/retry"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Retry</button></form>
-          {% endif %}
-          {% if group.attempts | length == 1 and status in ['done', 'failed', 'partial', 'cancelled'] %}
-          <form method="post" action="/downloads/{{ download.id }}/remove" onsubmit="return confirm('Remove this download from the queue?');"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Remove</button></form>
-          {% endif %}
-        </td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
+<div class="downloads-layout">
+  <div id="downloads-queue" aria-live="polite">
+  {% include "partials/_downloads_queue.html" %}
+  </div>
+  {% include "partials/_import_review.html" %}
 </div>
-{% else %}
-<div class="empty-state mini" role="status"><h3>No downloads yet</h3><p>Use the form above to enqueue your first acquisition.</p></div>
-{% endif %}
-{% if queue.active %}
-<p class="hint" role="status" aria-live="polite">Active jobs refresh every 10 seconds.</p>
-<script>window.setTimeout(() => { if (!document.hidden) window.location.reload(); }, 10000);</script>
-{% endif %}
+<script src="/static/js/downloads.js?v={{ app_version }}" defer></script>
 {% endblock %}

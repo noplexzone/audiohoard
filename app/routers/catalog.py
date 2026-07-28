@@ -9,7 +9,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -29,7 +29,12 @@ from app.services.catalog import (
     ReleaseProgress,
     get_artist_detail,
     get_library_artists_page,
+    get_library_stats,
+    get_missing_releases_page,
     get_release_progress,
+    list_distinct_formats,
+    list_distinct_sources,
+    list_library_tracks,
 )
 from app.services.catalog_metadata import (
     VALID_METADATA_PROVIDERS,
@@ -138,6 +143,19 @@ def _sanitize_error_class(exc: BaseException) -> str:
     return raw[:200]
 
 
+async def _queue_artist_enrichment(db: AsyncSession, artist_id: int) -> bool:
+    result = await db.execute(
+        update(CatalogArtist)
+        .where(
+            CatalogArtist.id == artist_id,
+            CatalogArtist.enrichment_state.not_in(("queued", "running")),
+        )
+        .values(enrichment_state="queued")
+    )
+    await db.commit()
+    return bool(getattr(result, "rowcount", 0))
+
+
 async def _enrich_artist_task(artist_id: int, providers: list[str]) -> None:
     from app.config import get_settings
     from app.database import get_session_factory
@@ -153,8 +171,15 @@ async def _enrich_artist_task(artist_id: int, providers: list[str]) -> None:
         )
         artist = result.scalar_one_or_none()
         if artist is not None:
+            artist.enrichment_state = "running"
+            await session.commit()
             try:
-                await enrich_catalog_artist(session, cfg, artist, providers)
+                enrichment = await enrich_catalog_artist(session, cfg, artist, providers)
+                survivor_value = enrichment.get("artist_id")
+                survivor_id = survivor_value if isinstance(survivor_value, int) else artist_id
+                survivor = await session.get(CatalogArtist, survivor_id)
+                if survivor is not None:
+                    survivor.enrichment_state = "idle"
                 await session.commit()
             except Exception as exc:
                 logger.error(
@@ -173,7 +198,42 @@ async def _enrich_artist_task(artist_id: int, providers: list[str]) -> None:
                         "message": _sanitize_error_class(exc),
                     }
                     artist.provenance_json = json.dumps(provenance, sort_keys=True)
+                    artist.enrichment_state = "failed"
                     await session.commit()
+
+
+async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
+    from app.config import get_settings
+    from app.database import get_session_factory
+    from app.settings_service import build_effective_settings
+
+    factory = get_session_factory()
+    async with factory() as session:
+        cfg = await build_effective_settings(session, get_settings())
+        load = selectinload(CatalogArtist.identities).selectinload(CatalogArtistIdentity.releases)
+        artist = (
+            await session.execute(
+                select(CatalogArtist).where(CatalogArtist.id == artist_id).options(load)
+            )
+        ).scalar_one_or_none()
+        if artist is None:
+            return
+        try:
+            await fetch_and_store_discography(
+                session,
+                cfg,
+                artist,
+                provider_name=provider_name,
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logger.error(
+                "Catalog discography refresh failed for artist %s via %s",
+                artist_id,
+                provider_name,
+                exc_info=True,
+            )
 
 
 def _templates(request: Request) -> Jinja2Templates:
@@ -184,11 +244,63 @@ def _templates(request: Request) -> Jinja2Templates:
 async def library_page(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
+    view: str = "artists",
     q: str = "",
     sort: str = "name",
+    artist: str = "",
+    album: str = "",
+    source: str = "",
+    fmt: str = "",
     page: int = Query(default=1, ge=1, le=10_000),
     per_page: int = Query(default=50, ge=1, le=200),
 ) -> HTMLResponse:
+    if view == "tracks":
+        track_sort = (
+            sort if sort in {"added", "title", "artist", "album", "year", "source"} else "added"
+        )
+        tracks = await list_library_tracks(
+            db,
+            q=q,
+            artist=artist,
+            album=album,
+            source=source,
+            fmt=fmt,
+            sort=track_sort,
+            page=page,
+            per_page=per_page,
+        )
+        track_filter_params = {
+            "view": "tracks",
+            "sort": track_sort,
+            "per_page": str(per_page),
+        }
+        for key, value in {
+            "q": q,
+            "artist": artist,
+            "album": album,
+            "source": source,
+            "fmt": fmt,
+        }.items():
+            if value:
+                track_filter_params[key] = value
+        return _templates(request).TemplateResponse(
+            request,
+            "library_tracks.html",
+            {
+                "stats": await get_library_stats(db),
+                "tracks": tracks,
+                "q": q,
+                "filter_artist": artist,
+                "filter_album": album,
+                "filter_source": source,
+                "filter_fmt": fmt,
+                "all_sources": await list_distinct_sources(db),
+                "all_formats": await list_distinct_formats(db),
+                "sort": track_sort,
+                "per_page": per_page,
+                "filter_qs": urlencode(track_filter_params),
+            },
+        )
     artists = await get_library_artists_page(db, q=q, sort=sort, page=page, per_page=per_page)
     filter_params: dict[str, str] = {}
     if q:
@@ -310,7 +422,7 @@ async def catalog_artist_page(
             .execution_options(populate_existing=True)
         )
     ).scalar_one()
-    if artist.last_enriched_at is None:
+    if artist.last_enriched_at is None and await _queue_artist_enrichment(db, artist.id):
         background_tasks.add_task(
             _enrich_artist_task, artist.id, runtime.enabled_metadata_providers
         )
@@ -322,18 +434,11 @@ async def catalog_artist_page(
         (identity for identity in artist.identities if identity.provider == selected_provider),
         None,
     )
-    try:
-        if selected_identity is not None and (
-            not selected_identity.releases
-            or any(_release_needs_track_count_refresh(item) for item in selected_identity.releases)
-        ):
-            await fetch_and_store_discography(
-                db, settings, artist, provider_name=selected_provider
-            )
-            await db.commit()
-    except Exception:
-        logger.exception("Catalog artist discography refresh failed for artist %s", artist_id)
-        await db.rollback()
+    if selected_identity is not None and (
+        not selected_identity.releases
+        or any(_release_needs_track_count_refresh(item) for item in selected_identity.releases)
+    ):
+        background_tasks.add_task(_refresh_discography_task, artist.id, selected_provider)
     artist = (
         await db.execute(
             select(CatalogArtist)
@@ -471,6 +576,7 @@ async def catalog_artist_page(
 async def enrich_catalog_artist_page(
     artist_id: int,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     _user: Annotated[object, Depends(require_mutation)],
@@ -484,68 +590,11 @@ async def enrich_catalog_artist_page(
     if artist is None:
         raise HTTPException(status_code=404, detail="Catalog artist not found")
     runtime = await get_runtime_settings(db)
-    form = await request.form()
-    requested_provider = str(form.get("provider", ""))
-    release_type = str(form.get("release_type", ""))
-    sort = str(form.get("sort", "desc"))
-    try:
-        outcome = await enrich_catalog_artist(
-            db, settings, artist, runtime.enabled_metadata_providers
+    if await _queue_artist_enrichment(db, artist.id):
+        background_tasks.add_task(
+            _enrich_artist_task, artist.id, runtime.enabled_metadata_providers
         )
-        redirect_value = outcome.get("artist_id", artist.id)
-        redirect_artist_id = redirect_value if isinstance(redirect_value, int) else artist.id
-        survivor = await db.get(CatalogArtist, redirect_artist_id)
-        if survivor is None:
-            raise RuntimeError("Enrichment survivor was not found")
-        provenance = (
-            json.loads(survivor.provenance_json or "{}") if survivor.provenance_json else {}
-        )
-        provenance.pop("last_enrichment_error", None)
-        survivor.provenance_json = json.dumps(provenance, sort_keys=True)
-        await db.commit()
-        artist_id = redirect_artist_id
-        enrichment_status = str(outcome.get("status", "ok"))
-    except Exception as exc:
-        logger.error(
-            "Manual catalog artist enrichment failed for artist %s", artist_id, exc_info=True
-        )
-        await db.rollback()
-        fresh = await db.get(CatalogArtist, artist_id)
-        if fresh is not None:
-            provenance = json.loads(fresh.provenance_json or "{}") if fresh.provenance_json else {}
-            provenance["last_enrichment_error"] = {
-                "at": datetime.now(tz=UTC).isoformat(),
-                "message": _sanitize_error_class(exc),
-            }
-            fresh.provenance_json = json.dumps(provenance, sort_keys=True)
-        await db.commit()
-        enrichment_status = "failed"
-    fresh_artist = (
-        await db.execute(
-            select(CatalogArtist)
-            .where(CatalogArtist.id == artist_id)
-            .options(selectinload(CatalogArtist.identities))
-        )
-    ).scalar_one_or_none()
-    available = available_artist_providers(fresh_artist) if fresh_artist is not None else []
-    selected_provider = _selected_provider(
-        requested_provider,
-        available,
-        runtime.primary_metadata_provider,
-        fresh_artist.watchlist_provider
-        if fresh_artist is not None
-        else runtime.primary_metadata_provider,
-    )
-    return RedirectResponse(
-        _artist_page_url(
-            artist_id,
-            provider=selected_provider,
-            release_type=release_type,
-            sort=sort,
-            enrichment=enrichment_status,
-        ),
-        status_code=303,
-    )
+    return RedirectResponse("/library", status_code=303)
 
 
 @router.post("/artists/catalog/{artist_id}/monitor", include_in_schema=False)
@@ -658,9 +707,30 @@ async def monitored_artists_page() -> RedirectResponse:
     return RedirectResponse("/library", status_code=303)
 
 
-@router.get("/wanted", include_in_schema=False)
-async def wanted_page() -> RedirectResponse:
-    return RedirectResponse("/library", status_code=303)
+@router.get("/wanted", response_class=HTMLResponse)
+async def wanted_page(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    q: str = "",
+    sort: str = "year",
+    page: int = Query(default=1, ge=1, le=10_000),
+    per_page: int = Query(default=50, ge=1, le=200),
+) -> HTMLResponse:
+    releases = await get_missing_releases_page(db, q=q, sort=sort, page=page, per_page=per_page)
+    filter_params: dict[str, str] = {"sort": sort, "per_page": str(per_page)}
+    if q:
+        filter_params["q"] = q
+    return _templates(request).TemplateResponse(
+        request,
+        "wanted.html",
+        {
+            "releases": releases,
+            "q": q,
+            "sort": sort,
+            "per_page": per_page,
+            "filter_qs": urlencode(filter_params),
+        },
+    )
 
 
 @router.get("/albums/{album_id}", response_class=HTMLResponse)
@@ -693,10 +763,15 @@ async def catalog_album_page(
     progress = (await get_release_progress(db, [album.id], library_root=settings.library_root))[
         album.id
     ]
+    total_runtime_sec = sum(track.duration_sec or 0 for track in album.tracks)
     return _templates(request).TemplateResponse(
         request,
         "catalog_album.html",
-        {"album": album, "progress": progress},
+        {
+            "album": album,
+            "progress": progress,
+            "total_runtime_sec": total_runtime_sec,
+        },
     )
 
 

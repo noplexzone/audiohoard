@@ -6,7 +6,7 @@ import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
-from app.metadata.deezer import DeezerClient
+from app.metadata.deezer import DeezerClient, _parse_artist
 
 _TRACK_DATA = {
     "id": 12345,
@@ -21,6 +21,21 @@ _TRACK_DATA = {
     "artist": {"name": "Daft Punk"},
     "album": {"title": "Random Access Memories"},
 }
+
+
+def test_parse_artist_prefers_picture_big() -> None:
+    artist = _parse_artist(
+        {
+            "id": 1,
+            "name": "Artist",
+            "picture": "https://example.test/picture.jpg",
+            "picture_medium": "https://example.test/picture-medium.jpg",
+            "picture_big": "https://example.test/picture-big.jpg",
+            "picture_xl": "https://example.test/picture-xl.jpg",
+        }
+    )
+
+    assert artist.artwork_url == "https://example.test/picture-big.jpg"
 
 
 class TestDeezerSearch:

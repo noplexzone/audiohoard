@@ -33,7 +33,7 @@
 
   <aside class="dashboard-side">
     <section class="panel" aria-labelledby="jobs-heading">
-      <div class="section-heading"><div><p class="eyebrow">Pipeline</p><h2 id="jobs-heading">Jobs</h2></div><a href="/jobs/ui/list">View all</a></div>
+      <div class="section-heading"><div><p class="eyebrow">Pipeline</p><h2 id="jobs-heading">Jobs</h2></div><a href="/downloads">View all</a></div>
       <div class="status-strip" aria-label="Job state counts">
         {% for status in ['running', 'pending', 'partial', 'done', 'failed', 'cancelled'] %}
         <a href="/downloads?status={{ status }}"><span class="status-dot {{ status }}"></span><strong data-job-status="{{ status }}">{{ dashboard.job_counts[status] }}</strong><small>{{ status | title }}</small></a>
@@ -65,7 +65,7 @@
   <div class="section-heading"><div><p class="eyebrow">Shortcuts</p><h2 id="quick-heading">Quick actions</h2></div></div>
   <div class="action-grid">
     <a class="action-card" href="/search"><svg><use href="#i-search"/></svg><span><strong>Search providers</strong><small>Find tracks and releases</small></span><span aria-hidden="true">→</span></a>
-    <a class="action-card" href="/jobs/ui/list"><svg><use href="#i-jobs"/></svg><span><strong>Queue a job</strong><small>Start an acquisition</small></span><span aria-hidden="true">→</span></a>
+    <a class="action-card" href="/downloads"><svg><use href="#i-jobs"/></svg><span><strong>Queue a job</strong><small>Start an acquisition</small></span><span aria-hidden="true">→</span></a>
     <a class="action-card" href="/downloads"><svg><use href="#i-jobs"/></svg><span><strong>Review staged audio</strong><small>Resolve fingerprint exceptions</small></span><span aria-hidden="true">→</span></a>
   </div>
 </section>

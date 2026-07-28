@@ -5,7 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>{% block title %}Audiohoard{% endblock %}</title>
-  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="stylesheet" href="/static/css/tokens.css?v={{ app_version }}">
+  <link rel="stylesheet" href="/static/css/base.css?v={{ app_version }}">
+  <link rel="stylesheet" href="/static/css/components.css?v={{ app_version }}">
+  <link rel="stylesheet" href="/static/css/pages.css?v={{ app_version }}">
   <link rel="icon" type="image/x-icon" href="/static/branding/favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="/static/branding/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/branding/favicon-16.png">
@@ -35,7 +38,8 @@
       <a href="/" {% if path == "/" %}class="active" aria-current="page"{% endif %}><svg><use href="#i-home"/></svg><span>Dashboard</span></a>
       <a href="/search" {% if path.startswith("/search") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-search"/></svg><span>Search</span></a>
       <a href="/library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
-      <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span></a>
+      <a href="/wanted" {% if path.startswith("/wanted") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Wanted</span></a>
+      <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span>{% if request.state.pending_review_count | default(0) > 0 %}<span class="nav-badge">{{ request.state.pending_review_count }}</span>{% endif %}</a>
     </nav>
     <nav class="utility-nav" aria-label="Utilities">
       <a href="/settings" {% if path.startswith("/settings") or path.startswith("/changelog") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-settings"/></svg><span>Settings</span></a>
@@ -68,7 +72,8 @@
     <a href="/" {% if path == "/" %}class="active" aria-current="page"{% endif %}><svg><use href="#i-home"/></svg><span>Home</span></a>
     <a href="/search" {% if path.startswith("/search") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-search"/></svg><span>Search</span></a>
     <a href="/library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
-    <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span></a>
+    <a href="/wanted" {% if path.startswith("/wanted") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Wanted</span></a>
+    <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span>{% if request.state.pending_review_count | default(0) > 0 %}<span class="nav-badge">{{ request.state.pending_review_count }}</span>{% endif %}</a>
   </nav>
   {% endif %}
 </div>

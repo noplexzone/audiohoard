@@ -1,0 +1,194 @@
+{% extends "base.html" %}
+{% block title %}Library — Audiohoard{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Library</h1>
+  <p>
+    {{ stats.track_count }} track{% if stats.track_count != 1 %}s{% endif %}
+    from {{ stats.artist_count }} artist{% if stats.artist_count != 1 %}s{% endif %}
+    across {{ stats.album_count }} album{% if stats.album_count != 1 %}s{% endif %}
+  </p>
+</div>
+
+<nav class="discography-filters" aria-label="Library views">
+  <a class="filter-chip" href="/library">Artists</a>
+  <a class="filter-chip active" href="/library?view=tracks">Tracks</a>
+</nav>
+
+<div class="catalog-stats" role="region" aria-label="Library statistics">
+  <div class="stat-card">
+    <div class="stat-value">{{ stats.track_count }}</div>
+    <div class="stat-label">Tracks</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{ stats.artist_count }}</div>
+    <div class="stat-label">Artists</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{ stats.album_count }}</div>
+    <div class="stat-label">Albums</div>
+  </div>
+  <div class="stat-card">
+    {% set h = (stats.total_duration_sec // 3600) %}
+    {% set m = ((stats.total_duration_sec % 3600) // 60) %}
+    {% if h > 0 %}
+    <div class="stat-value">{{ h }}h {{ m }}m</div>
+    {% else %}
+    <div class="stat-value">{{ m }}m</div>
+    {% endif %}
+    <div class="stat-label">Duration</div>
+  </div>
+  {% if stats.total_bytes > 0 %}
+  <div class="stat-card">
+    {% set gb = stats.total_bytes / 1073741824 %}
+    {% set mb = stats.total_bytes / 1048576 %}
+    {% set kb = stats.total_bytes / 1024 %}
+    {% if gb >= 1 %}
+    <div class="stat-value">{{ "%.1f"|format(gb) }} GB</div>
+    {% elif mb >= 1 %}
+    <div class="stat-value">{{ "%.1f"|format(mb) }} MB</div>
+    {% else %}
+    <div class="stat-value">{{ "%.1f"|format(kb) }} KB</div>
+    {% endif %}
+    <div class="stat-label">Total size</div>
+  </div>
+  {% endif %}
+  {% if stats.format_breakdown %}
+  <div class="stat-card">
+    <div class="stat-formats">
+      {% for fmt, cnt in stats.format_breakdown.items() | sort %}
+      <span class="badge info">{{ fmt }}</span><span class="stat-fmt-count">{{ cnt }}</span>
+      {% endfor %}
+    </div>
+    <div class="stat-label">Formats</div>
+  </div>
+  {% endif %}
+  {% if stats.source_breakdown %}
+  <div class="stat-card">
+    <div class="stat-formats">
+      {% for src, cnt in stats.source_breakdown.items() %}
+      <span class="badge info">{{ src }}</span><span class="stat-fmt-count">{{ cnt }}</span>
+      {% endfor %}
+    </div>
+    <div class="stat-label">Sources</div>
+  </div>
+  {% endif %}
+</div>
+
+<form method="get" action="/library" class="filter-bar" role="search" aria-label="Filter tracks">
+  <input type="hidden" name="view" value="tracks">
+  <label class="sr-only" for="lib-q">Search</label>
+  <input id="lib-q" type="search" name="q" value="{{ q }}" placeholder="Search title, artist, album…" aria-label="Search tracks">
+  <label class="sr-only" for="lib-artist">Artist</label>
+  <input id="lib-artist" type="text" name="artist" value="{{ filter_artist }}" placeholder="Artist">
+  <label class="sr-only" for="lib-album">Album</label>
+  <input id="lib-album" type="text" name="album" value="{{ filter_album }}" placeholder="Album">
+  <label class="sr-only" for="lib-source">Source</label>
+  <select id="lib-source" name="source" aria-label="Filter by source">
+    <option value="">All sources</option>
+    {% for s in all_sources %}
+    <option value="{{ s }}" {% if filter_source == s %}selected{% endif %}>{{ s }}</option>
+    {% endfor %}
+  </select>
+  {% if all_formats %}
+  <label class="sr-only" for="lib-fmt">Format</label>
+  <select id="lib-fmt" name="fmt" aria-label="Filter by format">
+    <option value="">All formats</option>
+    {% for f in all_formats %}
+    <option value="{{ f }}" {% if filter_fmt == f %}selected{% endif %}>{{ f }}</option>
+    {% endfor %}
+  </select>
+  {% endif %}
+  <label class="sr-only" for="lib-sort">Sort</label>
+  <select id="lib-sort" name="sort" aria-label="Sort order">
+    <option value="added"  {% if sort == "added"  %}selected{% endif %}>Newest</option>
+    <option value="title"  {% if sort == "title"  %}selected{% endif %}>Title</option>
+    <option value="artist" {% if sort == "artist" %}selected{% endif %}>Artist</option>
+    <option value="album"  {% if sort == "album"  %}selected{% endif %}>Album</option>
+    <option value="year"   {% if sort == "year"   %}selected{% endif %}>Year</option>
+    <option value="source" {% if sort == "source" %}selected{% endif %}>Source</option>
+  </select>
+  <button type="submit" class="btn">Filter</button>
+  {% if q or filter_artist or filter_album or filter_source or filter_fmt %}
+  <a href="/library?view=tracks" class="btn secondary">Clear</a>
+  {% endif %}
+</form>
+
+{% if tracks.items %}
+<div class="catalog-table-wrap">
+  <table aria-label="Track list">
+    <thead>
+      <tr>
+        <th scope="col">File</th>
+        <th scope="col">Title</th>
+        <th scope="col">Artist</th>
+        <th scope="col">Album</th>
+        <th scope="col">Year</th>
+        <th scope="col">Format</th>
+        <th scope="col">Size</th>
+        <th scope="col">Duration</th>
+        <th scope="col">Source</th>
+        <th scope="col">Acquisition</th>
+        <th scope="col">Import</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for track in tracks.items %}
+      <tr>
+        <td><code title="{{ track.file_path | e }}">{{ track.file_path.rsplit('/', 1)[-1] }}</code><div class="hint"><code>{{ track.file_path }}</code></div></td>
+        <td><a href="/tracks/{{ track.id }}/ui">{{ track.title }}</a></td>
+        <td>
+          <a href="/artists/detail?name={{ track.artist | urlencode }}">{{ track.artist }}</a>
+        </td>
+        <td>{{ track.album }}</td>
+        <td>{{ track.year or "—" }}</td>
+        <td>
+          {% if track.fmt %}<span class="badge info">{{ track.fmt }}</span>{% else %}—{% endif %}
+        </td>
+        <td>{% if track.file_size_bytes %}{{ "%.1f"|format(track.file_size_bytes / 1048576) }} MB{% else %}—{% endif %}</td>
+        <td>{% if track.duration_sec %}{{ "%d:%02d" % (track.duration_sec // 60, track.duration_sec % 60) }}{% else %}—{% endif %}</td>
+        <td><span class="badge info">{{ track.source }}</span></td>
+        <td><span class="badge ok">{{ track.acquisition_state }}</span></td>
+        <td>
+          {% if track.import_state == "imported" %}
+            <span class="badge ok">{{ track.import_state }}</span>
+          {% elif track.import_state == "failed" %}
+            <span class="badge error">{{ track.import_state }}</span>
+          {% else %}
+            <span class="badge warn">{{ track.import_state }}</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<nav class="pagination" aria-label="Track list pagination">
+  {% if tracks.has_prev %}
+  <a href="/library?{{ filter_qs }}&page={{ tracks.page - 1 }}" class="btn secondary" aria-label="Previous page">← Prev</a>
+  {% else %}
+  <span class="btn secondary disabled" aria-disabled="true">← Prev</span>
+  {% endif %}
+  <span class="pagination-info">Page {{ tracks.page }} of {{ tracks.total_pages }} ({{ tracks.total }} tracks)</span>
+  {% if tracks.has_next %}
+  <a href="/library?{{ filter_qs }}&page={{ tracks.page + 1 }}" class="btn secondary" aria-label="Next page">Next →</a>
+  {% else %}
+  <span class="btn secondary disabled" aria-disabled="true">Next →</span>
+  {% endif %}
+</nav>
+
+{% else %}
+<div class="empty-state" role="status">
+  {% if q or filter_artist or filter_album or filter_source or filter_fmt %}
+  <p>No tracks match your filters.</p>
+  <a href="/library?view=tracks" class="btn secondary">Clear filters</a>
+  {% elif stats.track_count == 0 %}
+  <p>Your library is empty.</p>
+  <p>Acquire music via <a href="/search">Search</a> or <a href="/downloads">Downloads</a>.</p>
+  {% else %}
+  <p>No tracks on this page.</p>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}

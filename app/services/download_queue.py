@@ -22,6 +22,12 @@ class DownloadAttempt:
 class DownloadGroup:
     key: str
     label: str
+    catalog_album_id: int | None
+    artwork_url: str | None
+    artist_name: str | None
+    album_title: str | None
+    year: str | None
+    release_kind: str | None
     attempts: tuple[DownloadAttempt, ...]
     status: JobStatus
     wanted_track_count: int
@@ -112,10 +118,22 @@ def project_download_groups(
             label = f"{album.artist.name} — {album.title}"
             wanted = {("catalog", track.id) for track in album.tracks}
             wanted_count = max(album.track_count or 0, len(wanted))
+            catalog_album_id = album.id
+            artwork_url = album.artwork_url
+            artist_name = album.artist.name
+            album_title = album.title
+            year = str(album.year) if album.year is not None else None
+            release_kind = album.release_type
         else:
             label = grouped_jobs[-1].query
             wanted = {_track_identity(track) for job in grouped_jobs for track in job.tracks}
             wanted_count = len(wanted)
+            catalog_album_id = None
+            artwork_url = None
+            artist_name = None
+            album_title = None
+            year = None
+            release_kind = None
         downloaded = {
             _track_identity(track)
             for job in grouped_jobs
@@ -129,6 +147,12 @@ def project_download_groups(
             DownloadGroup(
                 key=key,
                 label=label,
+                catalog_album_id=catalog_album_id,
+                artwork_url=artwork_url,
+                artist_name=artist_name,
+                album_title=album_title,
+                year=year,
+                release_kind=release_kind,
                 attempts=tuple(
                     DownloadAttempt(job=job, metadata=_metadata(job)) for job in visible_jobs
                 ),
