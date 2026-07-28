@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import re
 
 from pytest_httpx import HTTPXMock
 
+from app.metadata import deezer as deezer_module
 from app.metadata.deezer import DeezerClient
 from app.metadata.itunes import ITunesClient, _parse_album_hit
 from app.metadata.musicbrainz import MusicBrainzClient
@@ -183,6 +185,47 @@ async def test_deezer_discography_backfills_counts_missing_from_artist_albums(
         "Discovery": 14,
         "One More Time": 1,
     }
+
+
+async def test_deezer_count_backfill_has_an_overall_latency_budget(
+    httpx_mock: HTTPXMock, monkeypatch
+) -> None:
+    httpx_mock.add_response(
+        url="https://api.deezer.com/artist/1/albums?limit=100",
+        json={"data": [{"id": 10, "title": "Slow Album", "record_type": "album"}]},
+    )
+    monkeypatch.setattr(deezer_module, "_DISCOGRAPHY_COUNT_BUDGET_SECONDS", 0.01)
+
+    async def never_returns(self, http, album_id):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(DeezerClient, "_get_album_track_count", never_returns)
+
+    albums = await asyncio.wait_for(DeezerClient().get_discography("1"), timeout=0.25)
+
+    assert albums[0].track_count is None
+
+
+async def test_deezer_count_backfill_does_not_retry_rate_limits(
+    httpx_mock: HTTPXMock,
+) -> None:
+    httpx_mock.add_response(
+        url="https://api.deezer.com/artist/1/albums?limit=100",
+        json={"data": [{"id": 10, "title": "Limited Album", "record_type": "album"}]},
+    )
+    httpx_mock.add_response(
+        url="https://api.deezer.com/album/10/tracks?limit=1",
+        status_code=429,
+        headers={"Retry-After": "60"},
+    )
+
+    albums = await DeezerClient().get_discography("1")
+
+    count_requests = [
+        request for request in httpx_mock.get_requests() if request.url.path == "/album/10/tracks"
+    ]
+    assert albums[0].track_count is None
+    assert len(count_requests) == 1
 
 
 async def test_itunes_catalog_provider(httpx_mock: HTTPXMock) -> None:

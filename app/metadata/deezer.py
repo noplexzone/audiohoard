@@ -15,6 +15,8 @@ from app.sources.base import CapabilityState
 logger = logging.getLogger(__name__)
 
 _HTTP_TIMEOUT = httpx.Timeout(10.0)
+_DISCOGRAPHY_COUNT_HTTP_TIMEOUT = httpx.Timeout(2.0)
+_DISCOGRAPHY_COUNT_BUDGET_SECONDS = 4.0
 
 
 @dataclass
@@ -40,6 +42,9 @@ class DeezerClient:
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(base_url=self._base_url, timeout=_HTTP_TIMEOUT)
+
+    def _count_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(base_url=self._base_url, timeout=_DISCOGRAPHY_COUNT_HTTP_TIMEOUT)
 
     async def health(self) -> CapabilityState:
         return CapabilityState(available=True)
@@ -90,9 +95,9 @@ class DeezerClient:
         return albums
 
     async def _get_album_track_count(self, http: httpx.AsyncClient, album_id: str) -> int | None:
-        resp = await request_with_retry(
-            http, "GET", f"/album/{album_id}/tracks", params={"limit": 1}
-        )
+        # Count enrichment is optional page metadata. Do not amplify 429s or
+        # hold rendering through the general three-attempt retry policy.
+        resp = await http.get(f"/album/{album_id}/tracks", params={"limit": 1})
         resp.raise_for_status()
         payload = resp.json()
         return _to_int(payload.get("total")) if isinstance(payload, dict) else None
@@ -150,7 +155,7 @@ async def _backfill_discography_track_counts(
     """Fill counts omitted by Deezer's artist-albums endpoint with bounded I/O."""
     semaphore = asyncio.Semaphore(8)
 
-    async with client._client() as http:
+    async with client._count_client() as http:
 
         async def fill(row: dict[str, object]) -> None:
             if _to_int(row.get("nb_tracks")) is not None:
@@ -167,7 +172,14 @@ async def _backfill_discography_track_counts(
             if count is not None:
                 row["nb_tracks"] = count
 
-        await asyncio.gather(*(fill(row) for row in album_rows))
+        try:
+            async with asyncio.timeout(_DISCOGRAPHY_COUNT_BUDGET_SECONDS):
+                await asyncio.gather(*(fill(row) for row in album_rows))
+        except TimeoutError:
+            logger.warning(
+                "Deezer discography track-count backfill exceeded %.1f seconds",
+                _DISCOGRAPHY_COUNT_BUDGET_SECONDS,
+            )
 
 
 def _to_float(value: object) -> float | None:

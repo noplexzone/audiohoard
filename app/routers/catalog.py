@@ -68,7 +68,7 @@ async def _ensure_catalog_tracks(
         or 0
     )
     expected_before_hydration = album.track_count or 0
-    if existing and (not expected_before_hydration or existing >= expected_before_hydration):
+    if expected_before_hydration and existing >= expected_before_hydration:
         return
     await fetch_and_store_album(db, settings, album)
     after = int(

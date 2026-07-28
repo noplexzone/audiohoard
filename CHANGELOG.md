@@ -13,7 +13,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The default album directory format is now `{album} ({year})`, while track filenames retain their disc and track prefixes.
 
 ### Fixed
-- Deezer artist discographies now retain release track totals even though the artist-albums API omits them, and fully stored album pages no longer block on redundant provider refreshes.
+- Deezer artist discographies now retain release track totals even though the artist-albums API omits them, with a bounded non-retrying count lookup during provider outages; fully stored album pages avoid redundant refreshes while unknown-count partial manifests still hydrate.
 - Download queue grouping now retains completed release progress without re-exposing hidden attempts, bounds relationship loading to selected groups, and records successful slskd cleanup so startup does not repeat historical transfer deletions.
 - Successful imports now remove empty acquisition directories below the configured staging root while preserving non-empty directories and the staging root itself.
 - Matching expected recording MBIDs above the configured AcoustID threshold now auto-verify even when the fingerprint result lists alternate recordings, and stale review rows are cleared.
