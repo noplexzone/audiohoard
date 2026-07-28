@@ -110,6 +110,48 @@ class TestSlskdTransfers:
         assert "Validation failed" in exc_info.value.message
         assert "Files must be an array" in exc_info.value.message
 
+    async def test_cancel_resolves_transfer_id_and_removes_download(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        transfer_id = "4dd4add9-96ce-4ab2-80d4-5b171b324e3e"
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer1",
+                    "files": [
+                        {
+                            "id": transfer_id,
+                            "filename": "Music\\Artist\\Album\\01 Song.flac",
+                            "state": "Completed, Succeeded",
+                        }
+                    ],
+                }
+            ],
+        )
+        httpx_mock.add_response(
+            url=(f"http://slskd.local/api/v0/transfers/downloads/peer1/{transfer_id}?remove=true"),
+            method="DELETE",
+            status_code=200,
+        )
+
+        await SlskdAdapter("http://slskd.local", "key123").cancel(
+            "peer1", "Music\\Artist\\Album\\01 Song.flac"
+        )
+
+        requests = httpx_mock.get_requests()
+        assert [request.method for request in requests] == ["GET", "DELETE"]
+        assert requests[-1].url.params["remove"] == "true"
+
+    async def test_cancel_is_idempotent_when_transfer_is_already_absent(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(url="http://slskd.local/api/v0/transfers/downloads", json=[])
+
+        await SlskdAdapter("http://slskd.local", "key123").cancel("peer1", "Music\\missing.flac")
+
+        assert len(httpx_mock.get_requests()) == 1
+
     async def test_downloads_flattens_current_nested_response(self, httpx_mock: HTTPXMock) -> None:
         httpx_mock.add_response(
             url="http://slskd.local/api/v0/transfers/downloads",

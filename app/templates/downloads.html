@@ -46,7 +46,7 @@
 {% if release_reviews %}
 <section aria-label="Import review" style="margin-bottom:2rem">
   <h2 style="margin-bottom:.75rem">Import review</h2>
-  <p class="hint">Every blocked release includes the persisted reason. Dismiss and deny actions retain staged source files.</p>
+  <p class="hint">Every blocked release includes the persisted reason. Approve imports the track; deny removes the staged file and review item.</p>
   {% for review in release_reviews %}
   <article class="card" style="margin-bottom:1rem">
     <h3 style="margin:0 0 .5rem">{{ review.release.album_artist or "Unknown artist" }} — {{ review.release.title or "Unknown release" }}</h3>
@@ -63,14 +63,12 @@
       <audio controls style="width:100%;margin-bottom:.75rem" src="/staging/audio/{{ item.id }}">Your browser does not support audio playback.</audio>
       <div style="display:flex;gap:.5rem;flex-wrap:wrap">
         <form method="post" action="/staging/review/{{ item.id }}/approve"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn" type="submit">Approve — import</button></form>
-        <form method="post" action="/staging/review/{{ item.id }}/deny"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Deny — keep staged</button></form>
-        <form method="post" action="/staging/review/{{ item.id }}/dismiss"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Dismiss</button></form>
+        <form method="post" action="/staging/review/{{ item.id }}/deny" onsubmit="return confirm('Remove this review item and delete its staged file?');"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Deny — remove</button></form>
       </div>
     </div>
     {% endfor %}
     <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.75rem">
       {% if review.missing_source %}<form method="post" action="/staging/release/{{ review.release.id }}/reacquire"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn" type="submit">Re-acquire</button></form>{% endif %}
-      <form method="post" action="/staging/release/{{ review.release.id }}/dismiss"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Dismiss release review</button></form>
     </div>
   </article>
   {% endfor %}

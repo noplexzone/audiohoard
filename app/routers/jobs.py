@@ -279,6 +279,13 @@ async def downloads_page(
             reason = _review_item_reason(items[0])
         if not reason:
             reason = "review required: no structured reason was recorded"
+        if (
+            not items
+            and str(release.error_detail or "").startswith("AcoustID mismatch on track ")
+            and not release.rollback_detail
+            and plan_reason is None
+        ):
+            continue
         release_reviews.append(
             {
                 "release": release,
@@ -294,7 +301,7 @@ async def downloads_page(
         "not_found": ("Job not found.", "error"),
         "removed": ("Download removed from the queue.", "info"),
         "approved": ("Track approved — import pipeline resumed.", "ok"),
-        "denied": ("Track denied — file remains staged and marked rejected.", "info"),
+        "denied": ("Track denied — staged file and review item removed.", "info"),
         "already_reviewed": ("That item has already been reviewed.", "info"),
         "review_dismissed": ("Review entry dismissed; staged files were retained.", "info"),
         "reacquired": ("Re-acquisition queued for the missing staged source.", "info"),

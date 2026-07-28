@@ -611,6 +611,116 @@ async def test_catalog_artist_unifies_release_progress_on_existing_cards(
     assert f'href="/albums/{partial_id}"' in response.text
 
 
+async def test_release_progress_recognizes_current_library_folder_naming(
+    test_settings, db_session
+) -> None:
+    from app.services.catalog import get_release_progress
+
+    artist = CatalogArtist(name="Juice WRLD")
+    album = CatalogAlbum(title="Goodbye & Good Riddance", year="2018", track_count=15)
+    artist.albums.append(album)
+    album.tracks.extend(
+        [
+            CatalogAlbumTrack(position=position, title=f"Track {position}")
+            for position in range(1, 16)
+        ]
+    )
+    db_session.add(artist)
+    await db_session.flush()
+    release_folder = test_settings.library_root / "Juice WRLD" / "Goodbye & Good Riddance (2018)"
+    release_folder.mkdir(parents=True)
+    for position in range(1, 7):
+        (release_folder / f"{position:02d} - Track {position}.flac").write_bytes(b"audio")
+
+    progress = (
+        await get_release_progress(db_session, [album.id], library_root=test_settings.library_root)
+    )[album.id]
+
+    assert progress.wanted_track_count == 15
+    assert progress.downloaded_track_count == 6
+    assert progress.downloaded_catalog_track_ids == frozenset(
+        track.id for track in album.tracks[:6]
+    )
+
+
+async def test_release_progress_recognizes_unknown_year_default_folder(
+    test_settings, db_session
+) -> None:
+    from app.services.catalog import get_release_progress
+
+    artist = CatalogArtist(name="Unknown Artist")
+    album = CatalogAlbum(title="Unknown Album", year=None, track_count=1)
+    album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Track 1"))
+    artist.albums.append(album)
+    db_session.add(artist)
+    await db_session.flush()
+    release_folder = test_settings.library_root / "Unknown Artist" / "Unknown Album (0000)"
+    release_folder.mkdir(parents=True)
+    (release_folder / "001 - Track 1.flac").write_bytes(b"audio")
+
+    progress = (
+        await get_release_progress(db_session, [album.id], library_root=test_settings.library_root)
+    )[album.id]
+
+    assert progress.downloaded_track_count == 1
+    assert progress.downloaded_catalog_track_ids == frozenset({album.tracks[0].id})
+
+
+async def test_release_progress_maps_multi_disc_track_numbers(test_settings, db_session) -> None:
+    from app.services.catalog import get_release_progress
+
+    artist = CatalogArtist(name="Various Artist")
+    album = CatalogAlbum(title="Double Album", year="2020", track_count=2)
+    album.tracks.extend(
+        [
+            CatalogAlbumTrack(disc=1, position=1, title="Disc One"),
+            CatalogAlbumTrack(disc=2, position=1, title="Disc Two"),
+        ]
+    )
+    artist.albums.append(album)
+    db_session.add(artist)
+    await db_session.flush()
+    release_folder = test_settings.library_root / "Various Artist" / "Double Album (2020)"
+    release_folder.mkdir(parents=True)
+    (release_folder / "1-01 - Disc One.flac").write_bytes(b"audio")
+    (release_folder / "2-01 - Disc Two.flac").write_bytes(b"audio")
+
+    progress = (
+        await get_release_progress(db_session, [album.id], library_root=test_settings.library_root)
+    )[album.id]
+
+    assert progress.downloaded_track_count == 2
+    assert progress.downloaded_catalog_track_ids == frozenset(track.id for track in album.tracks)
+
+
+async def test_release_progress_rejects_intermediate_library_symlink(
+    test_settings, db_session, tmp_path
+) -> None:
+    from app.services.catalog import get_release_progress
+
+    artist = CatalogArtist(name="Juice WRLD")
+    album = CatalogAlbum(title="WRLD ON DRUGS", year="2018", track_count=1)
+    album.tracks.append(CatalogAlbumTrack(position=1, title="Track 1"))
+    artist.albums.append(album)
+    db_session.add(artist)
+    await db_session.flush()
+
+    outside = tmp_path / "outside"
+    release_folder = outside / "WRLD ON DRUGS (2018)"
+    release_folder.mkdir(parents=True)
+    (release_folder / "01 - Track 1.flac").write_bytes(b"audio")
+    test_settings.library_root.mkdir(parents=True, exist_ok=True)
+    artist_link = test_settings.library_root / "Juice WRLD"
+    artist_link.symlink_to(outside, target_is_directory=True)
+
+    progress = (
+        await get_release_progress(db_session, [album.id], library_root=test_settings.library_root)
+    )[album.id]
+
+    assert progress.downloaded_track_count == 0
+    assert progress.downloaded_catalog_track_ids == frozenset()
+
+
 async def test_catalog_album_shows_total_and_per_track_downloaded_wanted_states(
     client: AsyncClient, monkeypatch
 ) -> None:
