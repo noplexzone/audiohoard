@@ -15,6 +15,9 @@ from sqlalchemy.orm import selectinload
 from app.config import get_settings
 from app.database import get_session_factory
 from app.models.import_plan import ImportPlan
+from app.models.job import Job, JobStatus
+from app.models.release import Release
+from app.models.track import Track
 from app.models.workflow import ImportWorkflowState
 from app.settings_service import build_effective_settings
 from app.sources.slskd import SlskdAdapter
@@ -39,6 +42,103 @@ def _slskd_identity(provenance_json: str | None) -> tuple[str, str] | None:
         ):
             return str(provenance["username"]), str(provenance["filename"])
     return None
+
+
+@dataclass(frozen=True)
+class OrphanPruneResult:
+    tracks: int = 0
+    releases: int = 0
+    jobs: int = 0
+
+
+def _track_has_file(track: Track) -> bool:
+    paths = [track.staging_path, track.source_path]
+    paths.extend(plan.destination_path for plan in track.import_plans if plan.destination_path)
+    return any(Path(raw).is_file() for raw in paths if raw)
+
+
+async def prune_orphaned_terminal_records(
+    db: AsyncSession, *, batch_size: int = 500
+) -> OrphanPruneResult:
+    """Remove all terminal acquisition history that has no surviving file artifact."""
+    terminal = {JobStatus.done, JobStatus.failed, JobStatus.partial, JobStatus.cancelled}
+    removed_tracks = 0
+    last_track_id = 0
+    while True:
+        tracks = list(
+            (
+                await db.scalars(
+                    select(Track)
+                    .join(Job, Job.id == Track.job_id)
+                    .where(Job.status.in_(terminal), Track.id > last_track_id)
+                    .options(selectinload(Track.import_plans))
+                    .order_by(Track.id)
+                    .limit(batch_size)
+                )
+            ).all()
+        )
+        if not tracks:
+            break
+        last_track_id = tracks[-1].id
+        has_files = await asyncio.gather(
+            *(asyncio.to_thread(_track_has_file, track) for track in tracks)
+        )
+        for track, has_file in zip(tracks, has_files, strict=True):
+            if not has_file:
+                await db.delete(track)
+                removed_tracks += 1
+        await db.flush()
+        db.expire_all()
+
+    removed_releases = 0
+    while True:
+        releases = list(
+            (
+                await db.scalars(
+                    select(Release)
+                    .join(Job, Job.id == Release.job_id)
+                    .where(
+                        Job.status.in_(terminal),
+                        ~Release.tracks.any(),
+                        ~Release.monitoring_records.any(),
+                    )
+                    .order_by(Release.id)
+                    .limit(batch_size)
+                )
+            ).all()
+        )
+        if not releases:
+            break
+        for release in releases:
+            await db.delete(release)
+        removed_releases += len(releases)
+        await db.flush()
+        db.expire_all()
+
+    removed_jobs = 0
+    while True:
+        jobs = list(
+            (
+                await db.scalars(
+                    select(Job)
+                    .where(
+                        Job.status.in_(terminal),
+                        ~Job.tracks.any(),
+                        ~Job.releases.any(),
+                    )
+                    .order_by(Job.id)
+                    .limit(batch_size)
+                )
+            ).all()
+        )
+        if not jobs:
+            break
+        for job in jobs:
+            await db.delete(job)
+        removed_jobs += len(jobs)
+        await db.flush()
+        db.expire_all()
+    return OrphanPruneResult(removed_tracks, removed_releases, removed_jobs)
 
 
 async def pending_imported_source_cleanups(

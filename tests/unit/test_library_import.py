@@ -548,3 +548,81 @@ async def test_failed_import_does_not_change_catalog_ownership(
         )
 
     assert album.in_library is False
+
+
+async def test_partial_import_preserves_committed_plan_and_imports_later_track(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    release, tracks = await _release_with_staged_tracks(db_session, tmp_path, count=2)
+    library = tmp_path / "library"
+
+    first_plans = await plan_release_import(
+        db_session,
+        release,
+        library_root=library,
+        track_ids={tracks[0].id},
+    )
+    await execute_release_import(db_session, release, library_root=library)
+
+    assert first_plans[0].status == ImportWorkflowState.imported
+    assert tracks[0].import_state == ImportWorkflowState.imported
+    assert tracks[1].import_state != ImportWorkflowState.imported
+    assert release.import_state != ImportWorkflowState.imported
+
+    second_plans = await plan_release_import(
+        db_session,
+        release,
+        library_root=library,
+        track_ids={tracks[1].id},
+    )
+    persisted = list(
+        (
+            await db_session.scalars(
+                select(ImportPlan)
+                .where(ImportPlan.release_id == release.id)
+                .order_by(ImportPlan.id)
+            )
+        ).all()
+    )
+    assert persisted == [first_plans[0], second_plans[0]]
+
+    await execute_release_import(db_session, release, library_root=library)
+
+    assert first_plans[0].status == ImportWorkflowState.imported
+    assert second_plans[0].status == ImportWorkflowState.imported
+    assert all(track.import_state == ImportWorkflowState.imported for track in tracks)
+    assert release.import_state == ImportWorkflowState.imported
+    assert all(
+        Path(plan.destination_path).is_file()  # noqa: ASYNC240
+        for plan in persisted
+    )
+
+
+async def test_execute_import_is_scoped_to_selected_ready_plan_ids(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    release, tracks = await _release_with_staged_tracks(db_session, tmp_path, count=2)
+    library = tmp_path / "library"
+    plans = await plan_release_import(db_session, release, library_root=library)
+
+    await execute_release_import(
+        db_session,
+        release,
+        library_root=library,
+        plan_ids={plans[0].id},
+    )
+
+    assert plans[0].status == ImportWorkflowState.imported
+    assert tracks[0].import_state == ImportWorkflowState.imported
+    assert plans[1].status == ImportWorkflowState.ready
+    assert tracks[1].import_state != ImportWorkflowState.imported
+    assert not Path(plans[1].destination_path).exists()  # noqa: ASYNC240
+
+    await execute_release_import(
+        db_session,
+        release,
+        library_root=library,
+        plan_ids={plans[1].id},
+    )
+    assert plans[1].status == ImportWorkflowState.imported
+    assert release.import_state == ImportWorkflowState.imported
