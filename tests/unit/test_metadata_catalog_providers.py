@@ -140,6 +140,21 @@ async def test_deezer_catalog_provider(httpx_mock: HTTPXMock) -> None:
             },
         },
     )
+    httpx_mock.add_response(
+        url="https://api.deezer.com/album/10/tracks?limit=100",
+        json={
+            "data": [
+                {
+                    "id": 100,
+                    "title": "One More Time",
+                    "duration": 320,
+                    "disk_number": 1,
+                    "track_position": 1,
+                }
+            ],
+            "total": 1,
+        },
+    )
     client = DeezerClient()
     assert (await client.search_artists("Daft Punk"))[0].artwork_url == "artist.jpg"
     assert (await client.get_artist("1")).name == "Daft Punk"

@@ -108,12 +108,23 @@ class DeezerClient:
         if cached is not None:
             return cast(AlbumDetail, cached)
         async with self._client() as client:
-            resp = await request_with_retry(client, "GET", f"/album/{id}")
-            resp.raise_for_status()
-        data = resp.json()
+            album_resp = await request_with_retry(client, "GET", f"/album/{id}")
+            album_resp.raise_for_status()
+            data = album_resp.json()
+            tracks_raw: list[object] = []
+            try:
+                tracks_resp = await request_with_retry(
+                    client, "GET", f"/album/{id}/tracks", params={"limit": 100}
+                )
+                tracks_resp.raise_for_status()
+                tracks_raw = tracks_resp.json().get("data", [])
+            except httpx.HTTPError as exc:
+                logger.warning("Deezer album tracklist lookup failed for %s: %s", id, exc)
+
         hit = _parse_album_hit(data, artist_id=None)
-        tracks_obj = data.get("tracks", {})
-        tracks_raw = tracks_obj.get("data", []) if isinstance(tracks_obj, dict) else []
+        if not tracks_raw:
+            tracks_obj = data.get("tracks", {})
+            tracks_raw = tracks_obj.get("data", []) if isinstance(tracks_obj, dict) else []
         tracks = [_parse_album_track(item) for item in tracks_raw if isinstance(item, dict)]
         values = hit.__dict__.copy()
         values["track_count"] = len(tracks) or hit.track_count

@@ -76,6 +76,55 @@ class TestLookupRecording:
         assert results[0].mbid == "rec-001"
         assert results[0].title == "Yesterday"
 
+    async def test_search_retries_known_edition_suffix_with_base_album_title(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        url = re.compile(r"https://musicbrainz[.]org/ws/2/recording[?].*")
+        httpx_mock.add_response(url=url, json={"recordings": []})
+        httpx_mock.add_response(
+            url=url,
+            json={
+                "recordings": [
+                    {
+                        "id": "891276f5-77ca-4b7d-8765-a1c33f8bbad1",
+                        "title": "Maze",
+                        "artist-credit": [{"artist": {"name": "Juice WRLD"}, "joinphrase": ""}],
+                        "releases": [{"title": "Death Race For Love"}],
+                    }
+                ]
+            },
+        )
+
+        client = MusicBrainzClient(UA)
+        results = await client.search_recording(
+            "Maze", artist="Juice WRLD", album="Death Race For Love (Bonus Track Version)"
+        )
+
+        assert [result.mbid for result in results] == ["891276f5-77ca-4b7d-8765-a1c33f8bbad1"]
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        assert 'release:"Death Race For Love \\(Bonus Track Version\\)"' in str(
+            requests[0].url.params["query"]
+        )
+        assert 'release:"Death Race For Love"' in str(requests[1].url.params["query"])
+
+    async def test_search_does_not_strip_identity_changing_version_suffix(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url=re.compile(r"https://musicbrainz[.]org/ws/2/recording[?].*"),
+            json={"recordings": []},
+        )
+
+        results = await MusicBrainzClient(UA).search_recording(
+            "Song", artist="Artist", album="Album (Live Version)"
+        )
+
+        assert results == []
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 1
+        assert 'release:"Album \\(Live Version\\)"' in str(requests[0].url.params["query"])
+
 
 class TestMusicBrainzRetry:
     async def test_503_retries_then_succeeds(self, httpx_mock: HTTPXMock) -> None:
