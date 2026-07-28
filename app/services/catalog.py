@@ -3,13 +3,19 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlencode
 
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, exists, func, literal, or_, select
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.catalog_entities import CatalogArtist
+from app.models.catalog_entities import (
+    CatalogAlbum,
+    CatalogAlbumProvider,
+    CatalogArtist,
+    CatalogArtistIdentity,
+)
 from app.models.import_plan import ImportPlan
 from app.models.track import Track
 from app.models.workflow import AcquisitionState, ImportWorkflowState
@@ -20,7 +26,7 @@ _MAX_PAGE_SIZE = 200
 
 _VALID_LIBRARY_SORTS = frozenset({"title", "artist", "album", "year", "source", "added"})
 _VALID_ARTIST_SORTS = frozenset({"name", "tracks", "albums", "duration"})
-_VALID_WATCHLIST_SORTS = frozenset({"name", "releases", "albums", "singles", "compilations"})
+_VALID_WATCHLIST_SORTS = frozenset({"name", "downloaded", "wanted"})
 
 
 def _artist_expr() -> Any:
@@ -114,6 +120,23 @@ class Page[T]:
     @property
     def has_next(self) -> bool:
         return self.page < self.total_pages
+
+
+@dataclass
+class LibraryArtistRow:
+    id: int | None
+    name: str
+    detail_url: str
+    artwork_url: str | None
+    downloaded_file_count: int
+    wanted_release_count: int
+    watchlisted: bool
+
+
+@dataclass
+class CatalogArtistLibrarySections:
+    downloaded_files: list[TrackRow]
+    wanted_releases: list[CatalogAlbumProvider]
 
 
 @dataclass
@@ -407,6 +430,180 @@ async def list_distinct_formats(db: AsyncSession) -> list[str]:
         )
     ).scalars()
     return sorted({str(s) for s in rows})
+
+
+async def get_library_artists_page(
+    db: AsyncSession,
+    *,
+    q: str = "",
+    sort: str = "name",
+    page: int = 1,
+    per_page: int = _DEFAULT_PAGE_SIZE,
+) -> Page[LibraryArtistRow]:
+    """Return watchlisted artists and every artist with a persisted library artifact."""
+    per_page = _clamp_per_page(per_page)
+    page = max(1, page)
+    track_artist = func.lower(func.trim(_artist_expr()))
+    catalog_artist = func.lower(func.trim(CatalogArtist.name))
+    belongs_to_catalog_artist = or_(
+        CatalogAlbum.artist_id == CatalogArtist.id,
+        and_(Track.catalog_album_id.is_(None), track_artist == catalog_artist),
+    )
+    downloaded_count = (
+        select(func.count(Track.id))
+        .outerjoin(CatalogAlbum, CatalogAlbum.id == Track.catalog_album_id)
+        .where(belongs_to_catalog_artist, _library_artifact_filter())
+        .correlate(CatalogArtist)
+        .scalar_subquery()
+    )
+    wanted_count = (
+        select(func.count(CatalogAlbumProvider.id))
+        .join(
+            CatalogArtistIdentity,
+            CatalogArtistIdentity.id == CatalogAlbumProvider.artist_identity_id,
+        )
+        .outerjoin(CatalogAlbum, CatalogAlbum.id == CatalogAlbumProvider.catalog_album_id)
+        .where(
+            CatalogArtistIdentity.artist_id == CatalogArtist.id,
+            or_(
+                CatalogAlbumProvider.catalog_album_id.is_(None),
+                CatalogAlbum.in_library.is_(False),
+            ),
+        )
+        .correlate(CatalogArtist)
+        .scalar_subquery()
+    )
+    has_imported_file = exists(
+        select(Track.id)
+        .outerjoin(CatalogAlbum, CatalogAlbum.id == Track.catalog_album_id)
+        .where(belongs_to_catalog_artist, _library_artifact_filter())
+    )
+    catalog_filters: list[Any] = [or_(CatalogArtist.monitored.is_(True), has_imported_file)]
+    if q:
+        catalog_filters.append(CatalogArtist.name.ilike(f"%{q}%"))
+    catalog_rows = select(
+        CatalogArtist.id.label("catalog_id"),
+        CatalogArtist.name.label("name"),
+        CatalogArtist.artwork_url.label("artwork_url"),
+        CatalogArtist.monitored.label("monitored"),
+        downloaded_count.label("downloaded_file_count"),
+        wanted_count.label("wanted_release_count"),
+    ).where(*catalog_filters)
+
+    matching_catalog_artist = exists(
+        select(CatalogArtist.id).where(catalog_artist == track_artist).correlate(Track)
+    )
+    legacy_filters: list[Any] = [
+        Track.catalog_album_id.is_(None),
+        _library_artifact_filter(),
+        ~matching_catalog_artist,
+    ]
+    if q:
+        legacy_filters.append(_artist_expr().ilike(f"%{q}%"))
+    legacy_rows = (
+        select(
+            literal(None).label("catalog_id"),
+            _artist_expr().label("name"),
+            literal(None).label("artwork_url"),
+            literal(False).label("monitored"),
+            func.count(Track.id).label("downloaded_file_count"),
+            literal(0).label("wanted_release_count"),
+        )
+        .where(*legacy_filters)
+        .group_by(_artist_expr())
+    )
+    combined = catalog_rows.union_all(legacy_rows).subquery()
+    total = int((await db.scalar(select(func.count()).select_from(combined))) or 0)
+    page = _clamp_page(page, total, per_page)
+    stmt = select(combined)
+    valid_sort = sort if sort in _VALID_WATCHLIST_SORTS else "name"
+    if valid_sort == "downloaded":
+        stmt = stmt.order_by(
+            combined.c.downloaded_file_count.desc(),
+            combined.c.name,
+            combined.c.catalog_id,
+        )
+    elif valid_sort == "wanted":
+        stmt = stmt.order_by(
+            combined.c.wanted_release_count.desc(),
+            combined.c.name,
+            combined.c.catalog_id,
+        )
+    else:
+        stmt = stmt.order_by(combined.c.name, combined.c.catalog_id)
+    rows = (await db.execute(stmt.offset(_page_offset(page, per_page)).limit(per_page))).mappings()
+    items: list[LibraryArtistRow] = []
+    for row in rows:
+        catalog_id = int(row["catalog_id"]) if row["catalog_id"] is not None else None
+        name = str(row["name"])
+        detail_url = (
+            f"/artists/catalog/{catalog_id}"
+            if catalog_id is not None
+            else f"/artists/detail?{urlencode({'name': name})}"
+        )
+        items.append(
+            LibraryArtistRow(
+                id=catalog_id,
+                name=name,
+                detail_url=detail_url,
+                artwork_url=str(row["artwork_url"]) if row["artwork_url"] else None,
+                downloaded_file_count=int(row["downloaded_file_count"] or 0),
+                wanted_release_count=int(row["wanted_release_count"] or 0),
+                watchlisted=bool(row["monitored"]),
+            )
+        )
+    return Page(items=items, total=total, page=page, per_page=per_page)
+
+
+async def get_catalog_artist_library_sections(
+    db: AsyncSession,
+    *,
+    artist_id: int,
+    identity_id: int | None,
+    artist_name: str,
+) -> CatalogArtistLibrarySections:
+    downloaded_stmt = (
+        select(Track)
+        .outerjoin(CatalogAlbum, CatalogAlbum.id == Track.catalog_album_id)
+        .options(selectinload(Track.import_plans))
+        .where(
+            or_(
+                CatalogAlbum.artist_id == artist_id,
+                and_(
+                    Track.catalog_album_id.is_(None),
+                    func.lower(func.trim(_artist_expr())) == artist_name.strip().casefold(),
+                ),
+            ),
+            _library_artifact_filter(),
+        )
+        .order_by(Track.album, Track.disc, Track.track_no, Track.title, Track.id)
+        .limit(_MAX_PAGE_SIZE)
+    )
+    downloaded = list((await db.scalars(downloaded_stmt)).all())
+    wanted: list[CatalogAlbumProvider] = []
+    if identity_id is not None:
+        wanted_stmt = (
+            select(CatalogAlbumProvider)
+            .outerjoin(CatalogAlbum, CatalogAlbum.id == CatalogAlbumProvider.catalog_album_id)
+            .where(
+                CatalogAlbumProvider.artist_identity_id == identity_id,
+                or_(
+                    CatalogAlbumProvider.catalog_album_id.is_(None),
+                    CatalogAlbum.in_library.is_(False),
+                ),
+            )
+            .order_by(
+                CatalogAlbumProvider.year.desc(),
+                CatalogAlbumProvider.title,
+                CatalogAlbumProvider.id,
+            )
+            .limit(_MAX_PAGE_SIZE)
+        )
+        wanted = list((await db.scalars(wanted_stmt)).all())
+    return CatalogArtistLibrarySections(
+        downloaded_files=[to_track_row(track) for track in downloaded],
+        wanted_releases=wanted,
+    )
 
 
 async def get_watchlisted_artists_page(

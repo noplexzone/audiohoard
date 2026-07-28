@@ -1,8 +1,8 @@
 {% extends "base.html" %}
-{% block title %}{{ detail.display_name }} — Artists — Audiohoard{% endblock %}
+{% block title %}{{ detail.display_name }} — Library — Audiohoard{% endblock %}
 {% block content %}
 <nav class="breadcrumb" aria-label="Breadcrumb">
-  <a href="/artists">Artists</a> / <span aria-current="page">{{ detail.display_name }}</span>
+  <a href="/library">Library</a> / <span aria-current="page">{{ detail.display_name }}</span>
 </nav>
 
 <div class="page-header artist-hero">
@@ -97,7 +97,7 @@
 {% else %}
 <div class="empty-state" role="status">
   <p>No tracks found for <strong>{{ detail.display_name }}</strong>.</p>
-  <a href="/artists" class="btn secondary">Back to Artists</a>
+  <a href="/library" class="btn secondary">Back to Library</a>
 </div>
 {% endif %}
 {% endblock %}

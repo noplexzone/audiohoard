@@ -51,6 +51,22 @@ class OrphanPruneResult:
     jobs: int = 0
 
 
+def _prune_empty_parents(path: Path, staging_root: Path) -> None:
+    """Remove empty ancestors up to, but never including, the staging root."""
+    root = staging_root.absolute()
+    current = path.absolute().parent
+    while current != root:
+        if not current.is_relative_to(root) or current.is_symlink():
+            return
+        try:
+            current.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return
+        current = current.parent
+
+
 def _track_has_file(track: Track) -> bool:
     paths = [track.staging_path, track.source_path]
     paths.extend(plan.destination_path for plan in track.import_plans if plan.destination_path)
@@ -188,7 +204,7 @@ async def _mark_cleanup_attempted(plan_id: int | None, *, completed: bool) -> No
 
 async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> None:
     """Idempotently finish durable cleanup obligations after an import commit."""
-    settings = None
+    staging_root = get_settings().staging_root
     adapter = None
     if any(_slskd_identity(item.provenance_json) for item in items):
         try:
@@ -215,6 +231,12 @@ async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> 
         except OSError:
             failed = True
             logger.exception("post-import staging cleanup failed for %s", item.staged_path)
+        else:
+            try:
+                await asyncio.to_thread(_prune_empty_parents, item.staged_path, staging_root)
+            except Exception:
+                failed = True
+                logger.warning("post-import directory prune failed for %s", item.staged_path)
         try:
             await _mark_cleanup_attempted(item.plan_id, completed=not failed)
         except Exception:

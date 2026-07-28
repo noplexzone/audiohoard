@@ -228,5 +228,14 @@ code, .mono { padding: .1rem .28rem; border-radius: 5px; background: var(--surfa
 .compact-check { margin: 0; color: var(--muted); font-size: .72rem; }
 .album-download { opacity: 0; transform: translateY(4px); transition: opacity .16s ease, transform .16s ease; }
 .album-card:hover .album-download, .album-card:focus-within .album-download { opacity: 1; transform: translateY(0); }
+.library-section { margin-top: 1.2rem; padding: 1rem; border: 1px solid var(--border-soft); border-radius: var(--radius); background: var(--surface); }
+.section-heading-row { display: flex; align-items: center; gap: .55rem; margin-bottom: .8rem; }
+.section-heading-row h2 { margin: 0; }
+.downloaded-file-list { display: grid; gap: .55rem; }
+.downloaded-file-row { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(130px, auto) minmax(220px, 1.5fr); align-items: center; gap: .8rem; padding: .7rem; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface-2); }
+.downloaded-file-row h3, .downloaded-file-row p { margin: 0; }
+.downloaded-file-row p { margin-top: .2rem; color: var(--muted); font-size: .75rem; }
+.downloaded-file-path { min-width: 0; color: var(--muted); overflow-wrap: anywhere; white-space: normal; }
+.wanted-release-grid { grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr)); }
 @media (hover: none) { .album-download { opacity: 1; transform: none; } }
-@media (max-width: 760px) { .artist-view-hero { grid-template-columns: 86px minmax(0, 1fr); gap: .9rem; } .artist-view-art { width: 86px; height: 86px; border-radius: 20px; font-size: 1.35rem; } .artist-actions { align-items: stretch; flex-direction: column; } .artist-actions form, .artist-actions .btn { width: 100%; } }
+@media (max-width: 760px) { .downloaded-file-row { grid-template-columns: 1fr; } .artist-view-hero { grid-template-columns: 86px minmax(0, 1fr); gap: .9rem; } .artist-view-art { width: 86px; height: 86px; border-radius: 20px; font-size: 1.35rem; } .artist-actions { align-items: stretch; flex-direction: column; } .artist-actions form, .artist-actions .btn { width: 100%; } }

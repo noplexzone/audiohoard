@@ -93,7 +93,7 @@ async def test_plan_detects_same_path_conflict_and_same_bytes_duplicate(
 ) -> None:
     release, tracks = await _release_with_staged_tracks(db_session, tmp_path, count=1)
     library = tmp_path / "library"
-    destination = library / "Artist" / "1999 - Album" / "01 - Song 1.mp3"
+    destination = library / "Artist" / "Album (1999)" / "01 - Song 1.mp3"
     destination.parent.mkdir(parents=True)
     destination.write_bytes(b"different")
 

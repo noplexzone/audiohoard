@@ -670,3 +670,112 @@ async def test_prune_orphaned_terminal_records_removes_only_rows_without_files(
     assert await db_session.get(Track, ids["imported_track"]) is not None
     assert await db_session.get(Track, ids["active_track"]) is not None
     assert await db_session.get(Job, ids["mixed_job"]) is not None
+
+
+# ---------------------------------------------------------------------------
+# Empty-directory pruning after import cleanup
+# ---------------------------------------------------------------------------
+
+
+async def test_cleanup_prunes_empty_parent_dirs_within_staging_root(
+    test_settings, tmp_path
+) -> None:
+    staging_root = test_settings.staging_root
+    nested = staging_root / "Artist" / "Album"
+    nested.mkdir(parents=True)
+    staged = nested / "track.flac"
+    staged.write_bytes(b"audio")
+
+    await cleanup_imported_sources((ImportedSourceCleanup(None, staged, None),))
+
+    assert not staged.exists()
+    assert not nested.exists()
+    assert not (staging_root / "Artist").exists()
+    assert staging_root.exists()
+
+
+async def test_cleanup_stops_pruning_at_non_empty_parent(test_settings, tmp_path) -> None:
+    staging_root = test_settings.staging_root
+    artist_dir = staging_root / "Artist"
+    album_dir = artist_dir / "Album"
+    album_dir.mkdir(parents=True)
+    staged = album_dir / "track.flac"
+    staged.write_bytes(b"audio")
+    sibling = artist_dir / "cover.jpg"
+    sibling.write_bytes(b"image")
+
+    await cleanup_imported_sources((ImportedSourceCleanup(None, staged, None),))
+
+    assert not staged.exists()
+    assert not album_dir.exists()
+    assert artist_dir.exists()
+    assert sibling.exists()
+
+
+async def test_cleanup_never_removes_staging_root(test_settings, tmp_path) -> None:
+    staging_root = test_settings.staging_root
+    staging_root.mkdir(exist_ok=True)
+    staged = staging_root / "track.flac"
+    staged.write_bytes(b"audio")
+
+    await cleanup_imported_sources((ImportedSourceCleanup(None, staged, None),))
+
+    assert not staged.exists()
+    assert staging_root.exists()
+
+
+async def test_cleanup_skips_symlink_dir(test_settings, tmp_path) -> None:
+    staging_root = test_settings.staging_root
+    staging_root.mkdir(exist_ok=True)
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link_dir = staging_root / "link"
+    link_dir.symlink_to(real_dir)
+    staged = link_dir / "track.flac"
+    staged.write_bytes(b"audio")
+
+    await cleanup_imported_sources((ImportedSourceCleanup(None, staged, None),))
+
+    assert not staged.exists()
+    assert link_dir.exists()
+
+
+async def test_cleanup_does_not_prune_outside_staging_root(test_settings, tmp_path) -> None:
+    staging_root = test_settings.staging_root
+    staging_root.mkdir(exist_ok=True)
+    outside_dir = tmp_path / "other" / "Artist"
+    outside_dir.mkdir(parents=True)
+    staged = outside_dir / "track.flac"
+    staged.write_bytes(b"audio")
+
+    await cleanup_imported_sources((ImportedSourceCleanup(None, staged, None),))
+
+    assert not staged.exists()
+    assert outside_dir.exists()
+
+
+async def test_cleanup_dir_prune_oserror_retains_obligation(
+    test_settings, tmp_path, monkeypatch
+) -> None:
+    # A prune failure keeps staging_path set so startup can retry, even though the
+    # file itself is already gone (unlink uses missing_ok=True).
+    staging_root = test_settings.staging_root
+    staging_root.mkdir(exist_ok=True)
+    staged = staging_root / "track.flac"
+    staged.write_bytes(b"audio")
+
+    completed_flags: list[bool] = []
+
+    async def fake_mark(plan_id: int | None, *, completed: bool) -> None:
+        completed_flags.append(completed)
+
+    def raising_prune(path, root) -> None:  # noqa: ANN001
+        raise OSError("simulated dir-prune failure")
+
+    monkeypatch.setattr(acquisition_cleanup, "_mark_cleanup_attempted", fake_mark)
+    monkeypatch.setattr(acquisition_cleanup, "_prune_empty_parents", raising_prune)
+
+    await cleanup_imported_sources((ImportedSourceCleanup(42, staged, None),))
+
+    assert not staged.exists()
+    assert completed_flags == [False]

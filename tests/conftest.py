@@ -33,7 +33,7 @@ def test_settings(tmp_path: Path) -> Settings:
         prowlarr_api_key="",
         sabnzbd_url="",
         sabnzbd_api_key="",
-        naming_template="{album_artist}/{year} - {album}/{disc_track} - {title}.{ext}",
+        naming_template="{album_artist}/{album} ({year})/{disc_track} - {title}.{ext}",
     )
     override_settings(settings)
     return settings

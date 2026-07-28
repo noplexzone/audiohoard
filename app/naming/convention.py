@@ -40,7 +40,7 @@ _WINDOWS_RESERVED: frozenset[str] = frozenset(
 
 _SEGMENT_MAX = 200
 _EXTENSION_MAX = 32
-_DEFAULT_TEMPLATE = "{album_artist}/{year} - {album}/{disc_track} - {title}.{ext}"
+_DEFAULT_TEMPLATE = "{album_artist}/{album} ({year})/{disc_track} - {title}.{ext}"
 
 REQUIRED_TOKENS: frozenset[str] = frozenset(["title", "ext"])
 

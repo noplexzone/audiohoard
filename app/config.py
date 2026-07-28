@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./data/audiohoard.db"
 
     # Library naming
-    naming_template: str = "{album_artist}/{year} - {album}/{disc_track} - {title}.{ext}"
+    naming_template: str = "{album_artist}/{album} ({year})/{disc_track} - {title}.{ext}"
     library_root: Path = Path("/music")
     staging_root: Path = Path("/staging/audiohoard")
 

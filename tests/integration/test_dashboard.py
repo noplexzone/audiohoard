@@ -149,7 +149,8 @@ async def test_shared_shell_has_accessible_active_navigation(client: AsyncClient
     assert 'href="/library"' in body
     assert 'aria-current="page"' in body
     assert 'aria-label="Mobile navigation"' in body
-    assert "<span>Artists</span>" in body
+    assert "<span>Artists</span>" not in body
+    assert body.count("<span>Library</span>") == 2
     assert "<span>Imports</span>" not in body
     assert 'action="/logout"' in body
     assert "Sign out" in body

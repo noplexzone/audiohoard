@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest_asyncio
 from httpx import AsyncClient
 
 import app.database as db_module
-from app.models.catalog_entities import CatalogAlbum, CatalogArtist
+from app.models.catalog_entities import (
+    CatalogAlbum,
+    CatalogAlbumProvider,
+    CatalogArtist,
+    CatalogArtistIdentity,
+)
 from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
 from app.models.release import Release
@@ -178,13 +185,13 @@ async def test_library_empty_db_shows_zero_stats(client: AsyncClient) -> None:
     assert "0" in body
 
 
-async def test_artists_empty_db_returns_200(client: AsyncClient) -> None:
-    resp = await client.get("/artists")
-    assert resp.status_code == 200
-    assert "Artists" in resp.text
+async def test_artists_empty_db_redirects_to_library(client: AsyncClient) -> None:
+    resp = await client.get("/artists", follow_redirects=False)
+    assert resp.status_code == 307
+    assert resp.headers["location"] == "/library"
 
 
-async def test_artists_lists_only_watchlisted_catalog_artists(client: AsyncClient) -> None:
+async def test_library_lists_only_eligible_catalog_artists(client: AsyncClient) -> None:
     factory = db_module.get_session_factory()
     async with factory() as session:
         watched = CatalogArtist(
@@ -192,35 +199,24 @@ async def test_artists_lists_only_watchlisted_catalog_artists(client: AsyncClien
             monitored=True,
             artwork_url="https://images.example/watchlisted.jpg",
         )
-        watched.albums.extend(
-            [
-                CatalogAlbum(title="Record", release_type="Album"),
-                CatalogAlbum(title="Short", release_type="EP"),
-                CatalogAlbum(title="Collection", release_type="Compilation"),
-            ]
-        )
         session.add_all([watched, CatalogArtist(name="Hidden Artist", monitored=False)])
         await session.commit()
         watched_id = watched.id
-    resp = await client.get("/artists")
+    resp = await client.get("/library")
     assert resp.status_code == 200
     assert "Watchlisted Artist" in resp.text
     assert "Hidden Artist" not in resp.text
     assert f'href="/artists/catalog/{watched_id}"' in resp.text
     assert 'src="https://images.example/watchlisted.jpg"' in resp.text
-    assert "1 album" in resp.text
-    assert "1 single/EP" in resp.text
-    assert "1 compilation" in resp.text
-    assert "3 releases" in resp.text
-    assert "Monitored" not in resp.text
-    assert "Monitoring" not in resp.text
+    assert "Downloaded files" in resp.text
+    assert "Wanted releases" in resp.text
 
 
-async def test_legacy_artist_routes_redirect_to_artists(client: AsyncClient) -> None:
+async def test_legacy_artist_routes_redirect_to_library(client: AsyncClient) -> None:
     for path in ("/artists/monitored", "/wanted"):
         resp = await client.get(path, follow_redirects=False)
         assert resp.status_code in (302, 303, 307, 308)
-        assert resp.headers["location"] == "/artists"
+        assert resp.headers["location"] == "/library"
 
 
 async def test_settings_icon_is_a_conventional_gear(client: AsyncClient) -> None:
@@ -251,12 +247,10 @@ async def test_library_stats_aggregate(seeded_client: AsyncClient) -> None:
     assert "2" in body  # artist count
 
 
-async def test_library_shows_all_tracks(seeded_client: AsyncClient) -> None:
+async def test_library_shows_all_eligible_artists(seeded_client: AsyncClient) -> None:
     resp = await seeded_client.get("/library")
-    body = resp.text
-    assert "Song A" in body
-    assert "Song B" in body
-    assert "Song C" in body
+    assert "Album Artist A" in resp.text
+    assert "Artist B" in resp.text
 
 
 async def test_library_shows_track_artist(seeded_client: AsyncClient) -> None:
@@ -264,20 +258,17 @@ async def test_library_shows_track_artist(seeded_client: AsyncClient) -> None:
     assert "Album Artist A" in resp.text
 
 
-async def test_library_shows_year(seeded_client: AsyncClient) -> None:
+async def test_library_shows_file_and_wanted_counts(seeded_client: AsyncClient) -> None:
     resp = await seeded_client.get("/library")
-    assert "2020" in resp.text
+    assert "Downloaded files" in resp.text
+    assert "Wanted releases" in resp.text
 
 
-# ── Watchlisted artists and legacy library detail ─────────────────────────────
-
-
-async def test_artists_uses_watchlisted_catalog_artists(seeded_client: AsyncClient) -> None:
-    resp = await seeded_client.get("/artists")
+async def test_library_uses_watchlisted_catalog_artists(seeded_client: AsyncClient) -> None:
+    resp = await seeded_client.get("/library")
     assert resp.status_code == 200
-    body = resp.text
-    assert "Album Artist A" in body
-    assert "Artist B" in body
+    assert "Album Artist A" in resp.text
+    assert "Artist B" in resp.text
 
 
 async def test_artist_detail_renders_release_metadata(seeded_client: AsyncClient) -> None:
@@ -300,49 +291,17 @@ async def test_artist_detail_fallback_finds_tracks(seeded_client: AsyncClient) -
 
 
 async def test_library_text_filter(seeded_client: AsyncClient) -> None:
-    resp = await seeded_client.get("/library?q=Song+A")
+    resp = await seeded_client.get("/library?q=Artist+B")
     assert resp.status_code == 200
-    body = resp.text
-    assert "Song A" in body
-    assert "Song B" not in body
-    assert "Song C" not in body
+    assert "Artist B" in resp.text
+    assert "Album Artist A" not in resp.text
 
 
-async def test_library_artist_filter(seeded_client: AsyncClient) -> None:
-    resp = await seeded_client.get("/library?artist=Album+Artist+A")
+async def test_library_artist_search_filter(seeded_client: AsyncClient) -> None:
+    resp = await seeded_client.get("/library?q=Artist+B")
     assert resp.status_code == 200
-    body = resp.text
-    assert "Song A" in body
-    assert "Song C" not in body
-
-
-async def test_library_source_filter(seeded_client: AsyncClient) -> None:
-    resp = await seeded_client.get("/library?source=youtube")
-    assert resp.status_code == 200
-    body = resp.text
-    assert "Song B" in body
-    assert "Song A" not in body
-    assert "Song C" not in body
-
-
-async def test_library_fmt_filter(seeded_client: AsyncClient) -> None:
-    resp = await seeded_client.get("/library?fmt=mp3")
-    assert resp.status_code == 200
-    body = resp.text
-    assert "Song B" in body
-    assert "Song A" not in body
-    assert "Song C" not in body
-
-
-async def test_artists_search_filter(seeded_client: AsyncClient) -> None:
-    resp = await seeded_client.get("/artists?q=Artist+B")
-    assert resp.status_code == 200
-    body = resp.text
-    assert "Artist B" in body
-    assert "Album Artist A" not in body
-
-
-# ── Deterministic sort ────────────────────────────────────────────────────────
+    assert "Artist B" in resp.text
+    assert "Album Artist A" not in resp.text
 
 
 async def test_library_deterministic_sort_title(seeded_client: AsyncClient) -> None:
@@ -351,29 +310,24 @@ async def test_library_deterministic_sort_title(seeded_client: AsyncClient) -> N
     assert r1.text == r2.text
 
 
-async def test_artists_deterministic_sort_name(seeded_client: AsyncClient) -> None:
-    r1 = await seeded_client.get("/artists?sort=name")
-    r2 = await seeded_client.get("/artists?sort=name")
+async def test_library_deterministic_sort_name(seeded_client: AsyncClient) -> None:
+    r1 = await seeded_client.get("/library?sort=name")
+    r2 = await seeded_client.get("/library?sort=name")
     assert r1.text == r2.text
 
 
-# ── Pagination ────────────────────────────────────────────────────────────────
-
-
 async def test_library_pagination_first_page(seeded_client: AsyncClient) -> None:
-    resp = await seeded_client.get("/library?per_page=2&sort=title")
+    resp = await seeded_client.get("/library?per_page=1&sort=name")
     assert resp.status_code == 200
-    body = resp.text
-    assert "Page 1 of 2" in body
-    assert "Next" in body
+    assert "Page 1 of 2" in resp.text
+    assert "Next" in resp.text
 
 
 async def test_library_pagination_second_page(seeded_client: AsyncClient) -> None:
-    resp = await seeded_client.get("/library?per_page=2&page=2&sort=title")
+    resp = await seeded_client.get("/library?per_page=1&page=2&sort=name")
     assert resp.status_code == 200
-    body = resp.text
-    assert "Page 2 of 2" in body
-    assert "Prev" in body
+    assert "Page 2 of 2" in resp.text
+    assert "Prev" in resp.text
 
 
 async def test_library_pagination_beyond_bounds_shows_empty(seeded_client: AsyncClient) -> None:
@@ -381,14 +335,10 @@ async def test_library_pagination_beyond_bounds_shows_empty(seeded_client: Async
     assert resp.status_code == 200
 
 
-async def test_artists_pagination(seeded_client: AsyncClient) -> None:
-    resp = await seeded_client.get("/artists?per_page=1&sort=name")
-    assert resp.status_code == 200
-    body = resp.text
-    assert "Page 1 of 2" in body
-
-
-# ── Page bound validation ─────────────────────────────────────────────────────
+async def test_artists_pagination_query_is_preserved(seeded_client: AsyncClient) -> None:
+    resp = await seeded_client.get("/artists?per_page=1&sort=name", follow_redirects=False)
+    assert resp.status_code == 307
+    assert resp.headers["location"] == "/library?per_page=1&sort=name"
 
 
 async def test_library_page_too_large_returns_422(client: AsyncClient) -> None:
@@ -396,9 +346,10 @@ async def test_library_page_too_large_returns_422(client: AsyncClient) -> None:
     assert resp.status_code == 422
 
 
-async def test_artists_page_too_large_returns_422(client: AsyncClient) -> None:
-    resp = await client.get("/artists?page=99999")
-    assert resp.status_code == 422
+async def test_artists_page_too_large_redirects_unchanged(client: AsyncClient) -> None:
+    resp = await client.get("/artists?page=99999", follow_redirects=False)
+    assert resp.status_code == 307
+    assert resp.headers["location"] == "/library?page=99999"
 
 
 async def test_artist_detail_page_too_large_returns_422(client: AsyncClient) -> None:
@@ -409,10 +360,9 @@ async def test_artist_detail_page_too_large_returns_422(client: AsyncClient) -> 
 # ── HTML content and structure ────────────────────────────────────────────────
 
 
-async def test_library_html_has_table(seeded_client: AsyncClient) -> None:
+async def test_library_html_has_artist_cards(seeded_client: AsyncClient) -> None:
     resp = await seeded_client.get("/library")
-    assert "<table" in resp.text
-    assert "<th" in resp.text
+    assert "artist-card" in resp.text
 
 
 async def test_library_html_has_filter_form(seeded_client: AsyncClient) -> None:
@@ -421,14 +371,18 @@ async def test_library_html_has_filter_form(seeded_client: AsyncClient) -> None:
     assert 'name="q"' in resp.text
 
 
-async def test_library_html_has_format_filter(seeded_client: AsyncClient) -> None:
+async def test_library_html_has_count_sort_filters(seeded_client: AsyncClient) -> None:
     resp = await seeded_client.get("/library")
-    assert 'name="fmt"' in resp.text
+    assert '<option value="downloaded"' in resp.text
+    assert '<option value="wanted"' in resp.text
 
 
-async def test_artists_html_has_artist_cards(seeded_client: AsyncClient) -> None:
-    resp = await seeded_client.get("/artists")
-    assert "artist-card" in resp.text
+async def test_artists_redirects_instead_of_rendering_duplicate_cards(
+    seeded_client: AsyncClient,
+) -> None:
+    resp = await seeded_client.get("/artists", follow_redirects=False)
+    assert resp.status_code == 307
+    assert resp.headers["location"] == "/library"
 
 
 async def test_artist_detail_shows_album_section(seeded_client: AsyncClient) -> None:
@@ -440,14 +394,10 @@ async def test_artist_detail_shows_album_section(seeded_client: AsyncClient) -> 
     assert "Song B" in body
 
 
-async def test_nav_includes_library_and_artists(client: AsyncClient) -> None:
+async def test_nav_includes_only_combined_library(client: AsyncClient) -> None:
     resp = await client.get("/library")
-    body = resp.text
-    assert 'href="/library"' in body
-    assert 'href="/artists"' in body
-
-
-# ── No secret/path leakage ────────────────────────────────────────────────────
+    assert resp.text.count('href="/library"') == 2
+    assert "<span>Artists</span>" not in resp.text
 
 
 async def test_library_does_not_leak_secret_key(seeded_client: AsyncClient) -> None:
@@ -463,3 +413,98 @@ async def test_library_does_not_expose_db_url(seeded_client: AsyncClient) -> Non
 async def test_artists_does_not_leak_secret_key(seeded_client: AsyncClient) -> None:
     resp = await seeded_client.get("/artists")
     assert "test-secret" not in resp.text
+
+
+async def test_artists_redirects_to_library_preserving_query(client: AsyncClient) -> None:
+    response = await client.get("/artists?q=AC%2FDC&sort=wanted&page=2", follow_redirects=False)
+    assert response.status_code in (302, 303, 307, 308)
+    assert response.headers["location"] == "/library?q=AC%2FDC&sort=wanted&page=2"
+
+
+async def test_library_nav_has_no_separate_artists_item(client: AsyncClient) -> None:
+    response = await client.get("/library")
+    assert response.status_code == 200
+    assert response.text.count('href="/library"') == 2
+    assert "<span>Artists</span>" not in response.text
+
+
+async def test_catalog_artist_separates_downloaded_files_and_wanted_releases(
+    client: AsyncClient,
+) -> None:
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        job = Job(source="slskd", query="partial artist", status=JobStatus.done)
+        release = Release(job=job, source="slskd", title="Partial Album")
+        artist = CatalogArtist(
+            name="Partial Artist",
+            monitored=True,
+            watchlist_provider="musicbrainz",
+            last_enriched_at=datetime.now(tz=UTC),
+        )
+        partial = CatalogAlbum(title="Partial Album", in_library=False)
+        complete = CatalogAlbum(title="Complete Album", in_library=True)
+        artist.albums.extend([partial, complete])
+        identity = CatalogArtistIdentity(
+            provider="musicbrainz",
+            provider_artist_id="partial-artist",
+            name=artist.name,
+        )
+        identity.releases.extend(
+            [
+                CatalogAlbumProvider(
+                    provider_album_id="partial",
+                    title="Partial Album",
+                    release_kind="album",
+                    catalog_album=partial,
+                ),
+                CatalogAlbumProvider(
+                    provider_album_id="complete",
+                    title="Complete Album",
+                    release_kind="album",
+                    catalog_album=complete,
+                ),
+            ]
+        )
+        artist.identities.append(identity)
+        session.add_all([job, release, artist])
+        await session.flush()
+        imported = _make_track(
+            job.id,
+            title="Imported File",
+            artist=artist.name,
+            album="Partial Album",
+            source_path="/music/Partial Artist/Partial Album/01 Imported File.flac",
+            file_size_bytes=1234,
+            release_id=release.id,
+        )
+        imported.catalog_album_id = partial.id
+        staging = _make_track(
+            job.id,
+            title="Staging File",
+            artist=artist.name,
+            album="Partial Album",
+            source_path="/music/Partial Artist/Partial Album/02 Staging File.flac",
+            file_size_bytes=1234,
+            release_id=release.id,
+        )
+        staging.catalog_album_id = partial.id
+        staging.import_state = ImportWorkflowState.discovered
+        staging.import_plans[0].status = ImportWorkflowState.discovered
+        session.add_all([imported, staging])
+        await session.commit()
+        artist_id = artist.id
+
+    response = await client.get(f"/artists/catalog/{artist_id}")
+
+    assert response.status_code == 200
+    assert "Downloaded files" in response.text
+    assert "Wanted releases" in response.text
+    downloaded = response.text.split('data-section="downloaded-files"', 1)[1].split(
+        'data-section="wanted-releases"', 1
+    )[0]
+    wanted = response.text.split('data-section="wanted-releases"', 1)[1].split("</section>", 1)[0]
+    assert "Imported File.flac" in downloaded
+    assert "/music/Partial Artist/Partial Album/01 Imported File.flac" in downloaded
+    assert "Staging File" not in downloaded
+    assert "Partial Album" in wanted
+    assert "Complete Album" not in wanted

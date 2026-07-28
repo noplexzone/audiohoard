@@ -4,7 +4,7 @@
 {% set csrf_token = request.cookies.get('csrf', '') | e %}
 {% set total_releases = counts_by_type.albums + counts_by_type.singles_eps + counts_by_type.compilations %}
 {% set provenance = artist.provenance_json | from_json if artist.provenance_json else {} %}
-<nav class="breadcrumb"><a href="/artists">Artists</a> / {{ artist.name }}</nav>
+<nav class="breadcrumb"><a href="/library">Library</a> / {{ artist.name }}</nav>
 <section class="artist-view-hero card">
   <div class="artist-view-art" aria-hidden="true">
     {% if display_identity and display_identity.artwork_url %}
@@ -65,6 +65,57 @@
       {% endif %}
     </div>
   </div>
+</section>
+
+<section class="library-section" data-section="downloaded-files" aria-labelledby="downloaded-files-heading">
+  <div class="section-heading-row">
+    <h2 id="downloaded-files-heading">Downloaded files</h2>
+    <span class="badge info">{{ library_sections.downloaded_files | length }}</span>
+  </div>
+  {% if library_sections.downloaded_files %}
+  <div class="downloaded-file-list">
+    {% for track in library_sections.downloaded_files %}
+    <article class="downloaded-file-row">
+      <div>
+        <h3><a href="/tracks/{{ track.id }}/ui">{{ track.title }}</a></h3>
+        <p>{{ track.album }}{% if track.year %} · {{ track.year }}{% endif %}</p>
+      </div>
+      <code title="{{ track.file_path | e }}">{{ track.file_path.rsplit('/', 1)[-1] }}</code>
+      <code class="downloaded-file-path">{{ track.file_path }}</code>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state mini"><p>No successfully imported files for this artist.</p></div>
+  {% endif %}
+</section>
+
+<section class="library-section" data-section="wanted-releases" aria-labelledby="wanted-releases-heading">
+  <div class="section-heading-row">
+    <h2 id="wanted-releases-heading">Wanted releases</h2>
+    <span class="badge info">{{ library_sections.wanted_releases | length }}</span>
+  </div>
+  {% if library_sections.wanted_releases %}
+  <div class="album-grid wanted-release-grid">
+    {% for album in library_sections.wanted_releases %}
+    <article class="album-card">
+      {% if album.catalog_album_id %}<a class="album-art" href="/albums/{{ album.catalog_album_id }}" aria-label="Open {{ album.title }}">{% else %}<span class="album-art">{% endif %}
+        {% if album.artwork_url %}<img loading="lazy" src="{{ album.artwork_url | e }}" alt="">{% else %}<span>{{ album.title[:2] | upper }}</span>{% endif %}
+      {% if album.catalog_album_id %}</a>{% else %}</span>{% endif %}
+      <div class="album-card-body">
+        <h3>{% if album.catalog_album_id %}<a href="/albums/{{ album.catalog_album_id }}">{{ album.title }}</a>{% else %}{{ album.title }}{% endif %}</h3>
+        <p class="muted-line">{% if album.year %}{{ album.year }} · {% endif %}{{ album.release_type_raw or album.release_kind | title }}</p>
+        {% if album.catalog_album_id %}<form method="post" action="/albums/{{ album.catalog_album_id }}/download">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn secondary">Download</button>
+        </form>{% endif %}
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state mini"><p>No wanted releases for this provider.</p></div>
+  {% endif %}
 </section>
 
 <nav class="discography-filters" aria-label="Metadata provider discographies">

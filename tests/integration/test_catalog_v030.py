@@ -184,18 +184,20 @@ async def test_artists_is_single_watchlist_page(client: AsyncClient) -> None:
         data={"quick": "1", "csrf_token": client.cookies.get("csrf", "")},
     )
 
-    artists = await client.get("/artists")
+    artists = await client.get("/artists", follow_redirects=False)
+    library = await client.get("/library")
     monitored = await client.get("/artists/monitored", follow_redirects=False)
     wanted = await client.get("/wanted", follow_redirects=False)
 
-    assert artists.status_code == 200
-    assert "Daft Punk" in artists.text
-    assert "Watchlisted" in artists.text
-    assert "Monitored (" not in artists.text
-    assert "Wanted" not in artists.text
+    assert artists.status_code == 307
+    assert artists.headers["location"] == "/library"
+    assert library.status_code == 200
+    assert "Daft Punk" in library.text
+    assert "Watchlisted" in library.text
+    assert "Monitored (" not in library.text
     for legacy in (monitored, wanted):
         assert legacy.status_code == 303
-        assert legacy.headers["location"] == "/artists"
+        assert legacy.headers["location"] == "/library"
 
 
 async def test_artist_page_switches_provider_and_album_filter_excludes_singles(
