@@ -103,6 +103,9 @@ def project_download_groups(
     groups: list[DownloadGroup] = []
     for key, grouped_jobs in buckets.items():
         grouped_jobs.sort(key=lambda job: (job.created_at, job.id), reverse=True)
+        visible_jobs = [job for job in grouped_jobs if not job.queue_hidden]
+        if not visible_jobs:
+            continue
         album = next((job.catalog_album for job in grouped_jobs if job.catalog_album), None)
         wanted: set[tuple[object, ...]]
         if album is not None:
@@ -127,12 +130,12 @@ def project_download_groups(
                 key=key,
                 label=label,
                 attempts=tuple(
-                    DownloadAttempt(job=job, metadata=_metadata(job)) for job in grouped_jobs
+                    DownloadAttempt(job=job, metadata=_metadata(job)) for job in visible_jobs
                 ),
-                status=_group_status(grouped_jobs),
+                status=_group_status(visible_jobs),
                 wanted_track_count=wanted_count,
                 downloaded_track_count=min(len(downloaded & wanted), wanted_count),
-                action_attempt=_action_attempt(grouped_jobs),
+                action_attempt=_action_attempt(visible_jobs),
             )
         )
     groups.sort(

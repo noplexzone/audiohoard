@@ -9,9 +9,10 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.auth import get_current_user, require_mutation
 from app.database import get_db
@@ -98,29 +99,139 @@ async def downloads_page(
     status: JobStatus | None = None,
 ) -> HTMLResponse:
     templates = _get_templates(request)
-    query = (
-        select(Job)
+    load_options = (
+        selectinload(Job.tracks),
+        selectinload(Job.catalog_album).selectinload(CatalogAlbum.artist),
+        selectinload(Job.catalog_album).selectinload(CatalogAlbum.tracks),
+    )
+    metadata_query = (
+        select(Job.id, Job.parent_job_id, Job.catalog_album_id)
         .where(Job.queue_hidden.is_(False))
-        .options(
-            selectinload(Job.tracks),
-            selectinload(Job.catalog_album).selectinload(CatalogAlbum.artist),
-            selectinload(Job.catalog_album).selectinload(CatalogAlbum.tracks),
+        .order_by(Job.created_at.desc(), Job.id.desc())
+        .limit(500)
+    )
+    if status is not None:
+        metadata_query = metadata_query.where(Job.status == status)
+    metadata_rows = (await db.execute(metadata_query)).all()
+    parents = {
+        int(job_id): int(parent_job_id) if parent_job_id is not None else None
+        for job_id, parent_job_id, _catalog_album_id in metadata_rows
+    }
+
+    unresolved_parents = {
+        parent_job_id
+        for parent_job_id in parents.values()
+        if parent_job_id is not None and parent_job_id not in parents
+    }
+    while unresolved_parents:
+        ancestor_rows = (
+            await db.execute(
+                select(Job.id, Job.parent_job_id).where(Job.id.in_(unresolved_parents))
+            )
+        ).all()
+        if not ancestor_rows:
+            break
+        for job_id, parent_job_id in ancestor_rows:
+            parents[int(job_id)] = int(parent_job_id) if parent_job_id is not None else None
+        unresolved_parents = {
+            parent_job_id
+            for parent_job_id in parents.values()
+            if parent_job_id is not None and parent_job_id not in parents
+        }
+
+    candidate_root_ids = {
+        int(job_id)
+        for job_id, parent_job_id, _catalog_album_id in metadata_rows
+        if parent_job_id is None
+    }
+    parent_ids = set(
+        (
+            await db.scalars(
+                select(Job.parent_job_id)
+                .where(Job.parent_job_id.in_(candidate_root_ids))
+                .distinct()
+            )
+        ).all()
+    )
+
+    def root_id(job_id: int) -> int:
+        seen: set[int] = set()
+        current = job_id
+        while current not in seen:
+            parent_job_id = parents.get(current)
+            if parent_job_id is None:
+                break
+            seen.add(current)
+            current = parent_job_id
+        return current
+
+    selected_keys: set[tuple[str, int]] = set()
+    for job_id, parent_job_id, catalog_album_id in metadata_rows:
+        if catalog_album_id is not None:
+            key = ("album", int(catalog_album_id))
+        elif parent_job_id is not None or job_id in parent_ids:
+            key = ("chain", root_id(int(job_id)))
+        else:
+            key = ("job", int(job_id))
+        selected_keys.add(key)
+        if len(selected_keys) == 100:
+            break
+
+    album_ids = {value for kind, value in selected_keys if kind == "album"}
+    chain_roots = {value for kind, value in selected_keys if kind == "chain"}
+    standalone_ids = {value for kind, value in selected_keys if kind == "job"}
+    chain_ids = set(chain_roots)
+    descendant_frontier = set(chain_roots)
+    while descendant_frontier:
+        descendant_rows = (
+            await db.execute(
+                select(Job.id, Job.parent_job_id).where(Job.parent_job_id.in_(descendant_frontier))
+            )
+        ).all()
+        new_ids = {int(job_id) for job_id, _parent_job_id in descendant_rows} - chain_ids
+        for job_id, parent_job_id in descendant_rows:
+            parents[int(job_id)] = int(parent_job_id)
+        chain_ids.update(new_ids)
+        descendant_frontier = new_ids
+
+    visible_conditions: list[ColumnElement[bool]] = []
+    if album_ids:
+        visible_conditions.append(Job.catalog_album_id.in_(album_ids))
+    if chain_ids:
+        visible_conditions.append(Job.catalog_album_id.is_(None) & Job.id.in_(chain_ids))
+    if standalone_ids:
+        visible_conditions.append(Job.id.in_(standalone_ids))
+
+    downloads: list[Job] = []
+    if visible_conditions:
+        visible_query = (
+            select(Job)
+            .where(Job.queue_hidden.is_(False), or_(*visible_conditions))
+            .options(*load_options)
         )
-        .order_by(Job.created_at.desc())
-        .limit(100)
-    )
-    result = await db.execute(query)
-    downloads = list(result.scalars().all())
-    parent_rows = (await db.execute(select(Job.id, Job.parent_job_id))).all()
-    download_groups = project_download_groups(
-        downloads, {int(job_id): parent_id for job_id, parent_id in parent_rows}
-    )
+        downloads.extend((await db.scalars(visible_query)).all())
+
+    hidden_conditions: list[ColumnElement[bool]] = []
+    if album_ids:
+        hidden_conditions.append(Job.catalog_album_id.in_(album_ids))
+    if chain_ids:
+        hidden_conditions.append(Job.catalog_album_id.is_(None) & Job.id.in_(chain_ids))
+    if hidden_conditions:
+        hidden_query = (
+            select(Job)
+            .where(Job.queue_hidden.is_(True), or_(*hidden_conditions))
+            .options(*load_options)
+        )
+        downloads.extend((await db.scalars(hidden_query)).all())
+
+    download_groups = project_download_groups(downloads, parents)
     if status is not None:
         download_groups = [
             group
             for group in download_groups
             if any(attempt.job.status == status for attempt in group.attempts)
         ]
+    download_groups = download_groups[:100]
     review_result = await db.execute(
         select(StagingReviewItem)
         .where(

@@ -11,9 +11,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Downloads now group all acquisition attempts for the same release and automatically clear completed or timed-out work from Audiohoard and slskd queues after durable state is saved.
 - Verified tracks now import immediately without waiting for the rest of an album, while missing tracks remain available for targeted continuation searches.
 - The default album directory format is now `{album} ({year})`, while track filenames retain their disc and track prefixes.
-- Library and Artists are now one artist-card Library surface, with per-artist downloaded-file and wanted-release sections.
 
 ### Fixed
+- Download queue grouping now retains completed release progress without re-exposing hidden attempts, bounds relationship loading to selected groups, and records successful slskd cleanup so startup does not repeat historical transfer deletions.
 - Successful imports now remove empty acquisition directories below the configured staging root while preserving non-empty directories and the staging root itself.
 - Matching expected recording MBIDs above the configured AcoustID threshold now auto-verify even when the fingerprint result lists alternate recordings, and stale review rows are cleared.
 - Startup reconciliation removes terminal acquisition rows that no longer have a staged or imported file, preventing old jobs from affecting later acquisitions.

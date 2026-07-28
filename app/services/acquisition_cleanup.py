@@ -25,6 +25,20 @@ from app.sources.slskd import SlskdAdapter
 
 logger = logging.getLogger(__name__)
 
+_SOURCE_CLEANUP_COMPLETED_AT = "source_cleanup_completed_at"
+
+
+def _provenance(provenance_json: str | None) -> dict[str, object]:
+    with contextlib.suppress(json.JSONDecodeError, TypeError):
+        value = json.loads(provenance_json or "{}")
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _source_cleanup_completed(provenance_json: str | None) -> bool:
+    return bool(_provenance(provenance_json).get(_SOURCE_CLEANUP_COMPLETED_AT))
+
 
 @dataclass(frozen=True)
 class ImportedSourceCleanup:
@@ -95,24 +109,50 @@ async def cleanup_durable_slskd_transfers(
         if job_ids is not None:
             query = query.where(Track.job_id.in_(job_ids))
         tracks = list((await db.scalars(query.order_by(Track.id))).all())
-        identities = {
-            identity
-            for track in tracks
-            if (
-                (track.acquisition_state.value == "downloaded" and bool(track.staging_path))
-                or track.source_status == "transfer_timeout"
-            )
-            if (identity := _slskd_identity(track.acquisition_provenance_json)) is not None
-        }
+        attempts: dict[tuple[str, str], list[tuple[int, str]]] = {}
+        for track in tracks:
+            if _source_cleanup_completed(track.acquisition_provenance_json):
+                continue
+            durable = (
+                track.acquisition_state == AcquisitionState.downloaded and bool(track.staging_path)
+            ) or track.source_status == "transfer_timeout"
+            identity = _slskd_identity(track.acquisition_provenance_json)
+            source_job_id = track.source_job_id
+            if durable and identity is not None and source_job_id is not None:
+                attempts.setdefault(identity, []).append((track.id, source_job_id))
 
     completed = 0
-    for identity in sorted(identities):
+    cleaned_track_identities: dict[int, tuple[tuple[str, str], str]] = {}
+    for identity, track_refs in sorted(attempts.items()):
         try:
             await adapter.cancel(*identity)
         except Exception:
             logger.exception("durable slskd transfer cleanup failed")
         else:
             completed += 1
+            cleaned_track_identities.update(
+                {track_id: (identity, source_job_id) for track_id, source_job_id in track_refs}
+            )
+
+    if cleaned_track_identities:
+        async with session_factory() as db:
+            cleaned_tracks = list(
+                (
+                    await db.scalars(select(Track).where(Track.id.in_(cleaned_track_identities)))
+                ).all()
+            )
+            completed_at = datetime.now(UTC).isoformat()
+            for track in cleaned_tracks:
+                expected_identity, expected_source_job_id = cleaned_track_identities[track.id]
+                if (
+                    track.source_job_id != expected_source_job_id
+                    or _slskd_identity(track.acquisition_provenance_json) != expected_identity
+                ):
+                    continue
+                provenance = _provenance(track.acquisition_provenance_json)
+                provenance[_SOURCE_CLEANUP_COMPLETED_AT] = completed_at
+                track.acquisition_provenance_json = json.dumps(provenance, sort_keys=True)
+            await db.commit()
     return completed
 
 
