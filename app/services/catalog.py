@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import math
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -10,6 +13,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.media_formats import IMPORTABLE_AUDIO_SUFFIXES
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -20,6 +24,7 @@ from app.models.catalog_entities import (
 from app.models.import_plan import ImportPlan
 from app.models.track import Track
 from app.models.workflow import AcquisitionState, ImportWorkflowState
+from app.naming.convention import _sanitize_segment
 
 UNKNOWN = "Unknown"
 _DEFAULT_PAGE_SIZE = 50
@@ -282,8 +287,100 @@ def _library_artifact_filter() -> Any:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _FilesystemReleaseEvidence:
+    file_count: int
+    track_keys: frozenset[tuple[int, int]]
+
+
+_TRACK_NUMBER_PREFIX = re.compile(r"^(?:(?P<disc>\d{1,2})[-_.])?(?P<track>\d{1,3})(?:\D|$)")
+_DISC_FOLDER = re.compile(r"^(?:cd|disc)[ _.-]?(\d{1,2})$", re.IGNORECASE)
+
+
+def _has_symlink_component(root: Path, path: Path) -> bool:
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return True
+    current = root
+    for part in parts:
+        current /= part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _filesystem_release_evidence(
+    library_root: Path,
+    albums: list[tuple[int, int | None, str, str | None, str]],
+) -> dict[int, _FilesystemReleaseEvidence]:
+    """Inspect exact release folders while refusing paths that leave the library root."""
+    evidence: dict[int, _FilesystemReleaseEvidence] = {}
+    root = library_root.resolve()
+    for album_id, _track_count, title, year, artist_name in albums:
+        artist_segment = _sanitize_segment(artist_name)
+        title_segment = _sanitize_segment(title)
+        candidates = []
+        if year:
+            candidates.extend(
+                [
+                    root / artist_segment / _sanitize_segment(f"{title} ({year})"),
+                    root / artist_segment / _sanitize_segment(f"{year} - {title}"),
+                ]
+            )
+        else:
+            candidates.extend(
+                [
+                    root / artist_segment / _sanitize_segment(f"{title} (0000)"),
+                    root / artist_segment / title_segment,
+                ]
+            )
+        for folder in candidates:
+            if _has_symlink_component(root, folder) or not folder.is_dir():
+                continue
+            resolved_folder = folder.resolve()
+            try:
+                resolved_folder.relative_to(root)
+            except ValueError:
+                continue
+            file_count = 0
+            positions: set[tuple[int, int]] = set()
+            for path in folder.rglob("*"):
+                if (
+                    not path.is_file()
+                    or path.is_symlink()
+                    or path.suffix.casefold() not in IMPORTABLE_AUDIO_SUFFIXES
+                ):
+                    continue
+                try:
+                    path.resolve().relative_to(resolved_folder)
+                except ValueError:
+                    continue
+                file_count += 1
+                match = _TRACK_NUMBER_PREFIX.match(path.stem)
+                if match:
+                    disc = int(match.group("disc") or 1)
+                    track = int(match.group("track"))
+                    if match.group("disc") is None:
+                        for parent_part in path.relative_to(folder).parts[:-1]:
+                            disc_match = _DISC_FOLDER.match(parent_part)
+                            if disc_match:
+                                disc = int(disc_match.group(1))
+                        if track >= 100 and track <= 999:
+                            disc, track = divmod(track, 100)
+                    positions.add((disc, track))
+            candidate = _FilesystemReleaseEvidence(file_count, frozenset(positions))
+            current = evidence.get(album_id)
+            if file_count and (current is None or file_count > current.file_count):
+                evidence[album_id] = candidate
+    return evidence
+
+
 async def get_release_progress(
-    db: AsyncSession, album_ids: list[int] | set[int] | tuple[int, ...]
+    db: AsyncSession,
+    album_ids: list[int] | set[int] | tuple[int, ...],
+    *,
+    library_root: Path | None = None,
 ) -> dict[int, ReleaseProgress]:
     """Project catalog release ownership from wanted tracks and committed imports.
 
@@ -297,22 +394,35 @@ async def get_release_progress(
 
     album_rows = (
         await db.execute(
-            select(CatalogAlbum.id, CatalogAlbum.track_count).where(CatalogAlbum.id.in_(ids))
+            select(
+                CatalogAlbum.id,
+                CatalogAlbum.track_count,
+                CatalogAlbum.title,
+                CatalogAlbum.year,
+                CatalogArtist.name,
+            )
+            .join(CatalogArtist, CatalogArtist.id == CatalogAlbum.artist_id)
+            .where(CatalogAlbum.id.in_(ids))
         )
     ).all()
-    manifest_counts = {
-        int(album_id): int(track_count)
-        for album_id, track_count in (
-            await db.execute(
-                select(
-                    CatalogAlbumTrack.album_id,
-                    func.count(CatalogAlbumTrack.id),
-                )
-                .where(CatalogAlbumTrack.album_id.in_(ids))
-                .group_by(CatalogAlbumTrack.album_id)
-            )
-        ).all()
-    }
+    album_data = [(int(row[0]), row[1], row[2], row[3], row[4]) for row in album_rows]
+    manifest_tracks: dict[int, dict[tuple[int, int], int]] = {}
+    manifest_rows = await db.execute(
+        select(
+            CatalogAlbumTrack.album_id,
+            CatalogAlbumTrack.id,
+            CatalogAlbumTrack.disc,
+            CatalogAlbumTrack.position,
+        ).where(CatalogAlbumTrack.album_id.in_(ids))
+    )
+    for album_id, track_id, disc, position in manifest_rows:
+        manifest_tracks.setdefault(int(album_id), {})[(int(disc), int(position))] = int(track_id)
+    manifest_counts = {album_id: len(tracks) for album_id, tracks in manifest_tracks.items()}
+    filesystem_evidence = (
+        await asyncio.to_thread(_filesystem_release_evidence, library_root, album_data)
+        if library_root is not None
+        else {}
+    )
     imported_by_album: dict[int, set[int]] = {}
     imported_rows = await db.execute(
         select(Track.catalog_album_id, Track.catalog_track_id)
@@ -329,13 +439,30 @@ async def get_release_progress(
             imported_by_album.setdefault(int(album_id), set()).add(int(catalog_track_id))
 
     progress: dict[int, ReleaseProgress] = {}
-    for album_id, known_track_count in album_rows:
+    for album_id, known_track_count, _title, _year, _artist_name in album_data:
         release_id = int(album_id)
         wanted = max(int(known_track_count or 0), manifest_counts.get(release_id, 0))
-        downloaded_ids = frozenset(imported_by_album.get(release_id, set()))
+        downloaded_id_set = set(imported_by_album.get(release_id, set()))
+        release_evidence = filesystem_evidence.get(release_id)
+        release_manifest = manifest_tracks.get(release_id, {})
+        if release_evidence is not None:
+            downloaded_id_set.update(
+                release_manifest[track_key]
+                for track_key in release_evidence.track_keys
+                if track_key in release_manifest
+            )
+        downloaded_ids = frozenset(downloaded_id_set)
+        downloaded = (
+            len(downloaded_ids)
+            if release_manifest
+            else max(
+                len(downloaded_ids),
+                release_evidence.file_count if release_evidence is not None else 0,
+            )
+        )
         progress[release_id] = ReleaseProgress(
             wanted_track_count=wanted,
-            downloaded_track_count=min(len(downloaded_ids), wanted),
+            downloaded_track_count=min(downloaded, wanted),
             downloaded_catalog_track_ids=downloaded_ids,
         )
     return progress

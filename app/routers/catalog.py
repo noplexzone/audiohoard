@@ -358,6 +358,7 @@ async def catalog_artist_page(
             for release in provider_albums
             if release.catalog_album_id is not None
         },
+        library_root=settings.library_root,
     )
     release_progress: dict[int, ReleaseProgress] = {}
     for release in provider_albums:
@@ -689,7 +690,9 @@ async def catalog_album_page(
         .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
     )
     album = result.scalar_one()
-    progress = (await get_release_progress(db, [album.id]))[album.id]
+    progress = (await get_release_progress(db, [album.id], library_root=settings.library_root))[
+        album.id
+    ]
     return _templates(request).TemplateResponse(
         request,
         "catalog_album.html",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 import httpx
 
@@ -276,12 +277,28 @@ class SlskdAdapter:
         return CapabilityState(False, "transfer not found", {"transfer_id": transfer_id})
 
     async def cancel(self, username: str, filename: str) -> None:
+        """Remove a tracked download, treating an already-absent transfer as success."""
+        expected_filename = filename.replace("\\", "/")
+        transfer_id: str | None = None
+        for item in await self.downloads():
+            item_username = str(item.get("username") or "")
+            item_filename = str(item.get("filename") or "").replace("\\", "/")
+            if item_username == username and item_filename == expected_filename:
+                provider_id = item.get("id") or item.get("transferId")
+                if provider_id is not None:
+                    transfer_id = str(provider_id)
+                break
+        if transfer_id is None:
+            return
+
+        safe_username = quote(username, safe="")
+        safe_transfer_id = quote(transfer_id, safe="")
         async with self._client() as client:
             resp = await request_with_retry(
                 client,
                 "DELETE",
-                f"/api/v0/transfers/downloads/{username}",
-                json={"filename": filename},
+                f"/api/v0/transfers/downloads/{safe_username}/{safe_transfer_id}",
+                params={"remove": "true"},
             )
             if resp.status_code != 404:
                 resp.raise_for_status()

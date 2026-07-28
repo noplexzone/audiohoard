@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -111,7 +113,7 @@ async def serve_staged_audio(
     if track is None or not track.staging_path:
         raise HTTPException(status_code=404, detail="Staged track path not available")
 
-    resolved = await __import__("asyncio").to_thread(
+    resolved = await asyncio.to_thread(
         _validate_audio_path, track.staging_path, settings.staging_root
     )
     file_size = resolved.stat().st_size
@@ -197,25 +199,38 @@ async def deny_review_item(
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
-    """Deny a staged track, retain it, and schedule bounded reacquisition."""
+    """Deny and remove a staged track, then schedule bounded reacquisition."""
     item = await db.get(StagingReviewItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Review item not found")
     if item.review_state != ReviewDecision.pending:
         return RedirectResponse("/downloads?notice=already_reviewed", status_code=303)
 
-    item.review_state = ReviewDecision.denied
-    item.reviewed_at = datetime.now(UTC)
-
     track = await db.get(Track, item.track_id)
     continuation_id: int | None = None
     if track is not None:
+        staged_path = track.staging_path
+        resolved_staged_path: Path | None = None
+        if staged_path:
+            try:
+                resolved_staged_path = await asyncio.to_thread(
+                    _validate_audio_path, staged_path, settings.staging_root
+                )
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+            track.staging_path = None
+            if track.source_path == staged_path:
+                track.source_path = None
         track.acoustid_verification_state = AcoustIDVerificationState.denied
         track.acquisition_state = AcquisitionState.failed
         release = await db.get(Release, item.release_id)
         if release is not None:
             track_label = track.track_no or track.id or "unknown"
-            release.error_detail = f"AcoustID mismatch on track {track_label}"
+            if not release.error_detail or release.error_detail.startswith(
+                "AcoustID mismatch on track "
+            ):
+                release.error_detail = f"AcoustID mismatch on track {track_label}"
         parent = await db.get(Job, track.job_id)
         runtime = await get_runtime_settings(db)
         if (
@@ -247,40 +262,67 @@ async def deny_review_item(
                 await db.flush()
                 continuation_id = continuation.id
 
-    await db.commit()
+    await db.delete(item)
+    quarantine_path: Path | None = None
+    if track is not None and resolved_staged_path is not None:
+        quarantine_path = resolved_staged_path.with_name(
+            f".{resolved_staged_path.name}.denied-{uuid4().hex}"
+        )
+
+    def restore_quarantine() -> None:
+        if (
+            quarantine_path is not None
+            and resolved_staged_path is not None
+            and quarantine_path.exists()
+        ):
+            quarantine_path.replace(resolved_staged_path)
+
+    def delete_quarantine() -> None:
+        if quarantine_path is not None:
+            quarantine_path.unlink(missing_ok=True)
+
+    async def rollback_and_restore() -> None:
+        try:
+            await db.rollback()
+        finally:
+            restore_quarantine()  # noqa: ASYNC240
+
+    if quarantine_path is not None and resolved_staged_path is not None:
+        resolved_staged_path.replace(quarantine_path)  # noqa: ASYNC240
+    commit_task = asyncio.create_task(db.commit())
+
+    def clear_delivered_cancellation() -> None:
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            for _ in range(current_task.cancelling()):
+                current_task.uncancel()
+
+    async def settle_commit() -> None:
+        while not commit_task.done():
+            try:
+                await asyncio.shield(commit_task)
+            except asyncio.CancelledError:
+                clear_delivered_cancellation()
+        commit_task.result()
+
+    try:
+        await asyncio.shield(commit_task)
+    except asyncio.CancelledError:
+        clear_delivered_cancellation()
+        try:
+            await settle_commit()
+        except BaseException:
+            await rollback_and_restore()
+        else:
+            delete_quarantine()  # noqa: ASYNC240
+        raise
+    except BaseException:
+        await rollback_and_restore()
+        raise
+    delete_quarantine()  # noqa: ASYNC240
     if continuation_id is not None:
         await job_dispatcher.dispatch(continuation_id)
     return RedirectResponse("/downloads?notice=denied", status_code=303)
-
-
-@router.post("/review/{item_id}/dismiss", include_in_schema=False)
-async def dismiss_review_item(
-    item_id: int,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    _user: Annotated[object, Depends(require_mutation)],
-) -> RedirectResponse:
-    """Remove a stale review record without touching its staged source file."""
-    item = await db.get(StagingReviewItem, item_id)
-    if item is None:
-        raise HTTPException(status_code=404, detail="Review item not found")
-    await db.delete(item)
-    await db.commit()
-    return RedirectResponse("/downloads?notice=review_dismissed", status_code=303)
-
-
-@router.post("/release/{release_id}/dismiss", include_in_schema=False)
-async def dismiss_release_review(
-    release_id: int,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    _user: Annotated[object, Depends(require_mutation)],
-) -> RedirectResponse:
-    """Dismiss a release-level review while retaining every source file."""
-    release = await db.get(Release, release_id)
-    if release is None:
-        raise HTTPException(status_code=404, detail="Release not found")
-    release.review_dismissed_at = datetime.now(UTC)
-    await db.commit()
-    return RedirectResponse("/downloads?notice=review_dismissed", status_code=303)
 
 
 @router.post("/release/{release_id}/reacquire", include_in_schema=False)

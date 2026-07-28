@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
@@ -70,7 +71,7 @@ async def test_staged_audio_requires_auth_and_supports_ranges(
         client.cookies.set("session", session_cookie)
 
 
-async def test_review_approve_resumes_import_and_deny_retains_staging(
+async def test_review_approve_resumes_import_and_deny_removes_staged_item(
     client: AsyncClient, test_settings: Settings, monkeypatch
 ) -> None:
     from app.services import auto_import
@@ -92,7 +93,7 @@ async def test_review_approve_resumes_import_and_deny_retains_staging(
     assert approved.status_code == 303
     assert denied.status_code == 303
     assert imported
-    assert denied_path.exists()
+    assert not denied_path.exists()
 
     factory = get_session_factory()
     async with factory() as db:
@@ -103,9 +104,126 @@ async def test_review_approve_resumes_import_and_deny_retains_staging(
         assert approved_row.acoustid_verification_state == AcoustIDVerificationState.approved
         assert denied_row.acoustid_verification_state == AcoustIDVerificationState.denied
         assert denied_row.acquisition_state == AcquisitionState.failed
+        assert denied_row.staging_path is None
+        assert denied_row.source_path is None
+        assert await db.get(StagingReviewItem, denied_item) is None
 
 
-async def test_review_page_renders_release_reason_and_dismiss_retains_source(
+async def test_deny_restores_staged_file_when_database_commit_fails(
+    client: AsyncClient, test_settings: Settings, monkeypatch
+) -> None:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    item_id, _, staged_path = await _review_fixture(test_settings, "deny-rollback")
+
+    async def fail_commit(self) -> None:
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(AsyncSession, "commit", fail_commit)
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await client.post(f"/staging/review/{item_id}/deny", follow_redirects=False)
+
+    assert staged_path.exists()
+    assert not list(staged_path.parent.glob(f".{staged_path.name}.denied-*"))
+
+
+async def test_deny_settles_commit_before_cleanup_when_request_is_cancelled(
+    client: AsyncClient, test_settings: Settings, monkeypatch
+) -> None:
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    item_id, _, staged_path = await _review_fixture(test_settings, "deny-cancel")
+    original_commit = AsyncSession.commit
+    committed = asyncio.Event()
+    release_commit = asyncio.Event()
+
+    async def commit_then_wait(self) -> None:
+        await original_commit(self)
+        committed.set()
+        await release_commit.wait()
+
+    monkeypatch.setattr(AsyncSession, "commit", commit_then_wait)
+    request_task = asyncio.create_task(
+        client.post(f"/staging/review/{item_id}/deny", follow_redirects=False)
+    )
+    await committed.wait()
+    request_task.cancel()
+    await asyncio.sleep(0)
+    request_task.cancel()
+    release_commit.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+
+    assert not staged_path.exists()
+    assert not list(staged_path.parent.glob(f".{staged_path.name}.denied-*"))
+    factory = get_session_factory()
+    async with factory() as db:
+        assert await db.get(StagingReviewItem, item_id) is None
+
+
+async def test_deny_restores_staged_file_even_when_rollback_fails(
+    client: AsyncClient, test_settings: Settings, monkeypatch
+) -> None:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    item_id, _, staged_path = await _review_fixture(test_settings, "deny-rollback-failure")
+
+    async def fail_commit(self) -> None:
+        raise RuntimeError("commit failed")
+
+    async def fail_rollback(self) -> None:
+        raise RuntimeError("rollback failed")
+
+    monkeypatch.setattr(AsyncSession, "commit", fail_commit)
+    monkeypatch.setattr(AsyncSession, "rollback", fail_rollback)
+    with pytest.raises(RuntimeError, match="rollback failed"):
+        await client.post(f"/staging/review/{item_id}/deny", follow_redirects=False)
+
+    assert staged_path.exists()
+    assert not list(staged_path.parent.glob(f".{staged_path.name}.denied-*"))
+
+
+async def test_deny_preserves_unrelated_release_failure(
+    client: AsyncClient, test_settings: Settings
+) -> None:
+    item_id, track_id, _ = await _review_fixture(test_settings, "deny-unrelated")
+    factory = get_session_factory()
+    async with factory() as db:
+        track = await db.get(Track, track_id)
+        assert track is not None
+        release = await db.get(Release, track.release_id)
+        assert release is not None
+        release.error_detail = "import execution error: destination race"
+        release.import_state = ImportWorkflowState.failed
+        await db.commit()
+        release_id = release.id
+
+    denied = await client.post(f"/staging/review/{item_id}/deny", follow_redirects=False)
+    page = await client.get("/downloads")
+
+    assert denied.status_code == 303
+    assert "import execution error: destination race" in page.text
+    async with factory() as db:
+        release = await db.get(Release, release_id)
+        assert release is not None
+        assert release.error_detail == "import execution error: destination race"
+
+
+async def test_deny_does_not_leave_empty_acoustid_release_review(
+    client: AsyncClient, test_settings: Settings
+) -> None:
+    item_id, _, _ = await _review_fixture(test_settings, "deny-only")
+
+    denied = await client.post(f"/staging/review/{item_id}/deny", follow_redirects=False)
+    page = await client.get("/downloads")
+
+    assert denied.status_code == 303
+    assert "AcoustID mismatch on track 7" not in page.text
+
+
+async def test_review_page_has_only_approve_and_deny_actions(
     client: AsyncClient, test_settings: Settings
 ) -> None:
     item_id, _, staged_path = await _review_fixture(test_settings, "reason")
@@ -114,16 +232,14 @@ async def test_review_page_renders_release_reason_and_dismiss_retains_source(
     assert page.status_code == 200
     assert "Artist — Album" in page.text
     assert "AcoustID mismatch on track 7" in page.text
-    assert f"/staging/review/{item_id}/dismiss" in page.text
+    assert f"/staging/review/{item_id}/approve" in page.text
+    assert f"/staging/review/{item_id}/deny" in page.text
+    assert ">Deny — remove<" in page.text
+    assert "/dismiss" not in page.text
 
     dismissed = await client.post(f"/staging/review/{item_id}/dismiss", follow_redirects=False)
-    assert dismissed.status_code == 303
-    assert dismissed.headers["location"] == "/downloads?notice=review_dismissed"
+    assert dismissed.status_code == 404
     assert staged_path.exists()
-
-    factory = get_session_factory()
-    async with factory() as db:
-        assert await db.get(StagingReviewItem, item_id) is None
 
 
 async def test_missing_source_review_exposes_reacquire_and_queues_continuation(
@@ -218,51 +334,20 @@ async def test_missing_source_review_exposes_reacquire_and_queues_continuation(
         assert continuation.catalog_track_id is None
 
 
-async def test_release_review_dismissal_preserves_audit_state_and_source(
+async def test_release_review_dismiss_route_is_removed(
     client: AsyncClient, test_settings: Settings
 ) -> None:
-    item_id, track_id, staged_path = await _review_fixture(test_settings, "release-dismiss")
+    item_id, _, staged_path = await _review_fixture(test_settings, "release-dismiss")
     factory = get_session_factory()
     async with factory() as db:
         item = await db.get(StagingReviewItem, item_id)
         assert item is not None
-        release = await db.get(Release, item.release_id)
-        assert release is not None
-        release.import_state = ImportWorkflowState.rolled_back
-        release.error_detail = "import execution error: destination race"
-        release.rollback_detail = "rollback evidence"
-        plan = ImportPlan(
-            release_id=release.id,
-            track_id=track_id,
-            source_path=str(staged_path),
-            staging_path=str(staged_path),
-            destination_path=str(test_settings.library_root / "dismissed.mp3"),
-            status=ImportWorkflowState.rolled_back,
-            error_detail="destination race",
-            rollback_detail="rollback evidence",
-        )
-        db.add(plan)
-        await db.commit()
-        release_id = release.id
-        plan_id = plan.id
+        release_id = item.release_id
 
     response = await client.post(f"/staging/release/{release_id}/dismiss", follow_redirects=False)
-    assert response.status_code == 303
-    assert response.headers["location"] == "/downloads?notice=review_dismissed"
+
+    assert response.status_code == 404
     assert staged_path.exists()
-
-    async with factory() as db:
-        release = await db.get(Release, release_id)
-        assert release is not None
-        assert release.import_state == ImportWorkflowState.rolled_back
-        assert release.error_detail == "import execution error: destination race"
-        assert release.rollback_detail == "rollback evidence"
-        assert release.review_dismissed_at is not None
-        assert await db.get(ImportPlan, plan_id) is not None
-        assert await db.get(StagingReviewItem, item_id) is not None
-
-    page = await client.get("/downloads")
-    assert "import execution error: destination race" not in page.text
 
 
 async def test_reacquire_stops_after_persisted_continuation_attempt_cap(
