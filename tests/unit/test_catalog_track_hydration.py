@@ -754,6 +754,31 @@ async def test_dispatch_raises_when_hydration_fails_and_tracks_remain_empty(
         await catalog_router._ensure_catalog_tracks(db_session, settings, album)
 
 
+async def test_unknown_count_partial_manifest_still_refreshes_provider(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.routers import catalog as catalog_router
+    from app.settings_service import build_effective_settings
+
+    _, album = await _persist_artist_album(db_session, track_count=1, add_tracks=True)
+    album.track_count = None
+    await db_session.flush()
+    hydration_calls = 0
+
+    async def hydrate(db: AsyncSession, settings: Settings, target: CatalogAlbum) -> CatalogAlbum:
+        nonlocal hydration_calls
+        hydration_calls += 1
+        target.track_count = 1
+        return target
+
+    monkeypatch.setattr(catalog_router, "fetch_and_store_album", hydrate)
+    settings = await build_effective_settings(db_session, test_settings)
+
+    await catalog_router._ensure_catalog_tracks(db_session, settings, album)
+
+    assert hydration_calls == 1
+
+
 async def test_bulk_dispatch_hydrates_catalog_tracks_before_creating_jobs(
     db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
