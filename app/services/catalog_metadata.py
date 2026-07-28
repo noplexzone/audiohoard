@@ -15,7 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings
-from app.metadata.base import AlbumDetail, AlbumHit, ArtistDetail, ArtistHit, MetadataProvider
+from app.metadata.base import (
+    AlbumDetail,
+    AlbumHit,
+    AlbumTrack,
+    ArtistDetail,
+    ArtistHit,
+    MetadataProvider,
+)
 from app.metadata.deezer import DeezerClient
 from app.metadata.itunes import ITunesClient
 from app.metadata.musicbrainz import MusicBrainzClient
@@ -27,7 +34,7 @@ from app.models.catalog_entities import (
     CatalogArtistIdentity,
 )
 from app.models.job import Job
-from app.models.track import Track
+from app.models.track import IdentityResolutionState, Track
 from app.sources.base import CapabilityState
 
 VALID_METADATA_PROVIDERS = {"musicbrainz", "deezer", "itunes"}
@@ -402,25 +409,139 @@ async def fetch_and_store_album(
             )
         ).all()
     )
-    for existing in existing_tracks:
-        await db.delete(existing)
-    await db.flush()
-    for track in detail.tracks:
-        db.add(
-            CatalogAlbumTrack(
-                album_id=album.id,
-                position=track.position,
-                disc=track.disc,
-                title=track.title,
-                duration_sec=track.duration_sec,
-                recording_mbid=track.recording_mbid,
-            )
+    expected_manifest_count = max(known_track_count, detail.track_count or 0)
+    if (
+        existing_tracks
+        and expected_manifest_count
+        and len(detail.tracks) < expected_manifest_count
+    ):
+        raise RuntimeError(
+            "metadata provider returned an incomplete album manifest "
+            f"({len(detail.tracks)}/{expected_manifest_count} tracks)"
         )
+    provider_identities: set[tuple[int, int]] = set()
+    for provider_track in detail.tracks:
+        identity = (provider_track.disc, provider_track.position)
+        if (
+            provider_track.disc < 1
+            or provider_track.position < 1
+            or identity in provider_identities
+        ):
+            raise RuntimeError("metadata provider returned invalid album track positions")
+        provider_identities.add(identity)
+
+    unmatched = list(existing_tracks)
+    reconciliation: list[tuple[AlbumTrack, CatalogAlbumTrack | None]] = []
+    for provider_track in detail.tracks:
+        existing = _match_existing_catalog_track(unmatched, provider_track)
+        if existing is not None:
+            unmatched.remove(existing)
+        reconciliation.append((provider_track, existing))
+
+    if unmatched:
+        stale_ids = [track.id for track in unmatched]
+        linked_track_id = await db.scalar(
+            select(Track.id).where(Track.catalog_track_id.in_(stale_ids)).limit(1)
+        )
+        linked_job_id = await db.scalar(
+            select(Job.id).where(Job.catalog_track_id.in_(stale_ids)).limit(1)
+        )
+        if linked_track_id is not None or linked_job_id is not None:
+            raise RuntimeError("metadata reconciliation left referenced catalog tracks unmatched")
+
+    for provider_track, existing in reconciliation:
+        if existing is None:
+            db.add(
+                CatalogAlbumTrack(
+                    album_id=album.id,
+                    position=provider_track.position,
+                    disc=provider_track.disc,
+                    title=provider_track.title,
+                    duration_sec=provider_track.duration_sec,
+                    recording_mbid=provider_track.recording_mbid,
+                )
+            )
+            continue
+        existing.position = provider_track.position
+        existing.disc = provider_track.disc
+        existing.title = provider_track.title
+        existing.duration_sec = provider_track.duration_sec
+        existing.recording_mbid = provider_track.recording_mbid or existing.recording_mbid
+        linked_values: dict[str, object] = {
+            "title": provider_track.title,
+            "track_no": provider_track.position,
+            "disc": provider_track.disc,
+        }
+        if provider_track.duration_sec is not None:
+            linked_values["duration_sec"] = provider_track.duration_sec
+        if provider_track.recording_mbid:
+            linked_values["mbid"] = provider_track.recording_mbid
+            linked_values["identity_state"] = IdentityResolutionState.resolved
+        await db.execute(
+            update(Track).where(Track.catalog_track_id == existing.id).values(**linked_values)
+        )
+    for stale in unmatched:
+        await db.delete(stale)
     hydrated_track_count = max(detail.track_count or 0, len(detail.tracks))
     album.track_count = max(known_track_count, hydrated_track_count) or None
     await db.flush()
     await db.refresh(album, ["tracks"])
     return album
+
+
+def _match_existing_catalog_track(
+    existing_tracks: list[CatalogAlbumTrack], provider_track: AlbumTrack
+) -> CatalogAlbumTrack | None:
+    if provider_track.recording_mbid:
+        mbid_matches = [
+            existing
+            for existing in existing_tracks
+            if existing.recording_mbid == provider_track.recording_mbid
+        ]
+        if len(mbid_matches) > 1:
+            raise RuntimeError(
+                f"ambiguous recording identity for catalog track {provider_track.title!r}"
+            )
+        if mbid_matches:
+            return mbid_matches[0]
+    title_matches = [
+        existing
+        for existing in existing_tracks
+        if _norm_title(existing.title) == _norm_title(provider_track.title)
+    ]
+    if provider_track.recording_mbid:
+        conflicting = [
+            existing
+            for existing in title_matches
+            if existing.recording_mbid and existing.recording_mbid != provider_track.recording_mbid
+        ]
+        title_matches = [existing for existing in title_matches if not existing.recording_mbid]
+        if conflicting and not title_matches:
+            raise RuntimeError(
+                f"conflicting recording identity for catalog track {provider_track.title!r}"
+            )
+    if not title_matches:
+        return None
+    if len(title_matches) == 1:
+        return title_matches[0]
+    if provider_track.duration_sec is None or any(
+        existing.duration_sec is None for existing in title_matches
+    ):
+        raise RuntimeError(f"ambiguous catalog track title {provider_track.title!r}")
+    provider_duration = provider_track.duration_sec
+    assert provider_duration is not None
+    ranked = sorted(
+        title_matches,
+        key=lambda existing: (
+            abs((existing.duration_sec or 0) - provider_duration),
+            existing.id,
+        ),
+    )
+    first_distance = abs((ranked[0].duration_sec or 0) - provider_duration)
+    second_distance = abs((ranked[1].duration_sec or 0) - provider_duration)
+    if first_distance == second_distance:
+        raise RuntimeError(f"ambiguous catalog track title {provider_track.title!r}")
+    return ranked[0]
 
 
 _PUNCT_TRANSLATION = str.maketrans(
