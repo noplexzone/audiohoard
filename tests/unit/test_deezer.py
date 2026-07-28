@@ -67,3 +67,48 @@ class TestDeezerSearch:
         client = DeezerClient()
         track = await client.get_track("99999")
         assert track is None
+
+    async def test_get_album_uses_tracklist_endpoint_for_real_positions(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url="https://api.deezer.com/album/42",
+            json={
+                "id": 42,
+                "title": "Album (Bonus Track Version)",
+                "nb_tracks": 2,
+                "artist": {"id": 7, "name": "Artist"},
+                "tracks": {
+                    "data": [
+                        {"id": 101, "title": "First", "duration": 180},
+                        {"id": 102, "title": "Second", "duration": 181},
+                    ]
+                },
+            },
+        )
+        httpx_mock.add_response(
+            url="https://api.deezer.com/album/42/tracks?limit=100",
+            json={
+                "data": [
+                    {
+                        "id": 101,
+                        "title": "First",
+                        "duration": 180,
+                        "track_position": 1,
+                        "disk_number": 1,
+                    },
+                    {
+                        "id": 102,
+                        "title": "Second",
+                        "duration": 181,
+                        "track_position": 2,
+                        "disk_number": 1,
+                    },
+                ],
+                "total": 2,
+            },
+        )
+
+        album = await DeezerClient().get_album("42")
+
+        assert [track.position for track in album.tracks] == [1, 2]

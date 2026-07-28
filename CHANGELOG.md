@@ -40,6 +40,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Exposed the ordered Quality profile in Settings and enforced format-family, minimum MP3 bitrate, and lower-quality fallback rules during slskd selection.
 
 ### Fixed
+- Provider-edition album titles now fall back to their canonical MusicBrainz title during recording reconciliation, and Deezer album hydration fetches authoritative track positions before automated verification.
 - Album downloads now hydrate catalog track manifests before dispatch, report incomplete slskd folders as partial with targeted continuations, and release SQLite write locks before provider waits.
 - Approved legacy albums now reconcile catalog tracks and resume transactional import; committed imports remove staging inputs and completed slskd transfers.
 - Library and dashboard projections now exclude staging-only downloads and require committed import destinations.

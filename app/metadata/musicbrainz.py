@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from typing import cast
 
@@ -47,6 +48,37 @@ def escape_lucene(value: str) -> str:
     for token in _LUCENE_SPECIALS[1:]:
         escaped = escaped.replace(token, "\\" + token)
     return escaped
+
+
+_TRAILING_QUALIFIER_RE = re.compile(r"\s*(?:\((?P<paren>[^)]*)\)|\[(?P<bracket>[^]]*)\])\s*$")
+_EQUIVALENT_EDITION_RE = re.compile(
+    r"(?:"
+    r"bonus(?:\s+track)?\s+version"
+    r"|bonus\s+tracks?"
+    r"|deluxe(?:\s+(?:edition|version))?"
+    r"|expanded(?:\s+(?:edition|version))?"
+    r"|(?:\d+(?:st|nd|rd|th)\s+)?anniversary(?:\s+edition)?"
+    r"|special\s+edition"
+    r"|(?:\d{4}\s+)?remaster(?:ed)?(?:\s+(?:edition|version))?"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _album_title_candidates(album: str | None) -> list[str | None]:
+    if not album:
+        return [None]
+    candidates: list[str | None] = [album]
+    suffix = _TRAILING_QUALIFIER_RE.search(album)
+    if suffix is None:
+        return candidates
+    qualifier = suffix.group("paren") or suffix.group("bracket") or ""
+    if _EQUIVALENT_EDITION_RE.fullmatch(qualifier.strip()) is None:
+        return candidates
+    base_title = album[: suffix.start()].strip()
+    if base_title:
+        candidates.append(base_title)
+    return candidates
 
 
 _MB_BASE = "https://musicbrainz.org/ws/2"
@@ -232,20 +264,28 @@ class MusicBrainzClient:
     async def search_recording(
         self, title: str, artist: str | None = None, album: str | None = None
     ) -> list[TrackMeta]:
-        parts = [f'recording:"{escape_lucene(title)}"']
-        if artist:
-            parts.append(f'artist:"{escape_lucene(artist)}"')
-        if album:
-            parts.append(f'release:"{escape_lucene(album)}"')
-        lucene = " AND ".join(parts)
+        for album_candidate in _album_title_candidates(album):
+            parts = [f'recording:"{escape_lucene(title)}"']
+            if artist:
+                parts.append(f'artist:"{escape_lucene(artist)}"')
+            if album_candidate:
+                parts.append(f'release:"{escape_lucene(album_candidate)}"')
+            lucene = " AND ".join(parts)
 
-        resp = await self._get_with_retry(
-            "/recording",
-            {"query": lucene, "limit": "10", "fmt": "json"},
-        )
-        resp.raise_for_status()
-        recordings = resp.json().get("recordings", [])
-        return [r for r in (_parse_recording(rec) for rec in recordings) if r is not None]
+            resp = await self._get_with_retry(
+                "/recording",
+                {"query": lucene, "limit": "10", "fmt": "json"},
+            )
+            resp.raise_for_status()
+            recordings = resp.json().get("recordings", [])
+            results = [
+                result
+                for result in (_parse_recording(recording) for recording in recordings)
+                if result is not None
+            ]
+            if results:
+                return results
+        return []
 
 
 def _to_int(value: object) -> int | None:
