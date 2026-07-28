@@ -408,23 +408,13 @@ async def _run_job_in_session(
         results = selected_results or await _call_fetch_results(job, cfg, db)
         catalog_album = await _load_catalog_album(db, job.catalog_album_id)
         catalog_tracks = list(catalog_album.tracks) if catalog_album is not None else []
-        if job.catalog_track_id is not None:
-            catalog_tracks = [
-                track for track in catalog_tracks if track.id == job.catalog_track_id
-            ]
 
         declared_track_count = catalog_album.track_count if catalog_album is not None else None
-        # Defensive hydration: an absent or partial catalog manifest cannot be used
-        # to decide album completeness. Otherwise a 16-track album with only 10
-        # persisted catalog rows can be falsely closed as a complete 10-track release.
-        if (
-            catalog_album is not None
-            and job.catalog_track_id is None
-            and (
-                not catalog_tracks
-                or (catalog_album.track_count and len(catalog_tracks) < catalog_album.track_count)
-            )
-        ):
+        # Defensive hydration: an absent, partial, or structurally invalid catalog
+        # manifest cannot be used to decide album completeness. Validate the full
+        # album before narrowing a continuation job to its selected track.
+        manifest_issue = _catalog_manifest_issue(catalog_tracks, declared_track_count)
+        if catalog_album is not None and manifest_issue is not None:
             try:
                 from app.services.catalog_metadata import (
                     fetch_and_store_album as _fetch_and_store_album,
@@ -451,25 +441,20 @@ async def _run_job_in_session(
             )
             if catalog_album is not None:
                 catalog_album.track_count = expected_tracks
-            manifest_incomplete = not catalog_tracks or bool(
-                expected_tracks and len(catalog_tracks) < expected_tracks
-            )
-            if catalog_album is not None and manifest_incomplete:
+            manifest_issue = _catalog_manifest_issue(catalog_tracks, expected_tracks)
+            if catalog_album is not None and manifest_issue is not None:
                 job.status = JobStatus.failed
                 job.result_json = json.dumps(
                     {
                         "error": {
-                            "code": (
-                                "catalog_tracks_empty"
-                                if not catalog_tracks
-                                else "catalog_tracks_incomplete"
-                            ),
+                            "code": manifest_issue,
                             "operation": "hydrate",
                             "retryable": True,
                             "detail": (
                                 f"album_id={job.catalog_album_id} "
                                 f"track_count={expected_tracks} "
-                                f"catalog_tracks={len(catalog_tracks)} after hydration attempt"
+                                f"catalog_tracks={len(catalog_tracks)} "
+                                f"issue={manifest_issue} after hydration attempt"
                             ),
                         }
                     },
@@ -478,6 +463,31 @@ async def _run_job_in_session(
                 job.updated_at = _now()
                 await db.flush()
                 return
+
+        if job.catalog_track_id is not None:
+            catalog_tracks = [
+                track for track in catalog_tracks if track.id == job.catalog_track_id
+            ]
+
+        if job.catalog_track_id is not None and not catalog_tracks:
+            job.status = JobStatus.failed
+            job.result_json = json.dumps(
+                {
+                    "error": {
+                        "code": "catalog_track_missing",
+                        "operation": "catalog",
+                        "retryable": False,
+                        "detail": (
+                            f"catalog_track_id={job.catalog_track_id} does not belong to "
+                            f"album_id={job.catalog_album_id}"
+                        ),
+                    }
+                },
+                sort_keys=True,
+            )
+            job.updated_at = _now()
+            await db.flush()
+            return
 
         if (
             catalog_album is not None
@@ -757,6 +767,22 @@ async def _load_catalog_album(db: AsyncSession, album_id: int | None) -> Catalog
         .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
     )
     return result.scalar_one_or_none()
+
+
+def _catalog_manifest_issue(
+    tracks: list[CatalogAlbumTrack], expected_count: int | None
+) -> str | None:
+    if not tracks:
+        return "catalog_tracks_empty"
+    identities: set[tuple[int, int]] = set()
+    for track in tracks:
+        identity = (track.disc, track.position)
+        if track.disc < 1 or track.position < 1 or identity in identities:
+            return "catalog_tracks_invalid_positions"
+        identities.add(identity)
+    if expected_count and len(tracks) < expected_count:
+        return "catalog_tracks_incomplete"
+    return None
 
 
 def _catalog_track_for_result(

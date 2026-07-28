@@ -14,6 +14,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The default album directory format is now `{album} ({year})`, while track filenames retain their disc and track prefixes.
 
 ### Fixed
+- Existing full-count catalog manifests with duplicate or invalid disc/track positions are rehydrated in place, preserving linked acquisition identities and corrected numbering.
 - Provider-edition album titles now fall back to canonical MusicBrainz titles during recording reconciliation; Deezer hydration follows every authoritative tracklist page and rejects unpositioned fallbacks before automated mapping.
 - Deezer artist discographies now retain release track totals even though the artist-albums API omits them, with a bounded non-retrying count lookup during provider outages; fully stored album pages avoid redundant refreshes while unknown-count partial manifests still hydrate.
 - Download queue grouping now retains completed release progress without re-exposing hidden attempts, bounds relationship loading to selected groups, and records successful slskd cleanup so startup does not repeat historical transfer deletions.

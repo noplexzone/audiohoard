@@ -895,3 +895,302 @@ async def test_bulk_route_commits_each_album_before_next_hydration(
     hydration_positions = [i for i, item in enumerate(call_order) if item.startswith("hydrate:")]
     assert len(hydration_positions) == 2
     assert "commit" in call_order[hydration_positions[0] + 1 : hydration_positions[1]]
+
+
+async def test_metadata_rehydration_preserves_track_ids_and_repairs_linked_tracks(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artist, album = await _persist_artist_album(db_session, track_count=3, add_tracks=True)
+    original_tracks = sorted(album.tracks, key=lambda item: item.id)
+    original_ids = [item.id for item in original_tracks]
+    for item in original_tracks:
+        item.position = 1
+
+    job = await _make_album_job(db_session, album)
+    release = Release(job_id=job.id, source="slskd", title=album.title, track_count=3)
+    db_session.add(release)
+    await db_session.flush()
+    linked_tracks: list[Track] = []
+    for item in original_tracks:
+        linked = Track(
+            job_id=job.id,
+            release_id=release.id,
+            catalog_album_id=album.id,
+            catalog_track_id=item.id,
+            title=item.title,
+            artist=artist.name,
+            album=album.title,
+            disc=1,
+            track_no=1,
+            source="slskd",
+        )
+        db_session.add(linked)
+        linked_tracks.append(linked)
+    await db_session.flush()
+
+    class CorrectProvider:
+        async def get_album(self, provider_id: str) -> AlbumDetail:
+            return AlbumDetail(
+                provider="deezer",
+                provider_id=provider_id,
+                title=album.title,
+                artist_name=artist.name,
+                deezer_id=provider_id,
+                track_count=3,
+                tracks=[
+                    AlbumTrack(position=index, disc=1, title=f"Track {index:02d}")
+                    for index in range(1, 4)
+                ],
+            )
+
+    monkeypatch.setattr(
+        catalog_metadata,
+        "build_metadata_provider",
+        lambda provider_name, settings: CorrectProvider(),
+    )
+
+    hydrated = await catalog_metadata.fetch_and_store_album(db_session, test_settings, album)
+    await db_session.refresh(release)
+    for linked in linked_tracks:
+        await db_session.refresh(linked)
+
+    assert [
+        item.id for item in sorted(hydrated.tracks, key=lambda item: item.position)
+    ] == original_ids
+    assert [item.position for item in sorted(hydrated.tracks, key=lambda item: item.position)] == [
+        1,
+        2,
+        3,
+    ]
+    assert [linked.catalog_track_id for linked in linked_tracks] == original_ids
+    assert [linked.track_no for linked in linked_tracks] == [1, 2, 3]
+    assert [linked.title for linked in linked_tracks] == [
+        "Track 01",
+        "Track 02",
+        "Track 03",
+    ]
+
+
+async def test_runner_rehydrates_full_count_manifest_with_duplicate_positions(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _artist, album = await _persist_artist_album(db_session, track_count=3, add_tracks=True)
+    for item in album.tracks:
+        item.position = 1
+    job = await _make_album_job(db_session, album)
+    hydration_called = False
+
+    async def repair_hydration(
+        db: AsyncSession, settings: Settings, target: CatalogAlbum
+    ) -> CatalogAlbum:
+        nonlocal hydration_called
+        hydration_called = True
+        for position, item in enumerate(sorted(target.tracks, key=lambda row: row.id), start=1):
+            item.position = position
+        await db.flush()
+        return target
+
+    async def no_results(job: Job, cfg: Settings, db: AsyncSession) -> list[SearchResult]:
+        return []
+
+    monkeypatch.setattr(catalog_metadata, "fetch_and_store_album", repair_hydration)
+    monkeypatch.setattr(runner, "_fetch_results", no_results)
+    _noop_noops(monkeypatch)
+
+    await runner._run_job_in_session(job.id, db_session, test_settings)
+
+    assert hydration_called is True
+    assert sorted(item.position for item in album.tracks) == [1, 2, 3]
+
+
+async def test_targeted_job_validates_full_album_manifest_before_filtering(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _artist, album = await _persist_artist_album(db_session, track_count=3, add_tracks=True)
+    selected = sorted(album.tracks, key=lambda item: item.position)[1]
+    job = await _make_album_job(db_session, album)
+    job.catalog_track_id = selected.id
+    await db_session.flush()
+    hydration_called = False
+
+    async def unexpected_hydration(
+        db: AsyncSession, settings: Settings, target: CatalogAlbum
+    ) -> CatalogAlbum:
+        nonlocal hydration_called
+        hydration_called = True
+        return target
+
+    async def no_results(job: Job, cfg: Settings, db: AsyncSession) -> list[SearchResult]:
+        return []
+
+    monkeypatch.setattr(catalog_metadata, "fetch_and_store_album", unexpected_hydration)
+    monkeypatch.setattr(runner, "_fetch_results", no_results)
+    _noop_noops(monkeypatch)
+
+    await runner._run_job_in_session(job.id, db_session, test_settings)
+
+    assert hydration_called is False
+
+
+async def test_partial_rehydration_does_not_delete_existing_catalog_links(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artist, album = await _persist_artist_album(db_session, track_count=4, add_tracks=True)
+    original_tracks = sorted(album.tracks, key=lambda item: item.id)
+    original_ids = [item.id for item in original_tracks]
+    job = await _make_album_job(db_session, album)
+    linked = Track(
+        job_id=job.id,
+        catalog_album_id=album.id,
+        catalog_track_id=original_tracks[-1].id,
+        title=original_tracks[-1].title,
+        artist=artist.name,
+        album=album.title,
+        disc=1,
+        track_no=4,
+        source="slskd",
+    )
+    db_session.add(linked)
+    await db_session.flush()
+
+    class PartialProvider:
+        async def get_album(self, provider_id: str) -> AlbumDetail:
+            return AlbumDetail(
+                provider="deezer",
+                provider_id=provider_id,
+                title=album.title,
+                artist_name=artist.name,
+                deezer_id=provider_id,
+                track_count=4,
+                tracks=[
+                    AlbumTrack(position=index, disc=1, title=f"Track {index:02d}")
+                    for index in range(1, 3)
+                ],
+            )
+
+    monkeypatch.setattr(
+        catalog_metadata,
+        "build_metadata_provider",
+        lambda provider_name, settings: PartialProvider(),
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete album manifest"):
+        await catalog_metadata.fetch_and_store_album(db_session, test_settings, album)
+
+    await db_session.refresh(album, ["tracks"])
+    await db_session.refresh(linked)
+    assert sorted(item.id for item in album.tracks) == original_ids
+    assert linked.catalog_track_id == original_tracks[-1].id
+
+
+async def test_rehydration_rejects_conflicting_recording_identity(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artist, album = await _persist_artist_album(db_session, track_count=1, add_tracks=True)
+    existing = album.tracks[0]
+    existing.recording_mbid = "11111111-1111-1111-1111-111111111111"
+    job = await _make_album_job(db_session, album)
+    linked = Track(
+        job_id=job.id,
+        catalog_album_id=album.id,
+        catalog_track_id=existing.id,
+        title=existing.title,
+        artist=artist.name,
+        album=album.title,
+        disc=1,
+        track_no=1,
+        mbid=existing.recording_mbid,
+        source="slskd",
+    )
+    db_session.add(linked)
+    await db_session.flush()
+
+    class ConflictingProvider:
+        async def get_album(self, provider_id: str) -> AlbumDetail:
+            return AlbumDetail(
+                provider="musicbrainz",
+                provider_id=provider_id,
+                title=album.title,
+                artist_name=artist.name,
+                mbid=provider_id,
+                track_count=1,
+                tracks=[
+                    AlbumTrack(
+                        position=1,
+                        disc=1,
+                        title=existing.title,
+                        recording_mbid="22222222-2222-2222-2222-222222222222",
+                    )
+                ],
+            )
+
+    monkeypatch.setattr(
+        catalog_metadata,
+        "build_metadata_provider",
+        lambda provider_name, settings: ConflictingProvider(),
+    )
+
+    with pytest.raises(RuntimeError, match="conflicting recording identity"):
+        await catalog_metadata.fetch_and_store_album(db_session, test_settings, album)
+
+    await db_session.refresh(existing)
+    await db_session.refresh(linked)
+    assert existing.recording_mbid == "11111111-1111-1111-1111-111111111111"
+    assert linked.mbid == "11111111-1111-1111-1111-111111111111"
+
+
+async def test_targeted_job_fails_when_selected_catalog_track_is_absent(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _artist, album = await _persist_artist_album(db_session, track_count=3, add_tracks=True)
+    job = await _make_album_job(db_session, album)
+    job.catalog_track_id = 999999
+    await db_session.flush()
+
+    async def no_results(job: Job, cfg: Settings, db: AsyncSession) -> list[SearchResult]:
+        return []
+
+    monkeypatch.setattr(runner, "_fetch_results", no_results)
+    _noop_noops(monkeypatch)
+
+    await runner._run_job_in_session(job.id, db_session, test_settings)
+
+    assert job.status == JobStatus.failed
+    payload = json.loads(job.result_json or "{}")
+    assert payload.get("error", {}).get("code") == "catalog_track_missing"
+
+
+async def test_rehydration_rejects_invalid_provider_positions_before_mutation(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artist, album = await _persist_artist_album(db_session, track_count=3, add_tracks=True)
+    original_tracks = sorted(album.tracks, key=lambda item: item.id)
+    original_positions = [(item.disc, item.position) for item in original_tracks]
+
+    class InvalidProvider:
+        async def get_album(self, provider_id: str) -> AlbumDetail:
+            return AlbumDetail(
+                provider="deezer",
+                provider_id=provider_id,
+                title=album.title,
+                artist_name=artist.name,
+                deezer_id=provider_id,
+                track_count=3,
+                tracks=[
+                    AlbumTrack(position=1, disc=1, title=f"Track {index:02d}")
+                    for index in range(1, 4)
+                ],
+            )
+
+    monkeypatch.setattr(
+        catalog_metadata,
+        "build_metadata_provider",
+        lambda provider_name, settings: InvalidProvider(),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid album track positions"):
+        await catalog_metadata.fetch_and_store_album(db_session, test_settings, album)
+
+    for item in original_tracks:
+        await db_session.refresh(item)
+    assert [(item.disc, item.position) for item in original_tracks] == original_positions
