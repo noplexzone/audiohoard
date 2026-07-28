@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import cast
@@ -81,14 +82,20 @@ class DeezerClient:
                 client, "GET", f"/artist/{id}/albums", params={"limit": 100}
             )
             resp.raise_for_status()
-        albums = [
-            _parse_album_hit(item, artist_id=id)
-            for item in resp.json().get("data", [])
-            if isinstance(item, dict)
-        ]
+        album_rows = [item for item in resp.json().get("data", []) if isinstance(item, dict)]
+        await _backfill_discography_track_counts(self, album_rows)
+        albums = [_parse_album_hit(item, artist_id=id) for item in album_rows]
         albums.sort(key=lambda a: (a.year or "0000", a.title), reverse=True)
         self._cache.set(cache_key, albums, 24 * 60 * 60)
         return albums
+
+    async def _get_album_track_count(self, http: httpx.AsyncClient, album_id: str) -> int | None:
+        resp = await request_with_retry(
+            http, "GET", f"/album/{album_id}/tracks", params={"limit": 1}
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        return _to_int(payload.get("total")) if isinstance(payload, dict) else None
 
     async def get_album(self, id: str) -> AlbumDetail:
         cache_key = f"album:{id}"
@@ -135,6 +142,32 @@ class DeezerClient:
             return None
         resp.raise_for_status()
         return _parse_track(resp.json())
+
+
+async def _backfill_discography_track_counts(
+    client: DeezerClient, album_rows: list[dict[str, object]]
+) -> None:
+    """Fill counts omitted by Deezer's artist-albums endpoint with bounded I/O."""
+    semaphore = asyncio.Semaphore(8)
+
+    async with client._client() as http:
+
+        async def fill(row: dict[str, object]) -> None:
+            if _to_int(row.get("nb_tracks")) is not None:
+                return
+            album_id = str(row.get("id") or "")
+            if not album_id:
+                return
+            try:
+                async with semaphore:
+                    count = await client._get_album_track_count(http, album_id)
+            except httpx.HTTPError:
+                logger.warning("Could not load Deezer track count for album %s", album_id)
+                return
+            if count is not None:
+                row["nb_tracks"] = count
+
+        await asyncio.gather(*(fill(row) for row in album_rows))
 
 
 def _to_float(value: object) -> float | None:

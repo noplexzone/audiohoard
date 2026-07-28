@@ -145,6 +145,46 @@ async def test_deezer_catalog_provider(httpx_mock: HTTPXMock) -> None:
     assert (await client.get_album("10")).tracks[0].title == "One More Time"
 
 
+async def test_deezer_discography_backfills_counts_missing_from_artist_albums(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """Deezer's real artist-albums payload omits ``nb_tracks``."""
+    httpx_mock.add_response(
+        url="https://api.deezer.com/artist/1/albums?limit=100",
+        json={
+            "data": [
+                {
+                    "id": 10,
+                    "title": "Discovery",
+                    "record_type": "album",
+                    "tracklist": "https://api.deezer.com/album/10/tracks",
+                },
+                {
+                    "id": 11,
+                    "title": "One More Time",
+                    "record_type": "single",
+                    "tracklist": "https://api.deezer.com/album/11/tracks",
+                },
+            ]
+        },
+    )
+    httpx_mock.add_response(
+        url="https://api.deezer.com/album/10/tracks?limit=1",
+        json={"data": [{"id": 100}], "total": 14},
+    )
+    httpx_mock.add_response(
+        url="https://api.deezer.com/album/11/tracks?limit=1",
+        json={"data": [{"id": 101}], "total": 1},
+    )
+
+    albums = await DeezerClient().get_discography("1")
+
+    assert {album.title: album.track_count for album in albums} == {
+        "Discovery": 14,
+        "One More Time": 1,
+    }
+
+
 async def test_itunes_catalog_provider(httpx_mock: HTTPXMock) -> None:
     httpx_mock.add_response(
         url=re.compile(r"https://itunes[.]apple[.]com/search.*"),
