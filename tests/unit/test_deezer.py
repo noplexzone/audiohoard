@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 
+import httpx
+import pytest
 from pytest_httpx import HTTPXMock
 
 from app.metadata.deezer import DeezerClient
@@ -112,3 +114,79 @@ class TestDeezerSearch:
         album = await DeezerClient().get_album("42")
 
         assert [track.position for track in album.tracks] == [1, 2]
+
+    async def test_get_album_rejects_embedded_tracks_without_authoritative_positions(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url="https://api.deezer.com/album/43",
+            json={
+                "id": 43,
+                "title": "Album",
+                "nb_tracks": 2,
+                "artist": {"id": 7, "name": "Artist"},
+                "tracks": {
+                    "data": [
+                        {"id": 101, "title": "First", "duration": 180},
+                        {"id": 102, "title": "Second", "duration": 181},
+                    ]
+                },
+            },
+        )
+        for _ in range(3):
+            httpx_mock.add_response(
+                url="https://api.deezer.com/album/43/tracks?limit=100",
+                status_code=503,
+            )
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await DeezerClient().get_album("43")
+
+    async def test_get_album_follows_authoritative_tracklist_pagination(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url="https://api.deezer.com/album/44",
+            json={
+                "id": 44,
+                "title": "Long Album",
+                "nb_tracks": 2,
+                "artist": {"id": 7, "name": "Artist"},
+            },
+        )
+        httpx_mock.add_response(
+            url="https://api.deezer.com/album/44/tracks?limit=100",
+            json={
+                "data": [
+                    {
+                        "id": 101,
+                        "title": "First",
+                        "duration": 180,
+                        "track_position": 1,
+                        "disk_number": 1,
+                    }
+                ],
+                "total": 2,
+                "next": "https://api.deezer.com/album/44/tracks?limit=100&index=1",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://api.deezer.com/album/44/tracks?limit=100&index=1",
+            json={
+                "data": [
+                    {
+                        "id": 102,
+                        "title": "Second",
+                        "duration": 181,
+                        "track_position": 2,
+                        "disk_number": 1,
+                    }
+                ],
+                "total": 2,
+            },
+        )
+
+        album = await DeezerClient().get_album("44")
+
+        assert [track.position for track in album.tracks] == [1, 2]
+        assert album.track_count == 2
