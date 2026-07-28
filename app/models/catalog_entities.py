@@ -45,6 +45,9 @@ class CatalogArtist(Base):
     last_refreshed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    enrichment_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="idle", server_default="idle"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

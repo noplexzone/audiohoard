@@ -6,7 +6,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-28
+
+### Added
+- Restored the track-table library view alongside the artist library.
+- Added a global Wanted page for incomplete releases from watchlisted artists.
+- Added restrictive security headers to HTML responses with CSP exemptions for API documentation.
+- Cache allowlisted remote artist artwork locally behind the authenticated artwork proxy.
+
 ### Changed
+- Split the application stylesheet into layered tokens, base, components, and page assets.
+- Reworked Downloads with incremental queue updates, release artwork and progress, and a pending-review rail.
+- Reworked library artist cards into poster-style release progress cards.
+- Rebuilt catalog album pages with cover art, metadata, progress, and responsive track layouts.
+
+- Right-size artist artwork requests and defer image decoding in artist views.
+- Artist enrichment and discography refreshes now leave catalog page requests non-blocking and expose persisted enrichment state.
+- Filesystem release evidence is cached by album folder modification time to avoid repeated library walks during catalog rendering.
+- Added indexes for catalog ownership, workflow state, and job relationship columns used on request hot paths.
 - Track review now offers only approve or deny; denying removes the review row and staged artifact, current `{Album} ({Year})` library folders contribute truthful release progress, and completed slskd transfers are removed through the supported transfer-ID endpoint.
 - Library release cards and album details now show downloaded-versus-wanted track progress, replacing duplicate downloaded-file and wanted-release sections.
 - Downloads now group all acquisition attempts for the same release and automatically clear completed or timed-out work from Audiohoard and slskd queues after durable state is saved.
@@ -14,6 +31,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The default album directory format is now `{album} ({year})`, while track filenames retain their disc and track prefixes.
 
 ### Fixed
+- Reorganized catalog artist controls and added a persistent save bar for unsaved watchlist selections.
+
 - Catalog hydration now rejects and repairs overfull manifests instead of retaining phantom tracks.
 - Existing full-count catalog manifests with duplicate or invalid disc/track positions are rehydrated in place, preserving linked acquisition identities and corrected numbering.
 - Provider-edition album titles now fall back to canonical MusicBrainz titles during recording reconciliation; Deezer hydration follows every authoritative tracklist page and rejects unpositioned fallbacks before automated mapping.

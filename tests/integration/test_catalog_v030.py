@@ -195,9 +195,10 @@ async def test_artists_is_single_watchlist_page(client: AsyncClient) -> None:
     assert "Daft Punk" in library.text
     assert "Watchlisted" in library.text
     assert "Monitored (" not in library.text
-    for legacy in (monitored, wanted):
-        assert legacy.status_code == 303
-        assert legacy.headers["location"] == "/library"
+    assert monitored.status_code == 303
+    assert monitored.headers["location"] == "/library"
+    assert wanted.status_code == 200
+    assert "Wanted" in wanted.text
 
 
 async def test_artist_page_switches_provider_and_album_filter_excludes_singles(
@@ -215,11 +216,22 @@ async def test_artist_page_switches_provider_and_album_filter_excludes_singles(
         artist.albums.extend(
             [
                 CatalogAlbum(
-                    title="MB Album", release_type="Album", providers_json='["musicbrainz"]'
+                    title="MB Album",
+                    release_type="Album",
+                    providers_json='["musicbrainz"]',
+                    track_count=1,
                 ),
-                CatalogAlbum(title="DZ Album", release_type="album", providers_json='["deezer"]'),
                 CatalogAlbum(
-                    title="DZ Single", release_type="Single / EP", providers_json='["deezer"]'
+                    title="DZ Album",
+                    release_type="album",
+                    providers_json='["deezer"]',
+                    track_count=1,
+                ),
+                CatalogAlbum(
+                    title="DZ Single",
+                    release_type="Single / EP",
+                    providers_json='["deezer"]',
+                    track_count=1,
                 ),
             ]
         )
@@ -371,3 +383,108 @@ async def test_switching_watchlist_provider_preserves_target_provider_choices(
     assert refreshed_artist.watchlist_provider == "deezer"
     assert refreshed_mb is not None and refreshed_mb.monitored is True
     assert refreshed_dz is not None and refreshed_dz.monitored is True
+
+
+async def test_album_page_links_to_catalog_artist(client: AsyncClient) -> None:
+    artist_id = await _seed_catalog()
+    factory = get_session_factory()
+    async with factory() as db:
+        album = (
+            await db.scalars(select(CatalogAlbum).where(CatalogAlbum.artist_id == artist_id))
+        ).one()
+
+    response = await client.get(f"/albums/{album.id}")
+
+    assert response.status_code == 200
+    assert f'href="/artists/catalog/{artist_id}"' in response.text
+
+
+async def test_album_page_uses_list_for_three_tracks_or_fewer_and_table_for_more(
+    client: AsyncClient,
+) -> None:
+    artist_id = await _seed_catalog()
+    factory = get_session_factory()
+    async with factory() as db:
+        short_album = (
+            await db.scalars(select(CatalogAlbum).where(CatalogAlbum.artist_id == artist_id))
+        ).one()
+        long_album = CatalogAlbum(
+            artist_id=artist_id,
+            title="Long Album",
+            release_type="Album",
+            track_count=4,
+        )
+        db.add(long_album)
+        await db.flush()
+        db.add_all(
+            [
+                CatalogAlbumTrack(
+                    album_id=long_album.id,
+                    position=position,
+                    disc=1,
+                    title=f"Long Track {position}",
+                )
+                for position in range(1, 5)
+            ]
+        )
+        await db.commit()
+        short_album_id = short_album.id
+        long_album_id = long_album.id
+
+    short_response = await client.get(f"/albums/{short_album_id}")
+    long_response = await client.get(f"/albums/{long_album_id}")
+
+    assert 'class="album-track-list"' in short_response.text
+    assert 'class="table-wrap album-track-table"' not in short_response.text
+    assert 'class="table-wrap album-track-table"' in long_response.text
+
+
+async def test_artist_page_renders_one_discography_filter_bar(client: AsyncClient) -> None:
+    artist_id = await _seed_catalog()
+
+    response = await client.get(f"/artists/catalog/{artist_id}")
+
+    assert response.status_code == 200
+    assert response.text.count('class="discography-filters"') == 1
+
+
+async def test_artist_page_keeps_section_heading_with_release_type_filter(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Filtered Artist",
+            monitored=True,
+            watchlist_provider="musicbrainz",
+            last_enriched_at=datetime.now(tz=UTC),
+        )
+        db.add(artist)
+        await db.flush()
+        identity = CatalogArtistIdentity(
+            artist_id=artist.id,
+            provider="musicbrainz",
+            provider_artist_id="filtered-artist",
+            name="Filtered Artist",
+        )
+        db.add(identity)
+        await db.flush()
+        db.add(
+            CatalogAlbumProvider(
+                artist_identity_id=identity.id,
+                provider_album_id="filtered-album",
+                title="Filtered Album",
+                release_kind="album",
+                release_type_raw="Album",
+                track_count=1,
+            )
+        )
+        await db.commit()
+        artist_id = artist.id
+
+    response = await client.get(
+        f"/artists/catalog/{artist_id}?provider=musicbrainz&release_type=Album"
+    )
+
+    assert response.status_code == 200
+    assert "<h2>Album</h2>" in response.text

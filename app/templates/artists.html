@@ -5,6 +5,10 @@
   <h1>Library</h1>
   <p>{{ artists.total }} artist{% if artists.total != 1 %}s{% endif %} watchlisted or in your downloaded library</p>
 </div>
+<nav class="discography-filters" aria-label="Library views">
+  <a class="filter-chip active" href="/library">Artists</a>
+  <a class="filter-chip" href="/library?view=tracks">Tracks</a>
+</nav>
 <form method="get" action="/library" class="filter-bar" role="search" aria-label="Filter library artists">
   <label class="sr-only" for="art-q">Search</label>
   <input id="art-q" type="search" name="q" value="{{ q }}" placeholder="Search library artists…" aria-label="Search library artists">
@@ -12,7 +16,7 @@
   <select id="art-sort" name="sort" aria-label="Sort order">
     <option value="name" {% if sort == "name" %}selected{% endif %}>Name</option>
     <option value="downloaded" {% if sort == "downloaded" %}selected{% endif %}>Most downloaded files</option>
-    <option value="wanted" {% if sort == "wanted" %}selected{% endif %}>Most wanted releases</option>
+    <option value="wanted" {% if sort == "wanted" %}selected{% endif %}>Most not in library</option>
   </select>
   <button type="submit" class="btn">Filter</button>
   {% if q %}<a href="/library" class="btn secondary">Clear</a>{% endif %}
@@ -24,19 +28,23 @@
     <a href="{{ artist.detail_url }}" aria-label="Open {{ artist.name }}">
       <div class="artist-avatar avatar-{{ loop.index % 4 }}">
         {% if artist.artwork_url %}
-          <img loading="lazy" src="{{ artist.artwork_url | e }}" alt="{{ artist.name | e }} artwork">
+          <img loading="lazy" width="320" height="320" decoding="async" src="/artwork?url={{ artist.artwork_url | urlencode }}" alt="{{ artist.name | e }} artwork">
         {% else %}
           <span role="img" aria-label="No artwork available for {{ artist.name | e }}">{{ artist.name[:2] | upper }}</span>
         {% endif %}
       </div>
     </a>
-    <h2><a href="{{ artist.detail_url }}">{{ artist.name }}</a></h2>
-    <p>{% if artist.watchlisted %}<span class="badge ok">Watchlisted ✓</span>{% else %}<span class="badge info">In library</span>{% endif %}</p>
-    <dl class="artist-meta">
-      <dt>Downloaded files</dt><dd>{{ artist.downloaded_file_count }}</dd>
-      <dt>Wanted releases</dt><dd>{{ artist.wanted_release_count }}</dd>
-    </dl>
-    <p class="sr-only">{{ artist.downloaded_file_count }} downloaded file{% if artist.downloaded_file_count != 1 %}s{% endif %}, {{ artist.wanted_release_count }} wanted release{% if artist.wanted_release_count != 1 %}s{% endif %}</p>
+    <div class="artist-card-body">
+      <h2><a href="{{ artist.detail_url }}">{{ artist.name }}</a></h2>
+      <p class="muted-line">{{ artist.release_count }} release{% if artist.release_count != 1 %}s{% endif %}</p>
+      {% if artist.release_count %}
+        <progress value="{{ artist.release_count - artist.wanted_release_count }}" max="{{ artist.release_count }}">{{ artist.release_count - artist.wanted_release_count }} of {{ artist.release_count }}</progress>
+      {% else %}
+        <progress value="0" max="1">0 of 0</progress>
+      {% endif %}
+      <p>{% if artist.watchlisted %}<span class="badge ok">Watchlisted ✓</span>{% else %}<span class="badge info">In library</span>{% endif %}</p>
+      <p class="sr-only">{{ artist.release_count - artist.wanted_release_count }} of {{ artist.release_count }} releases in library, {{ artist.wanted_release_count }} not in library</p>
+    </div>
   </article>
   {% endfor %}
 </div>

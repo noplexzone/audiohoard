@@ -134,9 +134,21 @@ class LibraryArtistRow:
     name: str
     detail_url: str
     artwork_url: str | None
+    release_count: int
     downloaded_file_count: int
     wanted_release_count: int
     watchlisted: bool
+
+
+@dataclass
+class MissingReleaseRow:
+    id: int
+    artist_name: str
+    title: str
+    year: str | None
+    artwork_url: str | None
+    wanted_track_count: int
+    downloaded_track_count: int
 
 
 @dataclass(frozen=True)
@@ -295,6 +307,15 @@ class _FilesystemReleaseEvidence:
 
 _TRACK_NUMBER_PREFIX = re.compile(r"^(?:(?P<disc>\d{1,2})[-_.])?(?P<track>\d{1,3})(?:\D|$)")
 _DISC_FOLDER = re.compile(r"^(?:cd|disc)[ _.-]?(\d{1,2})$", re.IGNORECASE)
+_DirectoryState = tuple[tuple[str, int], ...]
+_RELEASE_EVIDENCE_CACHE: dict[
+    tuple[int, str], tuple[_DirectoryState, _FilesystemReleaseEvidence]
+] = {}
+_RELEASE_EVIDENCE_CACHE_MAX_ENTRIES = 2000
+
+
+def _clear_release_evidence_cache() -> None:
+    _RELEASE_EVIDENCE_CACHE.clear()
 
 
 def _has_symlink_component(root: Path, path: Path) -> bool:
@@ -308,6 +329,16 @@ def _has_symlink_component(root: Path, path: Path) -> bool:
         if current.is_symlink():
             return True
     return False
+
+
+def _directory_state(folder: Path) -> _DirectoryState:
+    directories = [folder]
+    directories.extend(
+        path for path in folder.rglob("*") if path.is_dir() and not path.is_symlink()
+    )
+    return tuple(
+        sorted((str(path.relative_to(folder)), path.stat().st_mtime_ns) for path in directories)
+    )
 
 
 def _filesystem_release_evidence(
@@ -343,33 +374,43 @@ def _filesystem_release_evidence(
                 resolved_folder.relative_to(root)
             except ValueError:
                 continue
-            file_count = 0
-            positions: set[tuple[int, int]] = set()
-            for path in folder.rglob("*"):
-                if (
-                    not path.is_file()
-                    or path.is_symlink()
-                    or path.suffix.casefold() not in IMPORTABLE_AUDIO_SUFFIXES
-                ):
-                    continue
-                try:
-                    path.resolve().relative_to(resolved_folder)
-                except ValueError:
-                    continue
-                file_count += 1
-                match = _TRACK_NUMBER_PREFIX.match(path.stem)
-                if match:
-                    disc = int(match.group("disc") or 1)
-                    track = int(match.group("track"))
-                    if match.group("disc") is None:
-                        for parent_part in path.relative_to(folder).parts[:-1]:
-                            disc_match = _DISC_FOLDER.match(parent_part)
-                            if disc_match:
-                                disc = int(disc_match.group(1))
-                        if track >= 100 and track <= 999:
-                            disc, track = divmod(track, 100)
-                    positions.add((disc, track))
-            candidate = _FilesystemReleaseEvidence(file_count, frozenset(positions))
+            directory_state = _directory_state(resolved_folder)
+            cache_key = (album_id, str(resolved_folder))
+            cached = _RELEASE_EVIDENCE_CACHE.get(cache_key)
+            if cached is not None and cached[0] == directory_state:
+                candidate = cached[1]
+            else:
+                file_count = 0
+                positions: set[tuple[int, int]] = set()
+                for path in folder.rglob("*"):
+                    if (
+                        not path.is_file()
+                        or path.is_symlink()
+                        or path.suffix.casefold() not in IMPORTABLE_AUDIO_SUFFIXES
+                    ):
+                        continue
+                    try:
+                        path.resolve().relative_to(resolved_folder)
+                    except ValueError:
+                        continue
+                    file_count += 1
+                    match = _TRACK_NUMBER_PREFIX.match(path.stem)
+                    if match:
+                        disc = int(match.group("disc") or 1)
+                        track = int(match.group("track"))
+                        if match.group("disc") is None:
+                            for parent_part in path.relative_to(folder).parts[:-1]:
+                                disc_match = _DISC_FOLDER.match(parent_part)
+                                if disc_match:
+                                    disc = int(disc_match.group(1))
+                            if track >= 100 and track <= 999:
+                                disc, track = divmod(track, 100)
+                        positions.add((disc, track))
+                candidate = _FilesystemReleaseEvidence(file_count, frozenset(positions))
+                _RELEASE_EVIDENCE_CACHE[cache_key] = (directory_state, candidate)
+                if len(_RELEASE_EVIDENCE_CACHE) > _RELEASE_EVIDENCE_CACHE_MAX_ENTRIES:
+                    _RELEASE_EVIDENCE_CACHE.clear()
+            file_count = candidate.file_count
             current = evidence.get(album_id)
             if file_count and (current is None or file_count > current.file_count):
                 evidence[album_id] = candidate
@@ -667,6 +708,16 @@ async def get_library_artists_page(
         .correlate(CatalogArtist)
         .scalar_subquery()
     )
+    release_count = (
+        select(func.count(CatalogAlbumProvider.id))
+        .join(
+            CatalogArtistIdentity,
+            CatalogArtistIdentity.id == CatalogAlbumProvider.artist_identity_id,
+        )
+        .where(CatalogArtistIdentity.artist_id == CatalogArtist.id)
+        .correlate(CatalogArtist)
+        .scalar_subquery()
+    )
     has_imported_file = exists(
         select(Track.id)
         .outerjoin(CatalogAlbum, CatalogAlbum.id == Track.catalog_album_id)
@@ -680,6 +731,7 @@ async def get_library_artists_page(
         CatalogArtist.name.label("name"),
         CatalogArtist.artwork_url.label("artwork_url"),
         CatalogArtist.monitored.label("monitored"),
+        release_count.label("release_count"),
         downloaded_count.label("downloaded_file_count"),
         wanted_count.label("wanted_release_count"),
     ).where(*catalog_filters)
@@ -700,6 +752,7 @@ async def get_library_artists_page(
             _artist_expr().label("name"),
             literal(None).label("artwork_url"),
             literal(False).label("monitored"),
+            literal(0).label("release_count"),
             func.count(Track.id).label("downloaded_file_count"),
             literal(0).label("wanted_release_count"),
         )
@@ -741,11 +794,89 @@ async def get_library_artists_page(
                 name=name,
                 detail_url=detail_url,
                 artwork_url=str(row["artwork_url"]) if row["artwork_url"] else None,
+                release_count=int(row["release_count"] or 0),
                 downloaded_file_count=int(row["downloaded_file_count"] or 0),
                 wanted_release_count=int(row["wanted_release_count"] or 0),
                 watchlisted=bool(row["monitored"]),
             )
         )
+    return Page(items=items, total=total, page=page, per_page=per_page)
+
+
+async def get_missing_releases_page(
+    db: AsyncSession,
+    *,
+    q: str = "",
+    sort: str = "year",
+    page: int = 1,
+    per_page: int = _DEFAULT_PAGE_SIZE,
+) -> Page[MissingReleaseRow]:
+    per_page = _clamp_per_page(per_page)
+    page = max(1, page)
+    manifest_count = (
+        select(func.count(CatalogAlbumTrack.id))
+        .where(CatalogAlbumTrack.album_id == CatalogAlbum.id)
+        .correlate(CatalogAlbum)
+        .scalar_subquery()
+    )
+    wanted_count = func.max(func.coalesce(CatalogAlbum.track_count, 0), manifest_count)
+    downloaded_count = (
+        select(func.count(func.distinct(Track.catalog_track_id)))
+        .where(
+            Track.catalog_album_id == CatalogAlbum.id,
+            Track.catalog_track_id.is_not(None),
+            _library_artifact_filter(),
+        )
+        .correlate(CatalogAlbum)
+        .scalar_subquery()
+    )
+    filters: list[Any] = [
+        CatalogArtist.monitored.is_(True),
+        CatalogAlbum.monitored.is_(True),
+        downloaded_count < wanted_count,
+    ]
+    if q:
+        pattern = f"%{q}%"
+        filters.append(or_(CatalogArtist.name.ilike(pattern), CatalogAlbum.title.ilike(pattern)))
+    rows_query = (
+        select(
+            CatalogAlbum.id.label("album_id"),
+            CatalogArtist.name.label("artist_name"),
+            CatalogAlbum.title.label("title"),
+            CatalogAlbum.year.label("year"),
+            CatalogAlbum.artwork_url.label("artwork_url"),
+            wanted_count.label("wanted_track_count"),
+            downloaded_count.label("downloaded_track_count"),
+        )
+        .join(CatalogArtist, CatalogArtist.id == CatalogAlbum.artist_id)
+        .where(*filters)
+    )
+    total = int((await db.scalar(select(func.count()).select_from(rows_query.subquery()))) or 0)
+    page = _clamp_page(page, total, per_page)
+    valid_sort = sort if sort in {"year", "artist", "title"} else "year"
+    if valid_sort == "artist":
+        rows_query = rows_query.order_by(CatalogArtist.name, CatalogAlbum.title, CatalogAlbum.id)
+    elif valid_sort == "title":
+        rows_query = rows_query.order_by(CatalogAlbum.title, CatalogArtist.name, CatalogAlbum.id)
+    else:
+        rows_query = rows_query.order_by(
+            CatalogAlbum.year.desc(), CatalogArtist.name, CatalogAlbum.title, CatalogAlbum.id
+        )
+    rows = (
+        await db.execute(rows_query.offset(_page_offset(page, per_page)).limit(per_page))
+    ).mappings()
+    items = [
+        MissingReleaseRow(
+            id=int(row["album_id"]),
+            artist_name=str(row["artist_name"]),
+            title=str(row["title"]),
+            year=str(row["year"]) if row["year"] else None,
+            artwork_url=str(row["artwork_url"]) if row["artwork_url"] else None,
+            wanted_track_count=int(row["wanted_track_count"] or 0),
+            downloaded_track_count=int(row["downloaded_track_count"] or 0),
+        )
+        for row in rows
+    ]
     return Page(items=items, total=total, page=page, per_page=per_page)
 
 

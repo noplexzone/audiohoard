@@ -321,8 +321,8 @@ def _parse_artist(data: dict[str, object]) -> ArtistHit:
         deezer_id=did or None,
         name=str(data.get("name") or ""),
         artwork_url=str(
-            data.get("picture_xl")
-            or data.get("picture_big")
+            data.get("picture_big")
+            or data.get("picture_xl")
             or data.get("picture_medium")
             or data.get("picture")
             or ""

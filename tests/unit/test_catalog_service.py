@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.catalog_entities import (
+    CatalogAlbumProvider,
+    CatalogArtist,
+    CatalogArtistIdentity,
+)
 from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
 from app.models.release import Release
@@ -12,9 +19,12 @@ from app.services.catalog import (
     UNKNOWN,
     LibraryStats,
     Page,
+    _clear_release_evidence_cache,
+    _filesystem_release_evidence,
     _normalize_artist,
     get_artist_detail,
     get_artists_page,
+    get_library_artists_page,
     get_library_stats,
     list_distinct_formats,
     list_library_tracks,
@@ -204,6 +214,38 @@ async def test_library_stats_empty_db(db_session: AsyncSession) -> None:
     assert stats.total_bytes == 0
     assert stats.format_breakdown == {}
     assert stats.source_breakdown == {}
+
+
+async def test_library_artist_release_count_for_catalog_and_legacy_rows(
+    db_session: AsyncSession, job: Job
+) -> None:
+    artist = CatalogArtist(name="Catalog Artist", monitored=True)
+    db_session.add(artist)
+    await db_session.flush()
+    identity = CatalogArtistIdentity(
+        artist_id=artist.id,
+        provider="musicbrainz",
+        provider_artist_id="catalog-artist",
+        name="Catalog Artist",
+    )
+    db_session.add(identity)
+    await db_session.flush()
+    db_session.add(
+        CatalogAlbumProvider(
+            artist_identity_id=identity.id,
+            provider_album_id="catalog-release",
+            title="Catalog Release",
+            release_kind="album",
+        )
+    )
+    db_session.add(_make_track(job.id, artist="Legacy Artist", album_artist=None))
+    await db_session.flush()
+
+    page = await get_library_artists_page(db_session)
+    rows = {row.name: row for row in page.items}
+
+    assert rows["Catalog Artist"].release_count == 1
+    assert rows["Legacy Artist"].release_count == 0
 
 
 async def test_library_stats_counts(db_session: AsyncSession, job: Job) -> None:
@@ -679,3 +721,41 @@ async def test_library_stats_distinguishes_same_album_across_artists(
     db_session.add(_make_track(job.id, artist="Artist B", album="Greatest Hits", year="2020"))
     await db_session.flush()
     assert (await get_library_stats(db_session)).album_count == 2
+
+
+def test_filesystem_release_evidence_reuses_unchanged_directory(tmp_path, monkeypatch) -> None:
+    _clear_release_evidence_cache()
+    folder = tmp_path / "Artist" / "Album (2020)"
+    folder.mkdir(parents=True)
+    audio = folder / "01 - Track.flac"
+    audio.write_bytes(b"audio")
+    albums = [(1, 1, "Album", "2020", "Artist")]
+
+    first = _filesystem_release_evidence(tmp_path, albums)
+    original_is_file = Path.is_file
+
+    def reject_rescan(path):
+        if path == audio:
+            raise AssertionError("cached audio files should not be rescanned")
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", reject_rescan)
+    second = _filesystem_release_evidence(tmp_path, albums)
+
+    assert first == second
+
+
+def test_filesystem_release_evidence_rewalks_changed_nested_directory(tmp_path) -> None:
+    _clear_release_evidence_cache()
+    folder = tmp_path / "Artist" / "Album (2020)"
+    disc = folder / "CD1"
+    disc.mkdir(parents=True)
+    (disc / "01 - Track.flac").write_bytes(b"audio")
+    albums = [(1, 2, "Album", "2020", "Artist")]
+
+    first = _filesystem_release_evidence(tmp_path, albums)
+    (disc / "02 - Track.flac").write_bytes(b"audio")
+    second = _filesystem_release_evidence(tmp_path, albums)
+
+    assert first[1].file_count == 1
+    assert second[1].file_count == 2

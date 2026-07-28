@@ -33,6 +33,7 @@ class Job(Base):
     status: Mapped[JobStatus] = mapped_column(
         Enum(JobStatus),
         nullable=False,
+        index=True,
         default=JobStatus.pending,
         server_default=JobStatus.pending.value,
     )
@@ -51,13 +52,13 @@ class Job(Base):
         Boolean, nullable=False, default=False, server_default=false()
     )
     parent_job_id: Mapped[int | None] = mapped_column(
-        ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True
     )
     partial_attempt: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
     catalog_album_id: Mapped[int | None] = mapped_column(
-        ForeignKey("catalog_albums.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("catalog_albums.id", ondelete="SET NULL"), nullable=True, index=True
     )
     catalog_track_id: Mapped[int | None] = mapped_column(
         ForeignKey("catalog_album_tracks.id", ondelete="SET NULL"), nullable=True

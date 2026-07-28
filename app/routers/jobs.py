@@ -92,13 +92,10 @@ async def get_job(job_id: int, db: Annotated[AsyncSession, Depends(get_db)]) -> 
     return job
 
 
-@router.get("/downloads", response_class=HTMLResponse, include_in_schema=False)
-async def downloads_page(
-    request: Request,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    status: JobStatus | None = None,
-) -> HTMLResponse:
-    templates = _get_templates(request)
+async def _assemble_downloads_context(
+    db: AsyncSession,
+    status: JobStatus | None,
+) -> dict[str, object]:
     load_options = (
         selectinload(Job.tracks),
         selectinload(Job.catalog_album).selectinload(CatalogAlbum.artist),
@@ -294,6 +291,26 @@ async def downloads_page(
                 "review_items": items,
             }
         )
+    now = dt.now(UTC)
+    return {
+        "downloads": downloads,
+        "jobs": downloads,
+        "download_groups": download_groups,
+        "pending_review_items": pending_review_items,
+        "release_reviews": release_reviews,
+        "selected_status": status.value if status is not None else None,
+        "now": now,
+    }
+
+
+@router.get("/downloads", response_class=HTMLResponse, include_in_schema=False)
+async def downloads_page(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    status: JobStatus | None = None,
+) -> HTMLResponse:
+    templates = _get_templates(request)
+    ctx = await _assemble_downloads_context(db, status)
     notices = {
         "cancelled": ("Cancellation requested.", "info"),
         "retried": ("Retry scheduled.", "info"),
@@ -314,22 +331,22 @@ async def downloads_page(
         except ValueError:
             count = 0
         notice = f"Cleared {count} download{'s' if count != 1 else ''} from the queue."
-    now = dt.now(UTC)
     return templates.TemplateResponse(
         request,
         "downloads.html",
-        {
-            "downloads": downloads,
-            "jobs": downloads,
-            "download_groups": download_groups,
-            "pending_review_items": pending_review_items,
-            "release_reviews": release_reviews,
-            "notice": notice,
-            "notice_type": notice_type,
-            "selected_status": status.value if status is not None else None,
-            "now": now,
-        },
+        {**ctx, "notice": notice, "notice_type": notice_type},
     )
+
+
+@router.get("/downloads/queue", response_class=HTMLResponse, include_in_schema=False)
+async def downloads_queue(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    status: JobStatus | None = None,
+) -> HTMLResponse:
+    templates = _get_templates(request)
+    ctx = await _assemble_downloads_context(db, status)
+    return templates.TemplateResponse(request, "partials/_downloads_queue.html", ctx)
 
 
 @router.get("/jobs/ui/list", include_in_schema=False)

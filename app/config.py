@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     naming_template: str = "{album_artist}/{album} ({year})/{disc_track} - {title}.{ext}"
     library_root: Path = Path("/music")
     staging_root: Path = Path("/staging/audiohoard")
+    artwork_cache_root: Path = Path("./data/artwork")
 
     # slskd
     slskd_url: str = ""

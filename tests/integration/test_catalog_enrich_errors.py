@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -13,7 +14,7 @@ from app.models.catalog_entities import CatalogArtist
 async def _seed_artist(name: str = "Test Artist", mbid: str = "test-provider-id") -> int:
     factory = db_module.get_session_factory()
     async with factory() as session:
-        artist = CatalogArtist(name=name, mbid=mbid)
+        artist = CatalogArtist(name=name, mbid=mbid, last_enriched_at=datetime.now(tz=UTC))
         session.add(artist)
         await session.commit()
         await session.refresh(artist)
@@ -32,9 +33,7 @@ async def test_manual_enrich_failure_returns_303_not_500(client: AsyncClient) ->
     assert resp.status_code == 303
     location = resp.headers["location"]
     assert "sql:" not in location.lower()
-    assert location == (
-        f"/artists/catalog/{artist_id}?provider=musicbrainz&sort=desc&enrichment=failed"
-    )
+    assert location == "/library"
 
 
 @pytest.mark.asyncio
@@ -73,7 +72,7 @@ async def test_manual_enrich_failure_redirect_has_no_sql_fragment(client: AsyncC
 
 
 @pytest.mark.asyncio
-async def test_manual_enrich_success_redirects_to_surviving_artist(client: AsyncClient) -> None:
+async def test_manual_enrich_redirects_to_stable_library_route(client: AsyncClient) -> None:
     original_id = await _seed_artist("Duplicate Artist")
     survivor_id = await _seed_artist("Surviving Artist", "survivor-provider-id")
 
@@ -85,9 +84,7 @@ async def test_manual_enrich_success_redirects_to_surviving_artist(client: Async
         resp = await client.post(f"/artists/catalog/{original_id}/enrich", follow_redirects=False)
 
     assert resp.status_code == 303
-    assert resp.headers["location"] == (
-        f"/artists/catalog/{survivor_id}?provider=musicbrainz&sort=desc&enrichment=ok"
-    )
+    assert resp.headers["location"] == "/library"
 
 
 @pytest.mark.asyncio
@@ -102,11 +99,11 @@ async def test_manual_enrich_success_clears_prior_error(client: AsyncClient) -> 
         )
         await session.commit()
 
-    with patch(
-        "app.routers.catalog.enrich_catalog_artist",
-        new_callable=AsyncMock,
-        return_value={"status": "ok"},
-    ):
+    async def successful_enrichment(db, settings, artist, providers):
+        artist.provenance_json = "{}"
+        return {"status": "ok", "artist_id": artist.id}
+
+    with patch("app.routers.catalog.enrich_catalog_artist", side_effect=successful_enrichment):
         resp = await client.post(f"/artists/catalog/{artist_id}/enrich", follow_redirects=False)
     assert resp.status_code == 303
     assert "failed" not in resp.headers["location"]

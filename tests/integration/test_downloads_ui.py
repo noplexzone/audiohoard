@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 from httpx import AsyncClient
 
@@ -11,6 +12,8 @@ from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, Catalog
 from app.models.job import Job, JobStatus
 from app.models.track import Track
 from app.models.workflow import AcquisitionState
+
+DOWNLOADS_JS = Path("app/static/js/downloads.js").read_text()
 
 
 async def test_downloads_show_state_details_and_valid_actions(client: AsyncClient) -> None:
@@ -36,7 +39,7 @@ async def test_downloads_show_state_details_and_valid_actions(client: AsyncClien
 
     assert response.status_code == 200
     assert "Download failed" in response.text
-    assert "Active jobs refresh every 10 seconds" in response.text
+    assert 'src="/static/js/downloads.js?v=0.7.1"' in response.text
     assert f'action="/downloads/{running_id}/cancel"' in response.text
     assert f'action="/downloads/{failed_id}/retry"' in response.text
     assert f'action="/downloads/{partial_id}/retry"' in response.text
@@ -178,9 +181,9 @@ async def test_downloads_shows_elapsed_and_external_transfer_wait(client: AsyncC
     assert response.status_code == 200
     text = response.text
 
-    # Auto-refresh at 10 seconds
-    assert "10000" in text
-    assert "Active jobs refresh every 10 seconds" in text
+    # Auto-refresh is implemented by the external CSP-compatible script.
+    assert 'src="/static/js/downloads.js?v=0.7.1"' in text
+    assert "POLL_INTERVAL_MS = 10000" in DOWNLOADS_JS
 
     # Elapsed and last-activity columns are present
     assert "Elapsed" in text
@@ -320,7 +323,7 @@ async def test_downloads_slow_source_page_renders_while_blocked(client: AsyncCli
     assert "downloading via slskd" in second.text
     assert "Elapsed" in second.text
     assert "Last activity" in second.text
-    assert "Active jobs refresh every 10 seconds" in second.text
+    assert 'src="/static/js/downloads.js?v=0.7.1"' in second.text
 
 
 async def test_downloads_group_album_jobs_and_target_active_attempt(client: AsyncClient) -> None:
@@ -413,7 +416,8 @@ async def test_downloads_group_album_jobs_and_target_active_attempt(client: Asyn
 
     assert response.status_code == 200
     assert response.text.count(f'data-download-group="album:{album_id}"') == 1
-    assert "Grouped Artist — Grouped Release" in response.text
+    assert "Grouped Artist" in response.text
+    assert "Grouped Release" in response.text
     assert "1 / 3 downloaded" in response.text
     assert "2 attempts" in response.text
     assert f"<code>#{root_id}</code>" not in response.text
@@ -489,3 +493,49 @@ async def test_downloads_group_uses_declared_count_before_manifest_hydration(
         0
     ]
     assert "0 / 12 downloaded" in group
+
+
+async def test_downloads_queue_returns_only_queue_partial(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        db.add(Job(source="slskd", query="Queue Partial Album", status=JobStatus.pending))
+        await db.commit()
+
+    response = await client.get("/downloads/queue")
+
+    assert response.status_code == 200
+    assert "<table>" in response.text
+    assert "Queue Partial Album" in response.text
+    assert "<h1>Downloads</h1>" not in response.text
+    assert 'aria-label="Import review"' not in response.text
+
+
+async def test_downloads_queue_honours_status_filter_like_page(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        db.add_all(
+            [
+                Job(source="slskd", query="Pending Queue Item", status=JobStatus.pending),
+                Job(source="slskd", query="Failed Queue Item", status=JobStatus.failed),
+            ]
+        )
+        await db.commit()
+
+    page = await client.get("/downloads?status=failed")
+    queue = await client.get("/downloads/queue?status=failed")
+
+    assert page.status_code == queue.status_code == 200
+    assert "Failed Queue Item" in page.text and "Failed Queue Item" in queue.text
+    assert "Pending Queue Item" not in page.text and "Pending Queue Item" not in queue.text
+
+
+async def test_downloads_queue_has_no_query_column(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        db.add(Job(source="slskd", query="No Query Column", status=JobStatus.done))
+        await db.commit()
+
+    response = await client.get("/downloads/queue")
+
+    assert response.status_code == 200
+    assert '<th scope="col">Query</th>' not in response.text

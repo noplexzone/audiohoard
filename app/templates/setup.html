@@ -69,34 +69,5 @@
     <button type="submit">Create owner &amp; open library</button>
   </form>
 </section>
-<script>
-document.getElementById("setup-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.target;
-  const data = Object.fromEntries(new FormData(form));
-  const credentials = {username: data.username, password: data.password};
-  const providerFields = [
-    "slskd_url","slskd_api_key","prowlarr_url","prowlarr_api_key",
-    "sabnzbd_url","sabnzbd_api_key","ytdlp_cookies_file",
-    "tidal_config_path","tidal_session_path","tidal_quality",
-    "musicbrainz_contact","acoustid_api_key","library_root","staging_root","naming_template",
-  ];
-  const providerSettings = {};
-  providerFields.forEach((f) => { if (data[f]) providerSettings[f] = data[f]; });
-  const payload = Object.keys(providerSettings).length
-    ? {...credentials, provider_settings: providerSettings}
-    : credentials;
-  const response = await fetch("/api/auth/setup", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    window.alert(err.detail || "Setup failed");
-    return;
-  }
-  window.location.assign("/");
-});
-</script>
+<script defer src="/static/js/setup.js?v={{ app_version }}"></script>
 {% endblock %}

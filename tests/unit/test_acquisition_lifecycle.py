@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,9 @@ import pytest
 
 from app.config import Settings
 from app.jobs import runner
+from app.models.catalog_entities import CatalogAlbum, CatalogArtist
+from app.models.job import Job, JobStatus
+from app.services.download_queue import project_download_groups
 from app.sources.base import CapabilityState
 from app.sources.youtube import ProviderError  # noqa: F401 (used by type-check below)
 
@@ -74,6 +78,58 @@ class _FakeSabAdapter:
 
     async def history_status(self, nzo_id: str) -> CapabilityState:  # noqa: ARG002
         return next(self._history)
+
+
+def test_download_group_projects_catalog_album_detail_and_fallback_label() -> None:
+    now = datetime.now(UTC)
+    artist = CatalogArtist(id=7, name="Projected Artist")
+    album = CatalogAlbum(
+        id=11,
+        artist=artist,
+        title="Projected Album",
+        artwork_url="https://example.test/cover.jpg",
+        year="2026",
+        release_type="album",
+        track_count=0,
+    )
+    catalog_job = Job(
+        id=21,
+        source="slskd",
+        query="catalog query",
+        status=JobStatus.pending,
+        catalog_album=album,
+        catalog_album_id=album.id,
+        queue_hidden=False,
+        created_at=now,
+        updated_at=now,
+    )
+    fallback_job = Job(
+        id=22,
+        source="slskd",
+        query="Fallback Query",
+        status=JobStatus.pending,
+        queue_hidden=False,
+        created_at=now,
+        updated_at=now,
+    )
+
+    groups = project_download_groups([catalog_job, fallback_job], {})
+    catalog_group = next(group for group in groups if group.catalog_album_id is not None)
+    fallback_group = next(group for group in groups if group.catalog_album_id is None)
+
+    assert catalog_group.catalog_album_id == 11
+    assert catalog_group.artist_name == "Projected Artist"
+    assert catalog_group.album_title == "Projected Album"
+    assert catalog_group.artwork_url == "https://example.test/cover.jpg"
+    assert (
+        fallback_group.catalog_album_id,
+        fallback_group.artwork_url,
+        fallback_group.artist_name,
+        fallback_group.album_title,
+        fallback_group.year,
+        fallback_group.release_kind,
+    ) == (None, None, None, None, None, None)
+    assert fallback_group.label == "Fallback Query"
 
 
 # ---------------------------------------------------------------------------

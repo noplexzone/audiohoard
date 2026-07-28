@@ -244,7 +244,7 @@ class MusicBrainzClient:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(10.0), follow_redirects=False
             ) as client:
-                resp = await client.get(url)
+                resp = await client.head(url)
         except httpx.HTTPError:
             return None
         if resp.status_code == 200:
