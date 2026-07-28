@@ -66,6 +66,44 @@ async def test_run_job_marks_failed_when_result_processing_fails(
     assert "result_processing_failed" in job.result_json
 
 
+async def test_background_cleanup_failure_does_not_rewrite_committed_success(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services import acquisition_cleanup
+
+    job = await _create_job(db_session)
+    await db_session.commit()
+    job_id = job.id
+
+    async def complete_job(
+        current_job_id: int,
+        session: AsyncSession,
+        cfg: Settings,
+        *,
+        commit_progress: bool = False,
+    ) -> None:
+        assert current_job_id == job_id
+        assert commit_progress is True
+        current = await session.get(Job, current_job_id)
+        assert current is not None
+        current.status = JobStatus.done
+
+    async def fail_cleanup(*args: object, **kwargs: object) -> tuple[list[int], int]:
+        raise RuntimeError("cleanup unavailable")
+
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(runner, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", complete_job)
+    monkeypatch.setattr(acquisition_cleanup, "cleanup_terminal_acquisitions", fail_cleanup)
+
+    await runner.run_job(job_id, settings=test_settings)
+
+    db_session.expire_all()
+    persisted = await db_session.get(Job, job_id)
+    assert persisted is not None
+    assert persisted.status == JobStatus.done
+
+
 async def test_provider_error_persists_typed_failure_without_secret(
     db_session: AsyncSession, test_settings: Settings, monkeypatch: object, caplog: object
 ) -> None:

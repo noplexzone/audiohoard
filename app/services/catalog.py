@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
+    CatalogAlbumTrack,
     CatalogArtist,
     CatalogArtistIdentity,
 )
@@ -133,10 +134,17 @@ class LibraryArtistRow:
     watchlisted: bool
 
 
-@dataclass
-class CatalogArtistLibrarySections:
-    downloaded_files: list[TrackRow]
-    wanted_releases: list[CatalogAlbumProvider]
+@dataclass(frozen=True)
+class ReleaseProgress:
+    wanted_track_count: int
+    downloaded_track_count: int
+    downloaded_catalog_track_ids: frozenset[int] = frozenset()
+
+    @property
+    def complete(self) -> bool:
+        return self.wanted_track_count > 0 and (
+            self.downloaded_track_count >= self.wanted_track_count
+        )
 
 
 @dataclass
@@ -272,6 +280,65 @@ def _library_artifact_filter() -> Any:
         Track.file_size_bytes > 0,
         imported_destination,
     )
+
+
+async def get_release_progress(
+    db: AsyncSession, album_ids: list[int] | set[int] | tuple[int, ...]
+) -> dict[int, ReleaseProgress]:
+    """Project catalog release ownership from wanted tracks and committed imports.
+
+    ``CatalogAlbum.track_count`` remains the truthful denominator when a provider has
+    reported a count but the track manifest has not been hydrated yet. Imported counts
+    are distinct catalog tracks so repeated acquisition attempts cannot inflate progress.
+    """
+    ids = sorted(set(album_ids))
+    if not ids:
+        return {}
+
+    album_rows = (
+        await db.execute(
+            select(CatalogAlbum.id, CatalogAlbum.track_count).where(CatalogAlbum.id.in_(ids))
+        )
+    ).all()
+    manifest_counts = {
+        int(album_id): int(track_count)
+        for album_id, track_count in (
+            await db.execute(
+                select(
+                    CatalogAlbumTrack.album_id,
+                    func.count(CatalogAlbumTrack.id),
+                )
+                .where(CatalogAlbumTrack.album_id.in_(ids))
+                .group_by(CatalogAlbumTrack.album_id)
+            )
+        ).all()
+    }
+    imported_by_album: dict[int, set[int]] = {}
+    imported_rows = await db.execute(
+        select(Track.catalog_album_id, Track.catalog_track_id)
+        .join(CatalogAlbumTrack, CatalogAlbumTrack.id == Track.catalog_track_id)
+        .where(
+            Track.catalog_album_id.in_(ids),
+            CatalogAlbumTrack.album_id == Track.catalog_album_id,
+            _library_artifact_filter(),
+        )
+        .distinct()
+    )
+    for album_id, catalog_track_id in imported_rows:
+        if album_id is not None and catalog_track_id is not None:
+            imported_by_album.setdefault(int(album_id), set()).add(int(catalog_track_id))
+
+    progress: dict[int, ReleaseProgress] = {}
+    for album_id, known_track_count in album_rows:
+        release_id = int(album_id)
+        wanted = max(int(known_track_count or 0), manifest_counts.get(release_id, 0))
+        downloaded_ids = frozenset(imported_by_album.get(release_id, set()))
+        progress[release_id] = ReleaseProgress(
+            wanted_track_count=wanted,
+            downloaded_track_count=min(len(downloaded_ids), wanted),
+            downloaded_catalog_track_ids=downloaded_ids,
+        )
+    return progress
 
 
 async def get_library_stats(db: AsyncSession) -> LibraryStats:
@@ -553,57 +620,6 @@ async def get_library_artists_page(
             )
         )
     return Page(items=items, total=total, page=page, per_page=per_page)
-
-
-async def get_catalog_artist_library_sections(
-    db: AsyncSession,
-    *,
-    artist_id: int,
-    identity_id: int | None,
-    artist_name: str,
-) -> CatalogArtistLibrarySections:
-    downloaded_stmt = (
-        select(Track)
-        .outerjoin(CatalogAlbum, CatalogAlbum.id == Track.catalog_album_id)
-        .options(selectinload(Track.import_plans))
-        .where(
-            or_(
-                CatalogAlbum.artist_id == artist_id,
-                and_(
-                    Track.catalog_album_id.is_(None),
-                    func.lower(func.trim(_artist_expr())) == artist_name.strip().casefold(),
-                ),
-            ),
-            _library_artifact_filter(),
-        )
-        .order_by(Track.album, Track.disc, Track.track_no, Track.title, Track.id)
-        .limit(_MAX_PAGE_SIZE)
-    )
-    downloaded = list((await db.scalars(downloaded_stmt)).all())
-    wanted: list[CatalogAlbumProvider] = []
-    if identity_id is not None:
-        wanted_stmt = (
-            select(CatalogAlbumProvider)
-            .outerjoin(CatalogAlbum, CatalogAlbum.id == CatalogAlbumProvider.catalog_album_id)
-            .where(
-                CatalogAlbumProvider.artist_identity_id == identity_id,
-                or_(
-                    CatalogAlbumProvider.catalog_album_id.is_(None),
-                    CatalogAlbum.in_library.is_(False),
-                ),
-            )
-            .order_by(
-                CatalogAlbumProvider.year.desc(),
-                CatalogAlbumProvider.title,
-                CatalogAlbumProvider.id,
-            )
-            .limit(_MAX_PAGE_SIZE)
-        )
-        wanted = list((await db.scalars(wanted_stmt)).all())
-    return CatalogArtistLibrarySections(
-        downloaded_files=[to_track_row(track) for track in downloaded],
-        wanted_releases=wanted,
-    )
 
 
 async def get_watchlisted_artists_page(

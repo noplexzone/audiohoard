@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- Library release cards and album details now show downloaded-versus-wanted track progress, replacing duplicate downloaded-file and wanted-release sections.
+- Downloads now group all acquisition attempts for the same release and automatically clear completed or timed-out work from Audiohoard and slskd queues after durable state is saved.
 - Verified tracks now import immediately without waiting for the rest of an album, while missing tracks remain available for targeted continuation searches.
 - The default album directory format is now `{album} ({year})`, while track filenames retain their disc and track prefixes.
 - Library and Artists are now one artist-card Library surface, with per-artist downloaded-file and wanted-release sections.

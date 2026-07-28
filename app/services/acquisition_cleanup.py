@@ -7,9 +7,10 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Protocol
 
 from sqlalchemy import case, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
@@ -18,7 +19,7 @@ from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import Track
-from app.models.workflow import ImportWorkflowState
+from app.models.workflow import AcquisitionState, ImportWorkflowState
 from app.settings_service import build_effective_settings
 from app.sources.slskd import SlskdAdapter
 
@@ -32,6 +33,10 @@ class ImportedSourceCleanup:
     provenance_json: str | None
 
 
+class SlskdCleanupAdapter(Protocol):
+    async def cancel(self, username: str, filename: str) -> None: ...
+
+
 def _slskd_identity(provenance_json: str | None) -> tuple[str, str] | None:
     with contextlib.suppress(json.JSONDecodeError, TypeError):
         provenance = json.loads(provenance_json or "{}")
@@ -42,6 +47,90 @@ def _slskd_identity(provenance_json: str | None) -> tuple[str, str] | None:
         ):
             return str(provenance["username"]), str(provenance["filename"])
     return None
+
+
+async def hide_completed_and_timed_out_jobs(
+    session_factory: async_sessionmaker[AsyncSession],
+    job_ids: set[int] | None = None,
+) -> list[int]:
+    """Hide durable successful/timeout attempts without deleting acquisition history."""
+    terminal = {JobStatus.done, JobStatus.failed, JobStatus.partial, JobStatus.cancelled}
+    async with session_factory() as db:
+        query = (
+            select(Job)
+            .where(Job.queue_hidden.is_(False), Job.status.in_(terminal))
+            .options(selectinload(Job.tracks))
+            .order_by(Job.id)
+        )
+        if job_ids is not None:
+            query = query.where(Job.id.in_(job_ids))
+        jobs = list((await db.scalars(query)).all())
+        hidden: list[int] = []
+        for job in jobs:
+            timed_out = any(track.source_status == "transfer_timeout" for track in job.tracks)
+            has_other_incomplete = any(
+                track.acquisition_state != AcquisitionState.downloaded
+                and track.source_status != "transfer_timeout"
+                for track in job.tracks
+            )
+            if job.status == JobStatus.done or (timed_out and not has_other_incomplete):
+                job.queue_hidden = True
+                hidden.append(job.id)
+        await db.commit()
+        return hidden
+
+
+async def cleanup_durable_slskd_transfers(
+    session_factory: async_sessionmaker[AsyncSession],
+    adapter: SlskdCleanupAdapter,
+    job_ids: set[int] | None = None,
+) -> int:
+    """Remove durable completed/timeout transfers with no DB transaction held during I/O."""
+    async with session_factory() as db:
+        query = select(Track).where(
+            Track.source == "slskd",
+            Track.source_job_id.is_not(None),
+            Track.acquisition_provenance_json.is_not(None),
+        )
+        if job_ids is not None:
+            query = query.where(Track.job_id.in_(job_ids))
+        tracks = list((await db.scalars(query.order_by(Track.id))).all())
+        identities = {
+            identity
+            for track in tracks
+            if (
+                (track.acquisition_state.value == "downloaded" and bool(track.staging_path))
+                or track.source_status == "transfer_timeout"
+            )
+            if (identity := _slskd_identity(track.acquisition_provenance_json)) is not None
+        }
+
+    completed = 0
+    for identity in sorted(identities):
+        try:
+            await adapter.cancel(*identity)
+        except Exception:
+            logger.exception("durable slskd transfer cleanup failed")
+        else:
+            completed += 1
+    return completed
+
+
+async def cleanup_terminal_acquisitions(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    slskd_url: str,
+    slskd_api_key: str,
+    job_ids: set[int] | None = None,
+) -> tuple[list[int], int]:
+    """Reconcile Audiohoard and slskd terminal cleanup debt idempotently."""
+    hidden = await hide_completed_and_timed_out_jobs(session_factory, job_ids)
+    removed = await cleanup_durable_slskd_transfers(
+        session_factory,
+        SlskdAdapter(slskd_url, slskd_api_key),
+        job_ids,
+    )
+    return hidden, removed
 
 
 @dataclass(frozen=True)

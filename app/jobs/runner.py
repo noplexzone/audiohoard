@@ -167,8 +167,6 @@ async def _poll_slskd_transfer(
     while True:
         remaining = deadline - _time.monotonic()
         if remaining <= 0:
-            with contextlib.suppress(Exception):
-                await adapter.cancel(username, filename)
             raise ProviderError("transfer_timeout", "slskd transfer timed out", "acquire", True)
         try:
             state = await adapter.status(transfer_id)
@@ -369,6 +367,18 @@ async def run_job(
                 )
                 job.updated_at = _now()
                 await s.commit()
+    finally:
+        try:
+            from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
+
+            await cleanup_terminal_acquisitions(
+                factory,
+                slskd_url=cfg.slskd_url,
+                slskd_api_key=cfg.slskd_api_key,
+                job_ids={job_id},
+            )
+        except Exception:
+            logger.exception("Job %d terminal acquisition cleanup failed", job_id)
 
 
 async def _run_job_in_session(
@@ -1202,6 +1212,12 @@ async def _prepare_acquisition(
                 suffix = staged.suffix.lower().lstrip(".")
                 if suffix and len(suffix) <= 16 and suffix.isalnum():
                     track.file_format = suffix
+        if checkpoint is not None:
+            await checkpoint()
+            try:
+                await adapter.cancel(username, filename)
+            except Exception:
+                logger.exception("post-checkpoint slskd transfer cleanup failed")
         return transfer_id, "downloaded"
     if source != "prowlarr":
         if track is not None:

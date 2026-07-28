@@ -164,6 +164,20 @@ class JobDispatcher:
         session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> list[int]:
         factory = session_factory or self._factory()
+        try:
+            from app.config import get_settings
+            from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
+            from app.settings_service import build_effective_settings
+
+            async with factory() as cleanup_db:
+                settings = await build_effective_settings(cleanup_db, get_settings())
+            await cleanup_terminal_acquisitions(
+                factory,
+                slskd_url=settings.slskd_url,
+                slskd_api_key=settings.slskd_api_key,
+            )
+        except Exception:
+            logger.exception("Startup terminal acquisition cleanup failed")
         async with factory() as db:
             result = await db.execute(
                 select(Job).where(Job.status.in_([JobStatus.pending, JobStatus.running]))

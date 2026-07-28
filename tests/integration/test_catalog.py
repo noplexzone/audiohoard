@@ -9,6 +9,7 @@ import app.database as db_module
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
+    CatalogAlbumTrack,
     CatalogArtist,
     CatalogArtistIdentity,
 )
@@ -428,9 +429,7 @@ async def test_library_nav_has_no_separate_artists_item(client: AsyncClient) -> 
     assert "<span>Artists</span>" not in response.text
 
 
-async def test_catalog_artist_separates_downloaded_files_and_wanted_releases(
-    client: AsyncClient,
-) -> None:
+async def _seed_release_progress_artist() -> tuple[int, int, dict[str, int]]:
     factory = db_module.get_session_factory()
     async with factory() as session:
         job = Job(source="slskd", query="partial artist", status=JobStatus.done)
@@ -441,9 +440,13 @@ async def test_catalog_artist_separates_downloaded_files_and_wanted_releases(
             watchlist_provider="musicbrainz",
             last_enriched_at=datetime.now(tz=UTC),
         )
-        partial = CatalogAlbum(title="Partial Album", in_library=False)
-        complete = CatalogAlbum(title="Complete Album", in_library=True)
-        artist.albums.extend([partial, complete])
+        partial = CatalogAlbum(title="Partial Album", release_type="Album", track_count=3)
+        complete = CatalogAlbum(title="Complete Single", release_type="Single", track_count=1)
+        known_unhydrated = CatalogAlbum(
+            title="Known Unhydrated Album", release_type="Album", track_count=4
+        )
+        empty = CatalogAlbum(title="Unknown Empty Album", release_type="Album")
+        artist.albums.extend([partial, complete, known_unhydrated, empty])
         identity = CatalogArtistIdentity(
             provider="musicbrainz",
             provider_artist_id="partial-artist",
@@ -459,14 +462,43 @@ async def test_catalog_artist_separates_downloaded_files_and_wanted_releases(
                 ),
                 CatalogAlbumProvider(
                     provider_album_id="complete",
-                    title="Complete Album",
-                    release_kind="album",
+                    title="Complete Single",
+                    release_kind="single",
                     catalog_album=complete,
+                ),
+                CatalogAlbumProvider(
+                    provider_album_id="known-unhydrated",
+                    title="Known Unhydrated Album",
+                    track_count=4,
+                    release_kind="album",
+                    catalog_album=known_unhydrated,
+                ),
+                CatalogAlbumProvider(
+                    provider_album_id="empty",
+                    title="Unknown Empty Album",
+                    release_kind="album",
+                    catalog_album=empty,
                 ),
             ]
         )
         artist.identities.append(identity)
         session.add_all([job, release, artist])
+        await session.flush()
+        catalog_tracks = {
+            "partial imported": CatalogAlbumTrack(
+                album_id=partial.id, position=1, disc=1, title="Imported File"
+            ),
+            "partial missing": CatalogAlbumTrack(
+                album_id=partial.id, position=2, disc=1, title="Missing File"
+            ),
+            "partial other": CatalogAlbumTrack(
+                album_id=partial.id, position=3, disc=1, title="Other Missing File"
+            ),
+            "complete": CatalogAlbumTrack(
+                album_id=complete.id, position=1, disc=1, title="Complete File"
+            ),
+        }
+        session.add_all(catalog_tracks.values())
         await session.flush()
         imported = _make_track(
             job.id,
@@ -478,6 +510,7 @@ async def test_catalog_artist_separates_downloaded_files_and_wanted_releases(
             release_id=release.id,
         )
         imported.catalog_album_id = partial.id
+        imported.catalog_track_id = catalog_tracks["partial imported"].id
         staging = _make_track(
             job.id,
             title="Staging File",
@@ -488,23 +521,101 @@ async def test_catalog_artist_separates_downloaded_files_and_wanted_releases(
             release_id=release.id,
         )
         staging.catalog_album_id = partial.id
+        staging.catalog_track_id = catalog_tracks["partial missing"].id
         staging.import_state = ImportWorkflowState.discovered
         staging.import_plans[0].status = ImportWorkflowState.discovered
-        session.add_all([imported, staging])
+        failed = _make_track(
+            job.id,
+            title="Failed File",
+            artist=artist.name,
+            album="Partial Album",
+            file_size_bytes=1234,
+            release_id=release.id,
+        )
+        failed.catalog_album_id = partial.id
+        failed.catalog_track_id = catalog_tracks["partial missing"].id
+        failed.import_state = ImportWorkflowState.failed
+        failed.import_plans[0].status = ImportWorkflowState.failed
+        empty_destination = _make_track(
+            job.id,
+            title="Empty Destination",
+            artist=artist.name,
+            album="Partial Album",
+            file_size_bytes=1234,
+            release_id=release.id,
+        )
+        empty_destination.catalog_album_id = partial.id
+        empty_destination.catalog_track_id = catalog_tracks["partial missing"].id
+        empty_destination.import_plans[0].destination_path = "  "
+        zero_byte = _make_track(
+            job.id,
+            title="Zero Byte",
+            artist=artist.name,
+            album="Partial Album",
+            file_size_bytes=0,
+            release_id=release.id,
+        )
+        zero_byte.catalog_album_id = partial.id
+        zero_byte.catalog_track_id = catalog_tracks["partial missing"].id
+        complete_file = _make_track(
+            job.id,
+            title="Complete File",
+            artist=artist.name,
+            album="Complete Single",
+            file_size_bytes=4321,
+            release_id=release.id,
+        )
+        complete_file.catalog_album_id = complete.id
+        complete_file.catalog_track_id = catalog_tracks["complete"].id
+        session.add_all([imported, staging, failed, empty_destination, zero_byte, complete_file])
         await session.commit()
-        artist_id = artist.id
+        return (
+            artist.id,
+            partial.id,
+            {name: track.id for name, track in catalog_tracks.items()},
+        )
+
+
+async def test_catalog_artist_unifies_release_progress_on_existing_cards(
+    client: AsyncClient,
+) -> None:
+    artist_id, partial_id, _ = await _seed_release_progress_artist()
 
     response = await client.get(f"/artists/catalog/{artist_id}")
 
     assert response.status_code == 200
-    assert "Downloaded files" in response.text
-    assert "Wanted releases" in response.text
-    downloaded = response.text.split('data-section="downloaded-files"', 1)[1].split(
-        'data-section="wanted-releases"', 1
-    )[0]
-    wanted = response.text.split('data-section="wanted-releases"', 1)[1].split("</section>", 1)[0]
-    assert "Imported File.flac" in downloaded
-    assert "/music/Partial Artist/Partial Album/01 Imported File.flac" in downloaded
-    assert "Staging File" not in downloaded
-    assert "Partial Album" in wanted
-    assert "Complete Album" not in wanted
+    assert 'data-section="downloaded-files"' not in response.text
+    assert 'data-section="wanted-releases"' not in response.text
+    assert "Downloaded files</h2>" not in response.text
+    assert "Wanted releases</h2>" not in response.text
+    assert "Albums" in response.text
+    assert "Singles &amp; EPs" in response.text
+    assert "1 / 3 downloaded" in response.text
+    assert "1 / 1 downloaded" in response.text
+    assert "0 / 4 downloaded" in response.text
+    assert "0 / 0 downloaded" in response.text
+    assert f'href="/albums/{partial_id}"' in response.text
+
+
+async def test_catalog_album_shows_total_and_per_track_downloaded_wanted_states(
+    client: AsyncClient, monkeypatch
+) -> None:
+    _, partial_id, catalog_track_ids = await _seed_release_progress_artist()
+
+    async def keep_stored_album(db, settings, album):
+        return album
+
+    monkeypatch.setattr("app.routers.catalog.fetch_and_store_album", keep_stored_album)
+    response = await client.get(f"/albums/{partial_id}")
+
+    assert response.status_code == 200
+    assert "1 / 3 downloaded" in response.text
+    imported_id = catalog_track_ids["partial imported"]
+    missing_id = catalog_track_ids["partial missing"]
+    imported_row = response.text.split(f'data-track-id="{imported_id}"', 1)[1].split("</tr>", 1)[0]
+    missing_row = response.text.split(f'data-track-id="{missing_id}"', 1)[1].split("</tr>", 1)[0]
+    assert "Downloaded" in imported_row
+    assert "Wanted" not in imported_row
+    assert f'action="/albums/{partial_id}/tracks/{imported_id}/download"' not in imported_row
+    assert "Wanted" in missing_row
+    assert f'action="/albums/{partial_id}/tracks/{missing_id}/download"' in missing_row
