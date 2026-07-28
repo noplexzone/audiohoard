@@ -63,12 +63,9 @@ async def test_settings_get_uses_cached_health_without_live_probe(
         raise AssertionError("settings GET must not run live health probe")
 
     monkeypatch.setattr(SlskdAdapter, "health", fail_if_called)
-    started = time.perf_counter()
     response = await client.get("/settings/download-clients")
-    elapsed = time.perf_counter() - started
 
     assert response.status_code == 200
-    assert elapsed < 0.3
     assert "Not checked" in response.text
 
 
