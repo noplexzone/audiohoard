@@ -4,6 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import cast
+from urllib.parse import urlsplit
 
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -111,26 +112,53 @@ class DeezerClient:
             album_resp = await request_with_retry(client, "GET", f"/album/{id}")
             album_resp.raise_for_status()
             data = album_resp.json()
-            tracks_raw: list[object] = []
+            embedded_tracks = _embedded_album_tracks(data)
             try:
-                tracks_resp = await request_with_retry(
-                    client, "GET", f"/album/{id}/tracks", params={"limit": 100}
+                tracks_raw = await self._get_album_tracks(client, id)
+            except httpx.HTTPError:
+                if not _tracks_have_authoritative_positions(embedded_tracks):
+                    raise
+                logger.warning(
+                    "Deezer album tracklist lookup failed for %s; "
+                    "using positioned embedded tracks",
+                    id,
                 )
-                tracks_resp.raise_for_status()
-                tracks_raw = tracks_resp.json().get("data", [])
-            except httpx.HTTPError as exc:
-                logger.warning("Deezer album tracklist lookup failed for %s: %s", id, exc)
+                tracks_raw = embedded_tracks
 
+        if not _tracks_have_authoritative_positions(tracks_raw):
+            raise ValueError(f"Deezer album {id} returned tracks without authoritative positions")
         hit = _parse_album_hit(data, artist_id=None)
-        if not tracks_raw:
-            tracks_obj = data.get("tracks", {})
-            tracks_raw = tracks_obj.get("data", []) if isinstance(tracks_obj, dict) else []
         tracks = [_parse_album_track(item) for item in tracks_raw if isinstance(item, dict)]
         values = hit.__dict__.copy()
-        values["track_count"] = len(tracks) or hit.track_count
+        values["track_count"] = max(hit.track_count or 0, len(tracks)) or None
         detail = AlbumDetail(**values, tracks=tracks)
         self._cache.set(cache_key, detail, 24 * 60 * 60)
         return detail
+
+    async def _get_album_tracks(self, client: httpx.AsyncClient, album_id: str) -> list[object]:
+        next_url = f"/album/{album_id}/tracks"
+        params: dict[str, int] | None = {"limit": 100}
+        tracks: list[object] = []
+        visited: set[str] = set()
+        for _ in range(100):
+            response = await request_with_retry(client, "GET", next_url, params=params)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError(f"Deezer album {album_id} returned an invalid tracklist")
+            page = payload.get("data", [])
+            if not isinstance(page, list):
+                raise ValueError(f"Deezer album {album_id} returned an invalid track page")
+            tracks.extend(page)
+            raw_next = payload.get("next")
+            if not raw_next:
+                return tracks
+            next_url = str(raw_next)
+            if not _same_deezer_origin(self._base_url, next_url) or next_url in visited:
+                raise ValueError(f"Deezer album {album_id} returned an unsafe track page")
+            visited.add(next_url)
+            params = None
+        raise ValueError(f"Deezer album {album_id} exceeded the track page limit")
 
     @retry(
         retry=retry_if_exception_type(httpx.TransportError),
@@ -158,6 +186,40 @@ class DeezerClient:
             return None
         resp.raise_for_status()
         return _parse_track(resp.json())
+
+
+def _embedded_album_tracks(data: dict[str, object]) -> list[object]:
+    tracks = data.get("tracks", {})
+    if not isinstance(tracks, dict):
+        return []
+    rows = tracks.get("data", [])
+    return rows if isinstance(rows, list) else []
+
+
+def _tracks_have_authoritative_positions(rows: list[object]) -> bool:
+    if not rows:
+        return False
+    positions: set[tuple[int, int]] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            return False
+        position = _to_int(row.get("track_position"))
+        disc = _to_int(row.get("disk_number")) or 1
+        key = (disc, position or 0)
+        if position is None or position < 1 or key in positions:
+            return False
+        positions.add(key)
+    return True
+
+
+def _same_deezer_origin(base_url: str, candidate: str) -> bool:
+    base = urlsplit(base_url)
+    next_page = urlsplit(candidate)
+    return (
+        next_page.scheme in {"http", "https"}
+        and next_page.scheme == base.scheme
+        and next_page.netloc == base.netloc
+    )
 
 
 async def _backfill_discography_track_counts(

@@ -14,6 +14,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The default album directory format is now `{album} ({year})`, while track filenames retain their disc and track prefixes.
 
 ### Fixed
+- Provider-edition album titles now fall back to canonical MusicBrainz titles during recording reconciliation; Deezer hydration follows every authoritative tracklist page and rejects unpositioned fallbacks before automated mapping.
 - Deezer artist discographies now retain release track totals even though the artist-albums API omits them, with a bounded non-retrying count lookup during provider outages; fully stored album pages avoid redundant refreshes while unknown-count partial manifests still hydrate.
 - Download queue grouping now retains completed release progress without re-exposing hidden attempts, bounds relationship loading to selected groups, and records successful slskd cleanup so startup does not repeat historical transfer deletions.
 - Successful imports now remove empty acquisition directories below the configured staging root while preserving non-empty directories and the staging root itself.
@@ -40,7 +41,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Exposed the ordered Quality profile in Settings and enforced format-family, minimum MP3 bitrate, and lower-quality fallback rules during slskd selection.
 
 ### Fixed
-- Provider-edition album titles now fall back to their canonical MusicBrainz title during recording reconciliation, and Deezer album hydration fetches authoritative track positions before automated verification.
 - Album downloads now hydrate catalog track manifests before dispatch, report incomplete slskd folders as partial with targeted continuations, and release SQLite write locks before provider waits.
 - Approved legacy albums now reconcile catalog tracks and resume transactional import; committed imports remove staging inputs and completed slskd transfers.
 - Library and dashboard projections now exclude staging-only downloads and require committed import destinations.
