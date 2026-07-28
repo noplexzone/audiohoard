@@ -203,6 +203,54 @@ async def test_slskd_success_finds_nested_completed_file(staging_root: Path) -> 
     assert result == staged.resolve()
 
 
+async def test_slskd_success_removes_transfer_only_after_durable_checkpoint(
+    fast_settings: Settings, staging_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staged = staging_root / "song.flac"
+    staged.write_bytes(b"audio")
+    events: list[str] = []
+
+    class CleanupAdapter:
+        def __init__(self, base_url: str, api_key: str) -> None:
+            pass
+
+        async def enqueue(self, username: str, filename: str, size: int | None = None) -> str:
+            return "transfer-1"
+
+        async def status(self, transfer_id: str) -> CapabilityState:
+            return CapabilityState(True, "Completed")
+
+        async def cancel(self, username: str, filename: str) -> None:
+            events.append("cancel")
+
+    monkeypatch.setattr(runner, "SlskdAdapter", CleanupAdapter)
+    track = runner.Track(
+        job_id=1,
+        source="slskd",
+        acquisition_state=runner.AcquisitionState.queued,
+    )
+    result = runner.SearchResult(
+        source="slskd",
+        title="Song",
+        size_bytes=5,
+        metadata={"username": "peer", "filename": "song.flac"},
+    )
+
+    async def checkpoint() -> None:
+        assert track.source_job_id == "transfer-1"
+        if events:
+            assert track.staging_path == str(staged.resolve())
+            assert track.acquisition_state == runner.AcquisitionState.downloaded
+        else:
+            assert track.staging_path is None
+            assert track.acquisition_state == runner.AcquisitionState.acquiring
+        events.append("checkpoint")
+
+    await runner._prepare_acquisition(result, "slskd", fast_settings, track, checkpoint=checkpoint)
+
+    assert events == ["checkpoint", "checkpoint", "cancel"]
+
+
 async def test_slskd_rejects_ambiguous_completed_file(staging_root: Path) -> None:
     for peer in ("peer-a", "peer-b"):
         directory = staging_root / peer
@@ -270,13 +318,14 @@ async def test_slskd_not_found_raises_provider_error(staging_root: Path) -> None
 async def test_slskd_timeout_raises_provider_error(staging_root: Path) -> None:
     class NeverDoneAdapter:
         call_count = 0
+        cancel_calls: list[tuple[str, str]] = []
 
         async def status(self, transfer_id: str) -> CapabilityState:  # noqa: ARG002
             NeverDoneAdapter.call_count += 1
             return CapabilityState(True, "InProgress")
 
-        async def cancel(self, username: str, filename: str) -> None:  # noqa: ARG002
-            pass
+        async def cancel(self, username: str, filename: str) -> None:
+            NeverDoneAdapter.cancel_calls.append((username, filename))
 
     t0 = time.monotonic()
     with pytest.raises(ProviderError) as exc_info:
@@ -294,6 +343,7 @@ async def test_slskd_timeout_raises_provider_error(staging_root: Path) -> None:
     assert exc_info.value.retryable is True
     assert elapsed < 2.0
     assert NeverDoneAdapter.call_count > 0
+    assert NeverDoneAdapter.cancel_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -753,11 +803,18 @@ async def test_prepare_acquisition_checkpoints_enqueue_before_poll(
             events.append("enqueue")
             return "new-transfer"
 
+        async def cancel(self, username: str, filename: str) -> None:
+            events.append("cancel")
+
     async def checkpoint() -> None:
         assert track.source_job_id == "new-transfer"
-        assert track.source_status == "acquiring"
-        assert track.acquisition_state == AcquisitionState.acquiring
         assert track.acquisition_provenance_json is not None
+        if events.count("checkpoint") == 0:
+            assert track.source_status == "acquiring"
+            assert track.acquisition_state == AcquisitionState.acquiring
+        else:
+            assert track.staging_path == str(audio_file)
+            assert track.acquisition_state == AcquisitionState.downloaded
         events.append("checkpoint")
 
     async def fake_poll(
@@ -783,7 +840,7 @@ async def test_prepare_acquisition_checkpoints_enqueue_before_poll(
 
     await runner._prepare_acquisition(result, "slskd", fast_settings, track, checkpoint=checkpoint)
 
-    assert events == ["enqueue", "checkpoint", "poll"]
+    assert events == ["enqueue", "checkpoint", "poll", "checkpoint", "cancel"]
 
 
 async def test_prepare_acquisition_resumes_sab_without_enqueue(

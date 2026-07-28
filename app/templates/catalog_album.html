@@ -5,19 +5,25 @@
   <p class="eyebrow">Catalog album</p>
   <h1>{{ album.artist.name }} — {{ album.title }}</h1>
   <p>{{ album.year or 'Unknown year' }} · {{ album.release_type or 'release' }} {% if album.mbid %}<span class="badge ok">MBID resolved</span>{% else %}<span class="badge warn">Unresolved MBID</span>{% endif %}</p>
+  <p class="release-progress"><strong>{{ progress.downloaded_track_count }} / {{ progress.wanted_track_count }} downloaded</strong></p>
   <form method="post" action="/albums/{{ album.id }}/download">
     <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
     <button type="submit" class="btn">Download album</button>
   </form>
 </header>
 {% if album.tracks %}
-<div class="table-wrap"><table><thead><tr><th>#</th><th>Title</th><th>Duration</th><th>Action</th></tr></thead><tbody>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Title</th><th>Duration</th><th>Status</th><th>Action</th></tr></thead><tbody>
 {% for track in album.tracks %}
-<tr>
+<tr data-track-id="{{ track.id }}">
   <td>{{ track.disc }}-{{ "%02d" % track.position }}</td>
   <td>{{ track.title }}</td>
   <td>{{ ("%d:%02d" % (track.duration_sec // 60, track.duration_sec % 60)) if track.duration_sec else "–" }}</td>
+  {% if track.id in progress.downloaded_catalog_track_ids %}
+  <td><span class="badge ok">Downloaded</span></td><td>–</td>
+  {% else %}
+  <td><span class="badge info">Wanted</span></td>
   <td><form method="post" action="/albums/{{ album.id }}/tracks/{{ track.id }}/download" style="display:inline;"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit" style="padding:0.2rem 0.6rem; font-size:0.8rem;">Download</button></form></td>
+  {% endif %}
 </tr>
 {% endfor %}
 </tbody></table></div>

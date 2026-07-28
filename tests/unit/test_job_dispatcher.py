@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,6 +16,12 @@ os.environ.setdefault("SECRET_KEY", "test-secret")
 from app.database import Base
 from app.jobs.dispatcher import JobDispatcher, JobNotFoundError, JobNotRetryableError
 from app.models.job import Job, JobStatus
+from app.models.track import Track
+from app.models.workflow import AcquisitionState
+from app.services.acquisition_cleanup import (
+    cleanup_durable_slskd_transfers,
+    hide_completed_and_timed_out_jobs,
+)
 
 _TEST_DB = "sqlite+aiosqlite:///:memory:"
 
@@ -185,6 +193,156 @@ class TestRecovery:
         job = await _make_job(session_factory, status=JobStatus.done)
         await dispatcher.recover(session_factory)
         assert job.id not in dispatcher._tasks
+
+
+class TestAutomaticTerminalCleanup:
+    async def test_hides_done_and_timeout_only_after_terminal_rows_are_committed(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            done = Job(source="youtube", query="done", status=JobStatus.done)
+            timeout = Job(source="slskd", query="timeout", status=JobStatus.failed)
+            ordinary = Job(source="slskd", query="ordinary failure", status=JobStatus.failed)
+            mixed = Job(source="slskd", query="mixed timeout", status=JobStatus.partial)
+            session.add_all([done, timeout, ordinary, mixed])
+            await session.flush()
+            continuation = Job(
+                source="priority",
+                query="alternate source",
+                status=JobStatus.pending,
+                parent_job_id=timeout.id,
+            )
+            session.add(continuation)
+            session.add_all(
+                [
+                    Track(
+                        job_id=timeout.id,
+                        source="slskd",
+                        source_job_id="timeout-transfer",
+                        source_status="transfer_timeout",
+                        acquisition_state=AcquisitionState.failed,
+                    ),
+                    Track(
+                        job_id=ordinary.id,
+                        source="slskd",
+                        source_job_id="failed-transfer",
+                        source_status="transfer_failed",
+                        acquisition_state=AcquisitionState.failed,
+                    ),
+                    Track(
+                        job_id=mixed.id,
+                        source="slskd",
+                        source_job_id="mixed-timeout-transfer",
+                        source_status="transfer_timeout",
+                        acquisition_state=AcquisitionState.failed,
+                    ),
+                    Track(
+                        job_id=mixed.id,
+                        source="youtube",
+                        source_status="result_processing_failed",
+                        acquisition_state=AcquisitionState.failed,
+                    ),
+                ]
+            )
+            await session.commit()
+            ids = (done.id, timeout.id, ordinary.id, mixed.id, continuation.id)
+
+        hidden = await hide_completed_and_timed_out_jobs(session_factory)
+
+        assert hidden == [ids[0], ids[1]]
+        async with session_factory() as session:
+            rows = [await session.get(Job, job_id) for job_id in ids]
+            assert [row.queue_hidden for row in rows if row is not None] == [
+                True,
+                True,
+                False,
+                False,
+                False,
+            ]
+
+    async def test_slskd_cleanup_is_idempotent_and_runs_without_database_transaction(
+        self, session_factory: async_sessionmaker[AsyncSession], tmp_path: Path
+    ) -> None:
+        staged = tmp_path / "song.flac"
+        staged.write_bytes(b"audio")
+        async with session_factory() as session:
+            success_job = Job(source="slskd", query="success", status=JobStatus.done)
+            timeout_job = Job(source="slskd", query="timeout", status=JobStatus.failed)
+            failed_job = Job(source="slskd", query="failed", status=JobStatus.failed)
+            session.add_all([success_job, timeout_job, failed_job])
+            await session.flush()
+            session.add_all(
+                [
+                    Track(
+                        job_id=success_job.id,
+                        source="slskd",
+                        source_job_id="success-transfer",
+                        source_status="downloaded",
+                        staging_path=str(staged),
+                        acquisition_provenance_json=json.dumps(
+                            {
+                                "source": "slskd",
+                                "username": "success-peer",
+                                "filename": "success.flac",
+                            }
+                        ),
+                        acquisition_state=AcquisitionState.downloaded,
+                    ),
+                    Track(
+                        job_id=timeout_job.id,
+                        source="slskd",
+                        source_job_id="timeout-transfer",
+                        source_status="transfer_timeout",
+                        acquisition_provenance_json=json.dumps(
+                            {
+                                "source": "slskd",
+                                "username": "timeout-peer",
+                                "filename": "timeout.flac",
+                            }
+                        ),
+                        acquisition_state=AcquisitionState.failed,
+                    ),
+                    Track(
+                        job_id=failed_job.id,
+                        source="slskd",
+                        source_job_id="failed-transfer",
+                        source_status="transfer_failed",
+                        acquisition_provenance_json=json.dumps(
+                            {
+                                "source": "slskd",
+                                "username": "failed-peer",
+                                "filename": "failed.flac",
+                            }
+                        ),
+                        acquisition_state=AcquisitionState.failed,
+                    ),
+                ]
+            )
+            await session.commit()
+
+        calls: list[tuple[str, str]] = []
+
+        class FakeAdapter:
+            async def cancel(self, username: str, filename: str) -> None:
+                # A separate write proves the candidate-read session is closed before HTTP I/O.
+                async with session_factory() as writer:
+                    row = await writer.get(Job, failed_job.id)
+                    assert row is not None
+                    row.query = "provider call completed"
+                    await writer.commit()
+                calls.append((username, filename))
+
+        first = await cleanup_durable_slskd_transfers(session_factory, FakeAdapter())
+        second = await cleanup_durable_slskd_transfers(session_factory, FakeAdapter())
+
+        assert first == 2
+        assert second == 2
+        assert calls == [
+            ("success-peer", "success.flac"),
+            ("timeout-peer", "timeout.flac"),
+            ("success-peer", "success.flac"),
+            ("timeout-peer", "timeout.flac"),
+        ]
 
 
 class TestRetry:

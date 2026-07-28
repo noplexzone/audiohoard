@@ -16,11 +16,13 @@ from sqlalchemy.orm import selectinload
 from app.auth import get_current_user, require_mutation
 from app.database import get_db
 from app.jobs.dispatcher import JobNotFoundError, JobStateError, job_dispatcher
+from app.models.catalog_entities import CatalogAlbum
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.staging_review import StagingReviewItem
 from app.models.workflow import ImportWorkflowState, ReviewDecision
 from app.schemas.job import JobCreate, JobRead, SelectedResultPayload
+from app.services.download_queue import project_download_groups
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 logger = logging.getLogger(__name__)
@@ -99,14 +101,26 @@ async def downloads_page(
     query = (
         select(Job)
         .where(Job.queue_hidden.is_(False))
-        .options(selectinload(Job.tracks))
+        .options(
+            selectinload(Job.tracks),
+            selectinload(Job.catalog_album).selectinload(CatalogAlbum.artist),
+            selectinload(Job.catalog_album).selectinload(CatalogAlbum.tracks),
+        )
         .order_by(Job.created_at.desc())
         .limit(100)
     )
-    if status is not None:
-        query = query.where(Job.status == status)
     result = await db.execute(query)
     downloads = list(result.scalars().all())
+    parent_rows = (await db.execute(select(Job.id, Job.parent_job_id))).all()
+    download_groups = project_download_groups(
+        downloads, {int(job_id): parent_id for job_id, parent_id in parent_rows}
+    )
+    if status is not None:
+        download_groups = [
+            group
+            for group in download_groups
+            if any(attempt.job.status == status for attempt in group.attempts)
+        ]
     review_result = await db.execute(
         select(StagingReviewItem)
         .where(
@@ -189,6 +203,7 @@ async def downloads_page(
         {
             "downloads": downloads,
             "jobs": downloads,
+            "download_groups": download_groups,
             "pending_review_items": pending_review_items,
             "release_reviews": release_reviews,
             "notice": notice,

@@ -25,9 +25,10 @@ from app.models.catalog_entities import (
 )
 from app.models.job import Job, JobStatus
 from app.services.catalog import (
+    ReleaseProgress,
     get_artist_detail,
-    get_catalog_artist_library_sections,
     get_library_artists_page,
+    get_release_progress,
 )
 from app.services.catalog_metadata import (
     VALID_METADATA_PROVIDERS,
@@ -336,12 +337,26 @@ async def catalog_artist_page(
         None,
     )
     provider_albums = list(selected_identity.releases) if selected_identity is not None else []
-    library_sections = await get_catalog_artist_library_sections(
+    canonical_progress = await get_release_progress(
         db,
-        artist_id=artist.id,
-        identity_id=selected_identity.id if selected_identity is not None else None,
-        artist_name=artist.name,
+        {
+            release.catalog_album_id
+            for release in provider_albums
+            if release.catalog_album_id is not None
+        },
     )
+    release_progress: dict[int, ReleaseProgress] = {}
+    for release in provider_albums:
+        projected = canonical_progress.get(
+            release.catalog_album_id or 0,
+            ReleaseProgress(wanted_track_count=0, downloaded_track_count=0),
+        )
+        wanted = max(projected.wanted_track_count, release.track_count or 0)
+        release_progress[release.id] = ReleaseProgress(
+            wanted_track_count=wanted,
+            downloaded_track_count=min(projected.downloaded_track_count, wanted),
+            downloaded_catalog_track_ids=projected.downloaded_catalog_track_ids,
+        )
     albums = sorted(
         provider_albums,
         key=lambda release: (release.year or "0000", release.title.casefold()),
@@ -354,11 +369,6 @@ async def catalog_artist_page(
     }.get(release_type)
     if requested_kinds:
         albums = [release for release in albums if release.release_kind in requested_kinds]
-        library_sections.wanted_releases = [
-            release
-            for release in library_sections.wanted_releases
-            if release.release_kind in requested_kinds
-        ]
     else:
         release_type = ""
     release_types = sorted(
@@ -437,7 +447,7 @@ async def catalog_artist_page(
             "selected_provider": selected_provider,
             "sort_url": sort_url,
             "enrichment": enrichment,
-            "library_sections": library_sections,
+            "release_progress": release_progress,
         },
     )
 
@@ -664,7 +674,12 @@ async def catalog_album_page(
         .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
     )
     album = result.scalar_one()
-    return _templates(request).TemplateResponse(request, "catalog_album.html", {"album": album})
+    progress = (await get_release_progress(db, [album.id]))[album.id]
+    return _templates(request).TemplateResponse(
+        request,
+        "catalog_album.html",
+        {"album": album, "progress": progress},
+    )
 
 
 @router.post("/artists/catalog/{artist_id}/download-monitored", include_in_schema=False)

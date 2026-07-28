@@ -7,6 +7,7 @@ from httpx import AsyncClient
 
 from app.database import get_session_factory
 from app.jobs.dispatcher import job_dispatcher
+from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.track import Track
 from app.models.workflow import AcquisitionState
@@ -320,3 +321,163 @@ async def test_downloads_slow_source_page_renders_while_blocked(client: AsyncCli
     assert "Elapsed" in second.text
     assert "Last activity" in second.text
     assert "Active jobs refresh every 10 seconds" in second.text
+
+
+async def test_downloads_group_album_jobs_and_target_active_attempt(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(name="Grouped Artist")
+        album = CatalogAlbum(title="Grouped Release", track_count=3)
+        artist.albums.append(album)
+        album.tracks.extend(
+            [
+                CatalogAlbumTrack(position=1, disc=1, title="First"),
+                CatalogAlbumTrack(position=2, disc=1, title="Second"),
+                CatalogAlbumTrack(position=3, disc=1, title="Third"),
+            ]
+        )
+        db.add(artist)
+        await db.flush()
+        root = Job(
+            source="slskd",
+            query="Grouped Artist Grouped Release",
+            status=JobStatus.partial,
+            catalog_album_id=album.id,
+        )
+        independent = Job(
+            source="youtube",
+            query="Grouped Release second search",
+            status=JobStatus.failed,
+            catalog_album_id=album.id,
+            catalog_track_id=album.tracks[1].id,
+            result_json=json.dumps(
+                {"error": {"code": "source_failed", "detail": "Second source failed"}}
+            ),
+        )
+        standalone = Job(source="prowlarr", query="Unrelated Release", status=JobStatus.failed)
+        db.add_all([root, independent, standalone])
+        await db.flush()
+        continuation = Job(
+            source="priority",
+            query="Grouped Release Third",
+            status=JobStatus.running,
+            catalog_album_id=album.id,
+            catalog_track_id=album.tracks[2].id,
+            parent_job_id=root.id,
+        )
+        db.add(continuation)
+        await db.flush()
+        db.add_all(
+            [
+                Track(
+                    job_id=root.id,
+                    source="slskd",
+                    title="First",
+                    catalog_album_id=album.id,
+                    catalog_track_id=album.tracks[0].id,
+                    acquisition_state=AcquisitionState.downloaded,
+                ),
+                Track(
+                    job_id=independent.id,
+                    source="youtube",
+                    title="Second",
+                    catalog_album_id=album.id,
+                    catalog_track_id=album.tracks[1].id,
+                    acquisition_state=AcquisitionState.failed,
+                ),
+                Track(
+                    job_id=continuation.id,
+                    source="slskd",
+                    title="Third",
+                    catalog_album_id=album.id,
+                    catalog_track_id=album.tracks[2].id,
+                    acquisition_state=AcquisitionState.acquiring,
+                ),
+            ]
+        )
+        await db.commit()
+        root_id = root.id
+        independent_id = independent.id
+        continuation_id = continuation.id
+        album_id = album.id
+
+    response = await client.get("/downloads")
+
+    assert response.status_code == 200
+    assert response.text.count(f'data-download-group="album:{album_id}"') == 1
+    assert "Grouped Artist — Grouped Release" in response.text
+    assert "1 / 3 downloaded" in response.text
+    assert "3 attempts" in response.text
+    assert f"#{root_id}" in response.text
+    assert f"#{independent_id}" in response.text
+    assert f"#{continuation_id}" in response.text
+    assert "Second source failed" in response.text
+    assert f'action="/downloads/{continuation_id}/cancel"' in response.text
+    assert f'action="/downloads/{independent_id}/retry"' not in response.text
+    assert response.text.count('data-download-group="job:') == 1
+    assert "Unrelated Release" in response.text
+
+    failed = await client.get("/downloads?status=failed")
+    assert failed.status_code == 200
+    assert failed.text.count(f'data-download-group="album:{album_id}"') == 1
+    assert "Grouped Release" in failed.text
+    assert "3 attempts" in failed.text
+    assert f'action="/downloads/{continuation_id}/cancel"' in failed.text
+    assert f'action="/downloads/{independent_id}/retry"' not in failed.text
+    assert "Unrelated Release" in failed.text
+
+
+async def test_downloads_group_parent_chain_without_catalog_album(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        root = Job(source="slskd", query="Chain Root", status=JobStatus.partial)
+        standalone = Job(source="youtube", query="Standalone", status=JobStatus.failed)
+        db.add_all([root, standalone])
+        await db.flush()
+        child = Job(
+            source="priority",
+            query="Chain Continuation",
+            status=JobStatus.pending,
+            parent_job_id=root.id,
+        )
+        db.add(child)
+        await db.commit()
+        root_id = root.id
+        child_id = child.id
+
+    response = await client.get("/downloads")
+
+    assert response.status_code == 200
+    assert response.text.count(f'data-download-group="chain:{root_id}"') == 1
+    assert f"#{root_id}" in response.text
+    assert f"#{child_id}" in response.text
+    assert response.text.count('data-download-group="job:') == 1
+
+
+async def test_downloads_group_uses_declared_count_before_manifest_hydration(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(name="Manifest Pending Artist")
+        album = CatalogAlbum(title="Manifest Pending Release", track_count=12)
+        artist.albums.append(album)
+        db.add(artist)
+        await db.flush()
+        job = Job(
+            source="slskd",
+            query="Manifest Pending Artist Manifest Pending Release",
+            status=JobStatus.pending,
+            catalog_album_id=album.id,
+        )
+        db.add(job)
+        await db.commit()
+        album_id = album.id
+
+    response = await client.get("/downloads")
+
+    assert response.status_code == 200
+    group = response.text.split(f'data-download-group="album:{album_id}"', 1)[1].split("</tr>", 1)[
+        0
+    ]
+    assert "0 / 12 downloaded" in group
