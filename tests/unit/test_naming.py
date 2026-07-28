@@ -6,7 +6,7 @@ import pytest
 
 from app.naming.convention import NamingError, _sanitize_segment, render_path
 
-DEFAULT = "{album_artist}/{year} - {album}/{disc_track} - {title}.{ext}"
+DEFAULT = "{album_artist}/{album} ({year})/{disc_track} - {title}.{ext}"
 
 
 class TestSanitizeSegment:
@@ -58,7 +58,7 @@ class TestRenderPath:
             ext="flac",
             template=DEFAULT,
         )
-        assert path == "Queen/1975 - A Night at the Opera/11 - Bohemian Rhapsody.flac"
+        assert path == "Queen/A Night at the Opera (1975)/11 - Bohemian Rhapsody.flac"
 
     def test_nominal_multi_disc(self) -> None:
         path = render_path(
@@ -72,7 +72,7 @@ class TestRenderPath:
             ext="flac",
             template=DEFAULT,
         )
-        assert path == "Pink Floyd/1979 - The Wall/2-06 - Comfortably Numb.flac"
+        assert path == "Pink Floyd/The Wall (1979)/2-06 - Comfortably Numb.flac"
 
     def test_track_zero_padded_two_digits(self) -> None:
         path = render_path(
@@ -163,7 +163,7 @@ class TestRenderPath:
             },
             template=DEFAULT,
         )
-        assert path == "Artist/2020 - Album/03 - Song.flac"
+        assert path == "Artist/Album (2020)/03 - Song.flac"
 
     def test_accepts_track_like_object(self) -> None:
         class TrackLike:
@@ -177,7 +177,7 @@ class TestRenderPath:
             track_no = 3
             source_path = "/downloads/song.mp3"
 
-        assert render_path(TrackLike(), template=DEFAULT) == "Artist/2020 - Album/2-03 - Song.mp3"
+        assert render_path(TrackLike(), template=DEFAULT) == "Artist/Album (2020)/2-03 - Song.mp3"
 
     def test_unknown_template_token_raises(self) -> None:
         with pytest.raises(NamingError, match="token"):

@@ -17,7 +17,7 @@ A private, self-hosted FastAPI application that coordinates music acquisition, m
 - External API calls are bounded, rate-limited where required, and retried only when safe.
 
 ### Naming and file operations
-- The default naming template is `{album_artist}/{year} - {album}/{disc_track} - {title}.{ext}`. One-disc releases use `TT`; multi-disc releases use `D-TT`.
+- The default naming template is `{album_artist}/{album} ({year})/{disc_track} - {title}.{ext}`. One-disc releases use `TT`; multi-disc releases use `D-TT`.
 - Library writes occur only through a persisted, reviewed import plan.
 - Import execution must enforce staging/library containment, collision policy, metadata write/readback verification, atomic replacement, and filesystem rollback.
 - The library mount must be writable when imports are enabled. Never delete or reorganize unrelated library files.

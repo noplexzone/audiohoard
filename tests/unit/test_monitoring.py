@@ -109,7 +109,7 @@ async def test_upgrade_failure_preserves_existing_library_file(db_session, tmp_p
     )
     db_session.add(track)
     await db_session.flush()
-    destination = tmp_path / "library" / "Artist" / "2000 - Album" / "01 - Song.wav"
+    destination = tmp_path / "library" / "Artist" / "Album (2000)" / "01 - Song.wav"
     destination.parent.mkdir(parents=True)
     destination.write_bytes(b"old preferred file")
     plans = await plan_release_import(db_session, release, library_root=tmp_path / "library")
@@ -262,7 +262,7 @@ async def test_upgrade_uses_only_candidate_bound_artifact(db_session, tmp_path: 
     )
     db_session.add(record)
     await db_session.flush()
-    destination = tmp_path / "library" / "Artist" / "2000 - Album" / "01 - Song.flac"
+    destination = tmp_path / "library" / "Artist" / "Album (2000)" / "01 - Song.flac"
     destination.parent.mkdir(parents=True)
     destination.write_bytes(b"old preferred bytes")
 

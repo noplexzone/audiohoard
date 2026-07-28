@@ -34,8 +34,7 @@
       {% set path = request.url.path %}
       <a href="/" {% if path == "/" %}class="active" aria-current="page"{% endif %}><svg><use href="#i-home"/></svg><span>Dashboard</span></a>
       <a href="/search" {% if path.startswith("/search") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-search"/></svg><span>Search</span></a>
-      <a href="/library" {% if path.startswith("/library") or path.startswith("/tracks") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
-      <a href="/artists" {% if path.startswith("/artists") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-artists"/></svg><span>Artists</span></a>
+      <a href="/library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
       <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span></a>
     </nav>
     <nav class="utility-nav" aria-label="Utilities">
@@ -69,7 +68,6 @@
     <a href="/" {% if path == "/" %}class="active" aria-current="page"{% endif %}><svg><use href="#i-home"/></svg><span>Home</span></a>
     <a href="/search" {% if path.startswith("/search") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-search"/></svg><span>Search</span></a>
     <a href="/library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
-    <a href="/artists" {% if path.startswith("/artists") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-artists"/></svg><span>Artists</span></a>
     <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span></a>
   </nav>
   {% endif %}

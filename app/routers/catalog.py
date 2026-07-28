@@ -26,11 +26,8 @@ from app.models.catalog_entities import (
 from app.models.job import Job, JobStatus
 from app.services.catalog import (
     get_artist_detail,
-    get_library_stats,
-    get_watchlisted_artists_page,
-    list_distinct_formats,
-    list_distinct_sources,
-    list_library_tracks,
+    get_catalog_artist_library_sections,
+    get_library_artists_page,
 )
 from app.services.catalog_metadata import (
     VALID_METADATA_PROVIDERS,
@@ -176,82 +173,16 @@ async def library_page(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     q: str = "",
-    artist: str = "",
-    album: str = "",
-    source: str = "",
-    fmt: str = "",
-    sort: str = "added",
-    page: int = Query(default=1, ge=1, le=10_000),
-    per_page: int = Query(default=50, ge=1, le=200),
-) -> HTMLResponse:
-    stats = await get_library_stats(db)
-    all_sources = await list_distinct_sources(db)
-    all_formats = await list_distinct_formats(db)
-    tracks = await list_library_tracks(
-        db,
-        q=q,
-        artist=artist,
-        album=album,
-        source=source,
-        fmt=fmt,
-        sort=sort,
-        page=page,
-        per_page=per_page,
-    )
-
-    filter_params: dict[str, str] = {}
-    if q:
-        filter_params["q"] = q
-    if artist:
-        filter_params["artist"] = artist
-    if album:
-        filter_params["album"] = album
-    if source:
-        filter_params["source"] = source
-    if fmt:
-        filter_params["fmt"] = fmt
-    filter_params["sort"] = sort
-    filter_params["per_page"] = str(per_page)
-    filter_qs = urlencode(filter_params)
-
-    return _templates(request).TemplateResponse(
-        request,
-        "library.html",
-        {
-            "stats": stats,
-            "tracks": tracks,
-            "all_sources": all_sources,
-            "all_formats": all_formats,
-            "q": q,
-            "filter_artist": artist,
-            "filter_album": album,
-            "filter_source": source,
-            "filter_fmt": fmt,
-            "sort": sort,
-            "per_page": per_page,
-            "filter_qs": filter_qs,
-        },
-    )
-
-
-@router.get("/artists", response_class=HTMLResponse)
-async def artists_page(
-    request: Request,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    q: str = "",
     sort: str = "name",
     page: int = Query(default=1, ge=1, le=10_000),
     per_page: int = Query(default=50, ge=1, le=200),
 ) -> HTMLResponse:
-    artists = await get_watchlisted_artists_page(db, q=q, sort=sort, page=page, per_page=per_page)
-
+    artists = await get_library_artists_page(db, q=q, sort=sort, page=page, per_page=per_page)
     filter_params: dict[str, str] = {}
     if q:
         filter_params["q"] = q
     filter_params["sort"] = sort
     filter_params["per_page"] = str(per_page)
-    filter_qs = urlencode(filter_params)
-
     return _templates(request).TemplateResponse(
         request,
         "artists.html",
@@ -260,9 +191,16 @@ async def artists_page(
             "q": q,
             "sort": sort,
             "per_page": per_page,
-            "filter_qs": filter_qs,
+            "filter_qs": urlencode(filter_params),
         },
     )
+
+
+@router.get("/artists", include_in_schema=False)
+async def artists_page(request: Request) -> RedirectResponse:
+    query = request.scope.get("query_string", b"").decode("ascii")
+    location = "/library" + (f"?{query}" if query else "")
+    return RedirectResponse(location, status_code=307)
 
 
 @router.get("/artists/detail", response_class=HTMLResponse)
@@ -398,6 +336,12 @@ async def catalog_artist_page(
         None,
     )
     provider_albums = list(selected_identity.releases) if selected_identity is not None else []
+    library_sections = await get_catalog_artist_library_sections(
+        db,
+        artist_id=artist.id,
+        identity_id=selected_identity.id if selected_identity is not None else None,
+        artist_name=artist.name,
+    )
     albums = sorted(
         provider_albums,
         key=lambda release: (release.year or "0000", release.title.casefold()),
@@ -410,6 +354,11 @@ async def catalog_artist_page(
     }.get(release_type)
     if requested_kinds:
         albums = [release for release in albums if release.release_kind in requested_kinds]
+        library_sections.wanted_releases = [
+            release
+            for release in library_sections.wanted_releases
+            if release.release_kind in requested_kinds
+        ]
     else:
         release_type = ""
     release_types = sorted(
@@ -488,6 +437,7 @@ async def catalog_artist_page(
             "selected_provider": selected_provider,
             "sort_url": sort_url,
             "enrichment": enrichment,
+            "library_sections": library_sections,
         },
     )
 
@@ -680,12 +630,12 @@ async def monitor_catalog_artist_page(
 
 @router.get("/artists/monitored", include_in_schema=False)
 async def monitored_artists_page() -> RedirectResponse:
-    return RedirectResponse("/artists", status_code=303)
+    return RedirectResponse("/library", status_code=303)
 
 
 @router.get("/wanted", include_in_schema=False)
 async def wanted_page() -> RedirectResponse:
-    return RedirectResponse("/artists", status_code=303)
+    return RedirectResponse("/library", status_code=303)
 
 
 @router.get("/albums/{album_id}", response_class=HTMLResponse)

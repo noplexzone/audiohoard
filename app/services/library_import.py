@@ -35,7 +35,7 @@ from app.services.pinned_destination import PinnedDestination
 
 logger = logging.getLogger(__name__)
 
-_DESTINATION_TEMPLATE = "{album_artist}/{year} - {album}/{disc_track} - {title}.{ext}"
+_DESTINATION_TEMPLATE = "{album_artist}/{album} ({year})/{disc_track} - {title}.{ext}"
 
 
 class ImportPlanningError(ValueError):
