@@ -782,6 +782,8 @@ def _catalog_manifest_issue(
         identities.add(identity)
     if expected_count and len(tracks) < expected_count:
         return "catalog_tracks_incomplete"
+    if expected_count and len(tracks) > expected_count:
+        return "catalog_tracks_overfull"
     return None
 
 

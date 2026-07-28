@@ -1194,3 +1194,12 @@ async def test_rehydration_rejects_invalid_provider_positions_before_mutation(
     for item in original_tracks:
         await db_session.refresh(item)
     assert [(item.disc, item.position) for item in original_tracks] == original_positions
+
+
+def test_manifest_validation_rejects_overfull_catalog() -> None:
+    tracks = [
+        CatalogAlbumTrack(album_id=1, position=position, disc=1, title=f"Track {position}")
+        for position in range(1, 5)
+    ]
+
+    assert runner._catalog_manifest_issue(tracks, 3) == "catalog_tracks_overfull"
