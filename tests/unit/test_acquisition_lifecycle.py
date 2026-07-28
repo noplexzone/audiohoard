@@ -203,7 +203,7 @@ async def test_slskd_success_finds_nested_completed_file(staging_root: Path) -> 
     assert result == staged.resolve()
 
 
-async def test_slskd_success_removes_transfer_only_after_durable_checkpoint(
+async def test_slskd_success_leaves_transfer_for_terminal_cleanup_after_checkpoint(
     fast_settings: Settings, staging_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     staged = staging_root / "song.flac"
@@ -248,7 +248,7 @@ async def test_slskd_success_removes_transfer_only_after_durable_checkpoint(
 
     await runner._prepare_acquisition(result, "slskd", fast_settings, track, checkpoint=checkpoint)
 
-    assert events == ["checkpoint", "checkpoint", "cancel"]
+    assert events == ["checkpoint", "checkpoint"]
 
 
 async def test_slskd_rejects_ambiguous_completed_file(staging_root: Path) -> None:
@@ -840,7 +840,7 @@ async def test_prepare_acquisition_checkpoints_enqueue_before_poll(
 
     await runner._prepare_acquisition(result, "slskd", fast_settings, track, checkpoint=checkpoint)
 
-    assert events == ["enqueue", "checkpoint", "poll", "checkpoint", "cancel"]
+    assert events == ["enqueue", "checkpoint", "poll", "checkpoint"]
 
 
 async def test_prepare_acquisition_resumes_sab_without_enqueue(

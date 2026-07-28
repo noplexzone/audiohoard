@@ -1214,10 +1214,6 @@ async def _prepare_acquisition(
                     track.file_format = suffix
         if checkpoint is not None:
             await checkpoint()
-            try:
-                await adapter.cancel(username, filename)
-            except Exception:
-                logger.exception("post-checkpoint slskd transfer cleanup failed")
         return transfer_id, "downloaded"
     if source != "prowlarr":
         if track is not None:

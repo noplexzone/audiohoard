@@ -343,6 +343,7 @@ async def test_downloads_group_album_jobs_and_target_active_attempt(client: Asyn
             query="Grouped Artist Grouped Release",
             status=JobStatus.partial,
             catalog_album_id=album.id,
+            queue_hidden=True,
         )
         independent = Job(
             source="youtube",
@@ -356,6 +357,13 @@ async def test_downloads_group_album_jobs_and_target_active_attempt(client: Asyn
         )
         standalone = Job(source="prowlarr", query="Unrelated Release", status=JobStatus.failed)
         db.add_all([root, independent, standalone])
+        await db.flush()
+        db.add_all(
+            [
+                Job(source="youtube", query=f"Noise {index}", status=JobStatus.pending)
+                for index in range(98)
+            ]
+        )
         await db.flush()
         continuation = Job(
             source="priority",
@@ -407,21 +415,21 @@ async def test_downloads_group_album_jobs_and_target_active_attempt(client: Asyn
     assert response.text.count(f'data-download-group="album:{album_id}"') == 1
     assert "Grouped Artist — Grouped Release" in response.text
     assert "1 / 3 downloaded" in response.text
-    assert "3 attempts" in response.text
-    assert f"#{root_id}" in response.text
+    assert "2 attempts" in response.text
+    assert f"<code>#{root_id}</code>" not in response.text
     assert f"#{independent_id}" in response.text
     assert f"#{continuation_id}" in response.text
     assert "Second source failed" in response.text
     assert f'action="/downloads/{continuation_id}/cancel"' in response.text
     assert f'action="/downloads/{independent_id}/retry"' not in response.text
-    assert response.text.count('data-download-group="job:') == 1
+    assert response.text.count('data-download-group="') == 100
     assert "Unrelated Release" in response.text
 
     failed = await client.get("/downloads?status=failed")
     assert failed.status_code == 200
     assert failed.text.count(f'data-download-group="album:{album_id}"') == 1
     assert "Grouped Release" in failed.text
-    assert "3 attempts" in failed.text
+    assert "2 attempts" in failed.text
     assert f'action="/downloads/{continuation_id}/cancel"' in failed.text
     assert f'action="/downloads/{independent_id}/retry"' not in failed.text
     assert "Unrelated Release" in failed.text

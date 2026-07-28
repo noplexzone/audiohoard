@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 os.environ.setdefault("SECRET_KEY", "test-secret")
@@ -336,13 +337,75 @@ class TestAutomaticTerminalCleanup:
         second = await cleanup_durable_slskd_transfers(session_factory, FakeAdapter())
 
         assert first == 2
-        assert second == 2
+        assert second == 0
         assert calls == [
             ("success-peer", "success.flac"),
             ("timeout-peer", "timeout.flac"),
-            ("success-peer", "success.flac"),
-            ("timeout-peer", "timeout.flac"),
         ]
+        async with session_factory() as session:
+            cleaned = list(
+                (
+                    await session.scalars(
+                        select(Track).where(Track.job_id.in_([success_job.id, timeout_job.id]))
+                    )
+                ).all()
+            )
+            assert all(
+                json.loads(track.acquisition_provenance_json or "{}").get(
+                    "source_cleanup_completed_at"
+                )
+                for track in cleaned
+            )
+
+    async def test_slskd_cleanup_does_not_mark_a_concurrently_reassigned_transfer(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            job = Job(source="slskd", query="race", status=JobStatus.failed)
+            session.add(job)
+            await session.flush()
+            track = Track(
+                job_id=job.id,
+                source="slskd",
+                source_job_id="old-transfer",
+                source_status="transfer_timeout",
+                acquisition_provenance_json=json.dumps(
+                    {"source": "slskd", "username": "old-peer", "filename": "old.flac"}
+                ),
+                acquisition_state=AcquisitionState.failed,
+            )
+            session.add(track)
+            await session.commit()
+            track_id = track.id
+
+        class ReassigningAdapter:
+            async def cancel(self, username: str, filename: str) -> None:
+                assert (username, filename) == ("old-peer", "old.flac")
+                async with session_factory() as writer:
+                    current = await writer.get(Track, track_id)
+                    assert current is not None
+                    current.source_job_id = "new-transfer"
+                    current.source_status = "acquiring"
+                    current.acquisition_state = AcquisitionState.acquiring
+                    current.acquisition_provenance_json = json.dumps(
+                        {
+                            "source": "slskd",
+                            "username": "old-peer",
+                            "filename": "old.flac",
+                        }
+                    )
+                    await writer.commit()
+
+        removed = await cleanup_durable_slskd_transfers(session_factory, ReassigningAdapter())
+
+        assert removed == 1
+        async with session_factory() as session:
+            current = await session.get(Track, track_id)
+            assert current is not None
+            provenance = json.loads(current.acquisition_provenance_json or "{}")
+            assert current.source_job_id == "new-transfer"
+            assert provenance["username"] == "old-peer"
+            assert "source_cleanup_completed_at" not in provenance
 
 
 class TestRetry:
