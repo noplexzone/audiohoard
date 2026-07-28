@@ -28,6 +28,7 @@ from app.services.catalog_metadata import (
     reconcile_duplicate_catalog_albums,
     reconcile_duplicate_catalog_artists,
     upsert_catalog_artist,
+    upsert_provider_release,
 )
 
 
@@ -48,6 +49,39 @@ def test_album_title_normalization_folds_typographic_punctuation() -> None:
         release_type="single",
     )
     assert _album_keys_match(mb, dz)
+
+
+async def test_provider_refresh_does_not_erase_a_known_track_count(db_session) -> None:
+    artist = CatalogArtist(name="Known Count Artist")
+    identity = CatalogArtistIdentity(
+        provider="deezer", provider_artist_id="artist-1", name=artist.name
+    )
+    release = CatalogAlbumProvider(
+        provider_album_id="album-1",
+        title="Known Count Album",
+        track_count=7,
+        release_kind="album",
+    )
+    identity.releases.append(release)
+    artist.identities.append(identity)
+    db_session.add(artist)
+    await db_session.flush()
+
+    refreshed = await upsert_provider_release(
+        db_session,
+        artist,
+        identity,
+        AlbumHit(
+            provider="deezer",
+            provider_id="album-1",
+            title="Known Count Album",
+            release_kind="album",
+            track_count=None,
+        ),
+    )
+
+    assert refreshed.track_count == 7
+    assert json.loads(refreshed.metadata_json or "{}")["track_count_checked"] is True
 
 
 async def test_reconcile_duplicate_catalog_albums_merges_legacy_curly_apostrophe_duplicate(

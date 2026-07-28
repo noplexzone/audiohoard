@@ -19,6 +19,7 @@ from app.database import get_db
 from app.jobs.dispatcher import job_dispatcher
 from app.models.catalog_entities import (
     CatalogAlbum,
+    CatalogAlbumProvider,
     CatalogAlbumTrack,
     CatalogArtist,
     CatalogArtistIdentity,
@@ -119,6 +120,16 @@ def _artist_page_url(
         params["enrichment"] = enrichment
     query = urlencode(params)
     return f"/artists/catalog/{artist_id}" + (f"?{query}" if query else "")
+
+
+def _release_needs_track_count_refresh(release: CatalogAlbumProvider) -> bool:
+    if release.track_count is not None:
+        return False
+    try:
+        metadata = json.loads(release.metadata_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return True
+    return not isinstance(metadata, dict) or not metadata.get("track_count_checked", False)
 
 
 def _sanitize_error_class(exc: BaseException) -> str:
@@ -312,7 +323,10 @@ async def catalog_artist_page(
         None,
     )
     try:
-        if selected_identity is not None and not selected_identity.releases:
+        if selected_identity is not None and (
+            not selected_identity.releases
+            or any(_release_needs_track_count_refresh(item) for item in selected_identity.releases)
+        ):
             await fetch_and_store_discography(
                 db, settings, artist, provider_name=selected_provider
             )
@@ -664,9 +678,10 @@ async def catalog_album_page(
     if album is None:
         raise HTTPException(status_code=404, detail="Catalog album not found")
     try:
-        album = await fetch_and_store_album(db, settings, album)
+        await _ensure_catalog_tracks(db, settings, album)
         await db.commit()
     except Exception:
+        logger.exception("Catalog album hydration failed for album %s", album_id)
         await db.rollback()
     result = await db.execute(
         select(CatalogAlbum)

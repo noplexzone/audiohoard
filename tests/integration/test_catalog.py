@@ -577,13 +577,26 @@ async def _seed_release_progress_artist() -> tuple[int, int, dict[str, int]]:
 
 
 async def test_catalog_artist_unifies_release_progress_on_existing_cards(
-    client: AsyncClient,
+    client: AsyncClient, monkeypatch
 ) -> None:
     artist_id, partial_id, _ = await _seed_release_progress_artist()
+    refreshes = 0
 
+    async def backfill_missing_counts(db, settings, artist, provider_name):
+        nonlocal refreshes
+        refreshes += 1
+        identity = next(item for item in artist.identities if item.provider == provider_name)
+        for release in identity.releases:
+            if release.title == "Unknown Empty Album":
+                release.track_count = 2
+        await db.flush()
+        return identity.releases
+
+    monkeypatch.setattr("app.routers.catalog.fetch_and_store_discography", backfill_missing_counts)
     response = await client.get(f"/artists/catalog/{artist_id}")
 
     assert response.status_code == 200
+    assert refreshes == 1
     assert 'data-section="downloaded-files"' not in response.text
     assert 'data-section="wanted-releases"' not in response.text
     assert "Downloaded files</h2>" not in response.text
@@ -593,7 +606,8 @@ async def test_catalog_artist_unifies_release_progress_on_existing_cards(
     assert "1 / 3 downloaded" in response.text
     assert "1 / 1 downloaded" in response.text
     assert "0 / 4 downloaded" in response.text
-    assert "0 / 0 downloaded" in response.text
+    assert "0 / 2 downloaded" in response.text
+    assert "0 / 0 downloaded" not in response.text
     assert f'href="/albums/{partial_id}"' in response.text
 
 
@@ -602,13 +616,18 @@ async def test_catalog_album_shows_total_and_per_track_downloaded_wanted_states(
 ) -> None:
     _, partial_id, catalog_track_ids = await _seed_release_progress_artist()
 
-    async def keep_stored_album(db, settings, album):
-        return album
+    provider_fetches = 0
 
-    monkeypatch.setattr("app.routers.catalog.fetch_and_store_album", keep_stored_album)
+    async def unexpected_provider_fetch(db, settings, album):
+        nonlocal provider_fetches
+        provider_fetches += 1
+        raise AssertionError("a complete persisted manifest must not refetch provider metadata")
+
+    monkeypatch.setattr("app.routers.catalog.fetch_and_store_album", unexpected_provider_fetch)
     response = await client.get(f"/albums/{partial_id}")
 
     assert response.status_code == 200
+    assert provider_fetches == 0
     assert "1 / 3 downloaded" in response.text
     imported_id = catalog_track_ids["partial imported"]
     missing_id = catalog_track_ids["partial missing"]

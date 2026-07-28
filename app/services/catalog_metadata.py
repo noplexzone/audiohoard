@@ -306,10 +306,18 @@ async def upsert_provider_release(
     release.title = hit.title
     release.year = hit.year
     release.artwork_url = hit.artwork_url
-    release.track_count = hit.track_count
+    if hit.track_count is not None:
+        release.track_count = hit.track_count
     release.release_kind = normalize_release_kind(hit)
     release.release_type_raw = hit.release_type_raw or hit.release_type
-    release.metadata_json = json.dumps({"source": "provider", "complete": True}, sort_keys=True)
+    release.metadata_json = json.dumps(
+        {
+            "source": "provider",
+            "complete": True,
+            "track_count_checked": release.track_count is not None,
+        },
+        sort_keys=True,
+    )
     await db.flush()
     return release
 
