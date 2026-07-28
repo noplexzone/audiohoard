@@ -1157,6 +1157,8 @@ async def test_first_complete_album_run_is_done_not_partial(
             for i, t in enumerate(cat_tracks, start=1)
         ]
 
+    events: list[str] = []
+
     async def fake_prepare(
         result: SearchResult,
         source: str,
@@ -1165,6 +1167,7 @@ async def test_first_complete_album_run_is_done_not_partial(
         *,
         checkpoint=None,
     ) -> tuple[None, str]:
+        events.append(f"prepare:{result.title}")
         if track is not None:
             track.source_path = "/staging/track.flac"
             track.staging_path = track.source_path
@@ -1184,7 +1187,7 @@ async def test_first_complete_album_run_is_done_not_partial(
         pass
 
     async def noop_auto_import(release: Release, db: AsyncSession, cfg: Settings) -> None:
-        pass
+        events.append("import")
 
     monkeypatch.setattr(runner, "_fetch_results", fake_fetch_results)
     monkeypatch.setattr(runner, "_prepare_acquisition", fake_prepare)
@@ -1196,6 +1199,13 @@ async def test_first_complete_album_run_is_done_not_partial(
 
     await runner.run_job(job.id, db_session, test_settings)
 
+    assert events == [
+        "prepare:Track One",
+        "import",
+        "prepare:Track Two",
+        "import",
+        "import",
+    ]
     assert job.status == JobStatus.done, (
         f"expected done but got {job.status}; result_json={job.result_json}"
     )

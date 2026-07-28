@@ -28,6 +28,7 @@ from app.services.acquisition_cleanup import (
     ImportedSourceCleanup,
     cleanup_imported_sources,
     pending_imported_source_cleanups,
+    prune_orphaned_terminal_records,
 )
 from app.services.acquisition_recovery import recover_approved_downloads
 from app.settings_service import get_runtime_settings, save_runtime_settings
@@ -504,6 +505,67 @@ async def test_recovery_rotates_past_unmappable_eligible_release(
     assert good_release.import_state == ImportWorkflowState.imported
 
 
+async def test_recovery_promotes_matching_review_and_imports_partial_release(
+    db_session: AsyncSession, monkeypatch, tmp_path
+) -> None:
+    expected = "11111111-1111-1111-1111-111111111111"
+    artist = CatalogArtist(name="Artist")
+    album = CatalogAlbum(artist=artist, title="Album", track_count=3)
+    catalog_tracks = [
+        CatalogAlbumTrack(position=index, disc=1, title=f"Song {index}") for index in range(1, 4)
+    ]
+    album.tracks.extend(catalog_tracks)
+    job = Job(source="slskd", query="partial", status=JobStatus.partial, catalog_album=album)
+    release = Release(job=job, source="slskd", title="Album", track_count=3)
+    source = tmp_path / "01 - Song 1.flac"
+    source.write_bytes(b"audio")
+    track = Track(
+        job=job,
+        release=release,
+        source="slskd",
+        title="Song 1",
+        source_path=str(source),
+        catalog_album_id=album.id,
+        catalog_track_id=catalog_tracks[0].id,
+        mbid=expected,
+        acquisition_state=AcquisitionState.downloaded,
+        acoustid_verification_state=AcoustIDVerificationState.unavailable,
+    )
+    db_session.add_all([artist, album, job, release, track])
+    await db_session.flush()
+    review = StagingReviewItem(
+        track_id=track.id,
+        release_id=release.id,
+        expected_recording_mbid=expected,
+        expected_title=track.title,
+        observed_acoustid_mbids_json=json.dumps(
+            [expected, "22222222-2222-2222-2222-222222222222"]
+        ),
+        acoustid_score=0.99,
+        fingerprint_duration_sec=180,
+        verification_reason="ambiguous",
+    )
+    db_session.add(review)
+    await db_session.flush()
+
+    imported: list[int] = []
+
+    async def fake_import(db, candidate_release, **kwargs):  # noqa: ANN001, ANN003
+        imported.append(candidate_release.id)
+        track.import_state = ImportWorkflowState.imported
+        return True
+
+    monkeypatch.setattr(acquisition_recovery, "try_auto_import_release", fake_import)
+    settings = get_settings().model_copy(
+        update={"library_root": tmp_path / "music", "staging_root": tmp_path}
+    )
+
+    assert await recover_approved_downloads(db_session, settings) == 1
+    assert imported == [release.id]
+    assert track.acoustid_verification_state == AcoustIDVerificationState.verified
+    assert await db_session.get(StagingReviewItem, review.id) is None
+
+
 async def test_pending_cleanup_rotates_unattempted_plan_before_failed_plan(
     db_session: AsyncSession, tmp_path
 ) -> None:
@@ -532,3 +594,79 @@ async def test_pending_cleanup_rotates_unattempted_plan_before_failed_plan(
     pending = await pending_imported_source_cleanups(db_session, limit=1)
     assert len(pending) == 1
     assert pending[0].plan_id == plans[1].id
+
+
+async def test_prune_orphaned_terminal_records_removes_only_rows_without_files(
+    db_session: AsyncSession, tmp_path
+) -> None:
+    kept_source = tmp_path / "kept.flac"
+    kept_source.write_bytes(b"audio")
+    imported_destination = tmp_path / "library" / "imported.flac"
+    imported_destination.parent.mkdir()
+    imported_destination.write_bytes(b"audio")
+
+    mixed_job = Job(source="slskd", query="mixed", status=JobStatus.partial)
+    mixed_release = Release(job=mixed_job, source="slskd", title="Mixed")
+    orphan_track = Track(job=mixed_job, release=mixed_release, source="slskd", title="Gone")
+    kept_track = Track(
+        job=mixed_job,
+        release=mixed_release,
+        source="slskd",
+        title="Kept",
+        source_path=str(kept_source),
+    )
+    imported_track = Track(
+        job=mixed_job,
+        release=mixed_release,
+        source="slskd",
+        title="Imported",
+        import_state=ImportWorkflowState.imported,
+    )
+    imported_plan = ImportPlan(
+        release=mixed_release,
+        track=imported_track,
+        source_path=str(tmp_path / "gone-source.flac"),
+        destination_path=str(imported_destination),
+        status=ImportWorkflowState.imported,
+    )
+    empty_job = Job(source="slskd", query="empty", status=JobStatus.failed)
+    empty_release = Release(job=empty_job, source="slskd", title="Empty")
+    empty_track = Track(job=empty_job, release=empty_release, source="slskd", title="Gone")
+    active_job = Job(source="slskd", query="active", status=JobStatus.running)
+    active_track = Track(job=active_job, source="slskd", title="Still active")
+    db_session.add_all(
+        [
+            mixed_job,
+            mixed_release,
+            orphan_track,
+            kept_track,
+            imported_track,
+            imported_plan,
+            empty_job,
+            empty_release,
+            empty_track,
+            active_job,
+            active_track,
+        ]
+    )
+    await db_session.flush()
+    ids = {
+        "mixed_job": mixed_job.id,
+        "orphan_track": orphan_track.id,
+        "kept_track": kept_track.id,
+        "imported_track": imported_track.id,
+        "empty_job": empty_job.id,
+        "active_track": active_track.id,
+    }
+
+    result = await prune_orphaned_terminal_records(db_session, batch_size=1)
+
+    assert result.tracks == 2
+    assert result.releases == 1
+    assert result.jobs == 1
+    assert await db_session.get(Track, ids["orphan_track"]) is None
+    assert await db_session.get(Job, ids["empty_job"]) is None
+    assert await db_session.get(Track, ids["kept_track"]) is not None
+    assert await db_session.get(Track, ids["imported_track"]) is not None
+    assert await db_session.get(Track, ids["active_track"]) is not None
+    assert await db_session.get(Job, ids["mixed_job"]) is not None

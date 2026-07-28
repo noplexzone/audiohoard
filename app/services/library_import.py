@@ -328,12 +328,24 @@ async def plan_release_import(
     library_root: Path,
     naming_template: str = _DESTINATION_TEMPLATE,
     source_artifacts: dict[int, tuple[Path, str]] | None = None,
+    track_ids: set[int] | None = None,
+    replace_existing_imports: bool = False,
 ) -> list[ImportPlan]:
-    await db.execute(delete(ImportPlan).where(ImportPlan.release_id == release.id))
+    delete_query = delete(ImportPlan).where(ImportPlan.release_id == release.id)
+    if not replace_existing_imports:
+        delete_query = delete_query.where(ImportPlan.status != ImportWorkflowState.imported)
+    if track_ids is not None:
+        if not track_ids:
+            return []
+        delete_query = delete_query.where(ImportPlan.track_id.in_(track_ids))
+    await db.execute(delete_query)
     await db.flush()
-    tracks_result = await db.execute(
-        select(Track).where(Track.release_id == release.id).order_by(Track.track_no, Track.id)
-    )
+    track_query = select(Track).where(Track.release_id == release.id)
+    if not replace_existing_imports:
+        track_query = track_query.where(Track.import_state != ImportWorkflowState.imported)
+    if track_ids is not None:
+        track_query = track_query.where(Track.id.in_(track_ids))
+    tracks_result = await db.execute(track_query.order_by(Track.track_no, Track.id))
     tracks = list(tracks_result.scalars().all())
 
     library_root = _resolved_path(library_root)
@@ -531,16 +543,21 @@ async def execute_release_import(
     tag_writer: MutagenTagWriter | None = None,
     before_commit: Callable[[Path], None] | None = None,
     replace_existing_verified: bool = False,
+    plan_ids: set[int] | None = None,
 ) -> list[ImportPlan]:
     tag_writer = tag_writer or MutagenTagWriter()
-    plans_result = await db.execute(
-        select(ImportPlan).where(ImportPlan.release_id == release.id).order_by(ImportPlan.id)
+    plan_query = select(ImportPlan).where(
+        ImportPlan.release_id == release.id,
+        ImportPlan.status == ImportWorkflowState.ready,
     )
+    if plan_ids is not None:
+        if not plan_ids:
+            raise ImportExecutionError("release import plans are not ready")
+        plan_query = plan_query.where(ImportPlan.id.in_(plan_ids))
+    plans_result = await db.execute(plan_query.order_by(ImportPlan.id))
     plans = list(plans_result.scalars().all())
     if not plans:
-        raise ImportExecutionError("release has no reviewed import plan")
-    if any(plan.status != ImportWorkflowState.ready for plan in plans):
-        raise ImportExecutionError("release has import plans that are not ready")
+        raise ImportExecutionError("release import plans are not ready")
 
     pinned_destinations: list[PinnedDestination] = []
     created_destinations: list[tuple[PinnedDestination, str]] = []
@@ -595,7 +612,42 @@ async def execute_release_import(
                 track.file_format = ext
             plan.status = ImportWorkflowState.imported
             plan.collision_state = CollisionState.clear
-        release.import_state = ImportWorkflowState.imported
+        imported_tracks = list(
+            (
+                await db.scalars(
+                    select(Track).where(
+                        Track.release_id == release.id,
+                        Track.import_state == ImportWorkflowState.imported,
+                    )
+                )
+            ).all()
+        )
+        imported_catalog_ids = {
+            track.catalog_track_id
+            for track in imported_tracks
+            if track.catalog_track_id is not None
+        }
+        remaining_tracks = list(
+            (
+                await db.scalars(
+                    select(Track).where(
+                        Track.release_id == release.id,
+                        Track.import_state != ImportWorkflowState.imported,
+                    )
+                )
+            ).all()
+        )
+        expected_count = release.track_count or 0
+        imported_identity_count = len(imported_catalog_ids) or len(imported_tracks)
+        release_complete = (
+            imported_identity_count >= expected_count if expected_count else not remaining_tracks
+        )
+        if release_complete:
+            release.import_state = ImportWorkflowState.imported
+        elif any(track.source_path or track.staging_path for track in remaining_tracks):
+            release.import_state = ImportWorkflowState.needs_review
+        else:
+            release.import_state = ImportWorkflowState.discovered
         await _reconcile_catalog_ownership(db, release)
         await db.flush()
 
@@ -655,10 +707,9 @@ async def execute_release_import(
                 plan.status = ImportWorkflowState.failed
                 plan.error_detail = detail
             plan.destination_temp_path = None
-        tracks_result = await db.execute(select(Track).where(Track.release_id == release.id))
-        for track in tracks_result.scalars().all():
-            if track.import_state == ImportWorkflowState.imported:
-                track.import_state = ImportWorkflowState.rolled_back
+        for plan in plans:
+            if plan.track is not None and plan.track.import_state == ImportWorkflowState.imported:
+                plan.track.import_state = ImportWorkflowState.rolled_back
         await db.flush()
         if isinstance(exc, ImportExecutionError):
             raise

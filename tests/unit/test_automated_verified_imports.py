@@ -181,7 +181,9 @@ async def test_acoustid_mismatch_creates_one_durable_review_item(
     assert items[0].review_state == ReviewDecision.pending
 
 
-async def test_acoustid_ambiguous_match_requires_review(db_session: AsyncSession) -> None:
+async def test_matching_expected_mbid_above_threshold_clears_stale_review(
+    db_session: AsyncSession,
+) -> None:
     job = Job(source="slskd", query="album", status=JobStatus.running)
     release = Release(job=job, source="slskd", title="Album", album_artist="Artist")
     expected = "11111111-1111-1111-1111-111111111111"
@@ -195,6 +197,20 @@ async def test_acoustid_ambiguous_match_requires_review(db_session: AsyncSession
         acquisition_state=AcquisitionState.downloaded,
     )
     db_session.add_all([job, release, track])
+    await db_session.flush()
+    db_session.add(
+        StagingReviewItem(
+            track_id=track.id,
+            release_id=release.id,
+            expected_recording_mbid=expected,
+            expected_title="Song",
+            observed_acoustid_mbids_json="[]",
+            acoustid_score=0.9,
+            fingerprint_duration_sec=180,
+            verification_reason="ambiguous",
+            review_state=ReviewDecision.pending,
+        )
+    )
     await db_session.flush()
     state = await run_acoustid_verification(
         track,
@@ -210,63 +226,51 @@ async def test_acoustid_ambiguous_match_requires_review(db_session: AsyncSession
         fingerprint_duration_sec=180,
         db=db_session,
     )
-    assert state == AcoustIDVerificationState.unavailable
+    assert state == AcoustIDVerificationState.verified
     item = await db_session.scalar(
         select(StagingReviewItem).where(StagingReviewItem.track_id == track.id)
     )
-    assert item is not None
-    assert item.verification_reason == "ambiguous"
+    assert item is None
 
 
-async def test_auto_import_requires_complete_verified_catalog_release(
+async def test_auto_import_starts_with_first_verified_track_of_partial_release(
     db_session: AsyncSession, tmp_path: Path, monkeypatch
 ) -> None:
     from app.services import auto_import
 
-    job = Job(source="slskd", query="album", status=JobStatus.done)
+    job = Job(source="slskd", query="album", status=JobStatus.partial)
     release = Release(job=job, source="slskd", title="Album", album_artist="Artist", track_count=2)
     first = Track(
         job=job,
         release=release,
         source="slskd",
         catalog_track_id=1,
+        source_path=str(tmp_path / "one.flac"),
         acquisition_state=AcquisitionState.downloaded,
         acoustid_verification_state=AcoustIDVerificationState.verified,
     )
     db_session.add_all([job, release, first])
     await db_session.flush()
-    assert not await try_auto_import_release(
-        db_session, release, library_root=tmp_path, naming_template="{title}.{ext}"
-    )
-    assert release.import_state == ImportWorkflowState.needs_review
-    assert release.error_detail == "track-count mismatch: expected 2, found 1"
-
-    second = Track(
-        job=job,
-        release=release,
-        source="slskd",
-        catalog_track_id=2,
-        acquisition_state=AcquisitionState.downloaded,
-        acoustid_verification_state=AcoustIDVerificationState.verified,
-    )
-    db_session.add(second)
-    await db_session.flush()
-    calls: list[str] = []
+    calls: list[object] = []
 
     async def fake_plan(*args, **kwargs):
-        calls.append("plan")
-        return [SimpleNamespace(status=auto_import.ImportWorkflowState.ready)]
+        calls.append(("plan", kwargs["track_ids"]))
+        return [SimpleNamespace(id=1, status=auto_import.ImportWorkflowState.ready)]
 
     async def fake_execute(*args, **kwargs):
         calls.append("execute")
+        release.import_state = ImportWorkflowState.discovered
+        first.import_state = ImportWorkflowState.imported
         return []
 
     monkeypatch.setattr(auto_import, "plan_release_import", fake_plan)
     monkeypatch.setattr(auto_import, "execute_release_import", fake_execute)
+
     assert await try_auto_import_release(
         db_session, release, library_root=tmp_path, naming_template="{title}.{ext}"
     )
-    assert calls == ["plan", "execute"]
+    assert calls == [("plan", {first.id}), "execute"]
+    assert release.import_state != ImportWorkflowState.imported
 
 
 async def test_missing_track_continuations_are_targeted_and_idempotent(

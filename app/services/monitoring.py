@@ -287,7 +287,11 @@ async def execute_quality_upgrade(
     if set(artifacts) != expected_track_ids:
         raise ImportExecutionError("candidate artifacts do not match the monitored release tracks")
     plans = await plan_release_import(
-        db, record.release, library_root=library_root, source_artifacts=artifacts
+        db,
+        record.release,
+        library_root=library_root,
+        source_artifacts=artifacts,
+        replace_existing_imports=True,
     )
     for plan in plans:
         # Existing preferred paths are expected; all other planner checks remain intact.

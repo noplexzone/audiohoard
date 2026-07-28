@@ -4,6 +4,16 @@ All notable changes to Audiohoard are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+- Verified tracks now import immediately without waiting for the rest of an album, while missing tracks remain available for targeted continuation searches.
+
+### Fixed
+- Matching expected recording MBIDs above the configured AcoustID threshold now auto-verify even when the fingerprint result lists alternate recordings, and stale review rows are cleared.
+- Startup reconciliation removes terminal acquisition rows that no longer have a staged or imported file, preventing old jobs from affecting later acquisitions.
+- Partial imports preserve committed plans and process only newly eligible tracks instead of replanning or rolling back the entire release.
+
 ## [0.7.0] - 2026-07-27
 
 ### Added

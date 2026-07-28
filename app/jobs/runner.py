@@ -599,6 +599,7 @@ async def _run_job_in_session(
                 await _enrich_deezer(track, cfg)
                 await _run_fingerprint_and_verify(track, cfg, db)
                 await _compute_path_preview(track, db, cfg)
+                await _try_auto_import(release, db, cfg)
 
                 tracks_created += 1
             except ProviderError as exc:
@@ -692,8 +693,8 @@ async def _run_job_in_session(
             job.result_json = json.dumps(payload, sort_keys=True)
         job.updated_at = _now()
 
-        # After completion, attempt automatic import for each release where all
-        # tracks are verified (or approved). Errors are logged and do not re-raise.
+        # Reconcile each release after the job closes. Per-track import already runs
+        # above; this retry is idempotent and catches any persisted eligible rows.
         if job.status in {JobStatus.done, JobStatus.partial}:
             all_releases = list(
                 (await db.scalars(select(Release).where(Release.job_id == root_job.id))).all()
@@ -1418,7 +1419,7 @@ async def _lookup_acoustid_raw(
 
 
 async def _try_auto_import(release: Release, db: AsyncSession, cfg: Settings) -> None:
-    """Trigger automatic import for a release when all downloaded tracks are verified."""
+    """Import every currently eligible verified track for a release."""
     from app.services.auto_import import try_auto_import_release
 
     await try_auto_import_release(

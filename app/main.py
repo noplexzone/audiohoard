@@ -30,6 +30,7 @@ from app.routers import settings as settings_router
 from app.services.acquisition_cleanup import (
     cleanup_imported_sources,
     pending_imported_source_cleanups,
+    prune_orphaned_terminal_records,
 )
 from app.services.acquisition_recovery import recover_approved_downloads
 from app.services.artist_monitoring import DiscographyRefreshScheduler
@@ -53,6 +54,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.health_status_service = health_status
     async with get_session_factory()() as db:
         pending_cleanups = await pending_imported_source_cleanups(db)
+        pruned = await prune_orphaned_terminal_records(db)
+        if pruned.tracks or pruned.releases or pruned.jobs:
+            logger.info(
+                "Pruned orphaned acquisition history at startup: "
+                "%d track(s), %d release(s), %d job(s)",
+                pruned.tracks,
+                pruned.releases,
+                pruned.jobs,
+            )
         n = await reconcile_duplicate_catalog_artists(db)
         await db.commit()
         if n:

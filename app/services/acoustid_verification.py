@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.metadata.filename_parse import normalize_for_catalog_match, strip_non_identity_descriptors
@@ -87,6 +87,35 @@ def _recording_title_matches_track(
     return False
 
 
+async def reconcile_matching_acoustid_reviews(
+    db: AsyncSession, *, acceptance_threshold: float
+) -> int:
+    """Promote persisted reviews whose expected MBID already has acceptable evidence."""
+    rows = (
+        await db.execute(
+            select(StagingReviewItem, Track)
+            .join(Track, Track.id == StagingReviewItem.track_id)
+            .where(StagingReviewItem.review_state == ReviewDecision.pending)
+            .order_by(StagingReviewItem.id)
+        )
+    ).all()
+    reconciled = 0
+    for item, track in rows:
+        expected = str(item.expected_recording_mbid or track.mbid or "").strip()
+        observed = {str(value).strip() for value in item.observed_acoustid_mbids}
+        if (
+            expected
+            and expected in observed
+            and (item.acoustid_score or 0.0) > acceptance_threshold
+        ):
+            track.mbid = track.mbid or expected
+            track.acoustid_verification_state = AcoustIDVerificationState.verified
+            await db.delete(item)
+            reconciled += 1
+    await db.flush()
+    return reconciled
+
+
 async def run_acoustid_verification(
     track: Track,
     *,
@@ -121,12 +150,15 @@ async def run_acoustid_verification(
     expected_mbid = track.mbid
 
     if observed_mbids and expected_mbid:
-        if (
-            expected_mbid in observed_mbids
-            and len(observed_mbids) == 1
-            and mbid_scores.get(expected_mbid, 0.0) > acceptance_threshold
-        ):
+        if mbid_scores.get(expected_mbid, 0.0) > acceptance_threshold:
             track.acoustid_verification_state = AcoustIDVerificationState.verified
+            if track.id is not None:
+                await db.execute(
+                    delete(StagingReviewItem).where(
+                        StagingReviewItem.track_id == track.id,
+                        StagingReviewItem.review_state == ReviewDecision.pending,
+                    )
+                )
             return AcoustIDVerificationState.verified
         reason = (
             "low_confidence"

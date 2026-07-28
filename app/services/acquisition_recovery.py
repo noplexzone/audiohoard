@@ -4,7 +4,7 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import case, or_, select
+from sqlalchemy import and_, case, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -18,7 +18,9 @@ from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
 from app.models.release import Release
 from app.models.track import IdentityResolutionState, Track
 from app.models.workflow import AcoustIDVerificationState, AcquisitionState, ImportWorkflowState
+from app.services.acoustid_verification import reconcile_matching_acoustid_reviews
 from app.services.auto_import import try_auto_import_release
+from app.settings_service import get_runtime_settings
 
 logger = logging.getLogger(__name__)
 
@@ -26,19 +28,22 @@ logger = logging.getLogger(__name__)
 async def recover_approved_downloads(
     db: AsyncSession, settings: Settings, *, limit: int = 25
 ) -> int:
-    """Bounded, idempotent repair of legacy fully-approved catalog releases."""
+    """Bounded, idempotent repair and import of eligible downloaded tracks."""
+    runtime = await get_runtime_settings(db)
+    await reconcile_matching_acoustid_reviews(
+        db, acceptance_threshold=runtime.acoustid_acceptance_threshold
+    )
     releases = list(
         (
             await db.scalars(
                 select(Release)
                 .where(
                     Release.import_state != ImportWorkflowState.imported,
-                    Release.tracks.any(),
-                    ~Release.tracks.any(
-                        or_(
-                            Track.acquisition_state != AcquisitionState.downloaded,
-                            Track.acoustid_verification_state.is_(None),
-                            Track.acoustid_verification_state.not_in(
+                    Release.tracks.any(
+                        and_(
+                            Track.acquisition_state == AcquisitionState.downloaded,
+                            Track.import_state != ImportWorkflowState.imported,
+                            Track.acoustid_verification_state.in_(
                                 {
                                     AcoustIDVerificationState.approved,
                                     AcoustIDVerificationState.verified,
@@ -70,12 +75,15 @@ async def recover_approved_downloads(
                 )
             ).all()
         )
-        if not tracks or any(
-            t.acquisition_state != AcquisitionState.downloaded
-            or t.acoustid_verification_state
-            not in {AcoustIDVerificationState.approved, AcoustIDVerificationState.verified}
-            for t in tracks
-        ):
+        eligible = [
+            track
+            for track in tracks
+            if track.acquisition_state == AcquisitionState.downloaded
+            and track.import_state != ImportWorkflowState.imported
+            and track.acoustid_verification_state
+            in {AcoustIDVerificationState.approved, AcoustIDVerificationState.verified}
+        ]
+        if not eligible:
             continue
         album_id = next((t.catalog_album_id for t in tracks if t.catalog_album_id), None)
         if album_id is None and release.job is not None:
@@ -120,7 +128,7 @@ async def recover_approved_downloads(
                     album_id_for_log,
                 )
                 continue
-        if album is None or (release.track_count and len(tracks) != release.track_count):
+        if album is None:
             continue
         expected_tracks = max(
             expected_tracks,
@@ -133,7 +141,7 @@ async def recover_approved_downloads(
             continue
         unused = {cat.id: cat for cat in album.tracks}
         assignments: list[tuple[Track, CatalogAlbumTrack]] = []
-        for track in tracks:
+        for track in eligible:
             if track.catalog_track_id in unused:
                 assignments.append((track, unused.pop(track.catalog_track_id)))
                 continue
@@ -163,7 +171,7 @@ async def recover_approved_downloads(
             cat = candidates[0]
             assignments.append((track, cat))
             unused.pop(cat.id)
-        if not assignments or unused:
+        if len(assignments) != len(eligible):
             continue
         for track, cat in assignments:
             track.catalog_album_id = album.id
