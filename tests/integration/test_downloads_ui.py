@@ -10,8 +10,10 @@ from app.database import get_session_factory
 from app.jobs.dispatcher import job_dispatcher
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
+from app.models.release import Release
+from app.models.staging_review import StagingReviewItem
 from app.models.track import Track
-from app.models.workflow import AcquisitionState
+from app.models.workflow import AcquisitionState, ImportWorkflowState, ReviewDecision
 
 DOWNLOADS_JS = Path("app/static/js/downloads.js").read_text()
 
@@ -51,6 +53,45 @@ async def test_downloads_show_state_details_and_valid_actions(client: AsyncClien
     assert f"/downloads/{running_id}/cancel" not in filtered.text
     assert f"/downloads/{failed_id}/retry" not in filtered.text
     assert "Showing partial jobs" in filtered.text
+
+
+async def test_downloads_hides_stale_review_release_without_actionable_items(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        job = Job(source="slskd", query="Juice WRLD Fighting Demons", status=JobStatus.done)
+        release = Release(
+            job=job,
+            source="slskd",
+            title="Fighting Demons (Digital Deluxe)",
+            album_artist="Juice WRLD",
+            import_state=ImportWorkflowState.needs_review,
+            error_detail="2 downloaded track(s) still require review",
+        )
+        track = Track(
+            job=job,
+            release=release,
+            source="slskd",
+            title="Feel Alone",
+            acquisition_state=AcquisitionState.downloaded,
+            import_state=ImportWorkflowState.imported,
+        )
+        review = StagingReviewItem(
+            track=track,
+            release=release,
+            expected_title="Feel Alone",
+            review_state=ReviewDecision.approved,
+        )
+        db.add_all([job, release, track, review])
+        await db.commit()
+
+    response = await client.get("/downloads")
+
+    assert response.status_code == 200
+    assert "Fighting Demons (Digital Deluxe)" not in response.text
+    assert "2 downloaded track(s) still require review" not in response.text
+    assert "Nothing waiting on you" in response.text
 
 
 async def test_download_job_controls_redirect_with_feedback(

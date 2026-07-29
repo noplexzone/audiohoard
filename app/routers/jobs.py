@@ -276,18 +276,20 @@ async def _assemble_downloads_context(
             reason = _review_item_reason(items[0])
         if not reason:
             reason = "review required: no structured reason was recorded"
+        missing_source = str(reason).startswith("missing staged source:")
         if (
             not items
-            and str(release.error_detail or "").startswith("AcoustID mismatch on track ")
-            and not release.rollback_detail
-            and plan_reason is None
+            and not missing_source
+            and release.import_state == ImportWorkflowState.needs_review
         ):
+            # Release-level needs_review can be stale after every per-track review item
+            # has already been approved/imported. Do not render an actionless card.
             continue
         release_reviews.append(
             {
                 "release": release,
                 "reason": reason,
-                "missing_source": str(reason).startswith("missing staged source:"),
+                "missing_source": missing_source,
                 "review_items": items,
             }
         )

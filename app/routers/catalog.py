@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlencode
 
@@ -24,7 +26,10 @@ from app.models.catalog_entities import (
     CatalogArtist,
     CatalogArtistIdentity,
 )
+from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
+from app.models.track import Track
+from app.models.workflow import ImportWorkflowState
 from app.services.catalog import (
     ReleaseProgress,
     get_artist_detail,
@@ -50,6 +55,27 @@ from app.settings_service import effective_settings_dep, get_runtime_settings
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 logger = logging.getLogger(__name__)
+
+
+async def _imported_catalog_track_ids(db: AsyncSession, album_id: int) -> set[int]:
+    rows = (
+        await db.execute(
+            select(Track.catalog_track_id, ImportPlan.destination_path)
+            .join(ImportPlan, ImportPlan.track_id == Track.id)
+            .where(
+                Track.catalog_album_id == album_id,
+                Track.catalog_track_id.is_not(None),
+                Track.import_state == ImportWorkflowState.imported,
+                ImportPlan.status == ImportWorkflowState.imported,
+                ImportPlan.destination_path != "",
+            )
+        )
+    ).all()
+    imported: set[int] = set()
+    for track_id, path in rows:
+        if track_id is not None and await asyncio.to_thread(Path(path).is_file):
+            imported.add(int(track_id))
+    return imported
 
 
 async def _ensure_catalog_tracks(
@@ -920,12 +946,37 @@ async def download_catalog_album(
             status_code=502,
             detail="Could not load album tracklist from provider; download not started",
         ) from None
+    imported_ids = await _imported_catalog_track_ids(db, album.id)
     query = f"{album.artist.name} {album.title}".strip()
-    job = Job(source="priority", query=query, status=JobStatus.pending, catalog_album_id=album.id)
-    db.add(job)
+    if not imported_ids:
+        job = Job(
+            source="priority", query=query, status=JobStatus.pending, catalog_album_id=album.id
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+        await job_dispatcher.dispatch(job.id)
+        return RedirectResponse("/downloads", status_code=303)
+
+    missing_tracks = [track for track in album.tracks if track.id not in imported_ids]
+    if not missing_tracks:
+        return RedirectResponse("/downloads", status_code=303)
+    job_ids: list[int] = []
+    for track in missing_tracks:
+        track_query = f"{album.artist.name} {track.title}".strip()
+        job = Job(
+            source="priority",
+            query=track_query,
+            status=JobStatus.pending,
+            catalog_album_id=album.id,
+            catalog_track_id=track.id,
+        )
+        db.add(job)
+        await db.flush()
+        job_ids.append(job.id)
     await db.commit()
-    await db.refresh(job)
-    await job_dispatcher.dispatch(job.id)
+    for job_id in job_ids:
+        await job_dispatcher.dispatch(job_id)
     return RedirectResponse("/downloads", status_code=303)
 
 

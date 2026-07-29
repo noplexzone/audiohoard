@@ -11,6 +11,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Added a confirmed album-detail action that transactionally retags every imported file in a release folder from Audiohoard's stored canonical metadata without changing database records or filenames.
 
 ### Fixed
+- Metadata repair now embeds canonical cover art, clears stale Navidrome grouping tags, and can retag matching legacy library files that were not originally imported by Audiohoard.
+- Import Review no longer shows stale actionless cards after every pending review item has already been approved or imported.
+- Album Download Missing now skips catalog tracks already imported with existing destination files and queues only genuinely missing tracks.
 - Made Downloads tolerate malformed historical errors, close fully imported album attempts across continuations, and periodically retry serialized source cleanup.
 - Enabled SQLite WAL, foreign-key enforcement, and a bounded busy timeout to reduce concurrent job contention and prevent new orphaned review rows.
 - Made album retagging durable across crashes, safe against duplicate or concurrently changed files, compatible with legacy unmapped imports, and non-blocking for unrelated web requests.

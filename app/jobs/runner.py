@@ -27,12 +27,13 @@ from app.metadata.filename_parse import (
 )
 from app.metadata.musicbrainz import MusicBrainzClient
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
+from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
 from app.models.path_preview import PathPreview
 from app.models.release import Release
 from app.models.source_candidate_block import SourceCandidateBlock
 from app.models.track import FingerprintState, IdentityResolutionState, Track
-from app.models.workflow import AcquisitionState
+from app.models.workflow import AcquisitionState, ImportWorkflowState
 from app.naming.convention import NamingError, render_path
 from app.schemas.search import SearchRequest, SearchResult
 from app.services.monitoring import map_slskd_transfer_state
@@ -673,10 +674,21 @@ async def _run_job_in_session(
                 await db.commit()
 
         if catalog_tracks and catalog_album is not None:
-            # Use releases.values() — includes newly created releases from this run, not
-            # just the stale existing_releases snapshot captured before the loop.
+            acquired_rows = (
+                await db.execute(
+                    select(Track.catalog_track_id, ImportPlan.destination_path)
+                    .join(ImportPlan, ImportPlan.track_id == Track.id)
+                    .where(
+                        Track.catalog_album_id == catalog_album.id,
+                        Track.catalog_track_id.is_not(None),
+                        Track.import_state == ImportWorkflowState.imported,
+                        ImportPlan.status == ImportWorkflowState.imported,
+                        ImportPlan.destination_path != "",
+                    )
+                )
+            ).all()
             root_release_ids = [r.id for r in releases.values() if r.id is not None]
-            acquired_ids = {
+            current_downloaded_ids = {
                 track.catalog_track_id
                 for track in (
                     await db.scalars(
@@ -688,6 +700,12 @@ async def _run_job_in_session(
                 ).all()
                 if track.catalog_track_id is not None
             }
+            acquired_ids: set[int] = set(current_downloaded_ids)
+            for track_id, destination_path in acquired_rows:
+                if track_id is not None and destination_path:
+                    exists = await asyncio.to_thread(Path(destination_path).is_file)
+                    if exists:
+                        acquired_ids.add(int(track_id))
             missing_catalog_ids = [
                 track.id for track in catalog_tracks if track.id not in acquired_ids
             ]

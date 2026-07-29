@@ -5,10 +5,12 @@ from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.release import Release
+from app.models.staging_review import StagingReviewItem
 from app.models.track import Track
-from app.models.workflow import AcoustIDVerificationState, ImportWorkflowState
+from app.models.workflow import AcoustIDVerificationState, ImportWorkflowState, ReviewDecision
 from app.services.library_import import (
     ImportExecutionError,
     ImportPlanningError,
@@ -105,21 +107,32 @@ async def try_auto_import_release(
             library_root=library_root,
             plan_ids={plan.id for plan in ready if plan.id is not None},
         )
-        if release.import_state == ImportWorkflowState.imported:
+        pending_reviews = list(
+            (
+                await db.scalars(
+                    select(StagingReviewItem)
+                    .where(
+                        StagingReviewItem.release_id == release.id,
+                        StagingReviewItem.review_state == ReviewDecision.pending,
+                    )
+                    .options(selectinload(StagingReviewItem.track))
+                )
+            ).all()
+        )
+        unresolved = [
+            item.track
+            for item in pending_reviews
+            if item.track is not None
+            and item.track.import_state != ImportWorkflowState.imported
+            and bool(item.track.staging_path or item.track.source_path)
+        ]
+        if release.import_state == ImportWorkflowState.imported or not unresolved:
             release.error_detail = None
             release.rollback_detail = None
+            if not unresolved and release.import_state == ImportWorkflowState.needs_review:
+                release.import_state = ImportWorkflowState.discovered
         else:
-            unresolved = [
-                track
-                for track in tracks
-                if track.import_state != ImportWorkflowState.imported
-                and bool(track.staging_path or track.source_path)
-            ]
-            release.error_detail = (
-                f"{len(unresolved)} downloaded track(s) still require review"
-                if unresolved
-                else None
-            )
+            release.error_detail = f"{len(unresolved)} downloaded track(s) still require review"
         logger.info("auto_import: imported %d track(s) for release %d", len(ready), release.id)
         return True
     except ImportExecutionError as exc:
