@@ -36,6 +36,10 @@
         <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
         <button type="submit" class="btn secondary">Repair metadata</button>
       </form>
+      <form method="post" action="/albums/{{ album.id }}/quality-deduplicate" data-confirm="Permanently delete lower-quality duplicate files for tracks that are duplicated inside this album folder? Ambiguous matches will be left for review.">
+        <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+        <button type="submit" class="btn secondary">Clean quality duplicates</button>
+      </form>
     </div>
   </div>
 </header>

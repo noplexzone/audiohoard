@@ -6,6 +6,7 @@ from httpx import AsyncClient
 import app.database as db_module
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.services.library_import import AlbumRetagResult, ImportExecutionError
+from app.services.quality_upgrade import QualityDuplicateResult
 
 
 @pytest_asyncio.fixture
@@ -29,6 +30,8 @@ async def test_album_page_offers_confirmed_manual_metadata_repair(
     assert f'action="/albums/{album_id}/retag"' in response.text
     assert "Repair metadata" in response.text
     assert 'data-confirm="Retag every audio file in this album folder' in response.text
+    assert f'action="/albums/{album_id}/quality-deduplicate"' in response.text
+    assert "Clean quality duplicates" in response.text
     assert "/static/js/album.js" in response.text
 
 
@@ -66,3 +69,24 @@ async def test_manual_metadata_repair_redirects_with_safe_error_notice(
 
     page = await client.get(response.headers["location"])
     assert "Metadata repair failed: album folder contains untracked audio" in page.text
+
+
+async def test_quality_duplicate_cleanup_redirects_with_count(
+    client: AsyncClient, album_id: int, monkeypatch
+) -> None:
+    async def fake_cleanup(
+        db, requested_album_id, *, library_root, quality_profile, defer_filesystem_delete
+    ):
+        assert requested_album_id == album_id
+        assert defer_filesystem_delete is True
+        return QualityDuplicateResult(deleted_files=2, review_required=1)
+
+    monkeypatch.setattr("app.routers.catalog.reconcile_album_quality_duplicates", fake_cleanup)
+    response = await client.post(f"/albums/{album_id}/quality-deduplicate", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/albums/{album_id}?quality=ok&deleted=2&review=1"
+
+    page = await client.get(response.headers["location"])
+    assert "Removed 2 lower-quality duplicates." in page.text
+    assert "1 ambiguous duplicate file(s) still need review." in page.text
