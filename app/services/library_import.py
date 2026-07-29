@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -17,7 +18,7 @@ from mutagen.id3 import ID3, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK, TXXX, ID3
 from mutagen.mp4 import MP4
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -422,7 +423,10 @@ async def retag_catalog_album(
             select(Track, ImportPlan)
             .join(ImportPlan, ImportPlan.track_id == Track.id)
             .where(
-                Track.catalog_album_id == album_id,
+                or_(
+                    Track.catalog_album_id == album_id,
+                    Track.catalog_album_id.is_(None),
+                ),
                 Track.import_state == ImportWorkflowState.imported,
                 ImportPlan.status == ImportWorkflowState.imported,
                 ImportPlan.destination_path != "",
@@ -432,16 +436,42 @@ async def retag_catalog_album(
     ).all()
     latest: dict[int, tuple[Track, ImportPlan]] = {}
     for track, plan in rows:
+        if track.catalog_album_id is None:
+            legacy_artist = track.album_artist or track.artist or ""
+            if (track.album or "").casefold() != album.title.casefold() or (
+                legacy_artist.casefold() != album.artist.name.casefold()
+            ):
+                continue
         latest[track.id] = (track, plan)
     if not latest:
         raise ImportExecutionError("album has no imported files to retag")
 
+    return await asyncio.to_thread(
+        _retag_catalog_album_files,
+        album,
+        list(latest.values()),
+        library_root=library_root,
+        tag_writer=tag_writer,
+    )
+
+
+def _retag_catalog_album_files(
+    album: CatalogAlbum,
+    imported: list[tuple[Track, ImportPlan]],
+    *,
+    library_root: Path,
+    tag_writer: MutagenTagWriter | None,
+) -> AlbumRetagResult:
     catalog_tracks = {item.id: item for item in album.tracks}
-    root = library_root.resolve()  # noqa: ASYNC240
+    catalog_tracks_by_position = {(item.disc, item.position): item for item in album.tracks}
+    root = library_root.resolve()
     targets: list[tuple[Path, Track, CatalogAlbumTrack]] = []
     folders: set[Path] = set()
-    for track, plan in latest.values():
+    mapped_destinations: set[Path] = set()
+    for track, plan in imported:
         catalog_track = catalog_tracks.get(track.catalog_track_id or 0)
+        if catalog_track is None:
+            catalog_track = catalog_tracks_by_position.get((track.disc or 1, track.track_no or 0))
         if catalog_track is None:
             raise ImportExecutionError("imported file is not linked to stored track metadata")
         destination = Path(plan.destination_path)
@@ -455,6 +485,10 @@ async def retag_catalog_album(
             raise ImportExecutionError(f"imported file is missing or unsafe: {destination.name}")
         if not is_importable_audio(destination):
             raise ImportExecutionError(f"unsupported audio format: {destination.suffix}")
+        resolved_destination = destination.resolve()
+        if resolved_destination in mapped_destinations:
+            raise ImportExecutionError("duplicate destination mapping in stored import metadata")
+        mapped_destinations.add(resolved_destination)
         targets.append((destination, track, catalog_track))
         folders.add(destination.parent.resolve())
     if len(folders) != 1:
@@ -488,7 +522,21 @@ async def retag_catalog_album(
             temp_paths.append((pinned, temp_name))
             if not writer.write_and_verify(temp_path, _catalog_tags(album, catalog_track, track)):
                 raise ImportExecutionError("tag readback failed")
+            with pinned.open_read(temp_name) as tagged_temp:
+                os.fsync(tagged_temp.fileno())
             prepared.append((pinned, temp_name, expected_hash))
+
+        temporary_names = {temp_name for _pinned, temp_name in temp_paths}
+        current_audio = {
+            item.resolve()
+            for item in folder.iterdir()
+            if item.is_file()
+            and not item.is_symlink()
+            and item.name not in temporary_names
+            and is_importable_audio(item)
+        }
+        if current_audio != actual_audio:
+            raise ImportExecutionError("album folder changed before retag commit")
 
         for pinned, temp_name, expected_hash in prepared:
             pinned.verify_attached()
@@ -506,13 +554,14 @@ async def retag_catalog_album(
         for pinned, _destination_name, backup_name in backup_paths:
             try:
                 pinned.unlink(backup_name)
+                pinned.fsync()
             except OSError:
                 logger.warning("retag succeeded but a temporary backup could not be removed")
-        _close_pinned_destinations(pinned_destinations)
+        _close_pinned_destinations_safely(pinned_destinations)
         return AlbumRetagResult(files_retagged=len(targets), folder=folder)
     except Exception as exc:
         _rollback_pinned_filesystem(temp_paths, created_destinations, backup_paths)
-        _close_pinned_destinations(pinned_destinations)
+        _close_pinned_destinations_safely(pinned_destinations)
         if isinstance(exc, ImportExecutionError):
             raise
         raise ImportExecutionError(f"album retag failed: {exc}") from exc
@@ -665,6 +714,14 @@ def _close_pinned_destinations(destinations: list[PinnedDestination]) -> None:
         pinned.close()
 
 
+def _close_pinned_destinations_safely(destinations: list[PinnedDestination]) -> None:
+    for pinned in reversed(destinations):
+        try:
+            pinned.close()
+        except OSError:
+            logger.warning("failed to close pinned album destination after retag")
+
+
 async def _reconcile_catalog_ownership(db: AsyncSession, release: Release) -> None:
     album_ids = set(
         (
@@ -722,7 +779,7 @@ def _rollback_pinned_filesystem(
             pinned.unlink(destination_name)
         except OSError:
             logger.exception("failed to remove imported destination during rollback")
-    for pinned, destination_name, backup_name in backup_paths:
+    for pinned, destination_name, backup_name in reversed(backup_paths):
         if pinned.exists(backup_name):
             try:
                 # os.replace overwrites a surviving new destination atomically.

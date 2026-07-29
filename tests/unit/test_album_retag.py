@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -7,6 +10,7 @@ from mutagen.flac import FLAC
 from mutagen.id3 import APIC, ID3, TXXX
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.services.library_import as library_import_module
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
@@ -14,6 +18,7 @@ from app.models.release import Release
 from app.models.track import Track
 from app.models.workflow import ImportWorkflowState
 from app.services.library_import import ImportExecutionError, MutagenTagWriter, retag_catalog_album
+from app.services.pinned_destination import PinnedDestination
 
 
 def _minimal_flac_bytes() -> bytes:
@@ -214,3 +219,157 @@ def test_tag_writer_preserves_mp3_artwork_while_replacing_grouping_tags(tmp_path
         if frame.desc.casefold() == "musicbrainz release group id"
     ]
     assert release_groups == ["canonical-release-group"]
+
+
+async def test_retag_catalog_album_supports_legacy_unmapped_imports(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, tracks = await _seed_imported_album(db_session, library_root)
+    album.title = "Édition"
+    album.artist.name = "Beyoncé"
+    for track in tracks:
+        track.catalog_album_id = None
+        track.catalog_track_id = None
+        track.album = "ÉDITION"
+        track.album_artist = "BEYONCÉ"
+    await db_session.flush()
+
+    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert result.files_retagged == 2
+    assert all(FLAC(path)["albumartist"] == [album.artist.name] for path in paths)
+
+
+async def test_retag_catalog_album_rejects_duplicate_destination_mappings(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, tracks = await _seed_imported_album(db_session, library_root)
+    tracks[1].import_plans[0].destination_path = str(paths[0])
+    await db_session.flush()
+
+    with pytest.raises(ImportExecutionError, match="duplicate destination mapping"):
+        await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+
+class _AddsAudioDuringPreparation(MutagenTagWriter):
+    def __init__(self, folder: Path) -> None:
+        self.folder = folder
+        self.calls = 0
+
+    def write_and_verify(self, path: Path, tags: dict[str, str]) -> bool:
+        result = super().write_and_verify(path, tags)
+        self.calls += 1
+        if self.calls == 2:
+            (self.folder / "18 - Added.flac").write_bytes(_minimal_flac_bytes())
+        return result
+
+
+async def test_retag_catalog_album_rechecks_folder_membership_before_commit(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, _tracks = await _seed_imported_album(db_session, library_root)
+    original_bytes = [path.read_bytes() for path in paths]
+
+    with pytest.raises(ImportExecutionError, match="album folder changed before retag commit"):
+        await retag_catalog_album(
+            db_session,
+            album.id,
+            library_root=library_root,
+            tag_writer=_AddsAudioDuringPreparation(paths[0].parent),
+        )
+
+    assert [path.read_bytes() for path in paths] == original_bytes
+
+
+async def test_retag_catalog_album_fsyncs_tagged_temps_before_replacement(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    library_root = tmp_path / "library"
+    album, _paths, _tracks = await _seed_imported_album(db_session, library_root)
+    regular_file_fsyncs = 0
+    real_fsync = os.fsync
+
+    def tracking_fsync(fd: int) -> None:
+        nonlocal regular_file_fsyncs
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            regular_file_fsyncs += 1
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", tracking_fsync)
+    await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    # One fsync after the copy and another after Mutagen writes, per file.
+    assert regular_file_fsyncs >= 4
+
+
+async def test_retag_catalog_album_runs_file_work_off_the_event_loop(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    library_root = tmp_path / "library"
+    album, _paths, _tracks = await _seed_imported_album(db_session, library_root)
+    event_loop_thread = threading.get_ident()
+    worker_threads: list[int] = []
+    real_retag = library_import_module._retag_catalog_album_files
+
+    def tracking_retag(*args, **kwargs):
+        worker_threads.append(threading.get_ident())
+        return real_retag(*args, **kwargs)
+
+    monkeypatch.setattr(library_import_module, "_retag_catalog_album_files", tracking_retag)
+    await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert worker_threads
+    assert worker_threads[0] != event_loop_thread
+
+
+async def test_retag_catalog_album_restores_all_files_when_replacement_fails(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, _tracks = await _seed_imported_album(db_session, library_root)
+    original_bytes = [path.read_bytes() for path in paths]
+    real_replace = PinnedDestination.replace
+    replacement_calls = 0
+
+    def fail_second_replacement(
+        self: PinnedDestination, source_name: str, destination_name: str
+    ) -> None:
+        nonlocal replacement_calls
+        if source_name.endswith(self.destination.suffix) and destination_name == self.name:
+            replacement_calls += 1
+            if replacement_calls == 2:
+                raise OSError("injected replacement failure")
+        real_replace(self, source_name, destination_name)
+
+    monkeypatch.setattr(PinnedDestination, "replace", fail_second_replacement)
+    with pytest.raises(ImportExecutionError, match="injected replacement failure"):
+        await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert [path.read_bytes() for path in paths] == original_bytes
+    assert not list(paths[0].parent.glob(".*.retag-*"))
+
+
+async def test_retag_catalog_album_close_failure_does_not_remove_committed_files(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, _tracks = await _seed_imported_album(db_session, library_root)
+    real_close = PinnedDestination.close
+    raised = False
+
+    def close_then_fail_once(self: PinnedDestination) -> None:
+        nonlocal raised
+        real_close(self)
+        if not raised:
+            raised = True
+            raise OSError("injected close failure")
+
+    monkeypatch.setattr(PinnedDestination, "close", close_then_fail_once)
+    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert result.files_retagged == 2
+    assert all(path.is_file() for path in paths)
+    assert all(FLAC(path)["albumartist"] == [album.artist.name] for path in paths)

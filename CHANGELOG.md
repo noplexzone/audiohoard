@@ -9,6 +9,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - Added a confirmed album-detail action that transactionally retags every imported file in a release folder from Audiohoard's stored canonical metadata without changing database records or filenames.
 
+### Fixed
+- Made album retagging durable across crashes, safe against duplicate or concurrently changed files, compatible with legacy unmapped imports, and non-blocking for unrelated web requests.
+
 ## [0.7.1] - 2026-07-28
 
 ### Added
