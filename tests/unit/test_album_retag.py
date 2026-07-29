@@ -509,6 +509,7 @@ def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: 
     original["title"] = "Feel Alone"
     original["album"] = "Fighting Demons (Digital Deluxe)"
     original["albumartist"] = "Juice WRLD"
+    original["year"] = "2021"
     original["releasedate"] = "2021"
     original["release_date"] = "2021"
     original["originaldate"] = "2021"
@@ -539,6 +540,7 @@ def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: 
 
     tags = {key.casefold(): values for key, values in FLAC(path).tags.items()}
     for key in {
+        "year",
         "releasedate",
         "originaldate",
         "recordlabel",

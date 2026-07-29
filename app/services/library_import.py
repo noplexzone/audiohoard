@@ -71,6 +71,7 @@ _MANAGED_TAG_KEYS = frozenset(
         "albumartist",
         "albumartists",
         "date",
+        "year",
         "releasedate",
         "release_date",
         "originaldate",
