@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, no_type_check
+from urllib.parse import urlparse
 
 import httpx
 from mutagen.flac import FLAC, Picture
@@ -39,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import register_transaction_callbacks
+from app.http import stream_with_retry
 from app.media_formats import is_importable_audio, supported_audio_formats_display
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
 from app.models.import_plan import CollisionState, ImportPlan, TagVerificationState
@@ -91,6 +93,20 @@ class CanonicalArtwork:
 
 
 _ARTWORK_TIMEOUT_SECONDS = 10.0
+_MAX_ARTWORK_BYTES = 5 * 1024 * 1024
+_ALLOWED_ARTWORK_HOSTS = frozenset(
+    {
+        "e-cdns-images.dzcdn.net",
+        "cdn-images.dzcdn.net",
+        "is1-ssl.mzstatic.com",
+        "is2-ssl.mzstatic.com",
+        "is3-ssl.mzstatic.com",
+        "is4-ssl.mzstatic.com",
+        "is5-ssl.mzstatic.com",
+        "coverartarchive.org",
+        "ia801504.us.archive.org",
+    }
+)
 
 
 class ImportPlanningError(ValueError):
@@ -212,20 +228,42 @@ def _track_source_path(track: Track) -> Path:
     return Path(raw)
 
 
+def _artwork_url_allowed(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme == "https" and parsed.hostname in _ALLOWED_ARTWORK_HOSTS
+
+
 async def _fetch_canonical_artwork(url: str | None) -> CanonicalArtwork | None:
-    if not url:
+    if not url or not _artwork_url_allowed(url):
         return None
+    data = bytearray()
+    content_type = ""
     try:
-        async with httpx.AsyncClient(
-            timeout=_ARTWORK_TIMEOUT_SECONDS, follow_redirects=True
-        ) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-    except Exception:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_ARTWORK_TIMEOUT_SECONDS)) as client:
+            response = await stream_with_retry(client, "GET", url)
+            try:
+                if response.status_code != 200:
+                    return None
+                content_type = (
+                    response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                )
+                content_length = response.headers.get("content-length")
+                if content_length:
+                    try:
+                        declared_size = int(content_length)
+                    except ValueError:
+                        declared_size = 0
+                    if declared_size > _MAX_ARTWORK_BYTES:
+                        return None
+                async for chunk in response.aiter_bytes():
+                    data.extend(chunk)
+                    if len(data) > _MAX_ARTWORK_BYTES:
+                        return None
+            finally:
+                await response.aclose()
+    except httpx.HTTPError:
         logger.warning("Could not fetch canonical artwork for metadata repair", exc_info=True)
         return None
-    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    data = response.content
     if content_type not in {"image/jpeg", "image/jpg", "image/png"}:
         if data.startswith(b"\xff\xd8"):
             content_type = "image/jpeg"
@@ -236,7 +274,7 @@ async def _fetch_canonical_artwork(url: str | None) -> CanonicalArtwork | None:
             return None
     if content_type == "image/jpg":
         content_type = "image/jpeg"
-    return CanonicalArtwork(data=data, mime=content_type)
+    return CanonicalArtwork(data=bytes(data), mime=content_type)
 
 
 def _mp4_cover_format(mime: str) -> int:
