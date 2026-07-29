@@ -272,6 +272,7 @@ async def test_retag_catalog_album_synchronizes_release_tags_without_changing_da
         assert tags["albumartist"] == [album.artist.name]
         assert tags["albumartists"] == [album.artist.name]
         assert tags["date"] == [album.year]
+        assert tags["releasedate"] == [album.year]
         assert tags["release_date"] == [album.year]
         assert "genre" not in tags
         assert "organization" not in tags
@@ -482,6 +483,7 @@ def test_tag_writer_clears_nav_grouping_txxx_fields_that_split_mp3_albums(
             "album": "Goodbye & Good Riddance",
             "album_artist": "Juice WRLD",
             "date": "2018",
+            "releasedate": "2018",
             "release_date": "2018",
             "tracknumber": "4",
             "discnumber": "1",
@@ -537,6 +539,7 @@ def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: 
             "album": "Fighting Demons (Digital Deluxe)",
             "album_artist": "Juice WRLD",
             "date": "2022",
+            "releasedate": "2022",
             "release_date": "2022",
             "tracknumber": "19",
             "discnumber": "1",
@@ -546,7 +549,6 @@ def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: 
     tags = {key.casefold(): values for key, values in FLAC(path).tags.items()}
     for key in {
         "year",
-        "releasedate",
         "originaldate",
         "originalyear",
         "recordlabel",
@@ -564,6 +566,7 @@ def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: 
         "disctotal",
     }:
         assert key not in tags
+    assert tags["releasedate"] == ["2022"]
 
 
 async def test_retag_catalog_album_repairs_mixed_imported_and_legacy_files(
@@ -595,6 +598,7 @@ async def test_retag_catalog_album_repairs_mixed_imported_and_legacy_files(
     assert result.files_retagged == 3
     repaired = {key.casefold(): values for key, values in FLAC(legacy_path).tags.items()}
     assert repaired["date"] == [album.year]
+    assert repaired["releasedate"] == [album.year]
     assert repaired["release_date"] == [album.year]
     assert repaired["musicbrainz_trackid"] == [legacy_catalog.recording_mbid]
     assert "originalyear" not in repaired
