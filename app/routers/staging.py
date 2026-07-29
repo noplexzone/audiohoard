@@ -45,10 +45,13 @@ _MIME_MAP: dict[str, str] = {
 }
 
 
-def _validate_audio_path(staging_path: str, staging_root: Path) -> Path:
-    """Validate and resolve a staged audio path.
+def _validate_audio_path(
+    staging_path: str, staging_root: Path, *, require_importable_audio: bool = True
+) -> Path:
+    """Validate and resolve a staged path.
 
-    Raises HTTPException on traversal, symlink, or non-audio extension.
+    Raises HTTPException on traversal, symlink, non-audio extension when required,
+    or missing files.
     """
     raw = Path(staging_path)
     if not raw.is_absolute():
@@ -68,7 +71,7 @@ def _validate_audio_path(staging_path: str, staging_root: Path) -> Path:
             raise HTTPException(status_code=400, detail="Symlinks are not permitted")
 
     suffix = resolved.suffix.casefold()
-    if suffix not in IMPORTABLE_AUDIO_SUFFIXES:
+    if require_importable_audio and suffix not in IMPORTABLE_AUDIO_SUFFIXES:
         raise HTTPException(status_code=400, detail="Not an importable audio file")
 
     if not resolved.is_file():
@@ -214,7 +217,10 @@ async def deny_review_item(
         if staged_path:
             try:
                 resolved_staged_path = await asyncio.to_thread(
-                    _validate_audio_path, staged_path, settings.staging_root
+                    _validate_audio_path,
+                    staged_path,
+                    settings.staging_root,
+                    require_importable_audio=False,
                 )
             except HTTPException as exc:
                 if exc.status_code != 404:
