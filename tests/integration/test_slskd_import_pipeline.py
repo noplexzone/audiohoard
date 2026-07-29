@@ -21,6 +21,8 @@ from app.models.workflow import (
     ReviewDecision,
 )
 from app.schemas.search import SearchResult
+from app.services import library_import
+from app.services.library_import import CanonicalArtwork
 from app.sources.base import CapabilityState
 
 _EXPECTED_MBID = "11111111-1111-1111-1111-111111111111"
@@ -57,6 +59,7 @@ async def _run_mocked_slskd_pipeline(
         year="2026",
         track_count=1,
         mbid="33333333-3333-3333-3333-333333333333",
+        artwork_url="https://cdn-images.dzcdn.net/images/cover/test.jpg",
     )
     catalog_track = CatalogAlbumTrack(
         album=album,
@@ -127,10 +130,15 @@ async def _run_mocked_slskd_pipeline(
     async def no_deezer(track: Track, cfg: Settings) -> None:
         return None
 
+    async def fake_artwork(url: str | None) -> CanonicalArtwork | None:
+        assert url == "https://cdn-images.dzcdn.net/images/cover/test.jpg"
+        return CanonicalArtwork(b"\xff\xd8\xffmock-jpeg", "image/jpeg")
+
     monkeypatch.setattr(runner, "SlskdAdapter", FakeSlskdAdapter)
     monkeypatch.setattr(runner, "fingerprint_file", fake_fingerprint)
     monkeypatch.setattr(runner, "_lookup_acoustid_raw", fake_acoustid_lookup)
     monkeypatch.setattr(runner, "_enrich_deezer", no_deezer)
+    monkeypatch.setattr(library_import, "_fetch_canonical_artwork", fake_artwork)
 
     await runner.run_job(job.id, db, cfg)
     release = (await db.scalars(select(Release).where(Release.job_id == job.id))).one()
@@ -166,6 +174,7 @@ async def test_mocked_slskd_completed_transfer_is_staged_verified_and_auto_impor
     tags = ID3(destination)
     assert str(tags["TIT2"]) == "Song"
     assert str(tags["TPE1"]) == "Artist"
+    assert len(tags.getall("APIC")) == 1
     assert staged_file.exists(), "source cleanup must wait for transaction commit"
 
 
