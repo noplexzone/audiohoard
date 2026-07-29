@@ -399,6 +399,7 @@ def _tags_for(release: Release, track: Track) -> dict[str, str]:
         "album_artist": track.album_artist or release.album_artist or track.artist or "",
         "date": track.year or release.year or "",
         "release_date": track.year or release.year or "",
+        "releasedate": track.year or release.year or "",
         "tracknumber": str(track.track_no or ""),
         "discnumber": str(track.disc or ""),
         "musicbrainz_trackid": track.mbid or "",
@@ -705,14 +706,21 @@ def _discover_legacy_album_files(
         if path.is_symlink() or not path.is_file() or not is_importable_audio(path):
             continue
         track_key = _track_key_from_filename(path, folder)
+        stripped = path.stem
+        prefix = _TRACK_NUMBER_PREFIX.match(path.stem.strip())
+        if prefix is not None:
+            stripped = stripped[prefix.end() :].lstrip(" .-_")
+        title_match = catalog_by_title.get(_normalized_title(stripped))
         catalog_track = catalog_by_position.get(track_key or (0, 0))
+        if (
+            title_match is not None
+            and track_key is not None
+            and title_match.position == track_key[1]
+            and title_match is not catalog_track
+        ):
+            catalog_track = title_match
         if catalog_track is None:
-            stripped = path.stem
-            if track_key is not None:
-                prefix = _TRACK_NUMBER_PREFIX.match(path.stem.strip())
-                if prefix is not None:
-                    stripped = stripped[prefix.end() :].lstrip(" .-_")
-            catalog_track = catalog_by_title.get(_normalized_title(stripped))
+            catalog_track = title_match
         if catalog_track is None or catalog_track.id in used_catalog_ids:
             raise ImportExecutionError(
                 "album folder contains audio not linked to stored track metadata"

@@ -361,6 +361,60 @@ async def test_retag_catalog_album_discovers_legacy_library_files_without_import
     assert FLAC(paths[1])["musicbrainz_trackid"] == ["agats-mbid"]
 
 
+async def test_retag_catalog_album_matches_flat_multidisc_files_by_title(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    library_root = tmp_path / "library"
+    artist = CatalogArtist(name="Ty Myers", mbid="artist-mbid")
+    album = CatalogAlbum(
+        title="The Select (Deluxe)", year="2025", release_type="album", track_count=3
+    )
+    artist.albums.append(album)
+    album.tracks.extend(
+        [
+            CatalogAlbumTrack(
+                disc=1,
+                position=5,
+                title="Worry is a Sickness (Acoustic)",
+                recording_mbid="acoustic-mbid",
+            ),
+            CatalogAlbumTrack(
+                disc=2, position=1, title="Ends of the Earth", recording_mbid="ends-mbid"
+            ),
+            CatalogAlbumTrack(
+                disc=2,
+                position=5,
+                title="Love Is Two Faced",
+                recording_mbid="love-mbid",
+            ),
+        ]
+    )
+    db_session.add(artist)
+    await db_session.flush()
+    folder = library_root / artist.name / f"{album.title} ({album.year})"
+    folder.mkdir(parents=True)
+    acoustic = folder / "05 - Worry is a Sickness (Acoustic).flac"
+    ends = folder / "01 - Ends of the Earth.flac"
+    love = folder / "05 - Love Is Two Faced.flac"
+    for path in (acoustic, ends, love):
+        path.write_bytes(_minimal_flac_bytes())
+
+    async def no_artwork(url: str | None) -> CanonicalArtwork | None:
+        return None
+
+    monkeypatch.setattr(library_import_module, "_fetch_canonical_artwork", no_artwork)
+
+    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert result.files_retagged == 3
+    assert FLAC(acoustic)["discnumber"] == ["1"]
+    assert FLAC(acoustic)["musicbrainz_trackid"] == ["acoustic-mbid"]
+    assert FLAC(ends)["discnumber"] == ["2"]
+    assert FLAC(ends)["musicbrainz_trackid"] == ["ends-mbid"]
+    assert FLAC(love)["discnumber"] == ["2"]
+    assert FLAC(love)["musicbrainz_trackid"] == ["love-mbid"]
+
+
 async def test_retag_catalog_album_maps_multidisc_legacy_filenames(
     db_session: AsyncSession, tmp_path: Path, monkeypatch
 ) -> None:

@@ -234,6 +234,7 @@ async def test_execute_import_writes_and_verifies_flac_tags(
     assert imported[0].tag_verification_state == TagVerificationState.verified
     readback = MutagenTagWriter().read_tags(destination)
     assert readback["title"] == "Song 1"
+    assert readback["release_date"] == "1999"
     assert readback["musicbrainz_albumid"] == "release-mbid"
 
 
