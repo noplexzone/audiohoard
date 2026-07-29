@@ -346,3 +346,26 @@ async def test_retag_catalog_album_restores_all_files_when_replacement_fails(
 
     assert [path.read_bytes() for path in paths] == original_bytes
     assert not list(paths[0].parent.glob(".*.retag-*"))
+
+
+async def test_retag_catalog_album_close_failure_does_not_remove_committed_files(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, _tracks = await _seed_imported_album(db_session, library_root)
+    real_close = PinnedDestination.close
+    raised = False
+
+    def close_then_fail_once(self: PinnedDestination) -> None:
+        nonlocal raised
+        real_close(self)
+        if not raised:
+            raised = True
+            raise OSError("injected close failure")
+
+    monkeypatch.setattr(PinnedDestination, "close", close_then_fail_once)
+    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert result.files_retagged == 2
+    assert all(path.is_file() for path in paths)
+    assert all(FLAC(path)["albumartist"] == [album.artist.name] for path in paths)

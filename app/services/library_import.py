@@ -527,12 +527,13 @@ def _retag_catalog_album_files(
                 os.fsync(tagged_temp.fileno())
             prepared.append((pinned, temp_name, expected_hash))
 
+        temporary_names = {temp_name for _pinned, temp_name in temp_paths}
         current_audio = {
             item.resolve()
             for item in folder.iterdir()
             if item.is_file()
             and not item.is_symlink()
-            and not item.name.startswith(".")
+            and item.name not in temporary_names
             and is_importable_audio(item)
         }
         if current_audio != actual_audio:
@@ -557,11 +558,11 @@ def _retag_catalog_album_files(
                 pinned.fsync()
             except OSError:
                 logger.warning("retag succeeded but a temporary backup could not be removed")
-        _close_pinned_destinations(pinned_destinations)
+        _close_pinned_destinations_safely(pinned_destinations)
         return AlbumRetagResult(files_retagged=len(targets), folder=folder)
     except Exception as exc:
         _rollback_pinned_filesystem(temp_paths, created_destinations, backup_paths)
-        _close_pinned_destinations(pinned_destinations)
+        _close_pinned_destinations_safely(pinned_destinations)
         if isinstance(exc, ImportExecutionError):
             raise
         raise ImportExecutionError(f"album retag failed: {exc}") from exc
@@ -712,6 +713,14 @@ def _copy_to_temp(source: Path, pinned: PinnedDestination, expected_hash: str) -
 def _close_pinned_destinations(destinations: list[PinnedDestination]) -> None:
     for pinned in reversed(destinations):
         pinned.close()
+
+
+def _close_pinned_destinations_safely(destinations: list[PinnedDestination]) -> None:
+    for pinned in reversed(destinations):
+        try:
+            pinned.close()
+        except OSError:
+            logger.warning("failed to close pinned album destination after retag")
 
 
 async def _reconcile_catalog_ownership(db: AsyncSession, release: Release) -> None:
