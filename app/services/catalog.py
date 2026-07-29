@@ -25,6 +25,7 @@ from app.models.import_plan import ImportPlan
 from app.models.track import Track
 from app.models.workflow import AcquisitionState, ImportWorkflowState
 from app.naming.convention import _sanitize_segment
+from app.settings_service import QualityProfile
 
 UNKNOWN = "Unknown"
 _DEFAULT_PAGE_SIZE = 50
@@ -33,6 +34,41 @@ _MAX_PAGE_SIZE = 200
 _VALID_LIBRARY_SORTS = frozenset({"title", "artist", "album", "year", "source", "added"})
 _VALID_ARTIST_SORTS = frozenset({"name", "tracks", "albums", "duration"})
 _VALID_WATCHLIST_SORTS = frozenset({"name", "downloaded", "wanted"})
+_BITRATE_RE = re.compile(r"(?P<bitrate>\d{2,4})\s*(?:kbps|k)?", re.IGNORECASE)
+
+
+def _format_family(value: str | None) -> str:
+    normalized = (value or "").strip().casefold().lstrip(".")
+    if normalized in {"m4a", "mp4", "aac"}:
+        return "m4a/aac"
+    if normalized.startswith("mp3"):
+        return "mp3"
+    return normalized
+
+
+def _known_mp3_bitrate(file_format: str | None) -> int | None:
+    normalized = (file_format or "").casefold()
+    if "mp3" not in normalized:
+        return None
+    for match in _BITRATE_RE.finditer(normalized):
+        bitrate = int(match.group("bitrate"))
+        if bitrate != 3:
+            return bitrate
+    return None
+
+
+def track_meets_quality(file_format: str | None, profile: QualityProfile) -> bool:
+    """Return whether an imported catalog track already satisfies the runtime profile."""
+    family = _format_family(file_format)
+    if not family:
+        return True
+    preferred = {_format_family(value) for value in profile.format_preference}
+    if family not in preferred:
+        return False
+    if family != "mp3":
+        return True
+    bitrate = _known_mp3_bitrate(file_format)
+    return bitrate is None or bitrate >= profile.min_mp3_bitrate
 
 
 def _artist_expr() -> Any:
@@ -332,12 +368,10 @@ def _has_symlink_component(root: Path, path: Path) -> bool:
 
 
 def _directory_state(folder: Path) -> _DirectoryState:
-    directories = [folder]
-    directories.extend(
-        path for path in folder.rglob("*") if path.is_dir() and not path.is_symlink()
-    )
+    paths = [folder]
+    paths.extend(path for path in folder.rglob("*") if not path.is_symlink())
     return tuple(
-        sorted((str(path.relative_to(folder)), path.stat().st_mtime_ns) for path in directories)
+        sorted((str(path.relative_to(folder)), path.stat().st_mtime_ns) for path in paths)
     )
 
 

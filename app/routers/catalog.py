@@ -9,7 +9,7 @@ from typing import Annotated
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,6 +42,7 @@ from app.services.catalog import (
     list_distinct_formats,
     list_distinct_sources,
     list_library_tracks,
+    track_meets_quality,
 )
 from app.services.catalog_metadata import (
     VALID_METADATA_PROVIDERS,
@@ -62,6 +63,18 @@ from app.settings_service import effective_settings_dep, get_runtime_settings
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 logger = logging.getLogger(__name__)
+
+
+def _is_fetch_request(request: Request | None) -> bool:
+    return (
+        request is not None and request.headers.get("x-requested-with", "").casefold() == "fetch"
+    )
+
+
+def _download_response(request: Request | None, *, queued: int, album_id: int) -> Response:
+    if _is_fetch_request(request):
+        return JSONResponse({"queued": queued, "album_id": album_id})
+    return RedirectResponse("/downloads", status_code=303)
 
 
 async def _imported_catalog_track_ids(db: AsyncSession, album_id: int) -> set[int]:
@@ -1034,7 +1047,8 @@ async def download_catalog_album(
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     _user: Annotated[object, Depends(require_mutation)],
-) -> RedirectResponse:
+    request: Request = None,  # type: ignore[assignment]
+) -> Response:
     result = await db.execute(
         select(CatalogAlbum)
         .where(CatalogAlbum.id == album_id)
@@ -1064,13 +1078,41 @@ async def download_catalog_album(
         await db.commit()
         await db.refresh(job)
         await job_dispatcher.dispatch(job.id)
-        return RedirectResponse("/downloads", status_code=303)
+        return _download_response(request, queued=1, album_id=album.id)
 
-    missing_tracks = [track for track in album.tracks if track.id not in imported_ids]
-    if not missing_tracks:
-        return RedirectResponse("/downloads", status_code=303)
+    runtime = await get_runtime_settings(db)
+    quality_rows = (
+        await db.execute(
+            select(Track.catalog_track_id, Track.file_format, ImportPlan.destination_path)
+            .join(ImportPlan, ImportPlan.track_id == Track.id)
+            .where(
+                Track.catalog_album_id == album.id,
+                Track.catalog_track_id.is_not(None),
+                Track.import_state == ImportWorkflowState.imported,
+                ImportPlan.status == ImportWorkflowState.imported,
+                ImportPlan.destination_path != "",
+            )
+        )
+    ).all()
+    subquality_ids: set[int] = set()
+    for catalog_track_id, file_format, destination_path in quality_rows:
+        if (
+            catalog_track_id is not None
+            and int(catalog_track_id) in imported_ids
+            and await asyncio.to_thread(Path(destination_path).is_file)
+            and not track_meets_quality(file_format, runtime.quality_profile)
+        ):
+            subquality_ids.add(int(catalog_track_id))
+
+    tracks_to_queue = [
+        track
+        for track in album.tracks
+        if track.id not in imported_ids or track.id in subquality_ids
+    ]
+    if not tracks_to_queue:
+        return _download_response(request, queued=0, album_id=album.id)
     job_ids: list[int] = []
-    for track in missing_tracks:
+    for track in tracks_to_queue:
         track_query = f"{album.artist.name} {track.title}".strip()
         job = Job(
             source="priority",
@@ -1085,7 +1127,7 @@ async def download_catalog_album(
     await db.commit()
     for job_id in job_ids:
         await job_dispatcher.dispatch(job_id)
-    return RedirectResponse("/downloads", status_code=303)
+    return _download_response(request, queued=len(job_ids), album_id=album.id)
 
 
 @router.post("/albums/{album_id}/tracks/{track_id}/download", include_in_schema=False)
@@ -1094,7 +1136,8 @@ async def download_catalog_track(
     track_id: int,
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
-) -> RedirectResponse:
+    request: Request = None,  # type: ignore[assignment]
+) -> Response:
     result = await db.execute(
         select(CatalogAlbum)
         .where(CatalogAlbum.id == album_id)
@@ -1118,4 +1161,4 @@ async def download_catalog_track(
     await db.commit()
     await db.refresh(job)
     await job_dispatcher.dispatch(job.id)
-    return RedirectResponse("/downloads", status_code=303)
+    return _download_response(request, queued=1, album_id=album.id)

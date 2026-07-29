@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Download buttons on catalog album pages and artist release cards now queue work in place with a brief confirmation while preserving native form redirects without JavaScript.
+- Added a bounded job dispatcher concurrency setting to keep download bursts from exhausting the SQLite connection pool.
+
+### Changed
+- Album downloads now queue missing catalog tracks and imported tracks that are positively known to be below the configured quality profile, while skipping already acceptable or unknown-bitrate imports.
+
+### Fixed
+- Filesystem release-progress caching now notices new files inside nested disc folders even when directory timestamp resolution is too coarse.
+
 ## [0.7.2] - 2026-07-29
 
 ### Added

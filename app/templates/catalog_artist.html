@@ -116,7 +116,7 @@
               <p class="provider-badges"><span class="badge info">{{ display_name(selected_provider) }}</span></p>
               <div class="album-card-actions">
                 {% if artist.monitored and artist.watchlist_provider == selected_provider %}<label class="check-label compact-check"><input type="checkbox" name="album_monitored" form="monitor-form" value="{{ album.id }}" {% if album.monitored %}checked{% endif %}> <span>Watchlist</span></label>{% endif %}
-                {% if album.catalog_album_id %}<form method="post" action="/albums/{{ album.catalog_album_id }}/download">
+                {% if album.catalog_album_id %}<form method="post" action="/albums/{{ album.catalog_album_id }}/download" data-download-form>
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                   <button type="submit" class="btn secondary album-download" aria-label="Download album">Download<span class="sr-only"> album</span></button>
                 </form>{% endif %}

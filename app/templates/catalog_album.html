@@ -28,7 +28,7 @@
       <span>{{ progress.downloaded_track_count }} of {{ progress.wanted_track_count }} in library</span>
     </div>
     <div class="form-row">
-      <form method="post" action="/albums/{{ album.id }}/download">
+      <form method="post" action="/albums/{{ album.id }}/download" data-download-form data-album-download>
         <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
         <button type="submit" class="btn">Download missing</button>
       </form>
@@ -63,7 +63,7 @@
         <span class="have-mark" aria-label="In library">✓</span><span>–</span>
       {% else %}
         <span aria-label="Not in library">–</span>
-        <form method="post" action="/albums/{{ album.id }}/tracks/{{ track.id }}/download"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary small" type="submit">Download</button></form>
+        <form method="post" action="/albums/{{ album.id }}/tracks/{{ track.id }}/download" data-download-form><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary small" type="submit">Download</button></form>
       {% endif %}
     </li>
     {% endfor %}
@@ -79,7 +79,7 @@
       <td><span class="have-mark" aria-label="In library">✓</span></td><td>–</td>
     {% else %}
       <td><span aria-label="Not in library">–</span></td>
-      <td><form method="post" action="/albums/{{ album.id }}/tracks/{{ track.id }}/download"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary small" type="submit">Download</button></form></td>
+      <td><form method="post" action="/albums/{{ album.id }}/tracks/{{ track.id }}/download" data-download-form><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary small" type="submit">Download</button></form></td>
     {% endif %}
   </tr>
   {% endfor %}

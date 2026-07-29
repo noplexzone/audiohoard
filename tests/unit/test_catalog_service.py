@@ -28,7 +28,9 @@ from app.services.catalog import (
     get_library_stats,
     list_distinct_formats,
     list_library_tracks,
+    track_meets_quality,
 )
+from app.settings_service import QualityProfile
 
 
 def _make_track(
@@ -199,6 +201,24 @@ def test_page_last_page_no_next() -> None:
     p: Page[int] = Page(items=[], total=100, page=2, per_page=50)
     assert p.has_prev is True
     assert p.has_next is False
+
+
+def test_track_meets_quality_accepts_preferred_lossless_format() -> None:
+    profile = QualityProfile(["flac", "mp3"], 320, True)
+
+    assert track_meets_quality("flac", profile) is True
+
+
+def test_track_meets_quality_rejects_known_below_threshold_mp3() -> None:
+    profile = QualityProfile(["flac", "mp3"], 320, True)
+
+    assert track_meets_quality("mp3 128kbps", profile) is False
+
+
+def test_track_meets_quality_accepts_unknown_bitrate_mp3() -> None:
+    profile = QualityProfile(["flac", "mp3"], 320, True)
+
+    assert track_meets_quality("mp3", profile) is True
 
 
 # ── DB-backed service tests ────────────────────────────────────────────────────

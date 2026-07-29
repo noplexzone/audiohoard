@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -719,3 +720,77 @@ async def test_cleanup_reconciler_has_single_owned_task(
     assert dispatcher._cleanup_task is first
     await dispatcher.shutdown()
     assert dispatcher._cleanup_task is None
+
+
+async def test_dispatcher_respects_max_concurrent_jobs() -> None:
+    current = 0
+    peak = 0
+    started_two = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_runner(job_id: int) -> None:
+        nonlocal current, peak
+        current += 1
+        peak = max(peak, current)
+        if current == 2:
+            started_two.set()
+        await release.wait()
+        current -= 1
+
+    dispatcher = JobDispatcher(runner=slow_runner, max_concurrent_jobs=2)
+    tasks = [await dispatcher.dispatch(job_id) for job_id in range(5)]
+    await asyncio.wait_for(started_two.wait(), timeout=1)
+    await asyncio.sleep(0.05)
+
+    assert peak == 2
+    assert current == 2
+
+    release.set()
+    await asyncio.gather(*tasks)
+    await dispatcher.shutdown()
+
+
+async def test_dispatcher_waiting_job_is_not_watchdog_redispatched(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    started: list[int] = []
+
+    async def gated_runner(job_id: int) -> None:
+        started.append(job_id)
+        if len(started) == 1:
+            first_started.set()
+            await release_first.wait()
+
+    async with session_factory() as session:
+        first = Job(source="youtube", query="first", status=JobStatus.pending)
+        second = Job(source="youtube", query="second", status=JobStatus.pending)
+        session.add_all([first, second])
+        await session.commit()
+        first_id = first.id
+        second_id = second.id
+
+    dispatcher = JobDispatcher(
+        runner=gated_runner, session_factory=session_factory, max_concurrent_jobs=1
+    )
+    first_task = await dispatcher.dispatch(first_id)
+    second_task = await dispatcher.dispatch(second_id)
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    async with session_factory() as session:
+        waiting = await session.get(Job, second_id)
+        assert waiting is not None
+        waiting.updated_at = datetime.now(UTC) - timedelta(seconds=600)
+        await session.commit()
+
+    await dispatcher._watchdog_tick(threshold_seconds=300)
+
+    release_first.set()
+    await asyncio.gather(first_task, second_task)
+
+    assert started == [first_id, second_id]
+    async with session_factory() as session:
+        waiting = await session.get(Job, second_id)
+        assert waiting is not None
+        assert waiting.result_json is None
+    await dispatcher.shutdown()
