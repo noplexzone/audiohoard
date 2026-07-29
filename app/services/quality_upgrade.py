@@ -22,6 +22,7 @@ _LOSSLESS_FORMATS = frozenset({"flac", "alac", "wav", "aiff", "aif"})
 class QualityDuplicateResult:
     deleted_files: int = 0
     review_required: int = 0
+    would_delete_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,7 @@ async def reconcile_album_quality_duplicates(
     library_root: Path,
     quality_profile: QualityProfile,
     defer_filesystem_delete: bool = False,
+    dry_run: bool = False,
 ) -> QualityDuplicateResult:
     """Remove lower-quality imported duplicates for one catalog album.
 
@@ -159,21 +161,31 @@ async def reconcile_album_quality_duplicates(
             ranked[1], quality_profile
         ):
             review_required += len(ranked)
-            for item in ranked:
-                item.plan.collision_state = CollisionState.needs_review
-                item.plan.error_detail = "same-folder duplicate quality is ambiguous"
-                item.plan.status = ImportWorkflowState.needs_review
-                item.track.import_state = ImportWorkflowState.needs_review
+            if not dry_run:
+                for item in ranked:
+                    item.plan.collision_state = CollisionState.needs_review
+                    item.plan.error_detail = "same-folder duplicate quality is ambiguous"
+                    item.plan.status = ImportWorkflowState.needs_review
+                    item.track.import_state = ImportWorkflowState.needs_review
             continue
         for loser in ranked[1:]:
             to_delete.append(loser.path)
-            loser.plan.status = ImportWorkflowState.rolled_back
-            loser.plan.rollback_detail = (
-                f"lower-quality duplicate removed; retained {winner.path.name}"
-            )
-            loser.track.import_state = ImportWorkflowState.rolled_back
-            loser.track.staging_path = None
-            loser.track.source_path = None
+            if not dry_run:
+                loser.plan.status = ImportWorkflowState.rolled_back
+                loser.plan.rollback_detail = (
+                    f"lower-quality duplicate removed; retained {winner.path.name}"
+                )
+                loser.track.import_state = ImportWorkflowState.rolled_back
+                loser.track.staging_path = None
+                loser.track.source_path = None
+
+    if dry_run:
+        unique_paths = tuple(dict.fromkeys(to_delete))
+        return QualityDuplicateResult(
+            deleted_files=len(unique_paths),
+            review_required=review_required,
+            would_delete_paths=tuple(str(path) for path in unique_paths),
+        )
 
     if to_delete:
         unique_paths = tuple(dict.fromkeys(to_delete))

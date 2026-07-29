@@ -28,6 +28,8 @@ from app.models.catalog_entities import (
 )
 from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
+from app.models.monitoring import MonitoringRecord, MonitoringStatus
+from app.models.release import Release
 from app.models.track import Track
 from app.models.workflow import ImportWorkflowState
 from app.services.catalog import (
@@ -51,6 +53,10 @@ from app.services.catalog_metadata import (
     open_catalog_artist,
 )
 from app.services.library_import import ImportExecutionError, retag_catalog_album
+from app.services.monitoring import (
+    _monitoring_profile_from_runtime,
+    current_release_quality,
+)
 from app.services.quality_upgrade import reconcile_album_quality_duplicates
 from app.settings_service import effective_settings_dep, get_runtime_settings
 
@@ -791,6 +797,18 @@ async def catalog_album_page(
     progress = (await get_release_progress(db, [album.id], library_root=settings.library_root))[
         album.id
     ]
+    watched_release_ids = {
+        row[0]
+        for row in (
+            await db.execute(
+                select(MonitoringRecord.release_id)
+                .join(Release, Release.id == MonitoringRecord.release_id)
+                .join(Track, Track.release_id == Release.id)
+                .where(Track.catalog_album_id == album.id)
+                .distinct()
+            )
+        ).all()
+    }
     total_runtime_sec = sum(track.duration_sec or 0 for track in album.tracks)
     retag_status = request.query_params.get("retag", "")
     flash_message: str | None = None
@@ -829,8 +847,56 @@ async def catalog_album_page(
             "total_runtime_sec": total_runtime_sec,
             "flash_message": flash_message,
             "flash_type": flash_type,
+            "watching_for_upgrades": bool(watched_release_ids),
         },
     )
+
+
+@router.post("/albums/{album_id}/watch-upgrade", include_in_schema=False)
+async def watch_album_quality_upgrade(
+    album_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    release = (
+        await db.scalars(
+            select(Release)
+            .join(Track, Track.release_id == Release.id)
+            .where(
+                Track.catalog_album_id == album_id,
+                Track.import_state == ImportWorkflowState.imported,
+            )
+            .order_by(Release.id.desc())
+            .limit(1)
+        )
+    ).first()
+    if release is None:
+        raise HTTPException(status_code=404, detail="No imported release found for album")
+    runtime = await get_runtime_settings(db)
+    profile = _monitoring_profile_from_runtime(runtime)
+    baseline_quality = await current_release_quality(db, release.id)
+    history = json.dumps([{"outcome": "watch_created", "baseline_quality": baseline_quality}])
+    record = (
+        await db.scalars(
+            select(MonitoringRecord).where(MonitoringRecord.release_id == release.id).limit(1)
+        )
+    ).first()
+    if record is None:
+        db.add(
+            MonitoringRecord(
+                release_id=release.id,
+                status=MonitoringStatus.active,
+                desired_quality_json=profile.to_json(),
+                history_json=history,
+            )
+        )
+    else:
+        record.status = MonitoringStatus.active
+        record.desired_quality_json = profile.to_json()
+        record.history_json = history
+        record.candidate_id = None
+    await db.commit()
+    return RedirectResponse(f"/albums/{album_id}", status_code=303)
 
 
 @router.post("/albums/{album_id}/retag", include_in_schema=False)

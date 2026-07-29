@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import logging
-from collections.abc import Awaitable
 from dataclasses import dataclass
 
 from sqlalchemy import func, select
@@ -11,9 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.models.job import Job, JobStatus
 from app.services.catalog import LibraryStats, TrackRow, get_library_stats, list_library_tracks
-from app.sources.base import CapabilityState
-from app.sources.tidal import TidalAdapter
-from app.sources.youtube import YouTubeAdapter
+from app.services.health_status import CachedProviderStatus
 
 logger = logging.getLogger(__name__)
 _RECENT_LIMIT = 6
@@ -35,26 +31,11 @@ class DashboardData:
     providers: list[ProviderReadiness]
 
 
-async def _safe_local_health(name: str, check: Awaitable[CapabilityState]) -> CapabilityState:
-    try:
-        return await check
-    except Exception:
-        logger.warning("%s dashboard readiness check failed", name, exc_info=True)
-        return CapabilityState(False, f"{name} local readiness check unavailable", {})
-
-
-async def _provider_readiness(settings: Settings) -> list[ProviderReadiness]:
-    youtube_state, tidal_state = await asyncio.gather(
-        _safe_local_health("YouTube", YouTubeAdapter(settings.ytdlp_cookies_file).local_health()),
-        _safe_local_health(
-            "TIDAL",
-            TidalAdapter(
-                settings.tidal_config_path,
-                settings.tidal_session_path,
-                settings.tidal_quality,
-            ).local_health(),
-        ),
-    )
+def _provider_readiness(
+    settings: Settings, provider_snapshot: dict[str, CachedProviderStatus]
+) -> list[ProviderReadiness]:
+    youtube_state = provider_snapshot.get("youtube")
+    tidal_state = provider_snapshot.get("tidal")
     return [
         ProviderReadiness(
             name="slskd",
@@ -74,26 +55,44 @@ async def _provider_readiness(settings: Settings) -> list[ProviderReadiness]:
         ),
         ProviderReadiness(
             name="YouTube",
-            configured=youtube_state.available,
+            configured=bool(youtube_state and youtube_state.available),
             detail=(
                 "Local yt-dlp backend is ready"
-                if youtube_state.available
-                else (youtube_state.reason or "yt-dlp is unavailable")
+                if youtube_state and youtube_state.available
+                else (
+                    "YouTube local readiness check unavailable"
+                    if youtube_state and youtube_state.reason == "Not checked"
+                    else (
+                        youtube_state.reason
+                        if youtube_state and youtube_state.reason
+                        else "yt-dlp is unavailable"
+                    )
+                )
             ),
         ),
         ProviderReadiness(
             name="TIDAL",
-            configured=tidal_state.available,
+            configured=bool(tidal_state and tidal_state.available),
             detail=(
                 "Local profile and session are ready"
-                if tidal_state.available
-                else (tidal_state.reason or "TIDAL is unavailable")
+                if tidal_state and tidal_state.available
+                else (
+                    "TIDAL local readiness check unavailable"
+                    if tidal_state and tidal_state.reason == "Not checked"
+                    else (
+                        tidal_state.reason
+                        if tidal_state and tidal_state.reason
+                        else "TIDAL is unavailable"
+                    )
+                )
             ),
         ),
     ]
 
 
-async def get_dashboard_data(db: AsyncSession, settings: Settings) -> DashboardData:
+async def get_dashboard_data(
+    db: AsyncSession, settings: Settings, provider_snapshot: dict[str, CachedProviderStatus]
+) -> DashboardData:
     """Load dashboard aggregates and bounded recent activity from persisted data."""
     library = await get_library_stats(db)
 
@@ -119,5 +118,5 @@ async def get_dashboard_data(db: AsyncSession, settings: Settings) -> DashboardD
         job_counts=job_counts,
         recent_jobs=list(jobs_result.scalars().all()),
         recent_tracks=recent_library.items,
-        providers=await _provider_readiness(settings),
+        providers=_provider_readiness(settings, provider_snapshot),
     )

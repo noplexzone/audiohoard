@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Maintenance — Audiohoard{% endblock %}
+{% macro csrf() -%}<input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">{%- endmacro %}
+{% block content %}
+<header class="page-header"><div><p class="eyebrow">Operations</p><h1>Maintenance</h1><p>Cached library verification and duplicate cleanup controls.</p></div></header>
+{% if deleted %}<div class="alert ok" role="status">Cleaned {{ deleted }} duplicate file{{ '' if deleted == '1' else 's' }}.</div>{% endif %}
+{% if upgrade_status == 'ok' %}<div class="alert ok" role="status">Quality upgrade imported.</div>{% elif upgrade_status == 'error' %}<div class="alert error" role="alert">Quality upgrade failed: {{ upgrade_detail }}</div>{% endif %}
+<div class="maintenance-grid">
+  <section class="panel maintenance-bucket" aria-labelledby="scan-heading">
+    <div class="section-heading"><div><p class="eyebrow">Library scan</p><h2 id="scan-heading">Filesystem verification</h2></div><form method="post" action="/maintenance/scan">{{ csrf() }}<button class="btn" type="submit">Scan now</button></form></div>
+    {% set scan = maintenance.library_scan %}
+    <div class="status-strip">
+      <span><strong>{{ scan.matched if scan else 0 }}</strong><small>Matched</small></span>
+      <span><strong>{{ scan.orphans | length if scan else 0 }}</strong><small>Orphans shown</small></span>
+      <span><strong>{{ scan.missing | length if scan else 0 }}</strong><small>Missing shown</small></span>
+      <span><strong>{{ scan.scanned_files if scan else 0 }}</strong><small>Scanned files</small></span>
+    </div>
+    <h3>Orphans</h3>
+    {% if scan and scan.orphans %}<ul class="maintenance-list">{% for path in scan.orphans if path not in maintenance.ignored_orphans %}<li><code>{{ path }}</code><span class="inline-actions"><form method="post" action="/maintenance/orphans/import">{{ csrf() }}<input type="hidden" name="path" value="{{ path }}"><button class="btn secondary" type="submit">Import</button></form><form method="post" action="/maintenance/orphans/ignore">{{ csrf() }}<input type="hidden" name="path" value="{{ path }}"><button class="btn secondary" type="submit">Ignore</button></form></span></li>{% endfor %}</ul>{% else %}<div class="empty-state mini"><h3>No orphaned files shown</h3><p>Run a scan to compare library files against imported plans.</p></div>{% endif %}
+    <h3>Missing imports</h3>
+    {% if scan and scan.missing %}<ul class="maintenance-list">{% for path in scan.missing %}<li><code>{{ path }}</code><a class="btn secondary" href="/search">Re-acquire</a></li>{% endfor %}</ul>{% else %}<div class="empty-state mini"><h3>No missing imports shown</h3><p>Imported plan destinations are present or no scan has run.</p></div>{% endif %}
+  </section>
+  <section class="panel maintenance-bucket" aria-labelledby="duplicates-heading">
+    <div class="section-heading"><div><p class="eyebrow">Duplicates</p><h2 id="duplicates-heading">Quality cleanup</h2></div></div>
+    {% set dup = maintenance.duplicate_scan %}
+    <div class="status-strip">
+      <span><strong>{{ dup.deleted_files }}</strong><small>Would reclaim</small></span>
+      <span><strong>{{ dup.review_required }}</strong><small>Need review</small></span>
+      <span><strong>{{ dup.safe_album_ids | length }}</strong><small>Safe albums</small></span>
+    </div>
+    <div class="button-row"><form method="post" action="/maintenance/duplicates/scan">{{ csrf() }}<button class="btn" type="submit">Scan for duplicates</button></form><form method="post" action="/maintenance/duplicates/clean">{{ csrf() }}<button class="btn secondary" type="submit" {% if not dup.safe_album_ids %}disabled{% endif %}>Clean {{ dup.deleted_files }} safe duplicates</button></form></div>
+    {% if dup.would_delete_paths %}<ul class="maintenance-list">{% for path in dup.would_delete_paths[:20] %}<li><code>{{ path }}</code><span class="badge warn">would delete</span></li>{% endfor %}</ul>{% else %}<div class="empty-state mini"><h3>No duplicate cleanup candidates</h3><p>Run a duplicate scan to calculate safe removals.</p></div>{% endif %}
+  </section>
+  <section class="panel maintenance-bucket" aria-labelledby="upgrades-heading">
+    <div class="section-heading"><div><p class="eyebrow">Upgrades</p><h2 id="upgrades-heading">Quality upgrades</h2></div></div>
+    {% if upgrade_records %}
+      <ul class="maintenance-list">
+      {% for record in upgrade_records %}
+        {% set candidate_quality = (record.candidate.quality_json | from_json) if record.candidate else {} %}
+        {% set current_quality = ((record.history_json | from_json)[0].baseline_quality if (record.history_json | from_json) else {}) %}
+        <li>
+          <span><strong>{{ record.release.album_artist or '' }}{% if record.release.album_artist %} — {% endif %}{{ record.release.title or ('Release #' ~ record.release_id) }}</strong><br><small>Current {{ current_quality.codec or 'unknown' }}{% if current_quality.lossless %} lossless{% endif %} → Candidate {{ candidate_quality.codec or 'unknown' }}{% if candidate_quality.lossless %} lossless{% endif %}</small></span>
+          <span class="inline-actions"><form method="post" action="/maintenance/upgrades/approve/{{ record.id }}">{{ csrf() }}<button class="btn" type="submit">Approve</button></form></span>
+        </li>
+      {% endfor %}
+      </ul>
+    {% else %}<div class="empty-state mini"><h3>No upgrade candidates</h3><p>No watched releases have a better approved candidate.</p></div>{% endif %}
+  </section>
+</div>
+{% endblock %}
