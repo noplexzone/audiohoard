@@ -1259,6 +1259,9 @@ async def execute_release_import(
             for track in imported_tracks
             if track.catalog_track_id is not None
         }
+        catalog_scoped_import = any(
+            track.catalog_album_id is not None for track in imported_tracks
+        )
         remaining_tracks = list(
             (
                 await db.scalars(
@@ -1270,12 +1273,19 @@ async def execute_release_import(
             ).all()
         )
         expected_count = release.track_count or 0
-        imported_identity_count = len(imported_catalog_ids) or len(imported_tracks)
+        imported_identity_count = (
+            len(imported_catalog_ids) if catalog_scoped_import else len(imported_tracks)
+        )
         release_complete = (
             imported_identity_count >= expected_count if expected_count else not remaining_tracks
         )
         if release_complete:
             release.import_state = ImportWorkflowState.imported
+            release.error_detail = None
+        elif catalog_scoped_import:
+            release.import_state = ImportWorkflowState.needs_review
+            missing_count = max(expected_count - imported_identity_count, 1)
+            release.error_detail = f"{missing_count} catalog track(s) still require review"
         elif any(track.source_path or track.staging_path for track in remaining_tracks):
             release.import_state = ImportWorkflowState.needs_review
         else:

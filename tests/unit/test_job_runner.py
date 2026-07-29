@@ -19,7 +19,7 @@ from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, Catalog
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import IdentityResolutionState, Track
-from app.models.workflow import AcquisitionState
+from app.models.workflow import AcquisitionState, ImportWorkflowState
 from app.naming.convention import NamingError
 from app.schemas.search import SearchResult
 from app.sources.base import CapabilityState
@@ -567,6 +567,60 @@ def test_catalog_track_matching_never_falls_back_to_result_position() -> None:
     matched = runner._catalog_track_for_result(result, [first, second], None)
 
     assert matched is None
+
+
+def test_single_track_catalog_match_falls_back_to_only_track() -> None:
+    only = CatalogAlbumTrack(id=7, position=1, disc=1, title="AGATS2 (Insecure)")
+    result = SearchResult(
+        source="slskd",
+        title="Juice WRLD AGATS2 01 AGATS2",
+        artist="Juice WRLD",
+    )
+
+    matched = runner._catalog_track_for_result(result, [only], None)
+
+    assert matched is only
+
+
+async def test_catalog_album_parent_reconciled_after_continuation_completes(
+    db_session: AsyncSession,
+) -> None:
+    artist = CatalogArtist(name="Juice WRLD")
+    album = CatalogAlbum(title="whoa (mind in awe) [Remix]", track_count=1)
+    artist.albums.append(album)
+    track = CatalogAlbumTrack(position=1, disc=1, title="whoa (mind in awe) (Remix)")
+    album.tracks.append(track)
+    parent = Job(
+        source="priority",
+        query="Juice WRLD whoa",
+        status=JobStatus.partial,
+        result_json=json.dumps({"missing_catalog_track_ids": [999], "missing_tracks": ["whoa"]}),
+        catalog_album=album,
+    )
+    child = Job(
+        source="slskd", query="Juice WRLD whoa", status=JobStatus.done, catalog_album=album
+    )
+    release = Release(job=child, source="slskd", title=album.title, album_artist=artist.name)
+    imported = Track(
+        job=child,
+        release=release,
+        catalog_album=album,
+        catalog_track=track,
+        source="slskd",
+        title=track.title,
+        artist=artist.name,
+        album=album.title,
+        import_state=ImportWorkflowState.imported,
+    )
+    db_session.add_all([artist, parent, child, release, imported])
+    await db_session.flush()
+
+    await runner._reconcile_catalog_album_jobs(db_session, album.id, {track.id})
+
+    assert parent.status == JobStatus.done
+    payload = json.loads(parent.result_json or "{}")
+    assert payload["missing_catalog_track_ids"] == []
+    assert payload["missing_tracks"] == []
 
 
 def test_catalogless_continuation_reuses_track_across_provider_fallback() -> None:

@@ -1070,3 +1070,65 @@ async def test_album_download_without_fetch_header_still_redirects(
 
     assert response.status_code == 303
     assert response.headers["location"] == "/downloads"
+
+
+async def test_artist_download_monitored_fetch_returns_json_and_stays_put(
+    client: AsyncClient, monkeypatch
+) -> None:
+    import app.routers.catalog as catalog_router
+
+    dispatched: list[int] = []
+
+    async def fake_dispatch(job_id: int):
+        dispatched.append(job_id)
+
+    monkeypatch.setattr(catalog_router.job_dispatcher, "dispatch", fake_dispatch)
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        artist = CatalogArtist(
+            name="Fetch Bulk Artist",
+            monitored=True,
+            watchlist_provider="deezer",
+            last_enriched_at=datetime.now(tz=UTC),
+        )
+        album = CatalogAlbum(title="Fetch Bulk Single", track_count=1, in_library=False)
+        album.tracks.append(CatalogAlbumTrack(position=1, disc=1, title="Fetch Bulk Single"))
+        identity = CatalogArtistIdentity(
+            provider="deezer", provider_artist_id="fetch-bulk", name=artist.name
+        )
+        identity.releases.append(
+            CatalogAlbumProvider(
+                provider_album_id="fetch-bulk-single",
+                title=album.title,
+                release_kind="single",
+                monitored=True,
+                catalog_album=album,
+            )
+        )
+        artist.albums.append(album)
+        artist.identities.append(identity)
+        session.add(artist)
+        await session.commit()
+        artist_id = artist.id
+
+    response = await client.post(
+        f"/artists/catalog/{artist_id}/download-monitored",
+        headers={"X-Requested-With": "fetch"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"queued": 1, "artist_id": artist_id}
+    async with factory() as session:
+        jobs = list(
+            (
+                await session.scalars(
+                    select(Job).where(
+                        Job.catalog_album_id == album.id,
+                        Job.status == JobStatus.pending,
+                    )
+                )
+            ).all()
+        )
+    assert len(jobs) == 1
+    assert dispatched == [jobs[0].id]

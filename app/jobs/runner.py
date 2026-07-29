@@ -726,6 +726,8 @@ async def _run_job_in_session(
             runtime = await get_runtime_settings(db)
             if missing_catalog_ids and job.partial_attempt < runtime.max_partial_attempts:
                 await _spawn_continuation_jobs(job, missing_catalog_ids, catalog_album, db)
+            elif not missing_catalog_ids:
+                await _reconcile_catalog_album_jobs(db, catalog_album.id, acquired_ids)
         elif failures and tracks_created:
             job.status = JobStatus.partial
             payload = _job_payload(job)
@@ -902,10 +904,13 @@ def _catalog_track_for_result(
             if catalog_stripped == title_stripped:
                 return track
 
-    # 5. (No-op: position-based matching is now fully handled by step 0, which runs
-    #    before title steps.  Repeating it here after title steps fail would return
-    #    the same miss or, for compound prefixes, misread the disc digit as a track
-    #    number.)
+    # 5. Single-track catalog releases: if the album context is already catalog-scoped,
+    #    the only stored catalog track is the intended identity.  This repairs singles
+    #    whose source filenames include extra artist/album/position tokens that defeat
+    #    title parsing, while preserving the no-position-fallback rule for multi-track
+    #    releases.
+    if len(tracks) == 1:
+        return tracks[0]
 
     return None
 
@@ -994,6 +999,37 @@ def _job_payload(job: Job) -> dict[str, object]:
         if isinstance(payload, dict):
             return payload
     return {}
+
+
+async def _reconcile_catalog_album_jobs(
+    db: AsyncSession, album_id: int, acquired_ids: set[int]
+) -> None:
+    expected_ids = set(
+        (
+            await db.scalars(
+                select(CatalogAlbumTrack.id).where(CatalogAlbumTrack.album_id == album_id)
+            )
+        ).all()
+    )
+    if not expected_ids or not expected_ids <= acquired_ids:
+        return
+    jobs = list(
+        (
+            await db.scalars(
+                select(Job).where(
+                    Job.catalog_album_id == album_id,
+                    Job.status == JobStatus.partial,
+                )
+            )
+        ).all()
+    )
+    for album_job in jobs:
+        payload = _job_payload(album_job)
+        payload["missing_catalog_track_ids"] = []
+        payload["missing_tracks"] = []
+        album_job.status = JobStatus.done
+        album_job.result_json = json.dumps(payload, sort_keys=True)
+        album_job.updated_at = _now()
 
 
 def _set_acquisition_provenance(
