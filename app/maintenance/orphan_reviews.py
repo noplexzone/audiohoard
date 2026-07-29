@@ -44,6 +44,15 @@ def _quick_check(connection: sqlite3.Connection) -> None:
         raise RuntimeError(f"SQLite quick_check failed: {', '.join(rows)}")
 
 
+def _data_version(connection: sqlite3.Connection) -> int:
+    row = connection.execute("PRAGMA data_version").fetchone()
+    return int(row[0] if row else 0)
+
+
+def _backup_database(source: sqlite3.Connection, destination: sqlite3.Connection) -> None:
+    source.backup(destination)
+
+
 def repair_orphan_reviews(
     database: Path,
     *,
@@ -68,16 +77,25 @@ def repair_orphan_reviews(
         backup_path = backup_path.expanduser().resolve()
         if backup_path.exists():
             raise FileExistsError(backup_path)
+        source_version = _data_version(connection)
         with sqlite3.connect(backup_path) as backup:
-            connection.backup(backup)
+            _backup_database(connection, backup)
             _quick_check(backup)
         try:
             connection.execute("BEGIN EXCLUSIVE")
         except sqlite3.OperationalError as exc:
+            backup_path.unlink(missing_ok=True)
             raise RuntimeError(
                 "could not acquire an exclusive SQLite write lock; stop Audiohoard and retry"
             ) from exc
         try:
+            if _data_version(connection) != source_version:
+                backup_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    "database changed while its backup was captured; stop Audiohoard and retry"
+                )
+            # Recount under the retained writer lock; this count is the exact repair scope.
+            orphan_count = _orphans(connection)
             cursor = connection.execute(
                 """
                 DELETE FROM staging_review_items AS review

@@ -49,10 +49,13 @@ class ImportedSourceCleanup:
     plan_id: int | None
     staged_path: Path
     provenance_json: str | None
+    source_job_id: str | None = None
 
 
 class SlskdCleanupAdapter(Protocol):
-    async def cancel(self, username: str, filename: str) -> None: ...
+    async def cancel(
+        self, username: str, filename: str, transfer_id: str | None = None
+    ) -> bool | None: ...
 
 
 def _slskd_identity(provenance_json: str | None) -> tuple[str, str] | None:
@@ -91,7 +94,11 @@ async def hide_completed_and_timed_out_jobs(
                 and track.source_status != "transfer_timeout"
                 for track in job.tracks
             )
-            if job.status == JobStatus.done or (timed_out and not has_other_incomplete):
+            completed_standalone = job.status == JobStatus.done and job.catalog_album_id is None
+            timed_out_standalone = (
+                job.catalog_album_id is None and timed_out and not has_other_incomplete
+            )
+            if completed_standalone or timed_out_standalone:
                 job.queue_hidden = True
                 hidden.add(job.id)
 
@@ -170,14 +177,52 @@ async def cleanup_durable_slskd_transfers(
     completed = 0
     cleaned_track_identities: dict[int, tuple[tuple[str, str], str]] = {}
     for identity, track_refs in sorted(attempts.items()):
+        # Revalidate immediately before provider I/O. The adapter additionally targets
+        # the exact provider transfer ID, so a replacement with the same peer/path
+        # cannot be removed after this transaction is released.
+        async with session_factory() as db:
+            current_tracks = list(
+                (
+                    await db.scalars(
+                        select(Track).where(Track.id.in_([ref[0] for ref in track_refs]))
+                    )
+                ).all()
+            )
+            current_refs = [
+                (track.id, expected_source_job_id)
+                for track in current_tracks
+                for expected_track_id, expected_source_job_id in track_refs
+                if track.id == expected_track_id
+                and track.source_job_id == expected_source_job_id
+                and _slskd_identity(track.acquisition_provenance_json) == identity
+                and not _source_cleanup_completed(track.acquisition_provenance_json)
+                and (
+                    (
+                        track.acquisition_state == AcquisitionState.downloaded
+                        and bool(track.staging_path)
+                    )
+                    or track.source_status == "transfer_timeout"
+                )
+            ]
+        if not current_refs:
+            continue
+        # Every row grouped under an identity should refer to the same provider
+        # transfer. Refuse ambiguous historical groups rather than deleting by path.
+        transfer_ids = {source_job_id for _, source_job_id in current_refs}
+        if len(transfer_ids) != 1:
+            logger.warning("skipping ambiguous durable slskd transfer cleanup identity")
+            continue
+        transfer_id = next(iter(transfer_ids))
         try:
-            await adapter.cancel(*identity)
+            cleanup_result = await adapter.cancel(*identity, transfer_id)
+            if cleanup_result is False:
+                continue
         except Exception:
             logger.exception("durable slskd transfer cleanup failed")
         else:
             completed += 1
             cleaned_track_identities.update(
-                {track_id: (identity, source_job_id) for track_id, source_job_id in track_refs}
+                {track_id: (identity, source_job_id) for track_id, source_job_id in current_refs}
             )
 
     if cleaned_track_identities:
@@ -379,6 +424,7 @@ async def pending_imported_source_cleanups(
             plan.id,
             Path(plan.staging_path or plan.source_path),
             plan.track.acquisition_provenance_json if plan.track else None,
+            plan.track.source_job_id if plan.track else None,
         )
         for plan in plans
     )
@@ -416,7 +462,11 @@ async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> 
                 failed = True
             else:
                 try:
-                    await adapter.cancel(*identity)
+                    if item.source_job_id is None:
+                        raise RuntimeError("slskd cleanup requires an exact transfer ID")
+                    cleanup_result = await adapter.cancel(*identity, item.source_job_id)
+                    if cleanup_result is False:
+                        failed = True
                 except Exception:
                     failed = True
                     logger.exception("post-import slskd transfer cleanup failed")

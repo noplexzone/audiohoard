@@ -143,6 +143,58 @@ class TestSlskdTransfers:
         assert [request.method for request in requests] == ["GET", "DELETE"]
         assert requests[-1].url.params["remove"] == "true"
 
+    async def test_cleanup_cancel_does_not_remove_replacement_with_same_identity(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer1",
+                    "files": [
+                        {
+                            "id": "new-transfer",
+                            "filename": "Music\\same.flac",
+                            "state": "InProgress",
+                        }
+                    ],
+                }
+            ],
+        )
+
+        result = await SlskdAdapter("http://slskd.local", "key123").cancel(
+            "peer1", "Music\\same.flac", "old-transfer"
+        )
+
+        assert result is True
+        assert [request.method for request in httpx_mock.get_requests()] == ["GET"]
+
+    async def test_cleanup_cancel_keeps_fallback_identity_pending_when_ambiguous(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer1",
+                    "files": [
+                        {
+                            "id": "provider-transfer",
+                            "filename": "Music\\same.flac",
+                            "state": "Completed, Succeeded",
+                        }
+                    ],
+                }
+            ],
+        )
+
+        result = await SlskdAdapter("http://slskd.local", "key123").cancel(
+            "peer1", "Music\\same.flac", "peer1:Music\\same.flac"
+        )
+
+        assert result is False
+        assert [request.method for request in httpx_mock.get_requests()] == ["GET"]
+
     async def test_cancel_is_idempotent_when_transfer_is_already_absent(
         self, httpx_mock: HTTPXMock
     ) -> None:

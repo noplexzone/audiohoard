@@ -121,13 +121,24 @@ orphaned staging-review rows, run the maintenance command in dry-run mode:
 uv run audiohoard-repair-reviews ./data/audiohoard.db
 ```
 
-Applying the repair is deliberately gated. Stop Audiohoard first, then run:
+For a Docker Compose installation, audit the live database without changing it:
 
 ```bash
-uv run audiohoard-repair-reviews ./data/audiohoard.db --apply --confirm-stopped
+docker compose exec app audiohoard-repair-reviews /app/data/audiohoard.db
 ```
 
-The command obtains an exclusive SQLite write lock, creates and verifies a timestamped
-backup beside the database, removes only review rows whose track or release no longer
-exists, and verifies database/FK integrity before committing. Never run `--apply` while
-the Audiohoard container is active.
+Applying the repair is deliberately gated. Stop Audiohoard, run the maintenance entrypoint
+against the mounted database, then restart and verify readiness:
+
+```bash
+docker compose stop app
+docker compose run --rm --entrypoint audiohoard-repair-reviews app \
+  /app/data/audiohoard.db --apply --confirm-stopped
+docker compose start app
+docker compose exec app audiohoard-repair-reviews /app/data/audiohoard.db
+```
+
+The command creates and verifies a timestamped backup, obtains an exclusive SQLite write
+lock, aborts if the database changed while the backup was captured, removes only review
+rows whose track or release no longer exists, and verifies database/FK integrity before
+committing. Never run `--apply` while the Audiohoard container is active.

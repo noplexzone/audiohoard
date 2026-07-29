@@ -55,13 +55,13 @@ def fast_settings(test_settings: Settings, staging_root: Path) -> Settings:
 class _FakeSlskdAdapter:
     def __init__(self, states: list[CapabilityState]) -> None:
         self._iter = iter(states)
-        self.cancel_calls: list[tuple[str, str]] = []
+        self.cancel_calls: list[tuple[str, str, str | None]] = []
 
     async def status(self, transfer_id: str) -> CapabilityState:  # noqa: ARG002
         return next(self._iter)
 
-    async def cancel(self, username: str, filename: str) -> None:
-        self.cancel_calls.append((username, filename))
+    async def cancel(self, username: str, filename: str, transfer_id: str | None = None) -> None:
+        self.cancel_calls.append((username, filename, transfer_id))
 
 
 class _FakeSabAdapter:
@@ -181,7 +181,7 @@ async def test_slskd_retry_adopts_existing_completed_transfer(
 
         async def status(self, transfer_id: str) -> CapabilityState:
             assert transfer_id == f"peer1:{filename}"
-            return CapabilityState(True, "Completed, Succeeded")
+            return CapabilityState(True, "Completed, Succeeded", {"id": "provider-uuid"})
 
         async def enqueue(self, username: str, name: str, size: int | None = None) -> str:
             enqueue_calls.append((username, name, size))
@@ -212,8 +212,9 @@ async def test_slskd_retry_adopts_existing_completed_transfer(
     )
 
     assert enqueue_calls == []
-    assert transfer_id == f"peer1:{filename}"
+    assert transfer_id == "provider-uuid"
     assert status == "downloaded"
+    assert track.source_job_id == "provider-uuid"
     assert track.acquisition_state == runner.AcquisitionState.downloaded
     assert track.source_path == str(staged.resolve())
 
@@ -236,7 +237,7 @@ async def test_slskd_success_waits_for_completed_state(staging_root: Path) -> No
         poll_interval=0.01,
         poll_timeout=5.0,
     )
-    assert result == staged.resolve()
+    assert result == (staged.resolve(), "t1")
 
 
 async def test_slskd_success_finds_nested_completed_file(staging_root: Path) -> None:
@@ -256,7 +257,7 @@ async def test_slskd_success_finds_nested_completed_file(staging_root: Path) -> 
         poll_timeout=5.0,
     )
 
-    assert result == staged.resolve()
+    assert result == (staged.resolve(), "t1")
 
 
 async def test_slskd_success_leaves_transfer_for_terminal_cleanup_after_checkpoint(
@@ -428,15 +429,24 @@ async def test_slskd_missing_artifact_raises_provider_error(staging_root: Path) 
 # ---------------------------------------------------------------------------
 
 
-async def test_slskd_cancellation_calls_adapter_cancel(staging_root: Path) -> None:
-    cancel_calls: list[tuple[str, str]] = []
+async def test_slskd_cancellation_calls_adapter_cancel(
+    staging_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cancel_calls: list[tuple[str, str, str | None]] = []
 
     class CancelRaisingAdapter:
         async def status(self, transfer_id: str) -> CapabilityState:  # noqa: ARG002
-            raise asyncio.CancelledError
+            return CapabilityState(True, "InProgress", {"id": transfer_id})
 
-        async def cancel(self, username: str, filename: str) -> None:
-            cancel_calls.append((username, filename))
+        async def cancel(
+            self, username: str, filename: str, transfer_id: str | None = None
+        ) -> None:
+            cancel_calls.append((username, filename, transfer_id))
+
+    async def cancelled_sleep(delay: float) -> None:  # noqa: ARG001
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(runner.asyncio, "sleep", cancelled_sleep)
 
     with pytest.raises(asyncio.CancelledError):
         await runner._poll_slskd_transfer(
@@ -448,7 +458,7 @@ async def test_slskd_cancellation_calls_adapter_cancel(staging_root: Path) -> No
             poll_interval=0.01,
             poll_timeout=5.0,
         )
-    assert cancel_calls == [("peer", "song.flac")]
+    assert cancel_calls == [("peer", "song.flac", "t1")]
 
 
 # ---------------------------------------------------------------------------
@@ -677,9 +687,10 @@ async def test_prepare_acquisition_slskd_polls_and_populates_track(
         staging_root: Path,
         poll_interval: float,
         poll_timeout: float,
-    ) -> Path:
+        on_provider_id: object | None = None,
+    ) -> tuple[Path, str]:
         polled.append(transfer_id)
-        return audio_file
+        return audio_file, "provider-uuid"
 
     import unittest.mock
 
@@ -709,6 +720,8 @@ async def test_prepare_acquisition_slskd_polls_and_populates_track(
         runner.SlskdAdapter = original_adapter  # type: ignore[assignment]
 
     assert polled == ["tid-42"]
+    assert job_id == "provider-uuid"
+    assert track.source_job_id == "provider-uuid"
     assert status == "downloaded"
     assert track.acquisition_state == AcquisitionState.downloaded
     assert track.source_path == str(audio_file)
@@ -810,9 +823,10 @@ async def test_prepare_acquisition_resumes_slskd_without_enqueue(
         staging_root: Path,
         poll_interval: float,
         poll_timeout: float,
-    ) -> Path:
+        on_provider_id: object | None = None,
+    ) -> tuple[Path, str]:
         poll_calls.append(transfer_id)
-        return audio_file
+        return audio_file, transfer_id
 
     monkeypatch.setattr(runner, "SlskdAdapter", FakeSlskd)
     monkeypatch.setattr(runner, "_poll_slskd_transfer", fake_poll)
@@ -881,9 +895,10 @@ async def test_prepare_acquisition_checkpoints_enqueue_before_poll(
         staging_root: Path,
         poll_interval: float,
         poll_timeout: float,
-    ) -> Path:
+        on_provider_id: object | None = None,
+    ) -> tuple[Path, str]:
         events.append("poll")
-        return audio_file
+        return audio_file, transfer_id
 
     monkeypatch.setattr(runner, "SlskdAdapter", FakeSlskd)
     monkeypatch.setattr(runner, "_poll_slskd_transfer", fake_poll)

@@ -276,23 +276,36 @@ class SlskdAdapter:
                 return CapabilityState(True, state, dict(item))
         return CapabilityState(False, "transfer not found", {"transfer_id": transfer_id})
 
-    async def cancel(self, username: str, filename: str) -> None:
-        """Remove a tracked download, treating an already-absent transfer as success."""
+    async def cancel(self, username: str, filename: str, transfer_id: str | None = None) -> bool:
+        """Remove one tracked download, optionally requiring its exact provider ID."""
         expected_filename = filename.replace("\\", "/")
-        transfer_id: str | None = None
+        resolved_transfer_id: str | None = None
+        matched_identity = False
         for item in await self.downloads():
             item_username = str(item.get("username") or "")
             item_filename = str(item.get("filename") or "").replace("\\", "/")
-            if item_username == username and item_filename == expected_filename:
-                provider_id = item.get("id") or item.get("transferId")
-                if provider_id is not None:
-                    transfer_id = str(provider_id)
-                break
-        if transfer_id is None:
-            return
+            provider_id = item.get("id") or item.get("transferId")
+            if item_username != username or item_filename != expected_filename:
+                continue
+            matched_identity = True
+            # Cleanup must never fall back to peer/path identity: that identity
+            # can be reused by a newer acquisition while reconciliation runs.
+            if transfer_id is not None and (
+                provider_id is None or str(provider_id) != transfer_id
+            ):
+                continue
+            if provider_id is not None:
+                resolved_transfer_id = str(provider_id)
+            break
+        if resolved_transfer_id is None:
+            fallback_id = f"{username}:{filename}"
+            # A persisted fallback identity cannot distinguish this transfer from a
+            # replacement using the same peer/path. Keep the cleanup obligation for
+            # later/manual reconciliation rather than report a false success.
+            return not (matched_identity and transfer_id == fallback_id)
 
         safe_username = quote(username, safe="")
-        safe_transfer_id = quote(transfer_id, safe="")
+        safe_transfer_id = quote(resolved_transfer_id, safe="")
         async with self._client() as client:
             resp = await request_with_retry(
                 client,
@@ -302,3 +315,4 @@ class SlskdAdapter:
             )
             if resp.status_code != 404:
                 resp.raise_for_status()
+        return True

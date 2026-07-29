@@ -264,6 +264,71 @@ class TestAutomaticTerminalCleanup:
                 False,
             ]
 
+    async def test_does_not_hide_done_catalog_job_before_durable_import(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            artist = CatalogArtist(name="Downloaded Artist")
+            album = CatalogAlbum(artist=artist, title="Downloaded Album", track_count=1)
+            catalog_track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+            job = Job(
+                source="slskd", query="downloaded", status=JobStatus.done, catalog_album=album
+            )
+            session.add_all([artist, album, catalog_track, job])
+            await session.flush()
+            session.add(
+                Track(
+                    job_id=job.id,
+                    source="slskd",
+                    catalog_album_id=album.id,
+                    catalog_track_id=catalog_track.id,
+                    acquisition_state=AcquisitionState.downloaded,
+                    import_state=ImportWorkflowState.ready,
+                )
+            )
+            await session.commit()
+            job_id = job.id
+
+        hidden = await hide_completed_and_timed_out_jobs(session_factory, {job_id})
+
+        assert hidden == []
+        async with session_factory() as session:
+            row = await session.get(Job, job_id)
+            assert row is not None and row.queue_hidden is False
+
+    async def test_does_not_hide_timed_out_catalog_job_before_durable_import(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            artist = CatalogArtist(name="Timeout Artist")
+            album = CatalogAlbum(artist=artist, title="Timeout Album", track_count=1)
+            catalog_track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+            job = Job(
+                source="slskd", query="timeout", status=JobStatus.failed, catalog_album=album
+            )
+            session.add_all([artist, album, catalog_track, job])
+            await session.flush()
+            session.add(
+                Track(
+                    job_id=job.id,
+                    source="slskd",
+                    catalog_album_id=album.id,
+                    catalog_track_id=catalog_track.id,
+                    source_status="transfer_timeout",
+                    acquisition_state=AcquisitionState.failed,
+                    import_state=ImportWorkflowState.ready,
+                )
+            )
+            await session.commit()
+            job_id = job.id
+
+        hidden = await hide_completed_and_timed_out_jobs(session_factory, {job_id})
+
+        assert hidden == []
+        async with session_factory() as session:
+            row = await session.get(Job, job_id)
+            assert row is not None and row.queue_hidden is False
+
     async def test_hides_all_terminal_album_attempts_only_after_full_import(
         self, session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -418,13 +483,16 @@ class TestAutomaticTerminalCleanup:
         calls: list[tuple[str, str]] = []
 
         class FakeAdapter:
-            async def cancel(self, username: str, filename: str) -> None:
+            async def cancel(
+                self, username: str, filename: str, transfer_id: str | None = None
+            ) -> None:
                 # A separate write proves the candidate-read session is closed before HTTP I/O.
                 async with session_factory() as writer:
                     row = await writer.get(Job, failed_job.id)
                     assert row is not None
                     row.query = "provider call completed"
                     await writer.commit()
+                assert transfer_id is not None
                 calls.append((username, filename))
 
         first = await cleanup_durable_slskd_transfers(session_factory, FakeAdapter())
@@ -473,8 +541,14 @@ class TestAutomaticTerminalCleanup:
             track_id = track.id
 
         class ReassigningAdapter:
-            async def cancel(self, username: str, filename: str) -> None:
-                assert (username, filename) == ("old-peer", "old.flac")
+            async def cancel(
+                self, username: str, filename: str, transfer_id: str | None = None
+            ) -> None:
+                assert (username, filename, transfer_id) == (
+                    "old-peer",
+                    "old.flac",
+                    "old-transfer",
+                )
                 async with session_factory() as writer:
                     current = await writer.get(Track, track_id)
                     assert current is not None
