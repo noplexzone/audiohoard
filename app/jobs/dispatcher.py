@@ -45,11 +45,14 @@ class JobDispatcher:
         self,
         runner: Callable[[int], Coroutine[Any, Any, None]] | None = None,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
+        max_concurrent_jobs: int | None = None,
     ) -> None:
         self._runner: Callable[[int], Coroutine[Any, Any, None]] = (
             runner if runner is not None else _default_runner
         )
         self._session_factory = session_factory
+        self._max_concurrent_jobs = max_concurrent_jobs
+        self._semaphore: asyncio.Semaphore | None = None
         self._tasks: dict[int, asyncio.Task[None]] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
@@ -57,12 +60,25 @@ class JobDispatcher:
     def _factory(self) -> async_sessionmaker[AsyncSession]:
         return self._session_factory or get_session_factory()
 
+    def _job_semaphore(self) -> asyncio.Semaphore:
+        if self._semaphore is None:
+            if self._max_concurrent_jobs is None:
+                from app.config import get_settings
+
+                self._max_concurrent_jobs = get_settings().max_concurrent_jobs
+            self._semaphore = asyncio.Semaphore(self._max_concurrent_jobs)
+        return self._semaphore
+
+    async def _run_with_limit(self, job_id: int) -> None:
+        async with self._job_semaphore():
+            await self._runner(job_id)
+
     async def dispatch(self, job_id: int) -> asyncio.Task[None]:
         existing = self._tasks.get(job_id)
         if existing is not None and not existing.done():
             return existing
 
-        task = asyncio.create_task(self._runner(job_id), name=f"job-{job_id}")
+        task = asyncio.create_task(self._run_with_limit(job_id), name=f"job-{job_id}")
 
         def _remove(done_task: asyncio.Task[None]) -> None:
             if self._tasks.get(job_id) is done_task:

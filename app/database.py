@@ -64,12 +64,16 @@ def _make_engine(url: str | None = None) -> AsyncEngine:
     if not db_url.startswith("sqlite"):
         return create_async_engine(db_url, echo=False)
 
-    engine = create_async_engine(
-        db_url,
-        echo=False,
-        connect_args={"check_same_thread": False, "timeout": 30.0},
-    )
     is_memory = ":memory:" in db_url or "mode=memory" in db_url
+    engine_kwargs = {
+        "echo": False,
+        "connect_args": {"check_same_thread": False, "timeout": 30.0},
+    }
+    if not is_memory:
+        max_concurrent = get_settings().max_concurrent_jobs
+        engine_kwargs["pool_size"] = max(8, max_concurrent + 4)
+        engine_kwargs["max_overflow"] = max(4, max_concurrent)
+    engine = create_async_engine(db_url, **engine_kwargs)
 
     @event.listens_for(engine.sync_engine, "connect")
     def _configure_sqlite(dbapi_connection: object, _connection_record: object) -> None:

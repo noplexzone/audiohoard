@@ -995,3 +995,78 @@ async def test_album_download_queues_only_missing_catalog_tracks(
     ]
     assert all(job.catalog_track_id is not None for job in jobs)
     assert len(dispatched) == 2
+
+
+async def test_album_download_fetch_returns_json_and_creates_job(
+    client: AsyncClient, monkeypatch
+) -> None:
+    import app.routers.catalog as catalog_router
+
+    dispatched: list[int] = []
+
+    async def fake_dispatch(job_id: int):
+        dispatched.append(job_id)
+
+    monkeypatch.setattr(catalog_router.job_dispatcher, "dispatch", fake_dispatch)
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        artist = CatalogArtist(name="Fetch Artist")
+        album = CatalogAlbum(title="Fetch Album", track_count=2)
+        artist.albums.append(album)
+        album.tracks.extend(
+            [
+                CatalogAlbumTrack(position=1, disc=1, title="One"),
+                CatalogAlbumTrack(position=2, disc=1, title="Two"),
+            ]
+        )
+        session.add(artist)
+        await session.commit()
+        album_id = album.id
+
+    response = await client.post(
+        f"/albums/{album_id}/download",
+        headers={"X-Requested-With": "fetch"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"queued": 1, "album_id": album_id}
+    async with factory() as session:
+        jobs = list(
+            (
+                await session.scalars(
+                    select(Job).where(
+                        Job.catalog_album_id == album_id,
+                        Job.status == JobStatus.pending,
+                    )
+                )
+            ).all()
+        )
+    assert len(jobs) == 1
+    assert jobs[0].catalog_track_id is None
+    assert dispatched == [jobs[0].id]
+
+
+async def test_album_download_without_fetch_header_still_redirects(
+    client: AsyncClient, monkeypatch
+) -> None:
+    import app.routers.catalog as catalog_router
+
+    async def fake_dispatch(job_id: int):
+        return None
+
+    monkeypatch.setattr(catalog_router.job_dispatcher, "dispatch", fake_dispatch)
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        artist = CatalogArtist(name="Redirect Artist")
+        album = CatalogAlbum(title="Redirect Album", track_count=1)
+        artist.albums.append(album)
+        album.tracks.append(CatalogAlbumTrack(position=1, disc=1, title="Only"))
+        session.add(artist)
+        await session.commit()
+        album_id = album.id
+
+    response = await client.post(f"/albums/{album_id}/download", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/downloads"

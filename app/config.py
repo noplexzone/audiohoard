@@ -76,6 +76,7 @@ class Settings(BaseSettings):
     job_watchdog_threshold_seconds: int = Field(default=300, ge=60)
     job_watchdog_interval_seconds: int = Field(default=60, ge=10)
     terminal_cleanup_interval_seconds: int = Field(default=300, ge=30)
+    max_concurrent_jobs: int = Field(default=3, ge=1, le=16)
 
     # Logging
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"

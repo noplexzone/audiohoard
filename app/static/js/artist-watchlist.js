@@ -24,4 +24,42 @@
   document.querySelectorAll(".dismiss-btn").forEach((button) => {
     button.addEventListener("click", () => button.closest('[role="alert"]')?.remove());
   });
+
+  document.querySelectorAll('form[data-download-form]').forEach((form) => {
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = form.querySelector('button[type="submit"]');
+      const original = button?.textContent ?? '';
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Queueing…';
+      }
+      try {
+        const response = await window.fetch(form.action, {
+          method: 'POST',
+          body: new FormData(form),
+          credentials: 'same-origin',
+          headers: { 'X-Requested-With': 'fetch' },
+        });
+        if (!response.ok) {
+          throw new Error('Download request failed');
+        }
+        const data = await response.json();
+        if (button) {
+          button.textContent = data.queued > 0 ? 'Queued' : 'Nothing to queue';
+        }
+        window.setTimeout(() => {
+          if (button) {
+            button.disabled = false;
+            button.textContent = original;
+          }
+        }, 1600);
+      } catch (_error) {
+        if (button) {
+          button.disabled = false;
+          button.textContent = 'Try again';
+        }
+      }
+    });
+  });
 })();
