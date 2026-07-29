@@ -18,7 +18,7 @@ from mutagen.id3 import ID3, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK, TXXX, ID3
 from mutagen.mp4 import MP4
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -425,14 +425,7 @@ async def retag_catalog_album(
             .where(
                 or_(
                     Track.catalog_album_id == album_id,
-                    and_(
-                        Track.catalog_album_id.is_(None),
-                        func.lower(Track.album) == album.title.casefold(),
-                        func.lower(
-                            func.coalesce(func.nullif(Track.album_artist, ""), Track.artist)
-                        )
-                        == album.artist.name.casefold(),
-                    ),
+                    Track.catalog_album_id.is_(None),
                 ),
                 Track.import_state == ImportWorkflowState.imported,
                 ImportPlan.status == ImportWorkflowState.imported,
@@ -443,6 +436,12 @@ async def retag_catalog_album(
     ).all()
     latest: dict[int, tuple[Track, ImportPlan]] = {}
     for track, plan in rows:
+        if track.catalog_album_id is None:
+            legacy_artist = track.album_artist or track.artist or ""
+            if (track.album or "").casefold() != album.title.casefold() or (
+                legacy_artist.casefold() != album.artist.name.casefold()
+            ):
+                continue
         latest[track.id] = (track, plan)
     if not latest:
         raise ImportExecutionError("album has no imported files to retag")

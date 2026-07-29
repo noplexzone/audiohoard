@@ -226,9 +226,13 @@ async def test_retag_catalog_album_supports_legacy_unmapped_imports(
 ) -> None:
     library_root = tmp_path / "library"
     album, paths, tracks = await _seed_imported_album(db_session, library_root)
+    album.title = "Édition"
+    album.artist.name = "Beyoncé"
     for track in tracks:
         track.catalog_album_id = None
         track.catalog_track_id = None
+        track.album = "ÉDITION"
+        track.album_artist = "BEYONCÉ"
     await db_session.flush()
 
     result = await retag_catalog_album(db_session, album.id, library_root=library_root)
