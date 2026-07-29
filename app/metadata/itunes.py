@@ -7,6 +7,7 @@ import httpx
 
 from app.http import request_with_retry
 from app.metadata.base import AlbumDetail, AlbumHit, AlbumTrack, ArtistDetail, ArtistHit, TTLCache
+from app.metadata.content_rating import itunes_content_rating
 from app.sources.base import CapabilityState
 
 _BASE_URL = "https://itunes.apple.com"
@@ -164,6 +165,7 @@ def _parse_album_hit(data: dict[str, object], artist_id: str | None) -> AlbumHit
         release_type_raw=str(data.get("collectionType") or "") or None,
         artwork_url=_artwork(data.get("artworkUrl100")),
         track_count=_to_int(data.get("trackCount")),
+        content_rating=itunes_content_rating(data),
     )
 
 
@@ -175,4 +177,5 @@ def _parse_track(data: dict[str, object]) -> AlbumTrack:
         title=str(data.get("trackName") or ""),
         duration_sec=duration_ms // 1000 if duration_ms else None,
         provider_track_id=str(data.get("trackId") or "") or None,
+        content_rating=itunes_content_rating(data),
     )

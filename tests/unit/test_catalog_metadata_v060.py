@@ -51,6 +51,102 @@ def test_album_title_normalization_folds_typographic_punctuation() -> None:
     assert _album_keys_match(mb, dz)
 
 
+def test_album_keys_keep_clean_and_explicit_singles_separate() -> None:
+    clean = AlbumHit(
+        provider="deezer",
+        provider_id="927173351",
+        deezer_id="927173351",
+        title="We Don’t Get Along",
+        year="2026",
+        release_type="single",
+        track_count=1,
+        content_rating="clean",
+    )
+    explicit = AlbumHit(
+        provider="deezer",
+        provider_id="927037751",
+        deezer_id="927037751",
+        title="We Don’t Get Along",
+        year="2026",
+        release_type="single",
+        track_count=1,
+        content_rating="explicit",
+    )
+
+    assert not _album_keys_match(clean, explicit)
+
+
+async def test_upsert_provider_release_splits_existing_clean_explicit_siblings(db_session) -> None:
+    artist = CatalogArtist(name="Juice WRLD")
+    identity = CatalogArtistIdentity(
+        provider="deezer", provider_artist_id="juice", name=artist.name
+    )
+    artist.identities.append(identity)
+    merged = CatalogAlbum(
+        artist=artist,
+        title="AGATS2 (Insecure)",
+        year="2024",
+        release_type="single",
+        deezer_id="670364511",
+        track_count=1,
+    )
+    identity.releases.extend(
+        [
+            CatalogAlbumProvider(
+                provider_album_id="670364511", title="AGATS2 (Insecure)", catalog_album=merged
+            ),
+            CatalogAlbumProvider(
+                provider_album_id="670362621", title="AGATS2 (Insecure)", catalog_album=merged
+            ),
+        ]
+    )
+    db_session.add(artist)
+    await db_session.flush()
+
+    clean = await upsert_provider_release(
+        db_session,
+        artist,
+        identity,
+        AlbumHit(
+            provider="deezer",
+            provider_id="670364511",
+            deezer_id="670364511",
+            title="AGATS2 (Insecure)",
+            year="2024",
+            release_type="single",
+            release_kind="single",
+            track_count=1,
+            content_rating="clean",
+            upc="602475636335",
+        ),
+    )
+    explicit = await upsert_provider_release(
+        db_session,
+        artist,
+        identity,
+        AlbumHit(
+            provider="deezer",
+            provider_id="670362621",
+            deezer_id="670362621",
+            title="AGATS2 (Insecure)",
+            year="2024",
+            release_type="single",
+            release_kind="single",
+            track_count=1,
+            content_rating="explicit",
+            upc="602475636328",
+        ),
+    )
+    await db_session.flush()
+
+    assert clean.catalog_album_id != explicit.catalog_album_id
+    albums = list((await db_session.scalars(select(CatalogAlbum))).all())
+    assert {(album.deezer_id, album.content_rating, album.upc) for album in albums} == {
+        ("670364511", "clean", "602475636335"),
+        ("670362621", "explicit", "602475636328"),
+    }
+
+
 async def test_provider_refresh_does_not_erase_a_known_track_count(db_session) -> None:
     artist = CatalogArtist(name="Known Count Artist")
     identity = CatalogArtistIdentity(
