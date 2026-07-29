@@ -48,8 +48,10 @@ def test_canonical_artwork_fetch_rejects_untrusted_hosts() -> None:
 
 
 class _FakeArtworkResponse:
-    def __init__(self, chunks: list[bytes], headers: dict[str, str]) -> None:
-        self.status_code = 200
+    def __init__(
+        self, chunks: list[bytes], headers: dict[str, str], status_code: int = 200
+    ) -> None:
+        self.status_code = status_code
         self.headers = headers
         self._chunks = chunks
         self.closed = False
@@ -97,6 +99,62 @@ async def test_canonical_artwork_fetch_streams_allowed_jpeg(monkeypatch) -> None
     )
 
     assert artwork == CanonicalArtwork(data=b"\xff\xd8jpeg", mime="image/jpeg")
+    assert response.closed
+
+
+async def test_canonical_artwork_fetch_follows_cover_art_archive_redirects(monkeypatch) -> None:
+    archive_url = "https://archive.org/download/mbid-release/cover_thumb250.jpg"
+    cdn_url = "https://dn721704.ca.archive.org/0/items/mbid-release/cover_thumb250.jpg"
+    responses = {
+        "https://coverartarchive.org/release-group/rg/front-250": _FakeArtworkResponse(
+            [],
+            {
+                "location": archive_url,
+            },
+            status_code=307,
+        ),
+        archive_url: _FakeArtworkResponse(
+            [],
+            {"location": cdn_url},
+            status_code=302,
+        ),
+        cdn_url: _FakeArtworkResponse(
+            [b"\xff\xd8", b"jpeg"],
+            {"content-type": "image/jpeg"},
+        ),
+    }
+    requested: list[str] = []
+
+    async def fake_stream_with_retry(client, method: str, url: str):
+        requested.append(url)
+        return responses[url]
+
+    monkeypatch.setattr(library_import_module, "stream_with_retry", fake_stream_with_retry)
+
+    artwork = await library_import_module._fetch_canonical_artwork(
+        "https://coverartarchive.org/release-group/rg/front-250"
+    )
+
+    assert artwork == CanonicalArtwork(data=b"\xff\xd8jpeg", mime="image/jpeg")
+    assert requested == list(responses)
+    assert all(response.closed for response in responses.values())
+
+
+async def test_canonical_artwork_fetch_rejects_untrusted_redirect(monkeypatch) -> None:
+    response = _FakeArtworkResponse(
+        [], {"location": "https://example.test/cover.jpg"}, status_code=302
+    )
+
+    async def fake_stream_with_retry(client, method: str, url: str):
+        return response
+
+    monkeypatch.setattr(library_import_module, "stream_with_retry", fake_stream_with_retry)
+
+    artwork = await library_import_module._fetch_canonical_artwork(
+        "https://coverartarchive.org/release-group/rg/front-250"
+    )
+
+    assert artwork is None
     assert response.closed
 
 
@@ -402,6 +460,58 @@ def test_tag_writer_preserves_mp3_artwork_while_replacing_grouping_tags(tmp_path
         if frame.desc.casefold() == "musicbrainz release group id"
     ]
     assert release_groups == ["canonical-release-group"]
+
+
+def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: Path) -> None:
+    path = tmp_path / "track.flac"
+    path.write_bytes(_minimal_flac_bytes())
+    original = FLAC(path)
+    original["title"] = "Feel Alone"
+    original["album"] = "Fighting Demons (Digital Deluxe)"
+    original["albumartist"] = "Juice WRLD"
+    original["releasedate"] = "2021"
+    original["release_date"] = "2021"
+    original["originaldate"] = "2021"
+    original["recordlabel"] = "Grade A Productions/Interscope Records"
+    original["barcode"] = "602445694884"
+    original["isrc"] = "USUG12106076"
+    original["media"] = "Digital Media"
+    original["releasecountry"] = "US"
+    original["releasestatus"] = "official"
+    original["releasetype"] = "album"
+    original["tracktotal"] = "23"
+    original["disctotal"] = "1"
+    original.save()
+
+    assert MutagenTagWriter().write_and_verify(
+        path,
+        {
+            "title": "Feel Alone",
+            "artist": "Juice WRLD",
+            "album": "Fighting Demons (Digital Deluxe)",
+            "album_artist": "Juice WRLD",
+            "date": "2022",
+            "release_date": "2022",
+            "tracknumber": "19",
+            "discnumber": "1",
+        },
+    )
+
+    tags = {key.casefold(): values for key, values in FLAC(path).tags.items()}
+    for key in {
+        "releasedate",
+        "originaldate",
+        "recordlabel",
+        "barcode",
+        "isrc",
+        "media",
+        "releasecountry",
+        "releasestatus",
+        "releasetype",
+        "tracktotal",
+        "disctotal",
+    }:
+        assert key not in tags
 
 
 async def test_retag_catalog_album_supports_legacy_unmapped_imports(
