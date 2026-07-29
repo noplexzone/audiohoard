@@ -99,6 +99,28 @@ _MANAGED_TAG_KEYS = frozenset(
     }
 )
 
+_MANAGED_ID3_TXXX_DESCRIPTIONS = frozenset(
+    {
+        "barcode",
+        "media",
+        "release country",
+        "release status",
+        "release type",
+        "track total",
+        "disc total",
+        "musicbrainz album release country",
+        "musicbrainz album status",
+        "musicbrainz album type",
+        "musicbrainz album media",
+        "musicbrainz track total",
+        "musicbrainz disc total",
+        "musicbrainz track id",
+        "musicbrainz album id",
+        "musicbrainz album artist id",
+        "musicbrainz release group id",
+    }
+)
+
 
 @dataclass(frozen=True)
 class CanonicalArtwork:
@@ -394,12 +416,7 @@ class MutagenTagWriter:
             if artwork is not None:
                 id3.delall("APIC")
             for frame in list(id3.getall("TXXX")):
-                if frame.desc.casefold() in {
-                    "musicbrainz track id",
-                    "musicbrainz album id",
-                    "musicbrainz album artist id",
-                    "musicbrainz release group id",
-                }:
+                if frame.desc.casefold() in _MANAGED_ID3_TXXX_DESCRIPTIONS:
                     id3.delall(f"TXXX:{frame.desc}")
             if title := tags.get("title"):
                 id3.add(TIT2(encoding=3, text=title))

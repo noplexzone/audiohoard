@@ -462,6 +462,46 @@ def test_tag_writer_preserves_mp3_artwork_while_replacing_grouping_tags(tmp_path
     assert release_groups == ["canonical-release-group"]
 
 
+def test_tag_writer_clears_nav_grouping_txxx_fields_that_split_mp3_albums(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "track.mp3"
+    original = ID3()
+    original.add(TXXX(encoding=3, desc="BARCODE", text="602445694884"))
+    original.add(TXXX(encoding=3, desc="MEDIA", text="Digital Media"))
+    original.add(TXXX(encoding=3, desc="MusicBrainz Album Status", text="official"))
+    original.add(TXXX(encoding=3, desc="MusicBrainz Album Type", text="album"))
+    original.add(TXXX(encoding=3, desc="MusicBrainz Album Release Country", text="US"))
+    original.save(path)
+
+    assert MutagenTagWriter().write_and_verify(
+        path,
+        {
+            "title": "Lean Wit Me",
+            "artist": "Juice WRLD",
+            "album": "Goodbye & Good Riddance",
+            "album_artist": "Juice WRLD",
+            "date": "2018",
+            "release_date": "2018",
+            "tracknumber": "4",
+            "discnumber": "1",
+        },
+    )
+
+    stale_descriptions = {
+        frame.desc.casefold() for frame in ID3(path).getall("TXXX") if frame.text
+    }
+    assert stale_descriptions.isdisjoint(
+        {
+            "barcode",
+            "media",
+            "musicbrainz album status",
+            "musicbrainz album type",
+            "musicbrainz album release country",
+        }
+    )
+
+
 def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: Path) -> None:
     path = tmp_path / "track.flac"
     path.write_bytes(_minimal_flac_bytes())
