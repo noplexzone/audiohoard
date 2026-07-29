@@ -5,6 +5,7 @@ import stat
 import threading
 from pathlib import Path
 
+import httpx
 import pytest
 from mutagen.flac import FLAC
 from mutagen.id3 import APIC, ID3, TXXX
@@ -36,6 +37,67 @@ def _minimal_flac_bytes() -> bytes:
         + bytes(16)
     )
     return b"fLaC" + bytes([0x80, 0, 0, 34]) + stream_info
+
+
+def test_canonical_artwork_fetch_rejects_untrusted_hosts() -> None:
+    assert not library_import_module._artwork_url_allowed("http://coverartarchive.org/release/x")
+    assert not library_import_module._artwork_url_allowed("https://example.test/cover.jpg")
+    assert library_import_module._artwork_url_allowed(
+        "https://coverartarchive.org/release/x/front"
+    )
+
+
+class _FakeArtworkResponse:
+    def __init__(self, chunks: list[bytes], headers: dict[str, str]) -> None:
+        self.status_code = 200
+        self.headers = headers
+        self._chunks = chunks
+        self.closed = False
+
+    async def aiter_bytes(self):
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+async def test_canonical_artwork_fetch_enforces_size_cap(monkeypatch) -> None:
+    response = _FakeArtworkResponse(
+        [b"x"], {"content-type": "image/jpeg", "content-length": "5242881"}
+    )
+
+    async def fake_stream_with_retry(client, method: str, url: str):
+        return response
+
+    monkeypatch.setattr(library_import_module, "stream_with_retry", fake_stream_with_retry)
+
+    artwork = await library_import_module._fetch_canonical_artwork(
+        "https://coverartarchive.org/release/x/front"
+    )
+
+    assert artwork is None
+    assert response.closed
+
+
+async def test_canonical_artwork_fetch_streams_allowed_jpeg(monkeypatch) -> None:
+    response = _FakeArtworkResponse(
+        [b"\xff\xd8", b"jpeg"], {"content-type": "application/octet-stream"}
+    )
+
+    async def fake_stream_with_retry(client, method: str, url: str):
+        assert isinstance(client, httpx.AsyncClient)
+        assert method == "GET"
+        return response
+
+    monkeypatch.setattr(library_import_module, "stream_with_retry", fake_stream_with_retry)
+
+    artwork = await library_import_module._fetch_canonical_artwork(
+        "https://coverartarchive.org/release/x/front"
+    )
+
+    assert artwork == CanonicalArtwork(data=b"\xff\xd8jpeg", mime="image/jpeg")
+    assert response.closed
 
 
 async def _seed_imported_album(
