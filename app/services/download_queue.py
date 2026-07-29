@@ -44,7 +44,35 @@ def _metadata(job: Job) -> dict[str, Any]:
         value = json.loads(job.result_json) if job.result_json else {}
     except (json.JSONDecodeError, TypeError):
         return {}
-    return value if isinstance(value, dict) else {}
+    if not isinstance(value, dict):
+        return {}
+    metadata = dict(value)
+    raw_errors = metadata.get("errors")
+    if raw_errors is not None:
+        values = raw_errors if isinstance(raw_errors, list) else [raw_errors]
+        metadata["errors"] = [_normalized_error(item) for item in values]
+    raw_error = metadata.get("error")
+    if raw_error is not None:
+        metadata["error"] = _normalized_error(raw_error)
+    return metadata
+
+
+def _normalized_error(value: object) -> dict[str, Any]:
+    """Normalize current and historical failure payloads for safe presentation."""
+    candidate = value
+    if isinstance(candidate, str):
+        try:
+            decoded = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            decoded = candidate
+        candidate = decoded
+    if isinstance(candidate, dict):
+        normalized = dict(candidate)
+        normalized.setdefault("code", "error")
+        return normalized
+    if candidate is None:
+        return {"code": "error"}
+    return {"code": str(candidate)}
 
 
 def _root_id(job: Job, parents: dict[int, int | None]) -> int:

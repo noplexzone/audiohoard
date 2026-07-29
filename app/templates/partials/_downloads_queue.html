@@ -110,7 +110,7 @@
             <section class="download-attempt" aria-label="Attempt {{ attempt_job.id }}">
             <p><code>#{{ attempt_job.id }}</code> · <span class="badge info">{{ attempt_job.source }}</span> · <strong>{{ attempt_job.status.value }}</strong><br><span class="hint">{{ attempt_job.query }}</span></p>
             {% if meta.error %}<p class="alert error compact"><strong>{{ meta.error.code | default('error') }}</strong>{% if meta.error.detail %}: {{ meta.error.detail }}{% endif %}</p>{% endif %}
-            {% if meta.errors %}{% for error_json in meta.errors %}{% set error = error_json | from_json %}<p class="alert error compact"><strong>{{ error.code | default('error') }}</strong>{% if error.detail %}: {{ error.detail }}{% endif %}</p>{% endfor %}{% endif %}
+            {% if meta.errors %}{% for error in meta.errors %}<p class="alert error compact"><strong>{{ error.code | default('error') }}</strong>{% if error.detail %}: {{ error.detail }}{% endif %}</p>{% endfor %}{% endif %}
             {% if meta.recovery %}<p class="alert compact">Recovered after {{ meta.recovery.code | replace('_', ' ') }}.</p>{% endif %}
             {% if meta.tracks_created is defined %}<p class="hint">Tracks created: {{ meta.tracks_created }}</p>{% endif %}
             {% if meta.missing_tracks %}<p class="hint">Missing: {{ meta.missing_tracks | join(', ') }}</p>{% endif %}

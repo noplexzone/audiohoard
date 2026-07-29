@@ -910,6 +910,7 @@ async def execute_release_import(
                 plan.id,
                 Path(plan.staging_path or plan.source_path),
                 plan.track.acquisition_provenance_json if plan.track else None,
+                plan.track.source_job_id if plan.track else None,
             )
             for plan in plans
         )

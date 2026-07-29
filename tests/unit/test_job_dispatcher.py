@@ -10,17 +10,20 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 os.environ.setdefault("SECRET_KEY", "test-secret")
 
 from app.database import Base
 from app.jobs.dispatcher import JobDispatcher, JobNotFoundError, JobNotRetryableError
+from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.track import Track
-from app.models.workflow import AcquisitionState
+from app.models.workflow import AcquisitionState, ImportWorkflowState
 from app.services.acquisition_cleanup import (
     cleanup_durable_slskd_transfers,
+    cleanup_terminal_acquisitions,
     hide_completed_and_timed_out_jobs,
 )
 
@@ -261,6 +264,162 @@ class TestAutomaticTerminalCleanup:
                 False,
             ]
 
+    async def test_does_not_hide_done_catalog_job_before_durable_import(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            artist = CatalogArtist(name="Downloaded Artist")
+            album = CatalogAlbum(artist=artist, title="Downloaded Album", track_count=1)
+            catalog_track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+            job = Job(
+                source="slskd", query="downloaded", status=JobStatus.done, catalog_album=album
+            )
+            session.add_all([artist, album, catalog_track, job])
+            await session.flush()
+            session.add(
+                Track(
+                    job_id=job.id,
+                    source="slskd",
+                    catalog_album_id=album.id,
+                    catalog_track_id=catalog_track.id,
+                    acquisition_state=AcquisitionState.downloaded,
+                    import_state=ImportWorkflowState.ready,
+                )
+            )
+            await session.commit()
+            job_id = job.id
+
+        hidden = await hide_completed_and_timed_out_jobs(session_factory, {job_id})
+
+        assert hidden == []
+        async with session_factory() as session:
+            row = await session.get(Job, job_id)
+            assert row is not None and row.queue_hidden is False
+
+    async def test_does_not_hide_timed_out_catalog_job_before_durable_import(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            artist = CatalogArtist(name="Timeout Artist")
+            album = CatalogAlbum(artist=artist, title="Timeout Album", track_count=1)
+            catalog_track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+            job = Job(
+                source="slskd", query="timeout", status=JobStatus.failed, catalog_album=album
+            )
+            session.add_all([artist, album, catalog_track, job])
+            await session.flush()
+            session.add(
+                Track(
+                    job_id=job.id,
+                    source="slskd",
+                    catalog_album_id=album.id,
+                    catalog_track_id=catalog_track.id,
+                    source_status="transfer_timeout",
+                    acquisition_state=AcquisitionState.failed,
+                    import_state=ImportWorkflowState.ready,
+                )
+            )
+            await session.commit()
+            job_id = job.id
+
+        hidden = await hide_completed_and_timed_out_jobs(session_factory, {job_id})
+
+        assert hidden == []
+        async with session_factory() as session:
+            row = await session.get(Job, job_id)
+            assert row is not None and row.queue_hidden is False
+
+    async def test_hides_all_terminal_album_attempts_only_after_full_import(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            artist = CatalogArtist(name="Complete Artist")
+            album = CatalogAlbum(artist=artist, title="Complete Album", track_count=2)
+            first = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+            second = CatalogAlbumTrack(album=album, position=2, disc=1, title="Two")
+            root = Job(source="slskd", query="root", status=JobStatus.partial, catalog_album=album)
+            continuation = Job(
+                source="youtube",
+                query="continuation",
+                status=JobStatus.done,
+                catalog_album=album,
+            )
+            active = Job(
+                source="priority", query="active", status=JobStatus.running, catalog_album=album
+            )
+            session.add_all([artist, album, first, second, root, continuation, active])
+            await session.flush()
+            session.add_all(
+                [
+                    Track(
+                        job_id=root.id,
+                        source="slskd",
+                        catalog_album_id=album.id,
+                        catalog_track_id=first.id,
+                        acquisition_state=AcquisitionState.downloaded,
+                        import_state=ImportWorkflowState.imported,
+                    ),
+                    Track(
+                        job_id=continuation.id,
+                        source="youtube",
+                        catalog_album_id=album.id,
+                        catalog_track_id=second.id,
+                        acquisition_state=AcquisitionState.downloaded,
+                        import_state=ImportWorkflowState.imported,
+                    ),
+                ]
+            )
+            await session.commit()
+            ids = root.id, continuation.id, active.id
+
+        hidden = await hide_completed_and_timed_out_jobs(session_factory, {ids[1]})
+
+        assert hidden == [ids[0], ids[1]]
+        async with session_factory() as session:
+            rows = [await session.get(Job, job_id) for job_id in ids]
+            assert [row.queue_hidden for row in rows if row is not None] == [True, True, False]
+
+    async def test_does_not_hide_partial_album_until_every_track_is_imported(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            artist = CatalogArtist(name="Incomplete Artist")
+            album = CatalogAlbum(artist=artist, title="Incomplete Album", track_count=2)
+            first = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+            second = CatalogAlbumTrack(album=album, position=2, disc=1, title="Two")
+            root = Job(source="slskd", query="root", status=JobStatus.partial, catalog_album=album)
+            session.add_all([artist, album, first, second, root])
+            await session.flush()
+            session.add_all(
+                [
+                    Track(
+                        job_id=root.id,
+                        source="slskd",
+                        catalog_album_id=album.id,
+                        catalog_track_id=first.id,
+                        acquisition_state=AcquisitionState.downloaded,
+                        import_state=ImportWorkflowState.imported,
+                    ),
+                    Track(
+                        job_id=root.id,
+                        source="slskd",
+                        catalog_album_id=album.id,
+                        catalog_track_id=second.id,
+                        acquisition_state=AcquisitionState.downloaded,
+                        import_state=ImportWorkflowState.ready,
+                    ),
+                ]
+            )
+            await session.commit()
+            root_id = root.id
+
+        hidden = await hide_completed_and_timed_out_jobs(session_factory, {root_id})
+
+        assert hidden == []
+        async with session_factory() as session:
+            row = await session.get(Job, root_id)
+            assert row is not None and row.queue_hidden is False
+
     async def test_slskd_cleanup_is_idempotent_and_runs_without_database_transaction(
         self, session_factory: async_sessionmaker[AsyncSession], tmp_path: Path
     ) -> None:
@@ -324,13 +483,16 @@ class TestAutomaticTerminalCleanup:
         calls: list[tuple[str, str]] = []
 
         class FakeAdapter:
-            async def cancel(self, username: str, filename: str) -> None:
+            async def cancel(
+                self, username: str, filename: str, transfer_id: str | None = None
+            ) -> None:
                 # A separate write proves the candidate-read session is closed before HTTP I/O.
                 async with session_factory() as writer:
                     row = await writer.get(Job, failed_job.id)
                     assert row is not None
                     row.query = "provider call completed"
                     await writer.commit()
+                assert transfer_id is not None
                 calls.append((username, filename))
 
         first = await cleanup_durable_slskd_transfers(session_factory, FakeAdapter())
@@ -379,8 +541,14 @@ class TestAutomaticTerminalCleanup:
             track_id = track.id
 
         class ReassigningAdapter:
-            async def cancel(self, username: str, filename: str) -> None:
-                assert (username, filename) == ("old-peer", "old.flac")
+            async def cancel(
+                self, username: str, filename: str, transfer_id: str | None = None
+            ) -> None:
+                assert (username, filename, transfer_id) == (
+                    "old-peer",
+                    "old.flac",
+                    "old-transfer",
+                )
                 async with session_factory() as writer:
                     current = await writer.get(Track, track_id)
                     assert current is not None
@@ -510,3 +678,44 @@ class TestRetry:
         job = await _make_job(session_factory, status=JobStatus.done)
         with pytest.raises(JobNotRetryableError):
             await dispatcher.retry(job.id, session_factory)
+
+
+async def test_terminal_cleanup_retries_transient_sqlite_lock(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services import acquisition_cleanup
+
+    attempts = 0
+
+    async def flaky_hide(factory, job_ids=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
+        return []
+
+    async def no_transfers(factory, adapter, job_ids=None):
+        return 0
+
+    async def no_sleep(delay):
+        assert delay == 0.25
+
+    monkeypatch.setattr(acquisition_cleanup, "hide_completed_and_timed_out_jobs", flaky_hide)
+    monkeypatch.setattr(acquisition_cleanup, "cleanup_durable_slskd_transfers", no_transfers)
+    monkeypatch.setattr(acquisition_cleanup.asyncio, "sleep", no_sleep)
+
+    result = await cleanup_terminal_acquisitions(session_factory, slskd_url="", slskd_api_key="")
+
+    assert result == ([], 0)
+    assert attempts == 2
+
+
+async def test_cleanup_reconciler_has_single_owned_task(
+    dispatcher: JobDispatcher,
+) -> None:
+    await dispatcher.start_cleanup_reconciler(interval_seconds=3600)
+    first = dispatcher._cleanup_task
+    await dispatcher.start_cleanup_reconciler(interval_seconds=3600)
+    assert dispatcher._cleanup_task is first
+    await dispatcher.shutdown()
+    assert dispatcher._cleanup_task is None

@@ -52,6 +52,7 @@ class JobDispatcher:
         self._session_factory = session_factory
         self._tasks: dict[int, asyncio.Task[None]] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
 
     def _factory(self) -> async_sessionmaker[AsyncSession]:
         return self._session_factory or get_session_factory()
@@ -262,6 +263,43 @@ class JobDispatcher:
             except Exception:
                 logger.exception("Watchdog tick failed")
 
+    async def _cleanup_reconcile_tick(self) -> None:
+        from app.config import get_settings
+        from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
+        from app.settings_service import build_effective_settings
+
+        factory = self._factory()
+        async with factory() as db:
+            settings = await build_effective_settings(db, get_settings())
+        await cleanup_terminal_acquisitions(
+            factory,
+            slskd_url=settings.slskd_url,
+            slskd_api_key=settings.slskd_api_key,
+        )
+
+    async def _cleanup_reconcile_loop(self, interval_seconds: int) -> None:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await self._cleanup_reconcile_tick()
+            except Exception:
+                logger.exception("Periodic terminal acquisition cleanup failed")
+
+    async def start_cleanup_reconciler(self, interval_seconds: int = 300) -> None:
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            return
+        self._cleanup_task = asyncio.create_task(
+            self._cleanup_reconcile_loop(interval_seconds),
+            name="terminal-cleanup-reconciler",
+        )
+
+    async def stop_cleanup_reconciler(self) -> None:
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._cleanup_task
+        self._cleanup_task = None
+
     async def start_watchdog(
         self, threshold_seconds: int = 300, interval_seconds: int = 60
     ) -> None:
@@ -280,6 +318,7 @@ class JobDispatcher:
         self._watchdog_task = None
 
     async def shutdown(self) -> None:
+        await self.stop_cleanup_reconciler()
         await self.stop_watchdog()
         tasks = list(self._tasks.values())
         for task in tasks:

@@ -256,14 +256,16 @@ async def test_committed_slskd_cleanup_removes_provider_row_and_staged_file(
 ) -> None:
     staged = tmp_path / "staged.flac"
     staged.write_bytes(b"audio")
-    calls: list[tuple[str, str]] = []
+    calls: list[tuple[str, str, str | None]] = []
 
     class FakeSlskdAdapter:
         def __init__(self, url: str, api_key: str) -> None:
             pass
 
-        async def cancel(self, username: str, filename: str) -> None:
-            calls.append((username, filename))
+        async def cancel(
+            self, username: str, filename: str, transfer_id: str | None = None
+        ) -> None:
+            calls.append((username, filename, transfer_id))
 
     class FakeSessionContext:
         async def __aenter__(self):
@@ -292,11 +294,12 @@ async def test_committed_slskd_cleanup_removes_provider_row_and_staged_file(
                         "filename": r"Album\01.flac",
                     }
                 ),
+                "original-transfer-id",
             ),
         )
     )
 
-    assert calls == [("peer", "Album\\01.flac")]
+    assert calls == [("peer", "Album\\01.flac", "original-transfer-id")]
     assert not staged.exists()
 
 

@@ -539,3 +539,37 @@ async def test_downloads_queue_has_no_query_column(client: AsyncClient) -> None:
 
     assert response.status_code == 200
     assert '<th scope="col">Query</th>' not in response.text
+
+
+async def test_downloads_queue_safely_renders_legacy_and_malformed_errors(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        db.add(
+            Job(
+                source="slskd",
+                query="Legacy failures",
+                status=JobStatus.failed,
+                result_json=json.dumps(
+                    {
+                        "errors": [
+                            "result_processing_failed",
+                            json.dumps({"code": "provider_failed", "detail": "Unavailable"}),
+                            "{malformed",
+                            {"code": "structured_failure"},
+                            None,
+                        ]
+                    }
+                ),
+            )
+        )
+        await db.commit()
+
+    response = await client.get("/downloads/queue")
+
+    assert response.status_code == 200
+    assert "result_processing_failed" in response.text
+    assert "provider_failed" in response.text
+    assert "Unavailable" in response.text
+    assert "structured_failure" in response.text

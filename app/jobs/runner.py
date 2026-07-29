@@ -159,33 +159,45 @@ async def _poll_slskd_transfer(
     staging_root: Path,
     poll_interval: float,
     poll_timeout: float,
-) -> Path:
-    """Poll slskd until transfer reaches a terminal state. Returns verified staged file path."""
+    on_provider_id: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[Path, str]:
+    """Poll slskd until terminal and return the staged path plus exact provider ID."""
     import time as _time
 
     deadline = _time.monotonic() + poll_timeout
-    while True:
-        remaining = deadline - _time.monotonic()
-        if remaining <= 0:
-            raise ProviderError("transfer_timeout", "slskd transfer timed out", "acquire", True)
-        try:
+    try:
+        while True:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                raise ProviderError(
+                    "transfer_timeout", "slskd transfer timed out", "acquire", True
+                )
             state = await adapter.status(transfer_id)
-        except asyncio.CancelledError:
-            with contextlib.suppress(Exception):
-                await adapter.cancel(username, filename)
-            raise
 
-        acq_state = map_slskd_transfer_state(state)
-        if acq_state == AcquisitionState.downloaded:
-            return await _locate_slskd_artifact(filename, state.extra, staging_root)
-        if acq_state == AcquisitionState.failed:
-            raise ProviderError(
-                "transfer_failed", f"slskd transfer failed: {state.reason}", "acquire", True
-            )
-        if acq_state == AcquisitionState.cancelled:
-            raise ProviderError("transfer_failed", "slskd transfer was cancelled", "acquire", True)
+            provider_id = state.extra.get("id") or state.extra.get("transferId")
+            if provider_id is not None and str(provider_id) != transfer_id:
+                transfer_id = str(provider_id)
+                if on_provider_id is not None:
+                    await on_provider_id(transfer_id)
 
-        await asyncio.sleep(min(poll_interval, max(0.01, remaining)))
+            acq_state = map_slskd_transfer_state(state)
+            if acq_state == AcquisitionState.downloaded:
+                staged = await _locate_slskd_artifact(filename, state.extra, staging_root)
+                return staged, transfer_id
+            if acq_state == AcquisitionState.failed:
+                raise ProviderError(
+                    "transfer_failed", f"slskd transfer failed: {state.reason}", "acquire", True
+                )
+            if acq_state == AcquisitionState.cancelled:
+                raise ProviderError(
+                    "transfer_failed", "slskd transfer was cancelled", "acquire", True
+                )
+
+            await asyncio.sleep(min(poll_interval, max(0.01, remaining)))
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            await adapter.cancel(username, filename, transfer_id)
+        raise
 
 
 async def _poll_sab_job(
@@ -500,7 +512,7 @@ async def _run_job_in_session(
             # every NZB and assigning candidates to tracks by position.
             results = results[:1]
         tracks_created = 0
-        failures: list[str] = []
+        failures: list[dict[str, object]] = []
         root_job = await _root_job(job, db)
         existing_releases = list(
             (await db.scalars(select(Release).where(Release.job_id == root_job.id))).all()
@@ -650,12 +662,12 @@ async def _run_job_in_session(
                         if commit_progress:
                             await db.commit()
                 logger.warning("Provider result processing failed with code %s", exc.code)
-                failures.append(json.dumps(exc.details(), sort_keys=True))
+                failures.append(exc.details())
             except Exception:
                 if track is not None:
                     track.acquisition_state = AcquisitionState.failed
                 logger.warning("Result processing failed")
-                failures.append("result_processing_failed")
+                failures.append({"code": "result_processing_failed"})
             if commit_progress:
                 job.updated_at = _now()
                 await db.commit()
@@ -1221,7 +1233,14 @@ async def _prepare_acquisition(
             )
         if checkpoint is not None:
             await checkpoint()
-        staged = await _poll_slskd_transfer(
+
+        async def persist_provider_id(provider_id: str) -> None:
+            if track is not None:
+                track.source_job_id = provider_id
+            if checkpoint is not None:
+                await checkpoint()
+
+        staged, transfer_id = await _poll_slskd_transfer(
             transfer_id,
             username,
             filename,
@@ -1229,8 +1248,12 @@ async def _prepare_acquisition(
             cfg.staging_root,
             cfg.slskd_poll_interval,
             cfg.slskd_poll_timeout,
+            persist_provider_id,
         )
         if track is not None:
+            # slskd queue responses may omit the provider UUID. Polling exposes it;
+            # persist it before cleanup so deletion never falls back to peer/path.
+            track.source_job_id = transfer_id
             track.source_path = str(staged)
             track.staging_path = str(staged)
             track.acquisition_state = AcquisitionState.downloaded

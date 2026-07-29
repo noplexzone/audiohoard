@@ -110,3 +110,35 @@ docker pull noplexzone/audiohoard:0.7.1
 ## Continuous integration
 
 Pull requests and pushes to `main` run pytest, Ruff lint and formatting checks, mypy, Python package build, and a Docker image build. Version tags run the same quality gate before publishing the Docker image.
+
+
+## Database maintenance
+
+Audiohoard normally maintains review-row integrity automatically. To audit historical
+orphaned staging-review rows, run the maintenance command in dry-run mode:
+
+```bash
+uv run audiohoard-repair-reviews ./data/audiohoard.db
+```
+
+For a Docker Compose installation, audit the live database without changing it:
+
+```bash
+docker compose exec app audiohoard-repair-reviews /app/data/audiohoard.db
+```
+
+Applying the repair is deliberately gated. Stop Audiohoard, run the maintenance entrypoint
+against the mounted database, then restart and verify readiness:
+
+```bash
+docker compose stop app
+docker compose run --rm --entrypoint audiohoard-repair-reviews app \
+  /app/data/audiohoard.db --apply --confirm-stopped
+docker compose start app
+docker compose exec app audiohoard-repair-reviews /app/data/audiohoard.db
+```
+
+The command creates and verifies a timestamped backup, obtains an exclusive SQLite write
+lock, aborts if the database changed while the backup was captured, removes only review
+rows whose track or release no longer exists, and verifies database/FK integrity before
+committing. Never run `--apply` while the Audiohoard container is active.

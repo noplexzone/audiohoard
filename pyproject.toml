@@ -26,6 +26,9 @@ dependencies = [
     "cryptography>=49.0.0",
 ]
 
+[project.scripts]
+audiohoard-repair-reviews = "app.maintenance.orphan_reviews:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2",

@@ -7,9 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Added an explicit backup-first maintenance command for auditing and repairing historical orphaned staging-review records.
 - Added a confirmed album-detail action that transactionally retags every imported file in a release folder from Audiohoard's stored canonical metadata without changing database records or filenames.
 
 ### Fixed
+- Made Downloads tolerate malformed historical errors, close fully imported album attempts across continuations, and periodically retry serialized source cleanup.
+- Enabled SQLite WAL, foreign-key enforcement, and a bounded busy timeout to reduce concurrent job contention and prevent new orphaned review rows.
 - Made album retagging durable across crashes, safe against duplicate or concurrently changed files, compatible with legacy unmapped imports, and non-blocking for unrelated web requests.
 
 ## [0.7.1] - 2026-07-28

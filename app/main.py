@@ -84,6 +84,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         threshold_seconds=settings.job_watchdog_threshold_seconds,
         interval_seconds=settings.job_watchdog_interval_seconds,
     )
+    await job_dispatcher.start_cleanup_reconciler(
+        interval_seconds=settings.terminal_cleanup_interval_seconds
+    )
     await scheduler.start()
     await health_status.start()
     try:
