@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.jobs.runner import _catalog_track_for_result, _spawn_continuation_jobs
+from app.metadata.filename_parse import parsed_position_evidence
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.release import Release
@@ -145,6 +146,37 @@ def test_catalog_matching_normalizes_track_prefixes_and_skit_descriptors() -> No
     for title, expected_id in (("01 Intro", 1), ("06 Betrayal", 6), ("10 Karma", 10)):
         result = SearchResult(source="slskd", title=title)
         assert _catalog_track_for_result(result, catalog, None).id == expected_id
+
+
+def test_scene_packed_disc_track_prefix_preserves_position_evidence() -> None:
+    assert parsed_position_evidence("101-ty_myers_harper_oneill-help_ourselves.mp3") == {
+        "disc": 1,
+        "track_no": 1,
+    }
+    assert parsed_position_evidence("210-tom_bukovac-man_on_the_side.mp3") == {
+        "disc": 2,
+        "track_no": 10,
+    }
+
+
+def test_catalog_matching_uses_scene_packed_disc_track_metadata() -> None:
+    catalog = [
+        CatalogAlbumTrack(id=1, album_id=1, position=1, disc=1, title="Help Ourselves"),
+        CatalogAlbumTrack(id=10, album_id=1, position=10, disc=2, title="Man On The Side"),
+    ]
+    first = SearchResult(
+        source="slskd",
+        title="ty myers harper oneill-help ourselves",
+        metadata=parsed_position_evidence("101-ty_myers_harper_oneill-help_ourselves.mp3"),
+    )
+    second = SearchResult(
+        source="slskd",
+        title="tom bukovac-man on the side",
+        metadata=parsed_position_evidence("210-tom_bukovac-man_on_the_side.mp3"),
+    )
+
+    assert _catalog_track_for_result(first, catalog, None).id == 1
+    assert _catalog_track_for_result(second, catalog, None).id == 10
 
 
 async def test_acoustid_mismatch_creates_one_durable_review_item(

@@ -169,6 +169,9 @@ def parsed_position_evidence(filename: str) -> dict[str, int]:
     )
     if compound:
         return {"disc": int(compound.group(1)), "track_no": int(compound.group(2))}
+    packed = re.match(r"^([1-9])(\d{2})(?:[-_.:]|\s+-\s|\s+)", stem, re.I)
+    if packed:
+        return {"disc": int(packed.group(1)), "track_no": int(packed.group(2))}
     simple = re.match(
         r"^(?:cd\s*(\d{1,2})\s*[-_.]?\s*)?(\d{1,2})(?:\s*[-_.:]|\s+-\s|\s+)", stem, re.I
     )

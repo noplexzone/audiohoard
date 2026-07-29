@@ -182,6 +182,20 @@ def _unlink_backup_after_commit(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
+def _write_tags_compatible(
+    tag_writer: MutagenTagWriter,
+    path: Path,
+    tags: dict[str, str],
+    artwork: CanonicalArtwork | None,
+) -> bool:
+    try:
+        return bool(tag_writer.write_and_verify(path, tags, artwork))
+    except TypeError as exc:
+        if "positional" not in str(exc) and "argument" not in str(exc):
+            raise
+        return bool(tag_writer.write_and_verify(path, tags))
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -1136,9 +1150,13 @@ async def execute_release_import(
     if quality_profile is None:
         runtime = await get_runtime_settings(db)
         quality_profile = runtime.quality_profile
-    plan_query = select(ImportPlan).where(
-        ImportPlan.release_id == release.id,
-        ImportPlan.status == ImportWorkflowState.ready,
+    plan_query = (
+        select(ImportPlan)
+        .join(Track, ImportPlan.track_id == Track.id)
+        .where(
+            ImportPlan.release_id == release.id,
+            ImportPlan.status == ImportWorkflowState.ready,
+        )
     )
     if plan_ids is not None:
         if not plan_ids:
@@ -1148,6 +1166,20 @@ async def execute_release_import(
     plans = list(plans_result.scalars().all())
     if not plans:
         raise ImportExecutionError("release import plans are not ready")
+
+    catalog_album_id = next(
+        (
+            plan.track.catalog_album_id
+            for plan in plans
+            if plan.track and plan.track.catalog_album_id
+        ),
+        None,
+    )
+    artwork = None
+    if catalog_album_id is not None:
+        catalog_album = await db.get(CatalogAlbum, catalog_album_id)
+        if catalog_album is not None:
+            artwork = await _fetch_canonical_artwork(catalog_album.artwork_url)
 
     pinned_destinations: list[PinnedDestination] = []
     created_destinations: list[tuple[PinnedDestination, str]] = []
@@ -1174,7 +1206,9 @@ async def execute_release_import(
             temp_name, temp_path = _copy_to_temp(source, pinned, expected_hash)
             temp_paths.append((pinned, temp_name))
             plan.destination_temp_path = str(pinned.display_path(temp_name))
-            if not tag_writer.write_and_verify(temp_path, _tags_for(release, track)):
+            if not _write_tags_compatible(
+                tag_writer, temp_path, _tags_for(release, track), artwork
+            ):
                 plan.tag_verification_state = TagVerificationState.failed
                 raise ImportExecutionError("tag readback failed")
             plan.tag_verification_state = TagVerificationState.verified
