@@ -6,6 +6,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Keep artist-page monitored-download submissions on the current page for fetch requests.
+- Bind catalog-scoped one-track releases to their sole catalog track so approved single imports count as complete.
+- Reconcile partial catalog album jobs after continuation imports complete the album.
+
 ### Added
 - Download buttons on catalog album pages and artist release cards now queue work in place with a brief confirmation while preserving native form redirects without JavaScript.
 - Added a bounded job dispatcher concurrency setting to keep download bursts from exhausting the SQLite connection pool.

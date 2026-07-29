@@ -627,3 +627,26 @@ async def test_execute_import_is_scoped_to_selected_ready_plan_ids(
     )
     assert plans[1].status == ImportWorkflowState.imported
     assert release.import_state == ImportWorkflowState.imported
+
+
+async def test_catalog_scoped_import_without_catalog_track_id_stays_incomplete(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    release, tracks = await _release_with_staged_tracks(db_session, tmp_path, count=1)
+    artist = CatalogArtist(name="Juice WRLD")
+    album = CatalogAlbum(title="AGATS2 (Insecure)", track_count=1)
+    catalog_track = CatalogAlbumTrack(position=1, disc=1, title="AGATS2 (Insecure)")
+    album.tracks.append(catalog_track)
+    artist.albums.append(album)
+    db_session.add(artist)
+    await db_session.flush()
+    tracks[0].catalog_album_id = album.id
+    tracks[0].catalog_track_id = None
+
+    library = tmp_path / "library"
+    await plan_release_import(db_session, release, library_root=library)
+    await execute_release_import(db_session, release, library_root=library)
+
+    assert tracks[0].import_state == ImportWorkflowState.imported
+    assert release.import_state == ImportWorkflowState.needs_review
+    assert "still require review" in (release.error_detail or "")

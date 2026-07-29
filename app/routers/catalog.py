@@ -77,6 +77,12 @@ def _download_response(request: Request | None, *, queued: int, album_id: int) -
     return RedirectResponse("/downloads", status_code=303)
 
 
+def _download_many_response(request: Request | None, *, queued: int, artist_id: int) -> Response:
+    if _is_fetch_request(request):
+        return JSONResponse({"queued": queued, "artist_id": artist_id})
+    return RedirectResponse("/downloads", status_code=303)
+
+
 async def _imported_catalog_track_ids(db: AsyncSession, album_id: int) -> set[int]:
     rows = (
         await db.execute(
@@ -969,7 +975,8 @@ async def download_monitored_catalog_albums(
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     _user: Annotated[object, Depends(require_mutation)],
-) -> RedirectResponse:
+    request: Request = None,  # type: ignore[assignment]
+) -> Response:
     load = selectinload(CatalogArtist.identities).selectinload(CatalogArtistIdentity.releases)
     artist = (
         await db.execute(
@@ -1038,7 +1045,7 @@ async def download_monitored_catalog_albums(
         job_ids.append(job.id)
     for job_id in job_ids:
         await job_dispatcher.dispatch(job_id)
-    return RedirectResponse("/downloads", status_code=303)
+    return _download_many_response(request, queued=len(job_ids), artist_id=artist_id)
 
 
 @router.post("/albums/{album_id}/download", include_in_schema=False)

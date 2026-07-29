@@ -42,7 +42,7 @@
         <button class="btn" type="submit">{% if artist.monitored %}Watchlisted ✓{% else %}Add to watchlist{% endif %}</button>
       </form>
       {% if artist.monitored %}
-      <form method="post" action="/artists/catalog/{{ artist.id }}/download-monitored">
+      <form method="post" action="/artists/catalog/{{ artist.id }}/download-monitored" data-download-form>
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="provider" value="{{ selected_provider }}">
         <input type="hidden" name="release_type" value="{{ release_type }}">
