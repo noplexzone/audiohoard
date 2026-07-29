@@ -946,7 +946,10 @@ async def download_catalog_album(
             status_code=502,
             detail="Could not load album tracklist from provider; download not started",
         ) from None
-    imported_ids = await _imported_catalog_track_ids(db, album.id)
+    progress = (await get_release_progress(db, [album.id], library_root=settings.library_root))[
+        album.id
+    ]
+    imported_ids = set(progress.downloaded_catalog_track_ids)
     query = f"{album.artist.name} {album.title}".strip()
     if not imported_ids:
         job = Job(

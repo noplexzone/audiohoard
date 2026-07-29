@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from pathlib import Path
 
 import pytest_asyncio
 from httpx import AsyncClient
@@ -869,8 +868,8 @@ async def test_catalog_album_shows_total_and_per_track_downloaded_wanted_states(
     assert f'action="/albums/{partial_id}/tracks/{missing_id}/download"' in missing_row
 
 
-async def test_album_download_queues_only_missing_catalog_tracks(
-    client: AsyncClient, tmp_path: Path, monkeypatch
+async def test_album_download_skips_legacy_files_counted_by_release_progress(
+    client: AsyncClient, test_settings, monkeypatch
 ) -> None:
     import app.routers.catalog as catalog_router
 
@@ -881,7 +880,61 @@ async def test_album_download_queues_only_missing_catalog_tracks(
 
     monkeypatch.setattr(catalog_router.job_dispatcher, "dispatch", fake_dispatch)
     factory = db_module.get_session_factory()
-    existing_path = tmp_path / "01 - Already Owned.flac"
+    async with factory() as session:
+        artist = CatalogArtist(name="Juice WRLD")
+        album = CatalogAlbum(title="Legacy Owned", year="2024", track_count=3)
+        artist.albums.append(album)
+        album.tracks.extend(
+            [
+                CatalogAlbumTrack(position=1, disc=1, title="Already Owned"),
+                CatalogAlbumTrack(position=2, disc=1, title="Actually Missing"),
+                CatalogAlbumTrack(position=3, disc=1, title="Also Missing"),
+            ]
+        )
+        session.add(artist)
+        await session.commit()
+        album_id = album.id
+    release_folder = test_settings.library_root / "Juice WRLD" / "Legacy Owned (2024)"
+    release_folder.mkdir(parents=True)
+    (release_folder / "01 - Already Owned.flac").write_bytes(b"audio")
+
+    response = await client.post(f"/albums/{album_id}/download", follow_redirects=False)
+
+    assert response.status_code == 303
+    async with factory() as session:
+        jobs = list(
+            (
+                await session.scalars(
+                    select(Job).where(
+                        Job.catalog_album_id == album_id,
+                        Job.status == JobStatus.pending,
+                    )
+                )
+            ).all()
+        )
+    assert [job.query for job in jobs] == [
+        "Juice WRLD Actually Missing",
+        "Juice WRLD Also Missing",
+    ]
+    assert all(job.catalog_track_id is not None for job in jobs)
+    assert len(dispatched) == 2
+
+
+async def test_album_download_queues_only_missing_catalog_tracks(
+    client: AsyncClient, test_settings, monkeypatch
+) -> None:
+    import app.routers.catalog as catalog_router
+
+    dispatched: list[int] = []
+
+    async def fake_dispatch(job_id: int):
+        dispatched.append(job_id)
+
+    monkeypatch.setattr(catalog_router.job_dispatcher, "dispatch", fake_dispatch)
+    factory = db_module.get_session_factory()
+    release_folder = test_settings.library_root / "Juice WRLD" / "The Party Never Ends 2.0"
+    release_folder.mkdir(parents=True)
+    existing_path = release_folder / "01 - Already Owned.flac"
     existing_path.write_bytes(b"audio")
     async with factory() as session:
         artist = CatalogArtist(name="Juice WRLD")

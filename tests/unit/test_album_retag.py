@@ -302,6 +302,42 @@ async def test_retag_catalog_album_discovers_legacy_library_files_without_import
     assert FLAC(paths[1])["musicbrainz_trackid"] == ["agats-mbid"]
 
 
+async def test_retag_catalog_album_maps_multidisc_legacy_filenames(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    library_root = tmp_path / "library"
+    artist = CatalogArtist(name="Various Artist", mbid="artist-mbid")
+    album = CatalogAlbum(title="Double Album", year="2020", release_type="album", track_count=2)
+    artist.albums.append(album)
+    album.tracks.extend(
+        [
+            CatalogAlbumTrack(disc=1, position=1, title="Disc One", recording_mbid="disc-one"),
+            CatalogAlbumTrack(disc=2, position=1, title="Disc Two", recording_mbid="disc-two"),
+        ]
+    )
+    db_session.add(artist)
+    await db_session.flush()
+    folder = library_root / artist.name / f"{album.title} ({album.year})"
+    folder.mkdir(parents=True)
+    disc_one = folder / "1-01 - Disc One.flac"
+    disc_two = folder / "2-01 - Disc Two.flac"
+    for path in (disc_one, disc_two):
+        path.write_bytes(_minimal_flac_bytes())
+
+    async def no_artwork(url: str | None) -> CanonicalArtwork | None:
+        return None
+
+    monkeypatch.setattr(library_import_module, "_fetch_canonical_artwork", no_artwork)
+
+    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert result.files_retagged == 2
+    assert FLAC(disc_one)["musicbrainz_trackid"] == ["disc-one"]
+    assert FLAC(disc_one)["discnumber"] == ["1"]
+    assert FLAC(disc_two)["musicbrainz_trackid"] == ["disc-two"]
+    assert FLAC(disc_two)["discnumber"] == ["2"]
+
+
 class _FailingSecondWriter(MutagenTagWriter):
     def __init__(self) -> None:
         self.calls = 0
