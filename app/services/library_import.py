@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 from collections.abc import Callable
@@ -281,15 +282,24 @@ def _mp4_cover_format(mime: str) -> int:
     return MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
 
 
-def _track_number_from_filename(path: Path) -> int | None:
-    stem = path.stem.strip()
-    digits = ""
-    for char in stem:
-        if char.isdigit():
-            digits += char
-        else:
-            break
-    return int(digits) if digits else None
+_TRACK_NUMBER_PREFIX = re.compile(r"^(?:(?P<disc>\d{1,2})[-_.])?(?P<track>\d{1,3})(?:\D|$)")
+_DISC_FOLDER = re.compile(r"^(?:cd|disc)[ _.-]?(\d{1,2})$", re.IGNORECASE)
+
+
+def _track_key_from_filename(path: Path, album_folder: Path) -> tuple[int, int] | None:
+    match = _TRACK_NUMBER_PREFIX.match(path.stem.strip())
+    if not match:
+        return None
+    disc = int(match.group("disc") or 1)
+    track = int(match.group("track"))
+    if match.group("disc") is None:
+        for parent_part in path.relative_to(album_folder).parts[:-1]:
+            disc_match = _DISC_FOLDER.match(parent_part)
+            if disc_match:
+                disc = int(disc_match.group(1))
+        if 100 <= track <= 999:
+            disc, track = divmod(track, 100)
+    return disc, track
 
 
 def _normalized_title(value: str) -> str:
@@ -596,15 +606,17 @@ def _discover_legacy_album_files(
     catalog_by_title = {_normalized_title(track.title): track for track in album.tracks}
     targets: list[tuple[Path, None, CatalogAlbumTrack]] = []
     used_catalog_ids: set[int] = set()
-    for path in sorted(folder.iterdir()):
+    for path in sorted(folder.rglob("*")):
         if path.is_symlink() or not path.is_file() or not is_importable_audio(path):
             continue
-        track_no = _track_number_from_filename(path)
-        catalog_track = catalog_by_position.get((1, track_no or 0))
+        track_key = _track_key_from_filename(path, folder)
+        catalog_track = catalog_by_position.get(track_key or (0, 0))
         if catalog_track is None:
             stripped = path.stem
-            if track_no is not None:
-                stripped = stripped[len(str(track_no)) :].lstrip(" .-_")
+            if track_key is not None:
+                prefix = _TRACK_NUMBER_PREFIX.match(path.stem.strip())
+                if prefix is not None:
+                    stripped = stripped[prefix.end() :].lstrip(" .-_")
             catalog_track = catalog_by_title.get(_normalized_title(stripped))
         if catalog_track is None or catalog_track.id in used_catalog_ids:
             raise ImportExecutionError(
