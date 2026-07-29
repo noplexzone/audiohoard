@@ -76,6 +76,7 @@ _MANAGED_TAG_KEYS = frozenset(
         "release_date",
         "originaldate",
         "original_date",
+        "originalyear",
         "tracknumber",
         "discnumber",
         "genre",
@@ -97,6 +98,10 @@ _MANAGED_TAG_KEYS = frozenset(
         "musicbrainz_albumid",
         "musicbrainz_albumartistid",
         "musicbrainz_releasegroupid",
+        "musicbrainz_albumstatus",
+        "musicbrainz_albumtype",
+        "musicbrainz_artistid",
+        "musicbrainz_releasetrackid",
     }
 )
 
@@ -119,6 +124,8 @@ _MANAGED_ID3_TXXX_DESCRIPTIONS = frozenset(
         "musicbrainz album id",
         "musicbrainz album artist id",
         "musicbrainz release group id",
+        "musicbrainz artist id",
+        "musicbrainz release track id",
     }
 )
 
@@ -556,6 +563,10 @@ class MutagenTagWriter:
             "musicbrainz_albumid",
             "musicbrainz_albumartistid",
             "musicbrainz_releasegroupid",
+            "musicbrainz_albumstatus",
+            "musicbrainz_albumtype",
+            "musicbrainz_artistid",
+            "musicbrainz_releasetrackid",
         )
         if suffix == ".flac":
             flac = FLAC(path)
@@ -737,7 +748,14 @@ async def retag_catalog_album(
                 continue
         latest[track.id] = (track, plan)
     artwork = await _fetch_canonical_artwork(album.artwork_url)
-    legacy_targets = [] if latest else _discover_legacy_album_files(album, library_root)
+    legacy_targets = _discover_legacy_album_files(album, library_root)
+    if latest:
+        imported_destinations = {plan.destination_path for _track, plan in latest.values()}
+        legacy_targets = [
+            (path, track, catalog_track)
+            for path, track, catalog_track in legacy_targets
+            if str(path) not in imported_destinations
+        ]
     if not latest and not legacy_targets:
         raise ImportExecutionError("album has no imported files to retag")
 

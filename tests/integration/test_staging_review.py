@@ -223,6 +223,55 @@ async def test_deny_does_not_leave_empty_acoustid_release_review(
     assert "AcoustID mismatch on track 7" not in page.text
 
 
+async def test_deny_removes_non_audio_review_artifact(
+    client: AsyncClient, test_settings: Settings
+) -> None:
+    settings = test_settings
+    settings.staging_root.mkdir(parents=True, exist_ok=True)
+    lyric = settings.staging_root / "track.lrc"
+    lyric.write_text("[00:00.00]lyrics")  # noqa: ASYNC240
+    factory = get_session_factory()
+    async with factory() as db:
+        job = Job(source="slskd", query="lyrics", status=JobStatus.done)
+        release = Release(job=job, source="slskd", title="Album", album_artist="Artist")
+        track = Track(
+            job=job,
+            release=release,
+            source="slskd",
+            title="Lyrics",
+            track_no=1,
+            source_path=str(lyric),
+            staging_path=str(lyric),
+            file_format="lrc",
+            acquisition_state=AcquisitionState.downloaded,
+            acoustid_verification_state=AcoustIDVerificationState.unavailable,
+        )
+        item = StagingReviewItem(
+            track=track,
+            release=release,
+            expected_title="Lyrics",
+            verification_reason="unavailable",
+            review_state=ReviewDecision.pending,
+        )
+        db.add_all([job, release, track, item])
+        await db.commit()
+        item_id = item.id
+        track_id = track.id
+
+    audio = await client.get(f"/staging/audio/{item_id}")
+    denied = await client.post(f"/staging/review/{item_id}/deny", follow_redirects=False)
+
+    assert audio.status_code == 400
+    assert denied.status_code == 303
+    assert not lyric.exists()
+    async with factory() as db:
+        assert await db.get(StagingReviewItem, item_id) is None
+        denied_track = await db.get(Track, track_id)
+        assert denied_track is not None
+        assert denied_track.staging_path is None
+        assert denied_track.acoustid_verification_state == AcoustIDVerificationState.denied
+
+
 async def test_review_page_has_only_approve_and_deny_actions(
     client: AsyncClient, test_settings: Settings
 ) -> None:

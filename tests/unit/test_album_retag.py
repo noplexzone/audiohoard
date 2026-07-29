@@ -513,7 +513,12 @@ def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: 
     original["releasedate"] = "2021"
     original["release_date"] = "2021"
     original["originaldate"] = "2021"
+    original["originalyear"] = "2021"
     original["recordlabel"] = "Grade A Productions/Interscope Records"
+    original["musicbrainz_albumstatus"] = "official"
+    original["musicbrainz_albumtype"] = "album"
+    original["musicbrainz_artistid"] = "stale-artist"
+    original["musicbrainz_releasetrackid"] = "stale-release-track"
     original["barcode"] = "602445694884"
     original["isrc"] = "USUG12106076"
     original["media"] = "Digital Media"
@@ -543,7 +548,12 @@ def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: 
         "year",
         "releasedate",
         "originaldate",
+        "originalyear",
         "recordlabel",
+        "musicbrainz_albumstatus",
+        "musicbrainz_albumtype",
+        "musicbrainz_artistid",
+        "musicbrainz_releasetrackid",
         "barcode",
         "isrc",
         "media",
@@ -554,6 +564,42 @@ def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: 
         "disctotal",
     }:
         assert key not in tags
+
+
+async def test_retag_catalog_album_repairs_mixed_imported_and_legacy_files(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, tracks = await _seed_imported_album(db_session, library_root)
+    legacy_catalog = CatalogAlbumTrack(
+        disc=1,
+        position=12,
+        title="Syphilis",
+        recording_mbid="a274f59b-78b6-4ee4-91f7-153befea1600",
+    )
+    album.tracks.append(legacy_catalog)
+    legacy_path = paths[0].parent / "12 - Syphilis.flac"
+    legacy_path.write_bytes(_minimal_flac_bytes())
+    legacy = FLAC(legacy_path)
+    legacy["title"] = "Syphilis"
+    legacy["album"] = album.title
+    legacy["albumartist"] = "Juice WRLD"
+    legacy["date"] = "2019"
+    legacy["originalyear"] = "2019"
+    legacy["musicbrainz_albumtype"] = "album"
+    legacy.save()
+    await db_session.flush()
+
+    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert result.files_retagged == 3
+    repaired = {key.casefold(): values for key, values in FLAC(legacy_path).tags.items()}
+    assert repaired["date"] == [album.year]
+    assert repaired["release_date"] == [album.year]
+    assert repaired["musicbrainz_trackid"] == [legacy_catalog.recording_mbid]
+    assert "originalyear" not in repaired
+    assert "musicbrainz_albumtype" not in repaired
+    assert all(path.exists() for path in paths)
 
 
 async def test_retag_catalog_album_supports_legacy_unmapped_imports(
