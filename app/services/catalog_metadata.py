@@ -23,6 +23,11 @@ from app.metadata.base import (
     ArtistHit,
     MetadataProvider,
 )
+from app.metadata.content_rating import (
+    CONTENT_RATING_UNKNOWN,
+    content_ratings_compatible,
+    normalize_content_rating,
+)
 from app.metadata.deezer import DeezerClient
 from app.metadata.itunes import ITunesClient
 from app.metadata.musicbrainz import MusicBrainzClient
@@ -317,6 +322,8 @@ async def upsert_provider_release(
         release.track_count = hit.track_count
     release.release_kind = normalize_release_kind(hit)
     release.release_type_raw = hit.release_type_raw or hit.release_type
+    release.content_rating = normalize_content_rating(hit.content_rating)
+    release.upc = hit.upc or release.upc
     release.metadata_json = json.dumps(
         {
             "source": "provider",
@@ -375,6 +382,13 @@ def _apply_album_hit(
     album.year = hit.year or album.year
     album.release_type = album.release_type or hit.release_type
     album.artwork_url = hit.artwork_url or album.artwork_url
+    incoming_rating = normalize_content_rating(hit.content_rating)
+    if (
+        normalize_content_rating(album.content_rating) == CONTENT_RATING_UNKNOWN
+        and incoming_rating != CONTENT_RATING_UNKNOWN
+    ):
+        album.content_rating = incoming_rating
+    album.upc = album.upc or hit.upc
     if hit.track_count and album.track_count is None:
         album.track_count = hit.track_count
     album.itunes_id = album.itunes_id or ids["itunes_id"]
@@ -459,6 +473,7 @@ async def fetch_and_store_album(
                     title=provider_track.title,
                     duration_sec=provider_track.duration_sec,
                     recording_mbid=provider_track.recording_mbid,
+                    content_rating=normalize_content_rating(provider_track.content_rating),
                 )
             )
             continue
@@ -467,6 +482,12 @@ async def fetch_and_store_album(
         existing.title = provider_track.title
         existing.duration_sec = provider_track.duration_sec
         existing.recording_mbid = provider_track.recording_mbid or existing.recording_mbid
+        incoming_rating = normalize_content_rating(provider_track.content_rating)
+        if (
+            normalize_content_rating(existing.content_rating) == CONTENT_RATING_UNKNOWN
+            and incoming_rating != CONTENT_RATING_UNKNOWN
+        ):
+            existing.content_rating = incoming_rating
         linked_values: dict[str, object] = {
             "title": provider_track.title,
             "track_no": provider_track.position,
@@ -674,6 +695,9 @@ async def merge_catalog_artists(
                 existing_release.year = existing_release.year or release.year
                 existing_release.artwork_url = existing_release.artwork_url or release.artwork_url
                 existing_release.track_count = existing_release.track_count or release.track_count
+                if existing_release.content_rating == CONTENT_RATING_UNKNOWN:
+                    existing_release.content_rating = release.content_rating
+                existing_release.upc = existing_release.upc or release.upc
                 await db.delete(release)
             survivor_identity.name = survivor_identity.name or duplicate_identity.name
             survivor_identity.artwork_url = (
@@ -866,6 +890,8 @@ async def ensure_legacy_provider_snapshots(db: AsyncSession, artist: CatalogArti
                         "compilation": "compilation",
                     }[bucket],
                     release_type_raw=album.release_type,
+                    content_rating=album.content_rating,
+                    upc=album.upc,
                     metadata_json=json.dumps(
                         {"legacy_runtime_repair": True, "lossy": True}, sort_keys=True
                     ),
@@ -881,27 +907,52 @@ def _edition_marker(value: str) -> str:
     return ":".join(markers)
 
 
-def _album_key(hit: Any) -> tuple[str, str | None, str, str]:
+def _album_key(hit: Any) -> tuple[str, str | None, str, str, int | None, str]:
     return (
         _norm_title(str(hit.title)),
         getattr(hit, "year", None),
         _edition_marker(str(hit.title)),
         _norm_release_type(getattr(hit, "release_type", None)),
+        getattr(hit, "track_count", None),
+        normalize_content_rating(getattr(hit, "content_rating", None)),
     )
 
 
+def _provider_ids_compatible(left: Any, right: Any) -> bool:
+    for field in ("mbid", "deezer_id", "itunes_id"):
+        left_value = getattr(left, field, None)
+        right_value = getattr(right, field, None)
+        if left_value and right_value and left_value != right_value:
+            return False
+    return True
+
+
 def _album_keys_match(left: Any, right: Any) -> bool:
-    lt, ly, le, lr = _album_key(left)
-    rt, ry, re_, rr = _album_key(right)
+    lt, ly, le, lr, lc, lrating = _album_key(left)
+    rt, ry, re_, rr, rc, rrating = _album_key(right)
+    if not _provider_ids_compatible(left, right):
+        return False
     if (lt, le, lr) != (rt, re_, rr):
         return False
-    return ly == ry or ly is None or ry is None
+    if ly != ry and ly is not None and ry is not None:
+        return False
+    if lc != rc and lc is not None and rc is not None:
+        return False
+    return content_ratings_compatible(lrating, rrating)
 
 
 def _canonical_album_keys_match(left: Any, right: Any) -> bool:
-    lt, ly, le, _ = _album_key(left)
-    rt, ry, re_, _ = _album_key(right)
-    return (lt, le) == (rt, re_) and (ly == ry or ly is None or ry is None)
+    lt, ly, le, _, lc, lrating = _album_key(left)
+    rt, ry, re_, _, rc, rrating = _album_key(right)
+    if not _provider_ids_compatible(left, right):
+        return False
+    if (lt, le) != (rt, re_):
+        return False
+    if ly != ry and ly is not None and ry is not None:
+        return False
+    if lc != rc and lc is not None and rc is not None:
+        return False
+    return content_ratings_compatible(lrating, rrating)
 
 
 def _merge_provider_json(*values: str | None) -> str | None:
@@ -918,8 +969,10 @@ def _merge_provider_json(*values: str | None) -> str | None:
     return json.dumps(sorted(providers)) if providers else None
 
 
-def _album_data_score(album: CatalogAlbum) -> tuple[int, int, int, int, int, int]:
+def _album_data_score(album: CatalogAlbum) -> tuple[int, int, int, int, int, int, int, int]:
     return (
+        1 if album.content_rating != CONTENT_RATING_UNKNOWN else 0,
+        1 if album.upc else 0,
         1 if album.mbid else 0,
         1 if album.track_count else 0,
         1 if album.artwork_url else 0,

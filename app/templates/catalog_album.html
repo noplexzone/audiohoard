@@ -16,7 +16,7 @@
     <a class="eyebrow" href="/artists/catalog/{{ album.artist.id }}">{{ album.artist.name }}</a>
     <h1>{{ album.title }}</h1>
     <p class="muted-line">
-      {{ album.year or 'Unknown year' }} · {{ album.release_type or 'Release' }} · {{ album.track_count or album.tracks | length }} track{% if (album.track_count or album.tracks | length) != 1 %}s{% endif %}
+      {{ album.year or 'Unknown year' }} · {{ album.release_type or 'Release' }}{% if album.content_rating and album.content_rating != 'unknown' %} · {{ album.content_rating.replace('_', ' ') | title }}{% endif %} · {{ album.track_count or album.tracks | length }} track{% if (album.track_count or album.tracks | length) != 1 %}s{% endif %}
       {% if total_runtime_sec %} · {{ total_runtime_sec // 3600 }}:{% if (total_runtime_sec % 3600) // 60 < 10 %}0{% endif %}{{ (total_runtime_sec % 3600) // 60 }}:{% if total_runtime_sec % 60 < 10 %}0{% endif %}{{ total_runtime_sec % 60 }}{% endif %}
     </p>
     <div class="release-progress">

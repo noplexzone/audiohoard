@@ -42,6 +42,8 @@ class AlbumHit:
     itunes_id: str | None = None
     artwork_url: str | None = None
     track_count: int | None = None
+    content_rating: str = "unknown"
+    upc: str | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,7 @@ class AlbumTrack:
     duration_sec: int | None = None
     recording_mbid: str | None = None
     provider_track_id: str | None = None
+    content_rating: str = "unknown"
 
 
 @dataclass(frozen=True)

@@ -81,6 +81,10 @@ class CatalogAlbum(Base):
     itunes_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
     artwork_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     track_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content_rating: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unknown", server_default="unknown"
+    )
+    upc: Mapped[str | None] = mapped_column(String(64), nullable=True)
     providers_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     provenance_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     monitored: Mapped[bool] = mapped_column(
@@ -173,6 +177,10 @@ class CatalogAlbumProvider(Base):
         String(32), nullable=False, default="unknown", server_default="unknown"
     )
     release_type_raw: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    content_rating: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unknown", server_default="unknown"
+    )
+    upc: Mapped[str | None] = mapped_column(String(64), nullable=True)
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     monitored: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="0"
@@ -204,6 +212,9 @@ class CatalogAlbumTrack(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     duration_sec: Mapped[int | None] = mapped_column(Integer, nullable=True)
     recording_mbid: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    content_rating: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unknown", server_default="unknown"
+    )
 
     album: Mapped[CatalogAlbum] = relationship("CatalogAlbum", back_populates="tracks")
     jobs: Mapped[list[Job]] = relationship("Job", back_populates="catalog_track")

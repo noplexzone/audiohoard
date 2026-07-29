@@ -114,6 +114,9 @@ async def test_deezer_catalog_provider(httpx_mock: HTTPXMock) -> None:
                     "record_type": "album",
                     "cover_medium": "cover.jpg",
                     "nb_tracks": 14,
+                    "explicit_lyrics": True,
+                    "explicit_content_lyrics": 1,
+                    "upc": "123456789",
                 }
             ]
         },
@@ -135,6 +138,8 @@ async def test_deezer_catalog_provider(httpx_mock: HTTPXMock) -> None:
                         "duration": 320,
                         "disk_number": 1,
                         "track_position": 1,
+                        "explicit_lyrics": True,
+                        "explicit_content_lyrics": 1,
                     }
                 ]
             },
@@ -150,6 +155,8 @@ async def test_deezer_catalog_provider(httpx_mock: HTTPXMock) -> None:
                     "duration": 320,
                     "disk_number": 1,
                     "track_position": 1,
+                    "explicit_lyrics": True,
+                    "explicit_content_lyrics": 1,
                 }
             ],
             "total": 1,
@@ -158,8 +165,13 @@ async def test_deezer_catalog_provider(httpx_mock: HTTPXMock) -> None:
     client = DeezerClient()
     assert (await client.search_artists("Daft Punk"))[0].artwork_url == "artist.jpg"
     assert (await client.get_artist("1")).name == "Daft Punk"
-    assert (await client.get_discography("1"))[0].track_count == 14
-    assert (await client.get_album("10")).tracks[0].title == "One More Time"
+    discography_album = (await client.get_discography("1"))[0]
+    assert discography_album.track_count == 14
+    assert discography_album.content_rating == "explicit"
+    assert discography_album.upc == "123456789"
+    album_detail = await client.get_album("10")
+    assert album_detail.tracks[0].title == "One More Time"
+    assert album_detail.tracks[0].content_rating == "explicit"
 
 
 async def test_deezer_discography_backfills_counts_missing_from_artist_albums(
@@ -261,6 +273,8 @@ async def test_itunes_catalog_provider(httpx_mock: HTTPXMock) -> None:
                     "collectionType": "Album",
                     "artworkUrl100": "100x100bb.jpg",
                     "trackCount": 12,
+                    "collectionExplicitness": "cleaned",
+                    "contentAdvisoryRating": "Clean",
                 },
             ]
         },
@@ -285,14 +299,19 @@ async def test_itunes_catalog_provider(httpx_mock: HTTPXMock) -> None:
                     "trackNumber": 1,
                     "discNumber": 1,
                     "trackTimeMillis": 301000,
+                    "trackExplicitness": "explicit",
                 },
             ]
         },
     )
     client = ITunesClient()
     assert (await client.search_artists("Nirvana"))[0].provider_id == "1"
-    assert (await client.get_discography("1"))[0].year == "1991"
-    assert (await client.get_album("2")).tracks[0].duration_sec == 301
+    discography_album = (await client.get_discography("1"))[0]
+    assert discography_album.year == "1991"
+    assert discography_album.content_rating == "clean"
+    album_detail = await client.get_album("2")
+    assert album_detail.tracks[0].duration_sec == 301
+    assert album_detail.tracks[0].content_rating == "explicit"
 
 
 async def test_musicbrainz_discography_does_not_probe_cover_art_per_album(

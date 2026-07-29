@@ -11,6 +11,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from app.http import request_with_retry
 from app.metadata.base import AlbumDetail, AlbumHit, AlbumTrack, ArtistDetail, ArtistHit, TTLCache
+from app.metadata.content_rating import deezer_content_rating
 from app.sources.base import CapabilityState
 
 logger = logging.getLogger(__name__)
@@ -371,6 +372,8 @@ def _parse_album_hit(data: dict[str, object], artist_id: str | None) -> AlbumHit
         )
         or None,
         track_count=_to_int(data.get("nb_tracks")),
+        content_rating=deezer_content_rating(data),
+        upc=str(data.get("upc") or "") or None,
     )
 
 
@@ -382,4 +385,5 @@ def _parse_album_track(data: dict[str, object]) -> AlbumTrack:
         title=str(data.get("title") or data.get("title_short") or ""),
         duration_sec=_to_int(data.get("duration")),
         provider_track_id=tid,
+        content_rating=deezer_content_rating(data),
     )

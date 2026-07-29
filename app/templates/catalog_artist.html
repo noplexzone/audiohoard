@@ -110,10 +110,10 @@
             <div class="album-card-body">
               <h3>{% if album.catalog_album_id %}<a href="/albums/{{ album.catalog_album_id }}" title="{{ album.title | e }}">{{ album.title }}</a>{% else %}{{ album.title }}{% endif %}</h3>
               <p class="muted-line">
-                {% if album.year %}{{ album.year }}{% endif %}{% if album.year and album.release_type_raw %} · {% endif %}{% if album.release_type_raw %}{{ album.release_type_raw }}{% else %}{{ album.release_kind | title }}{% endif %}{% if album.track_count %}{% if album.year or album.release_type_raw %} · {% endif %}{{ album.track_count }} tracks{% endif %}
+                {% if album.year %}{{ album.year }}{% endif %}{% if album.year and album.release_type_raw %} · {% endif %}{% if album.release_type_raw %}{{ album.release_type_raw }}{% else %}{{ album.release_kind | title }}{% endif %}{% if album.content_rating and album.content_rating != "unknown" %}{% if album.year or album.release_type_raw %} · {% endif %}{{ album.content_rating.replace("_", " ") | title }}{% endif %}{% if album.track_count %}{% if album.year or album.release_type_raw or (album.content_rating and album.content_rating != "unknown") %} · {% endif %}{{ album.track_count }} tracks{% endif %}
               </p>
               <p class="release-progress">{% if progress.wanted_track_count %}{{ progress.downloaded_track_count }} / {{ progress.wanted_track_count }} downloaded{% else %}Track count unavailable{% endif %}</p>
-              <p class="provider-badges"><span class="badge info">{{ display_name(selected_provider) }}</span></p>
+              <p class="provider-badges"><span class="badge info">{{ display_name(selected_provider) }}</span>{% if album.content_rating and album.content_rating != "unknown" %}<span class="badge warn">{{ album.content_rating.replace("_", " ") | title }}</span>{% endif %}</p>
               <div class="album-card-actions">
                 {% if artist.monitored and artist.watchlist_provider == selected_provider %}<label class="check-label compact-check"><input type="checkbox" name="album_monitored" form="monitor-form" value="{{ album.id }}" {% if album.monitored %}checked{% endif %}> <span>Watchlist</span></label>{% endif %}
                 {% if album.catalog_album_id %}<form method="post" action="/albums/{{ album.catalog_album_id }}/download" data-download-form>
