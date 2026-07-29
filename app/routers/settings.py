@@ -311,6 +311,9 @@ async def save_runtime_settings_page(
         duplicate_scan_hours = int(
             str(form.get("duplicate_scan_hours", runtime.duplicate_scan_hours)) or "0"
         )
+        upgrade_check_hours = int(
+            str(form.get("upgrade_check_hours", runtime.upgrade_check_hours)) or "0"
+        )
         source_budget = int(
             str(form.get("source_search_budget_seconds", runtime.source_search_budget_seconds))
             or "15"
@@ -332,6 +335,7 @@ async def save_runtime_settings_page(
         and 1 <= refresh_hours <= 720
         and 0 <= library_scan_hours <= 720
         and 0 <= duplicate_scan_hours <= 720
+        and 0 <= upgrade_check_hours <= 720
         and 3 <= source_budget <= 60
         and 10 <= slskd_timeout <= 86400
         and 0.5 <= acoustid_threshold <= 0.9999
@@ -418,6 +422,7 @@ async def save_runtime_settings_page(
         library_scan_hours,
         duplicate_scan_hours,
         duplicate_auto_clean,
+        upgrade_check_hours,
         auto_download,
         source_budget,
         quality_profile=quality_profile,

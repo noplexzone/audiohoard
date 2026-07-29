@@ -54,6 +54,7 @@ from app.services.dashboard import get_dashboard_data
 from app.services.health_status import get_health_status_service
 from app.services.maintenance_scheduler import MaintenanceScheduler
 from app.services.maintenance_state import empty_maintenance_state
+from app.services.monitoring import MonitoringScheduler, QualityUpgradeCycleScheduler
 from app.settings_service import build_effective_settings, effective_settings_dep
 from app.version import APP_VERSION
 
@@ -69,10 +70,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     health_status = get_health_status_service()
     maintenance_state = getattr(app.state, "maintenance_state", empty_maintenance_state())
     maintenance_scheduler = MaintenanceScheduler(maintenance_state)
+    monitoring_scheduler = MonitoringScheduler()
+    quality_upgrade_scheduler = QualityUpgradeCycleScheduler()
     app.state.maintenance_state = maintenance_state
     app.state.discography_scheduler = scheduler
     app.state.health_status_service = health_status
     app.state.maintenance_scheduler = maintenance_scheduler
+    app.state.monitoring_scheduler = monitoring_scheduler
+    app.state.quality_upgrade_scheduler = quality_upgrade_scheduler
     async with get_session_factory()() as db:
         pending_cleanups = await pending_imported_source_cleanups(db)
         pruned = await prune_orphaned_terminal_records(db)
@@ -106,11 +111,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     await scheduler.start()
     await maintenance_scheduler.start()
+    await quality_upgrade_scheduler.start()
     await health_status.start()
     try:
         yield
     finally:
         await health_status.stop()
+        await quality_upgrade_scheduler.stop()
         await maintenance_scheduler.stop()
         await scheduler.stop()
         await job_dispatcher.shutdown()

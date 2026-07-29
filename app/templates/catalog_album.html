@@ -40,6 +40,14 @@
         <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
         <button type="submit" class="btn secondary">Clean quality duplicates</button>
       </form>
+      {% if watching_for_upgrades %}
+        <span class="badge ok">Watching for upgrades</span>
+      {% else %}
+        <form method="post" action="/albums/{{ album.id }}/watch-upgrade">
+          <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+          <button type="submit" class="btn secondary">Watch for upgrade</button>
+        </form>
+      {% endif %}
     </div>
   </div>
 </header>

@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Wired quality-upgrade monitoring into album watch actions, maintenance approval, and a disabled-by-default scheduled check interval.
 - Added a background-backed Maintenance page with library filesystem verification, duplicate dry-run summaries, safe tie-free cleanup, and scheduling controls.
 - Added quality-duplicate cleanup that follows the Settings quality profile, permanently removes only clear same-folder lower-quality duplicates, and leaves ambiguous matches for review.
 - Added an explicit backup-first maintenance command for auditing and repairing historical orphaned staging-review records.

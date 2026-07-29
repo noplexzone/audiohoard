@@ -10,9 +10,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
+from app.database import get_session_factory
 from app.models.monitoring import MonitoringRecord, MonitoringStatus
 from app.models.release_candidate import MatchReviewState, ReleaseCandidate
 from app.models.track import Track
@@ -24,6 +26,7 @@ from app.services.library_import import (
     execute_release_import,
     plan_release_import,
 )
+from app.settings_service import build_effective_settings, get_runtime_settings
 from app.sources.base import CapabilityState as _CapabilityState
 
 
@@ -337,3 +340,109 @@ def map_slskd_transfer_state(state: _CapabilityState) -> _AcquisitionState:
     if tokens & {"queued", "initializing"}:
         return _AcquisitionState.queued
     return _AcquisitionState.acquiring
+
+
+_LOSSLESS_FILE_FORMATS = {"flac", "alac", "wav", "aiff", "aif"}
+
+
+def _monitoring_profile_from_runtime(runtime: Any) -> QualityProfile:
+    qp = getattr(runtime, "quality_profile", None)
+    preferred: list[str] = []
+    for fmt in getattr(qp, "format_preference", []) or []:
+        value = str(fmt).casefold()
+        if value == "m4a/aac":
+            preferred.extend(["aac", "m4a"])
+        else:
+            preferred.append(value)
+    if not preferred:
+        preferred = ["flac", "aac", "mp3", "opus"]
+    min_mp3 = int(getattr(qp, "min_mp3_bitrate", 0) or 0)
+    return QualityProfile(
+        preferred_codecs=tuple(dict.fromkeys(preferred)),
+        minimum_bitrate_kbps=min_mp3,
+    )
+
+
+async def current_release_quality(db: AsyncSession, release_id: int) -> dict[str, Any]:
+    rows = (
+        await db.execute(
+            select(Track.file_format, func.count(Track.id))
+            .where(
+                Track.release_id == release_id,
+                Track.import_state == ImportWorkflowState.imported,
+                Track.file_format.is_not(None),
+            )
+            .group_by(Track.file_format)
+            .order_by(func.count(Track.id).desc())
+        )
+    ).all()
+    codec = str(rows[0][0]).casefold() if rows else ""
+    if codec == "m4a":
+        codec = "aac"
+    return {"codec": codec, "lossless": codec in _LOSSLESS_FILE_FORMATS, "reliability": 1.0}
+
+
+class QualityUpgradeCycleScheduler:
+    def __init__(self) -> None:
+        self._task: asyncio.Task[None] | None = None
+        self._stop = asyncio.Event()
+        self._last_check = 0.0
+
+    async def start(self) -> None:
+        if self._task is None:
+            self._stop.clear()
+            self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            self._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+
+    async def _refresh_cycle(self) -> float:
+        import time
+
+        from app.services.quality_discovery import build_upgrade_discovery
+
+        factory = get_session_factory()
+        async with factory() as db:
+            runtime = await get_runtime_settings(db)
+            if runtime.upgrade_check_hours <= 0:
+                return 3600.0
+            interval = runtime.upgrade_check_hours * 3600
+            now = time.monotonic()
+            if now - self._last_check < interval:
+                return float(interval - (now - self._last_check))
+            cfg = await build_effective_settings(db, get_settings())
+            records = (
+                await db.scalars(
+                    select(MonitoringRecord).where(
+                        MonitoringRecord.status == MonitoringStatus.active
+                    )
+                )
+            ).all()
+            for record in records:
+                current_quality = await current_release_quality(db, record.release_id)
+                discover = build_upgrade_discovery(db, cfg, record)
+                await run_monitoring_check(db, record, current_quality, discover)
+            await db.commit()
+            self._last_check = now
+            return float(interval)
+
+    async def _run(self) -> None:
+        while not self._stop.is_set():
+            delay = 3600.0
+            try:
+                delay = await self._refresh_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).exception("Quality upgrade monitoring cycle failed")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=delay)
+            except TimeoutError:
+                continue
