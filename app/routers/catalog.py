@@ -45,6 +45,7 @@ from app.services.catalog_metadata import (
     fetch_and_store_discography,
     open_catalog_artist,
 )
+from app.services.library_import import ImportExecutionError, retag_catalog_album
 from app.settings_service import effective_settings_dep, get_runtime_settings
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -764,6 +765,21 @@ async def catalog_album_page(
         album.id
     ]
     total_runtime_sec = sum(track.duration_sec or 0 for track in album.tracks)
+    retag_status = request.query_params.get("retag", "")
+    flash_message: str | None = None
+    flash_type = "info"
+    if retag_status == "ok":
+        try:
+            count = max(0, int(request.query_params.get("count", "0")))
+        except ValueError:
+            count = 0
+        noun = "file" if count == 1 else "files"
+        flash_message = f"Retagged {count} audio {noun} from Audiohoard metadata."
+        flash_type = "ok"
+    elif retag_status == "error":
+        detail = request.query_params.get("detail", "Metadata repair could not be completed")
+        flash_message = f"Metadata repair failed: {detail}"
+        flash_type = "error"
     return _templates(request).TemplateResponse(
         request,
         "catalog_album.html",
@@ -771,8 +787,36 @@ async def catalog_album_page(
             "album": album,
             "progress": progress,
             "total_runtime_sec": total_runtime_sec,
+            "flash_message": flash_message,
+            "flash_type": flash_type,
         },
     )
+
+
+@router.post("/albums/{album_id}/retag", include_in_schema=False)
+async def retag_catalog_album_files(
+    album_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    try:
+        result = await retag_catalog_album(
+            db,
+            album_id,
+            library_root=settings.library_root,
+        )
+    except ImportExecutionError as exc:
+        query = urlencode({"retag": "error", "detail": str(exc)})
+        return RedirectResponse(f"/albums/{album_id}?{query}", status_code=303)
+    except Exception:
+        logger.exception("Unexpected metadata repair failure for album %d", album_id)
+        query = urlencode(
+            {"retag": "error", "detail": "Unexpected error while repairing metadata"}
+        )
+        return RedirectResponse(f"/albums/{album_id}?{query}", status_code=303)
+    query = urlencode({"retag": "ok", "count": str(result.files_retagged)})
+    return RedirectResponse(f"/albums/{album_id}?{query}", status_code=303)
 
 
 @router.post("/artists/catalog/{artist_id}/download-monitored", include_in_schema=False)
