@@ -54,6 +54,8 @@ from app.services.acquisition_cleanup import (
     schedule_imported_source_cleanup,
 )
 from app.services.pinned_destination import PinnedDestination
+from app.services.quality_upgrade import reconcile_album_quality_duplicates
+from app.settings_service import QualityProfile, get_runtime_settings
 
 logger = logging.getLogger(__name__)
 
@@ -1042,8 +1044,12 @@ async def execute_release_import(
     before_commit: Callable[[Path], None] | None = None,
     replace_existing_verified: bool = False,
     plan_ids: set[int] | None = None,
+    quality_profile: QualityProfile | None = None,
 ) -> list[ImportPlan]:
     tag_writer = tag_writer or MutagenTagWriter()
+    if quality_profile is None:
+        runtime = await get_runtime_settings(db)
+        quality_profile = runtime.quality_profile
     plan_query = select(ImportPlan).where(
         ImportPlan.release_id == release.id,
         ImportPlan.status == ImportWorkflowState.ready,
@@ -1146,6 +1152,19 @@ async def execute_release_import(
             release.import_state = ImportWorkflowState.needs_review
         else:
             release.import_state = ImportWorkflowState.discovered
+        album_ids_for_quality = {
+            track.catalog_album_id
+            for track in imported_tracks
+            if track.catalog_album_id is not None
+        }
+        for album_id in album_ids_for_quality:
+            await reconcile_album_quality_duplicates(
+                db,
+                album_id,
+                library_root=library_root,
+                quality_profile=quality_profile,
+                defer_filesystem_delete=True,
+            )
         await _reconcile_catalog_ownership(db, release)
         await db.flush()
 

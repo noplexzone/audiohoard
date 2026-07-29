@@ -51,6 +51,7 @@ from app.services.catalog_metadata import (
     open_catalog_artist,
 )
 from app.services.library_import import ImportExecutionError, retag_catalog_album
+from app.services.quality_upgrade import reconcile_album_quality_duplicates
 from app.settings_service import effective_settings_dep, get_runtime_settings
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -802,6 +803,19 @@ async def catalog_album_page(
         noun = "file" if count == 1 else "files"
         flash_message = f"Retagged {count} audio {noun} from Audiohoard metadata."
         flash_type = "ok"
+    quality_status = request.query_params.get("quality", "")
+    if quality_status == "ok":
+        try:
+            count = max(0, int(request.query_params.get("deleted", "0")))
+            review = max(0, int(request.query_params.get("review", "0")))
+        except ValueError:
+            count = 0
+            review = 0
+        noun = "duplicate" if count == 1 else "duplicates"
+        flash_message = f"Removed {count} lower-quality {noun}."
+        if review:
+            flash_message += f" {review} ambiguous duplicate file(s) still need review."
+        flash_type = "ok"
     elif retag_status == "error":
         detail = request.query_params.get("detail", "Metadata repair could not be completed")
         flash_message = f"Metadata repair failed: {detail}"
@@ -842,6 +856,31 @@ async def retag_catalog_album_files(
         )
         return RedirectResponse(f"/albums/{album_id}?{query}", status_code=303)
     query = urlencode({"retag": "ok", "count": str(result.files_retagged)})
+    return RedirectResponse(f"/albums/{album_id}?{query}", status_code=303)
+
+
+@router.post("/albums/{album_id}/quality-deduplicate", include_in_schema=False)
+async def deduplicate_catalog_album_quality(
+    album_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    runtime = await get_runtime_settings(db)
+    result = await reconcile_album_quality_duplicates(
+        db,
+        album_id,
+        library_root=settings.library_root,
+        quality_profile=runtime.quality_profile,
+        defer_filesystem_delete=True,
+    )
+    query = urlencode(
+        {
+            "quality": "ok",
+            "deleted": str(result.deleted_files),
+            "review": str(result.review_required),
+        }
+    )
     return RedirectResponse(f"/albums/{album_id}?{query}", status_code=303)
 
 

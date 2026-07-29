@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Added quality-duplicate cleanup that follows the Settings quality profile, permanently removes only clear same-folder lower-quality duplicates, and leaves ambiguous matches for review.
 - Added an explicit backup-first maintenance command for auditing and repairing historical orphaned staging-review records.
 - Added a confirmed album-detail action that transactionally retags every imported file in a release folder from Audiohoard's stored canonical metadata without changing database records or filenames.
 
