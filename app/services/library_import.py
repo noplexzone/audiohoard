@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, no_type_check
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from mutagen.flac import FLAC, Picture
@@ -30,6 +30,7 @@ from mutagen.id3 import (
     TPOS,
     TPUB,
     TRCK,
+    TSRC,
     TXXX,
     ID3NoHeaderError,
 )
@@ -81,10 +82,42 @@ _MANAGED_TAG_KEYS = frozenset(
         "label",
         "recordlabel",
         "copyright",
+        "barcode",
+        "isrc",
+        "media",
+        "releasecountry",
+        "releasestatus",
+        "releasetype",
+        "tracktotal",
+        "disctotal",
+        "totaltracks",
+        "totaldiscs",
         "musicbrainz_trackid",
         "musicbrainz_albumid",
         "musicbrainz_albumartistid",
         "musicbrainz_releasegroupid",
+    }
+)
+
+_MANAGED_ID3_TXXX_DESCRIPTIONS = frozenset(
+    {
+        "barcode",
+        "media",
+        "release country",
+        "release status",
+        "release type",
+        "track total",
+        "disc total",
+        "musicbrainz album release country",
+        "musicbrainz album status",
+        "musicbrainz album type",
+        "musicbrainz album media",
+        "musicbrainz track total",
+        "musicbrainz disc total",
+        "musicbrainz track id",
+        "musicbrainz album id",
+        "musicbrainz album artist id",
+        "musicbrainz release group id",
     }
 )
 
@@ -107,6 +140,7 @@ _ALLOWED_ARTWORK_HOSTS = frozenset(
         "is4-ssl.mzstatic.com",
         "is5-ssl.mzstatic.com",
         "coverartarchive.org",
+        "archive.org",
         "ia801504.us.archive.org",
     }
 )
@@ -233,7 +267,19 @@ def _track_source_path(track: Track) -> Path:
 
 def _artwork_url_allowed(url: str) -> bool:
     parsed = urlparse(url)
-    return parsed.scheme == "https" and parsed.hostname in _ALLOWED_ARTWORK_HOSTS
+    hostname = parsed.hostname or ""
+    if parsed.scheme != "https":
+        return False
+    if hostname in _ALLOWED_ARTWORK_HOSTS:
+        return True
+    return hostname.endswith(".ca.archive.org") and hostname.startswith("dn")
+
+
+def _redirect_location_allowed(current_url: str, location: str | None) -> str | None:
+    if not location:
+        return None
+    redirected = urljoin(current_url, location)
+    return redirected if _artwork_url_allowed(redirected) else None
 
 
 async def _fetch_canonical_artwork(url: str | None) -> CanonicalArtwork | None:
@@ -241,29 +287,44 @@ async def _fetch_canonical_artwork(url: str | None) -> CanonicalArtwork | None:
         return None
     data = bytearray()
     content_type = ""
+    current_url = url
+    redirects_remaining = 5
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(_ARTWORK_TIMEOUT_SECONDS)) as client:
-            response = await stream_with_retry(client, "GET", url)
-            try:
-                if response.status_code != 200:
-                    return None
-                content_type = (
-                    response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                )
-                content_length = response.headers.get("content-length")
-                if content_length:
-                    try:
-                        declared_size = int(content_length)
-                    except ValueError:
-                        declared_size = 0
-                    if declared_size > _MAX_ARTWORK_BYTES:
+            while True:
+                response = await stream_with_retry(client, "GET", current_url)
+                try:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        if redirects_remaining <= 0:
+                            return None
+                        redirected = _redirect_location_allowed(
+                            current_url, response.headers.get("location")
+                        )
+                        if redirected is None:
+                            return None
+                        current_url = redirected
+                        redirects_remaining -= 1
+                        continue
+                    if response.status_code != 200:
                         return None
-                async for chunk in response.aiter_bytes():
-                    data.extend(chunk)
-                    if len(data) > _MAX_ARTWORK_BYTES:
-                        return None
-            finally:
-                await response.aclose()
+                    content_type = (
+                        response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                    )
+                    content_length = response.headers.get("content-length")
+                    if content_length:
+                        try:
+                            declared_size = int(content_length)
+                        except ValueError:
+                            declared_size = 0
+                        if declared_size > _MAX_ARTWORK_BYTES:
+                            return None
+                    async for chunk in response.aiter_bytes():
+                        data.extend(chunk)
+                        if len(data) > _MAX_ARTWORK_BYTES:
+                            return None
+                    break
+                finally:
+                    await response.aclose()
     except httpx.HTTPError:
         logger.warning("Could not fetch canonical artwork for metadata repair", exc_info=True)
         return None
@@ -349,17 +410,13 @@ class MutagenTagWriter:
                 "TCON",
                 "TPUB",
                 "TCOP",
+                "TSRC",
             ):
                 id3.delall(frame_id)
             if artwork is not None:
                 id3.delall("APIC")
             for frame in list(id3.getall("TXXX")):
-                if frame.desc.casefold() in {
-                    "musicbrainz track id",
-                    "musicbrainz album id",
-                    "musicbrainz album artist id",
-                    "musicbrainz release group id",
-                }:
+                if frame.desc.casefold() in _MANAGED_ID3_TXXX_DESCRIPTIONS:
                     id3.delall(f"TXXX:{frame.desc}")
             if title := tags.get("title"):
                 id3.add(TIT2(encoding=3, text=title))
@@ -381,6 +438,8 @@ class MutagenTagWriter:
                 id3.add(TCON(encoding=3, text=genre))
             if label := tags.get("label"):
                 id3.add(TPUB(encoding=3, text=label))
+            if isrc := tags.get("isrc"):
+                id3.add(TSRC(encoding=3, text=isrc))
             if artwork is not None:
                 id3.add(
                     APIC(encoding=3, mime=artwork.mime, type=3, desc="Cover", data=artwork.data)
@@ -448,6 +507,9 @@ class MutagenTagWriter:
                 "covr",
                 "cprt",
                 "----:com.apple.iTunes:LABEL",
+                "----:com.apple.iTunes:BARCODE",
+                "----:com.apple.iTunes:ISRC",
+                "----:com.apple.iTunes:MEDIA",
                 "----:com.apple.iTunes:MusicBrainz Album Id",
                 *freeform_atoms.values(),
             }
@@ -486,6 +548,7 @@ class MutagenTagWriter:
             "release_date",
             "genre",
             "label",
+            "isrc",
             "tracknumber",
             "discnumber",
             "musicbrainz_trackid",
@@ -548,6 +611,7 @@ class MutagenTagWriter:
             "release_date": "TDRL",
             "genre": "TCON",
             "label": "TPUB",
+            "isrc": "TSRC",
             "tracknumber": "TRCK",
             "discnumber": "TPOS",
         }
