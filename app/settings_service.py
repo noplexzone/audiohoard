@@ -39,6 +39,9 @@ VALID_METADATA_PROVIDERS = {str(item["name"]) for item in DEFAULT_METADATA_PROVI
 DEFAULT_FREE_TEXT_RESULT_LIMIT = 10
 DEFAULT_PRIMARY_METADATA_PROVIDER = "musicbrainz"
 DEFAULT_DISCOGRAPHY_REFRESH_HOURS = 24
+DEFAULT_LIBRARY_SCAN_HOURS = 0
+DEFAULT_DUPLICATE_SCAN_HOURS = 0
+DEFAULT_DUPLICATE_AUTO_CLEAN = False
 DEFAULT_AUTO_DOWNLOAD_WANTED = False
 DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS = 15
 SUPPORTED_FORMAT_PREFERENCES: tuple[str, ...] = ("flac", "mp3", "m4a/aac", "ogg", "opus")
@@ -82,6 +85,9 @@ class RuntimeSettings:
     metadata_providers: list[dict[str, object]]
     primary_metadata_provider: str
     discography_refresh_hours: int
+    library_scan_hours: int
+    duplicate_scan_hours: int
+    duplicate_auto_clean: bool
     auto_download_wanted: bool
     source_search_budget_seconds: int
     quality_profile: QualityProfile = dataclasses_field(
@@ -172,6 +178,22 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
         )
     except ValueError:
         refresh_hours = DEFAULT_DISCOGRAPHY_REFRESH_HOURS
+    try:
+        library_scan_hours = int(values.get("library_scan_hours", str(DEFAULT_LIBRARY_SCAN_HOURS)))
+    except ValueError:
+        library_scan_hours = DEFAULT_LIBRARY_SCAN_HOURS
+    try:
+        duplicate_scan_hours = int(
+            values.get("duplicate_scan_hours", str(DEFAULT_DUPLICATE_SCAN_HOURS))
+        )
+    except ValueError:
+        duplicate_scan_hours = DEFAULT_DUPLICATE_SCAN_HOURS
+    duplicate_auto_clean = values.get("duplicate_auto_clean", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     auto_download = values.get("auto_download_wanted", "false").lower() in {
         "1",
         "true",
@@ -224,6 +246,9 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
         metadata_providers,
         primary,
         max(1, min(refresh_hours, 24 * 30)),
+        max(0, min(library_scan_hours, 24 * 30)),
+        max(0, min(duplicate_scan_hours, 24 * 30)),
+        duplicate_auto_clean,
         auto_download,
         max(3, min(source_budget, 60)),
         quality_profile=QualityProfile(
@@ -244,6 +269,9 @@ async def save_runtime_settings(
     metadata_providers: list[dict[str, object]] | None = None,
     primary_metadata_provider: str | None = None,
     discography_refresh_hours: int | None = None,
+    library_scan_hours: int | None = None,
+    duplicate_scan_hours: int | None = None,
+    duplicate_auto_clean: bool | None = None,
     auto_download_wanted: bool | None = None,
     source_search_budget_seconds: int | None = None,
     quality_profile: QualityProfile | None = None,
@@ -267,6 +295,12 @@ async def save_runtime_settings(
         if discography_refresh_hours is not None
         else DEFAULT_DISCOGRAPHY_REFRESH_HOURS
     )
+    library_hours = (
+        library_scan_hours if library_scan_hours is not None else DEFAULT_LIBRARY_SCAN_HOURS
+    )
+    duplicate_hours = (
+        duplicate_scan_hours if duplicate_scan_hours is not None else DEFAULT_DUPLICATE_SCAN_HOURS
+    )
     qp = quality_profile or QualityProfile(
         format_preference=list(DEFAULT_FORMAT_PREFERENCE),
         min_mp3_bitrate=DEFAULT_MIN_MP3_BITRATE,
@@ -280,6 +314,9 @@ async def save_runtime_settings(
         "metadata_providers": json.dumps(metadata_normalized),
         "primary_metadata_provider": primary,
         "discography_refresh_hours": str(max(1, min(refresh_hours, 24 * 30))),
+        "library_scan_hours": str(max(0, min(library_hours, 24 * 30))),
+        "duplicate_scan_hours": str(max(0, min(duplicate_hours, 24 * 30))),
+        "duplicate_auto_clean": "true" if bool(duplicate_auto_clean) else "false",
         "auto_download_wanted": "true" if bool(auto_download_wanted) else "false",
         "source_search_budget_seconds": str(
             max(3, min(source_search_budget_seconds or DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS, 60))

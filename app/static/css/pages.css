@@ -1312,3 +1312,48 @@ a.metric-card:hover {
     width: 100%;
   }
 }
+
+
+.maintenance-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: .95rem;
+}
+
+.maintenance-bucket {
+  display: grid;
+  gap: .85rem;
+  align-content: start;
+}
+
+.maintenance-list {
+  display: grid;
+  gap: .45rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.maintenance-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .7rem;
+  padding: .55rem 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.maintenance-list code {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inline-actions,
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .45rem;
+  align-items: center;
+}

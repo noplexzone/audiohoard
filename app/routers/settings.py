@@ -305,6 +305,12 @@ async def save_runtime_settings_page(
         refresh_hours = int(
             str(form.get("discography_refresh_hours", runtime.discography_refresh_hours)) or "24"
         )
+        library_scan_hours = int(
+            str(form.get("library_scan_hours", runtime.library_scan_hours)) or "0"
+        )
+        duplicate_scan_hours = int(
+            str(form.get("duplicate_scan_hours", runtime.duplicate_scan_hours)) or "0"
+        )
         source_budget = int(
             str(form.get("source_search_budget_seconds", runtime.source_search_budget_seconds))
             or "15"
@@ -324,6 +330,8 @@ async def save_runtime_settings_page(
     if not (
         1 <= limit <= 100
         and 1 <= refresh_hours <= 720
+        and 0 <= library_scan_hours <= 720
+        and 0 <= duplicate_scan_hours <= 720
         and 3 <= source_budget <= 60
         and 10 <= slskd_timeout <= 86400
         and 0.5 <= acoustid_threshold <= 0.9999
@@ -340,6 +348,11 @@ async def save_runtime_settings_page(
         str(form.get("auto_download_wanted", "")).lower() in {"1", "true", "yes", "on"}
         if section == "behavior"
         else runtime.auto_download_wanted
+    )
+    duplicate_auto_clean = (
+        str(form.get("duplicate_auto_clean", "")).lower() in {"1", "true", "yes", "on"}
+        if section == "behavior"
+        else runtime.duplicate_auto_clean
     )
     if section == "quality":
         fmt_order = [str(v) for v in form.getlist("format_order")]
@@ -402,6 +415,9 @@ async def save_runtime_settings_page(
         metadata_providers,
         primary,
         refresh_hours,
+        library_scan_hours,
+        duplicate_scan_hours,
+        duplicate_auto_clean,
         auto_download,
         source_budget,
         quality_profile=quality_profile,

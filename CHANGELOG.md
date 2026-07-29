@@ -7,11 +7,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Added a background-backed Maintenance page with library filesystem verification, duplicate dry-run summaries, safe tie-free cleanup, and scheduling controls.
 - Added quality-duplicate cleanup that follows the Settings quality profile, permanently removes only clear same-folder lower-quality duplicates, and leaves ambiguous matches for review.
 - Added an explicit backup-first maintenance command for auditing and repairing historical orphaned staging-review records.
 - Added a confirmed album-detail action that transactionally retags every imported file in a release folder from Audiohoard's stored canonical metadata without changing database records or filenames.
 
 ### Fixed
+- Dashboard provider readiness now uses cached health snapshots instead of live YouTube/TIDAL probes, and the staged-review quick action points directly at the import review rail.
+- Dashboard listening time now shows hour and minute remainders together.
 - Repair Metadata now handles flat multi-disc album folders where files are named with per-disc track numbers, preventing albums like `The Select (Deluxe)` from failing with unlinked-audio errors.
 - Import tagging now writes Navidrome-compatible `releasedate` metadata immediately during auto-import, not only during later metadata repair.
 - Auto-import now embeds catalog album artwork and scene-style three-digit track prefixes like `101-`/`210-` bind to the correct disc/track before AcoustID review.

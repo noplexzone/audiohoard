@@ -10,7 +10,7 @@
   <a class="metric-card" href="/library"><span class="metric-icon"><svg><use href="#i-library"/></svg></span><span class="metric-value" data-stat="tracks">{{ dashboard.library.track_count }}</span><span class="metric-label">Tracks</span></a>
   <a class="metric-card" href="/artists"><span class="metric-monogram" aria-hidden="true">A</span><span class="metric-value" data-stat="artists">{{ dashboard.library.artist_count }}</span><span class="metric-label">Artists</span></a>
   <a class="metric-card" href="/library"><span class="metric-monogram alt" aria-hidden="true">LP</span><span class="metric-value" data-stat="albums">{{ dashboard.library.album_count }}</span><span class="metric-label">Albums</span></a>
-  <div class="metric-card"><span class="metric-monogram soft" aria-hidden="true">⏱</span><span class="metric-value">{% set hours = dashboard.library.total_duration_sec // 3600 %}{% if hours %}{{ hours }}h{% else %}{{ dashboard.library.total_duration_sec // 60 }}m{% endif %}</span><span class="metric-label">Listening time</span></div>
+  <div class="metric-card"><span class="metric-monogram soft" aria-hidden="true">⏱</span><span class="metric-value">{% set hours = dashboard.library.total_duration_sec // 3600 %}{% set minutes = (dashboard.library.total_duration_sec % 3600) // 60 %}{% if hours %}{{ hours }}h{% if minutes %} {{ minutes }}m{% endif %}{% else %}{{ minutes }}m{% endif %}</span><span class="metric-label">Listening time</span></div>
 </section>
 
 <div class="dashboard-grid">
@@ -66,7 +66,7 @@
   <div class="action-grid">
     <a class="action-card" href="/search"><svg><use href="#i-search"/></svg><span><strong>Search providers</strong><small>Find tracks and releases</small></span><span aria-hidden="true">→</span></a>
     <a class="action-card" href="/downloads"><svg><use href="#i-jobs"/></svg><span><strong>Queue a job</strong><small>Start an acquisition</small></span><span aria-hidden="true">→</span></a>
-    <a class="action-card" href="/downloads"><svg><use href="#i-jobs"/></svg><span><strong>Review staged audio</strong><small>Resolve fingerprint exceptions</small></span><span aria-hidden="true">→</span></a>
+    <a class="action-card" href="/downloads#import-review"><svg><use href="#i-jobs"/></svg><span><strong>Review staged audio</strong><small>Resolve fingerprint exceptions</small></span><span aria-hidden="true">→</span></a>
   </div>
 </section>
 {% endblock %}

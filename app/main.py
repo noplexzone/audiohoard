@@ -28,7 +28,18 @@ from app.jobs.dispatcher import job_dispatcher
 from app.models.release import Release
 from app.models.staging_review import StagingReviewItem
 from app.models.workflow import ReviewDecision
-from app.routers import artwork, auth, health, imports, jobs, naming, search, staging, tracks
+from app.routers import (
+    artwork,
+    auth,
+    health,
+    imports,
+    jobs,
+    maintenance,
+    naming,
+    search,
+    staging,
+    tracks,
+)
 from app.routers import catalog as catalog_router
 from app.routers import settings as settings_router
 from app.services.acquisition_cleanup import (
@@ -41,6 +52,8 @@ from app.services.artist_monitoring import DiscographyRefreshScheduler
 from app.services.catalog_metadata import reconcile_duplicate_catalog_artists
 from app.services.dashboard import get_dashboard_data
 from app.services.health_status import get_health_status_service
+from app.services.maintenance_scheduler import MaintenanceScheduler
+from app.services.maintenance_state import empty_maintenance_state
 from app.settings_service import build_effective_settings, effective_settings_dep
 from app.version import APP_VERSION
 
@@ -54,8 +67,12 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     scheduler = DiscographyRefreshScheduler()
     health_status = get_health_status_service()
+    maintenance_state = getattr(app.state, "maintenance_state", empty_maintenance_state())
+    maintenance_scheduler = MaintenanceScheduler(maintenance_state)
+    app.state.maintenance_state = maintenance_state
     app.state.discography_scheduler = scheduler
     app.state.health_status_service = health_status
+    app.state.maintenance_scheduler = maintenance_scheduler
     async with get_session_factory()() as db:
         pending_cleanups = await pending_imported_source_cleanups(db)
         pruned = await prune_orphaned_terminal_records(db)
@@ -88,11 +105,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         interval_seconds=settings.terminal_cleanup_interval_seconds
     )
     await scheduler.start()
+    await maintenance_scheduler.start()
     await health_status.start()
     try:
         yield
     finally:
         await health_status.stop()
+        await maintenance_scheduler.stop()
         await scheduler.stop()
         await job_dispatcher.shutdown()
 
@@ -115,6 +134,8 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    app.state.maintenance_state = empty_maintenance_state()
+    app.state.health_status_service = get_health_status_service()
     app.state.templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
     app.state.templates.env.filters["from_json"] = lambda value: json.loads(value or "[]")
     app.state.templates.env.filters["display_name"] = display_name
@@ -201,6 +222,7 @@ def create_app() -> FastAPI:
     app.include_router(naming.router, tags=["naming"])
     app.include_router(imports.router, tags=["imports"])
     app.include_router(staging.router, tags=["staging"])
+    app.include_router(maintenance.router, tags=["maintenance"])
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def dashboard(
@@ -214,7 +236,9 @@ def create_app() -> FastAPI:
             await get_current_user(request, db)
         except HTTPException:
             return RedirectResponse("/login", status_code=307)
-        dashboard_data = await get_dashboard_data(db, effective_settings)
+        dashboard_data = await get_dashboard_data(
+            db, effective_settings, request.app.state.health_status_service.snapshot()
+        )
         templates: Jinja2Templates = request.app.state.templates
         return templates.TemplateResponse(
             request,
