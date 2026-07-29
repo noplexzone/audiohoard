@@ -27,10 +27,16 @@
       {% endif %}
       <span>{{ progress.downloaded_track_count }} of {{ progress.wanted_track_count }} in library</span>
     </div>
-    <form method="post" action="/albums/{{ album.id }}/download">
-      <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
-      <button type="submit" class="btn">Download missing</button>
-    </form>
+    <div class="form-row">
+      <form method="post" action="/albums/{{ album.id }}/download">
+        <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+        <button type="submit" class="btn">Download missing</button>
+      </form>
+      <form method="post" action="/albums/{{ album.id }}/retag" data-confirm="Retag every audio file in this album folder from Audiohoard's stored metadata? The database and filenames will not change.">
+        <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+        <button type="submit" class="btn secondary">Repair metadata</button>
+      </form>
+    </div>
   </div>
 </header>
 {% if album.tracks %}
@@ -80,4 +86,5 @@
   </dl>
 </details>
 {% endif %}
+<script src="/static/js/album.js?v={{ app_version }}" defer></script>
 {% endblock %}

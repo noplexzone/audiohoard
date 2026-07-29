@@ -8,16 +8,18 @@ import os
 import shutil
 import stat
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, no_type_check
 
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK, TXXX
+from mutagen.id3 import ID3, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK, TXXX, ID3NoHeaderError
 from mutagen.mp4 import MP4
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.database import register_transaction_callbacks
 from app.media_formats import is_importable_audio, supported_audio_formats_display
@@ -36,6 +38,24 @@ from app.services.pinned_destination import PinnedDestination
 logger = logging.getLogger(__name__)
 
 _DESTINATION_TEMPLATE = "{album_artist}/{album} ({year})/{disc_track} - {title}.{ext}"
+
+_MANAGED_TAG_KEYS = frozenset(
+    {
+        "title",
+        "artist",
+        "album",
+        "album_artist",
+        "albumartist",
+        "albumartists",
+        "date",
+        "tracknumber",
+        "discnumber",
+        "musicbrainz_trackid",
+        "musicbrainz_albumid",
+        "musicbrainz_albumartistid",
+        "musicbrainz_releasegroupid",
+    }
+)
 
 
 class ImportPlanningError(ValueError):
@@ -177,7 +197,20 @@ class MutagenTagWriter:
     def write_and_verify(self, path: Path, tags: dict[str, str]) -> bool:
         suffix = path.suffix.casefold()
         if suffix == ".mp3":
-            id3 = ID3()
+            try:
+                id3 = ID3(path)
+            except ID3NoHeaderError:
+                id3 = ID3()
+            for frame_id in ("TIT2", "TPE1", "TALB", "TPE2", "TDRC", "TRCK", "TPOS"):
+                id3.delall(frame_id)
+            for frame in list(id3.getall("TXXX")):
+                if frame.desc.casefold() in {
+                    "musicbrainz track id",
+                    "musicbrainz album id",
+                    "musicbrainz album artist id",
+                    "musicbrainz release group id",
+                }:
+                    id3.delall(f"TXXX:{frame.desc}")
             if title := tags.get("title"):
                 id3.add(TIT2(encoding=3, text=title))
             if artist := tags.get("artist"):
@@ -192,20 +225,36 @@ class MutagenTagWriter:
                 id3.add(TRCK(encoding=3, text=tracknumber))
             if discnumber := tags.get("discnumber"):
                 id3.add(TPOS(encoding=3, text=discnumber))
-            if recording := tags.get("musicbrainz_trackid"):
-                id3.add(TXXX(encoding=3, desc="MusicBrainz Track Id", text=recording))
-            if release := tags.get("musicbrainz_albumid"):
-                id3.add(TXXX(encoding=3, desc="MusicBrainz Album Id", text=release))
+            for key, description in {
+                "musicbrainz_trackid": "MusicBrainz Track Id",
+                "musicbrainz_albumid": "MusicBrainz Album Id",
+                "musicbrainz_albumartistid": "MusicBrainz Album Artist Id",
+                "musicbrainz_releasegroupid": "MusicBrainz Release Group Id",
+            }.items():
+                if value := tags.get(key):
+                    id3.add(TXXX(encoding=3, desc=description, text=value))
             id3.save(path, v2_version=3)
         elif suffix == ".flac":
             flac = FLAC(path)
+            for key in _MANAGED_TAG_KEYS:
+                if key in flac:
+                    del flac[key]
             for key, value in tags.items():
                 flac[key] = value
+            if album_artist := tags.get("album_artist"):
+                flac["albumartist"] = album_artist
+                flac["albumartists"] = album_artist
             flac.save()
         elif suffix in {".ogg", ".oga", ".opus"}:
             ogg = OggOpus(path) if suffix == ".opus" else OggVorbis(path)
+            for key in _MANAGED_TAG_KEYS:
+                if key in ogg:
+                    del ogg[key]
             for key, value in tags.items():
                 ogg[key] = value
+            if album_artist := tags.get("album_artist"):
+                ogg["albumartist"] = album_artist
+                ogg["albumartists"] = album_artist
             ogg.save()
         elif suffix in {".m4a", ".mp4"}:
             mp4 = MP4(path)
@@ -216,6 +265,15 @@ class MutagenTagWriter:
                 "album_artist": "aART",
                 "date": "\xa9day",
             }
+            freeform_atoms = {
+                "musicbrainz_trackid": "----:com.apple.iTunes:MusicBrainz Track Id",
+                "musicbrainz_albumid": "----:com.apple.iTunes:MusicBrainz Album Id",
+                "musicbrainz_albumartistid": "----:com.apple.iTunes:MusicBrainz Album Artist Id",
+                "musicbrainz_releasegroupid": "----:com.apple.iTunes:MusicBrainz Release Group Id",
+            }
+            for atom in (*text_atoms.values(), "trkn", "disk", *freeform_atoms.values()):
+                if atom in mp4:
+                    del mp4[atom]
             for key, atom in text_atoms.items():
                 if value := tags.get(key):
                     mp4[atom] = [value]
@@ -223,10 +281,9 @@ class MutagenTagWriter:
                 mp4["trkn"] = [(int(value), 0)]
             if value := tags.get("discnumber"):
                 mp4["disk"] = [(int(value), 0)]
-            if value := tags.get("musicbrainz_trackid"):
-                mp4["----:com.apple.iTunes:MusicBrainz Track Id"] = [value.encode()]
-            if value := tags.get("musicbrainz_albumid"):
-                mp4["----:com.apple.iTunes:MusicBrainz Album Id"] = [value.encode()]
+            for key, atom in freeform_atoms.items():
+                if value := tags.get(key):
+                    mp4[atom] = [value.encode()]
             mp4.save()
         else:
             return False
@@ -236,39 +293,28 @@ class MutagenTagWriter:
     @no_type_check
     def read_tags(self, path: Path) -> dict[str, str]:
         suffix = path.suffix.casefold()
+        comment_keys = (
+            "title",
+            "artist",
+            "album",
+            "album_artist",
+            "date",
+            "tracknumber",
+            "discnumber",
+            "musicbrainz_trackid",
+            "musicbrainz_albumid",
+            "musicbrainz_albumartistid",
+            "musicbrainz_releasegroupid",
+        )
         if suffix == ".flac":
             flac = FLAC(path)
-            flac_values: dict[str, str] = {}
-            for key in (
-                "title",
-                "artist",
-                "album",
-                "album_artist",
-                "date",
-                "tracknumber",
-                "discnumber",
-                "musicbrainz_trackid",
-                "musicbrainz_albumid",
-            ):
-                if tag_values := flac.get(key):
-                    flac_values[key] = str(tag_values[0])
-            return flac_values
+            return {
+                key: str(tag_values[0]) for key in comment_keys if (tag_values := flac.get(key))
+            }
         if suffix in {".ogg", ".oga", ".opus"}:
             ogg = OggOpus(path) if suffix == ".opus" else OggVorbis(path)
             return {
-                key: str(ogg_values[0])
-                for key in (
-                    "title",
-                    "artist",
-                    "album",
-                    "album_artist",
-                    "date",
-                    "tracknumber",
-                    "discnumber",
-                    "musicbrainz_trackid",
-                    "musicbrainz_albumid",
-                )
-                if (ogg_values := ogg.get(key))
+                key: str(ogg_values[0]) for key in comment_keys if (ogg_values := ogg.get(key))
             }
         if suffix in {".m4a", ".mp4"}:
             mp4 = MP4(path)
@@ -290,6 +336,8 @@ class MutagenTagWriter:
             for key, atom in {
                 "musicbrainz_trackid": "----:com.apple.iTunes:MusicBrainz Track Id",
                 "musicbrainz_albumid": "----:com.apple.iTunes:MusicBrainz Album Id",
+                "musicbrainz_albumartistid": "----:com.apple.iTunes:MusicBrainz Album Artist Id",
+                "musicbrainz_releasegroupid": "----:com.apple.iTunes:MusicBrainz Release Group Id",
             }.items():
                 if atom_values := mp4.get(atom):
                     raw = atom_values[0]
@@ -312,13 +360,162 @@ class MutagenTagWriter:
             frame = id3.get(frame_id)
             if frame is not None and getattr(frame, "text", None):
                 values[key] = str(frame.text[0])
+        descriptions = {
+            "musicbrainz track id": "musicbrainz_trackid",
+            "musicbrainz album id": "musicbrainz_albumid",
+            "musicbrainz album artist id": "musicbrainz_albumartistid",
+            "musicbrainz release group id": "musicbrainz_releasegroupid",
+        }
         for frame in id3.getall("TXXX"):
-            desc = frame.desc.casefold()
-            if frame.text and desc == "musicbrainz track id":
-                values["musicbrainz_trackid"] = str(frame.text[0])
-            if frame.text and desc == "musicbrainz album id":
-                values["musicbrainz_albumid"] = str(frame.text[0])
+            if frame.text and (key := descriptions.get(frame.desc.casefold())):
+                values[key] = str(frame.text[0])
         return values
+
+
+@dataclass(frozen=True)
+class AlbumRetagResult:
+    files_retagged: int
+    folder: Path
+
+
+def _catalog_tags(
+    album: CatalogAlbum, catalog_track: CatalogAlbumTrack, track: Track
+) -> dict[str, str]:
+    values = {
+        "title": catalog_track.title,
+        "artist": track.artist or album.artist.name,
+        "album": album.title,
+        "album_artist": album.artist.name,
+        "date": album.year or "",
+        "tracknumber": str(catalog_track.position),
+        "discnumber": str(catalog_track.disc),
+        "musicbrainz_trackid": catalog_track.recording_mbid or track.mbid or "",
+        "musicbrainz_releasegroupid": album.mbid or "",
+        "musicbrainz_albumartistid": album.artist.mbid or "",
+    }
+    if not values["title"] or not values["artist"] or not values["album_artist"]:
+        raise ImportExecutionError("stored track metadata is incomplete")
+    if catalog_track.position < 1 or catalog_track.disc < 1:
+        raise ImportExecutionError("stored track numbering is invalid")
+    return {key: value for key, value in values.items() if value}
+
+
+async def retag_catalog_album(
+    db: AsyncSession,
+    album_id: int,
+    *,
+    library_root: Path,
+    tag_writer: MutagenTagWriter | None = None,
+) -> AlbumRetagResult:
+    album = (
+        await db.execute(
+            select(CatalogAlbum)
+            .where(CatalogAlbum.id == album_id)
+            .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
+        )
+    ).scalar_one_or_none()
+    if album is None:
+        raise ImportExecutionError("catalog album not found")
+
+    rows = (
+        await db.execute(
+            select(Track, ImportPlan)
+            .join(ImportPlan, ImportPlan.track_id == Track.id)
+            .where(
+                Track.catalog_album_id == album_id,
+                Track.import_state == ImportWorkflowState.imported,
+                ImportPlan.status == ImportWorkflowState.imported,
+                ImportPlan.destination_path != "",
+            )
+            .order_by(ImportPlan.id)
+        )
+    ).all()
+    latest: dict[int, tuple[Track, ImportPlan]] = {}
+    for track, plan in rows:
+        latest[track.id] = (track, plan)
+    if not latest:
+        raise ImportExecutionError("album has no imported files to retag")
+
+    catalog_tracks = {item.id: item for item in album.tracks}
+    root = library_root.resolve()  # noqa: ASYNC240
+    targets: list[tuple[Path, Track, CatalogAlbumTrack]] = []
+    folders: set[Path] = set()
+    for track, plan in latest.values():
+        catalog_track = catalog_tracks.get(track.catalog_track_id or 0)
+        if catalog_track is None:
+            raise ImportExecutionError("imported file is not linked to stored track metadata")
+        destination = Path(plan.destination_path)
+        try:
+            _destination_inside_root(root, destination)
+        except ImportPlanningError as exc:
+            raise ImportExecutionError(str(exc)) from exc
+        if _existing_parent_symlink(root, destination) is not None:
+            raise ImportExecutionError("album folder contains a symlinked path")
+        if not _is_regular_non_symlink(destination):
+            raise ImportExecutionError(f"imported file is missing or unsafe: {destination.name}")
+        if not is_importable_audio(destination):
+            raise ImportExecutionError(f"unsupported audio format: {destination.suffix}")
+        targets.append((destination, track, catalog_track))
+        folders.add(destination.parent.resolve())
+    if len(folders) != 1:
+        raise ImportExecutionError("imported album files do not share one album folder")
+    folder = next(iter(folders))
+    actual_audio = {
+        item.resolve()
+        for item in folder.iterdir()
+        if item.is_file() and not item.is_symlink() and is_importable_audio(item)
+    }
+    tracked_audio = {path.resolve() for path, _track, _catalog_track in targets}
+    if actual_audio != tracked_audio:
+        raise ImportExecutionError(
+            "album folder contains audio not linked to stored track metadata"
+        )
+
+    writer = tag_writer or MutagenTagWriter()
+    pinned_destinations: list[PinnedDestination] = []
+    temp_paths: list[tuple[PinnedDestination, str]] = []
+    created_destinations: list[tuple[PinnedDestination, str]] = []
+    backup_paths: list[tuple[PinnedDestination, str, str]] = []
+    prepared: list[tuple[PinnedDestination, str, str]] = []
+    try:
+        for destination, track, catalog_track in targets:
+            pinned = PinnedDestination.open(root, destination)
+            pinned_destinations.append(pinned)
+            if not pinned.is_regular_non_symlink():
+                raise ImportExecutionError("album file changed before retag preparation")
+            expected_hash = _sha256_regular_source_no_follow(destination)
+            temp_name, temp_path = _copy_to_temp(destination, pinned, expected_hash)
+            temp_paths.append((pinned, temp_name))
+            if not writer.write_and_verify(temp_path, _catalog_tags(album, catalog_track, track)):
+                raise ImportExecutionError("tag readback failed")
+            prepared.append((pinned, temp_name, expected_hash))
+
+        for pinned, temp_name, expected_hash in prepared:
+            pinned.verify_attached()
+            if not pinned.is_regular_non_symlink():
+                raise ImportExecutionError("album file changed before retag commit")
+            with pinned.open_read(pinned.name) as current_file:
+                if _sha256_fileobj(current_file) != expected_hash:
+                    raise ImportExecutionError("album file changed before retag commit")
+            backup_name = pinned.backup_existing(suffix=".retag-backup")
+            backup_paths.append((pinned, pinned.name, backup_name))
+            pinned.replace(temp_name, pinned.name)
+            pinned.fsync()
+            temp_paths.remove((pinned, temp_name))
+            created_destinations.append((pinned, pinned.name))
+        for pinned, _destination_name, backup_name in backup_paths:
+            try:
+                pinned.unlink(backup_name)
+            except OSError:
+                logger.warning("retag succeeded but a temporary backup could not be removed")
+        _close_pinned_destinations(pinned_destinations)
+        return AlbumRetagResult(files_retagged=len(targets), folder=folder)
+    except Exception as exc:
+        _rollback_pinned_filesystem(temp_paths, created_destinations, backup_paths)
+        _close_pinned_destinations(pinned_destinations)
+        if isinstance(exc, ImportExecutionError):
+            raise
+        raise ImportExecutionError(f"album retag failed: {exc}") from exc
 
 
 async def plan_release_import(
