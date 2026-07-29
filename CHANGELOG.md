@@ -12,6 +12,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Added a confirmed album-detail action that transactionally retags every imported file in a release folder from Audiohoard's stored canonical metadata without changing database records or filenames.
 
 ### Fixed
+- Repair Metadata now handles flat multi-disc album folders where files are named with per-disc track numbers, preventing albums like `The Select (Deluxe)` from failing with unlinked-audio errors.
+- Import tagging now writes Navidrome-compatible `releasedate` metadata immediately during auto-import, not only during later metadata repair.
 - Auto-import now embeds catalog album artwork and scene-style three-digit track prefixes like `101-`/`210-` bind to the correct disc/track before AcoustID review.
 - Metadata repair now writes a Navidrome-compatible `releasedate` tag for FLAC/Vorbis album files so mixed-format albums do not split from MP3 release-date frames.
 - Metadata repair now handles mixed imported/legacy album folders and clears additional Navidrome grouping tags such as original year and MusicBrainz status/type leftovers.
