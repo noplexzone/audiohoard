@@ -500,7 +500,7 @@ async def _run_job_in_session(
             # every NZB and assigning candidates to tracks by position.
             results = results[:1]
         tracks_created = 0
-        failures: list[str] = []
+        failures: list[dict[str, object]] = []
         root_job = await _root_job(job, db)
         existing_releases = list(
             (await db.scalars(select(Release).where(Release.job_id == root_job.id))).all()
@@ -650,12 +650,12 @@ async def _run_job_in_session(
                         if commit_progress:
                             await db.commit()
                 logger.warning("Provider result processing failed with code %s", exc.code)
-                failures.append(json.dumps(exc.details(), sort_keys=True))
+                failures.append(exc.details())
             except Exception:
                 if track is not None:
                     track.acquisition_state = AcquisitionState.failed
                 logger.warning("Result processing failed")
-                failures.append("result_processing_failed")
+                failures.append({"code": "result_processing_failed"})
             if commit_progress:
                 job.updated_at = _now()
                 await db.commit()

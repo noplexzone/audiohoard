@@ -61,11 +61,29 @@ def _run_after_rollback_callbacks(session: Session) -> None:
 
 def _make_engine(url: str | None = None) -> AsyncEngine:
     db_url = url or get_settings().database_url
-    return create_async_engine(
+    if not db_url.startswith("sqlite"):
+        return create_async_engine(db_url, echo=False)
+
+    engine = create_async_engine(
         db_url,
         echo=False,
-        connect_args={"check_same_thread": False},
+        connect_args={"check_same_thread": False, "timeout": 30.0},
     )
+    is_memory = ":memory:" in db_url or "mode=memory" in db_url
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _configure_sqlite(dbapi_connection: object, _connection_record: object) -> None:
+        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            if not is_memory:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.fetchone()
+        finally:
+            cursor.close()
+
+    return engine
 
 
 _engine: AsyncEngine | None = None

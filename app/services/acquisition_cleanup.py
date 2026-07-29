@@ -10,11 +10,14 @@ from pathlib import Path
 from typing import Protocol
 
 from sqlalchemy import case, select
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
 from app.database import get_session_factory
+from app.models.catalog_entities import CatalogAlbumTrack
 from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
 from app.models.release import Release
@@ -26,6 +29,7 @@ from app.sources.slskd import SlskdAdapter
 logger = logging.getLogger(__name__)
 
 _SOURCE_CLEANUP_COMPLETED_AT = "source_cleanup_completed_at"
+_TERMINAL_CLEANUP_LOCK = asyncio.Lock()
 
 
 def _provenance(provenance_json: str | None) -> dict[str, object]:
@@ -79,7 +83,7 @@ async def hide_completed_and_timed_out_jobs(
         if job_ids is not None:
             query = query.where(Job.id.in_(job_ids))
         jobs = list((await db.scalars(query)).all())
-        hidden: list[int] = []
+        hidden: set[int] = set()
         for job in jobs:
             timed_out = any(track.source_status == "transfer_timeout" for track in job.tracks)
             has_other_incomplete = any(
@@ -89,9 +93,51 @@ async def hide_completed_and_timed_out_jobs(
             )
             if job.status == JobStatus.done or (timed_out and not has_other_incomplete):
                 job.queue_hidden = True
-                hidden.append(job.id)
+                hidden.add(job.id)
+
+        album_ids = {job.catalog_album_id for job in jobs if job.catalog_album_id is not None}
+        if album_ids:
+            wanted_rows = await db.execute(
+                select(CatalogAlbumTrack.album_id, CatalogAlbumTrack.id).where(
+                    CatalogAlbumTrack.album_id.in_(album_ids)
+                )
+            )
+            imported_rows = await db.execute(
+                select(Track.catalog_album_id, Track.catalog_track_id).where(
+                    Track.catalog_album_id.in_(album_ids),
+                    Track.catalog_track_id.is_not(None),
+                    Track.import_state == ImportWorkflowState.imported,
+                )
+            )
+            wanted: dict[int, set[int]] = {}
+            imported: dict[int, set[int]] = {}
+            for album_id, track_id in wanted_rows:
+                wanted.setdefault(album_id, set()).add(track_id)
+            for album_id, track_id in imported_rows:
+                if album_id is not None and track_id is not None:
+                    imported.setdefault(album_id, set()).add(track_id)
+            completed_album_ids = {
+                album_id
+                for album_id, track_ids in wanted.items()
+                if track_ids and track_ids.issubset(imported.get(album_id, set()))
+            }
+            if completed_album_ids:
+                completed_jobs = list(
+                    (
+                        await db.scalars(
+                            select(Job).where(
+                                Job.catalog_album_id.in_(completed_album_ids),
+                                Job.queue_hidden.is_(False),
+                                Job.status.in_(terminal),
+                            )
+                        )
+                    ).all()
+                )
+                for job in completed_jobs:
+                    job.queue_hidden = True
+                    hidden.add(job.id)
         await db.commit()
-        return hidden
+        return sorted(hidden)
 
 
 async def cleanup_durable_slskd_transfers(
@@ -156,21 +202,40 @@ async def cleanup_durable_slskd_transfers(
     return completed
 
 
+def _transient_cleanup_error(exc: BaseException) -> bool:
+    if isinstance(exc, SQLAlchemyTimeoutError):
+        return True
+    return isinstance(exc, OperationalError) and any(
+        marker in str(exc).casefold() for marker in ("locked", "busy")
+    )
+
+
 async def cleanup_terminal_acquisitions(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     slskd_url: str,
     slskd_api_key: str,
     job_ids: set[int] | None = None,
+    max_attempts: int = 3,
 ) -> tuple[list[int], int]:
-    """Reconcile Audiohoard and slskd terminal cleanup debt idempotently."""
-    hidden = await hide_completed_and_timed_out_jobs(session_factory, job_ids)
-    removed = await cleanup_durable_slskd_transfers(
-        session_factory,
-        SlskdAdapter(slskd_url, slskd_api_key),
-        job_ids,
-    )
-    return hidden, removed
+    """Serialize and retry idempotent terminal cleanup after transient contention."""
+    async with _TERMINAL_CLEANUP_LOCK:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                hidden = await hide_completed_and_timed_out_jobs(session_factory, job_ids)
+                removed = await cleanup_durable_slskd_transfers(
+                    session_factory,
+                    SlskdAdapter(slskd_url, slskd_api_key),
+                    job_ids,
+                )
+                return hidden, removed
+            except Exception as exc:
+                if attempt == max_attempts or not _transient_cleanup_error(exc):
+                    raise
+                delay = 0.25 * (2 ** (attempt - 1))
+                logger.warning("Terminal acquisition cleanup contention; retrying in %.2fs", delay)
+                await asyncio.sleep(delay)
+    raise RuntimeError("terminal cleanup retry loop exited unexpectedly")
 
 
 @dataclass(frozen=True)
