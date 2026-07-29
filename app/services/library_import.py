@@ -13,9 +13,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, no_type_check
 
-from mutagen.flac import FLAC
-from mutagen.id3 import ID3, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK, TXXX, ID3NoHeaderError
-from mutagen.mp4 import MP4
+import httpx
+from mutagen.flac import FLAC, Picture
+from mutagen.id3 import (
+    APIC,
+    ID3,
+    TALB,
+    TCON,
+    TDRC,
+    TDRL,
+    TIT2,
+    TPE1,
+    TPE2,
+    TPOS,
+    TPUB,
+    TRCK,
+    TXXX,
+    ID3NoHeaderError,
+)
+from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 from sqlalchemy import delete, or_, select
@@ -49,14 +65,32 @@ _MANAGED_TAG_KEYS = frozenset(
         "albumartist",
         "albumartists",
         "date",
+        "releasedate",
+        "release_date",
+        "originaldate",
+        "original_date",
         "tracknumber",
         "discnumber",
+        "genre",
+        "organization",
+        "label",
+        "recordlabel",
+        "copyright",
         "musicbrainz_trackid",
         "musicbrainz_albumid",
         "musicbrainz_albumartistid",
         "musicbrainz_releasegroupid",
     }
 )
+
+
+@dataclass(frozen=True)
+class CanonicalArtwork:
+    data: bytes
+    mime: str
+
+
+_ARTWORK_TIMEOUT_SECONDS = 10.0
 
 
 class ImportPlanningError(ValueError):
@@ -178,6 +212,52 @@ def _track_source_path(track: Track) -> Path:
     return Path(raw)
 
 
+async def _fetch_canonical_artwork(url: str | None) -> CanonicalArtwork | None:
+    if not url:
+        return None
+    try:
+        async with httpx.AsyncClient(
+            timeout=_ARTWORK_TIMEOUT_SECONDS, follow_redirects=True
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+    except Exception:
+        logger.warning("Could not fetch canonical artwork for metadata repair", exc_info=True)
+        return None
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    data = response.content
+    if content_type not in {"image/jpeg", "image/jpg", "image/png"}:
+        if data.startswith(b"\xff\xd8"):
+            content_type = "image/jpeg"
+        elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+            content_type = "image/png"
+        else:
+            logger.warning("Canonical artwork URL did not return JPEG/PNG content")
+            return None
+    if content_type == "image/jpg":
+        content_type = "image/jpeg"
+    return CanonicalArtwork(data=data, mime=content_type)
+
+
+def _mp4_cover_format(mime: str) -> int:
+    return MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
+
+
+def _track_number_from_filename(path: Path) -> int | None:
+    stem = path.stem.strip()
+    digits = ""
+    for char in stem:
+        if char.isdigit():
+            digits += char
+        else:
+            break
+    return int(digits) if digits else None
+
+
+def _normalized_title(value: str) -> str:
+    return " ".join(value.casefold().replace("_", " ").replace("-", " ").split())
+
+
 def _tags_for(release: Release, track: Track) -> dict[str, str]:
     tags = {
         "title": track.title or "",
@@ -185,6 +265,7 @@ def _tags_for(release: Release, track: Track) -> dict[str, str]:
         "album": track.album or release.title or "",
         "album_artist": track.album_artist or release.album_artist or track.artist or "",
         "date": track.year or release.year or "",
+        "release_date": track.year or release.year or "",
         "tracknumber": str(track.track_no or ""),
         "discnumber": str(track.disc or ""),
         "musicbrainz_trackid": track.mbid or "",
@@ -195,15 +276,33 @@ def _tags_for(release: Release, track: Track) -> dict[str, str]:
 
 class MutagenTagWriter:
     @no_type_check
-    def write_and_verify(self, path: Path, tags: dict[str, str]) -> bool:
+    def write_and_verify(
+        self, path: Path, tags: dict[str, str], artwork: CanonicalArtwork | None = None
+    ) -> bool:
         suffix = path.suffix.casefold()
         if suffix == ".mp3":
             try:
                 id3 = ID3(path)
             except ID3NoHeaderError:
                 id3 = ID3()
-            for frame_id in ("TIT2", "TPE1", "TALB", "TPE2", "TDRC", "TRCK", "TPOS"):
+            for frame_id in (
+                "TIT2",
+                "TPE1",
+                "TALB",
+                "TPE2",
+                "TDRC",
+                "TDRL",
+                "TDOR",
+                "TORY",
+                "TRCK",
+                "TPOS",
+                "TCON",
+                "TPUB",
+                "TCOP",
+            ):
                 id3.delall(frame_id)
+            if artwork is not None:
+                id3.delall("APIC")
             for frame in list(id3.getall("TXXX")):
                 if frame.desc.casefold() in {
                     "musicbrainz track id",
@@ -222,10 +321,20 @@ class MutagenTagWriter:
                 id3.add(TPE2(encoding=3, text=album_artist))
             if date := tags.get("date"):
                 id3.add(TDRC(encoding=3, text=date))
+            if release_date := tags.get("release_date"):
+                id3.add(TDRL(encoding=3, text=release_date))
             if tracknumber := tags.get("tracknumber"):
                 id3.add(TRCK(encoding=3, text=tracknumber))
             if discnumber := tags.get("discnumber"):
                 id3.add(TPOS(encoding=3, text=discnumber))
+            if genre := tags.get("genre"):
+                id3.add(TCON(encoding=3, text=genre))
+            if label := tags.get("label"):
+                id3.add(TPUB(encoding=3, text=label))
+            if artwork is not None:
+                id3.add(
+                    APIC(encoding=3, mime=artwork.mime, type=3, desc="Cover", data=artwork.data)
+                )
             for key, description in {
                 "musicbrainz_trackid": "MusicBrainz Track Id",
                 "musicbrainz_albumid": "MusicBrainz Album Id",
@@ -245,6 +354,14 @@ class MutagenTagWriter:
             if album_artist := tags.get("album_artist"):
                 flac["albumartist"] = album_artist
                 flac["albumartists"] = album_artist
+            if artwork is not None:
+                flac.clear_pictures()
+                picture = Picture()
+                picture.type = 3
+                picture.mime = artwork.mime
+                picture.desc = "Cover"
+                picture.data = artwork.data
+                flac.add_picture(picture)
             flac.save()
         elif suffix in {".ogg", ".oga", ".opus"}:
             ogg = OggOpus(path) if suffix == ".opus" else OggVorbis(path)
@@ -265,6 +382,8 @@ class MutagenTagWriter:
                 "album": "\xa9alb",
                 "album_artist": "aART",
                 "date": "\xa9day",
+                "release_date": "\xa9day",
+                "genre": "\xa9gen",
             }
             freeform_atoms = {
                 "musicbrainz_trackid": "----:com.apple.iTunes:MusicBrainz Track Id",
@@ -272,7 +391,17 @@ class MutagenTagWriter:
                 "musicbrainz_albumartistid": "----:com.apple.iTunes:MusicBrainz Album Artist Id",
                 "musicbrainz_releasegroupid": "----:com.apple.iTunes:MusicBrainz Release Group Id",
             }
-            for atom in (*text_atoms.values(), "trkn", "disk", *freeform_atoms.values()):
+            cleanup_atoms = {
+                *text_atoms.values(),
+                "trkn",
+                "disk",
+                "covr",
+                "cprt",
+                "----:com.apple.iTunes:LABEL",
+                "----:com.apple.iTunes:MusicBrainz Album Id",
+                *freeform_atoms.values(),
+            }
+            for atom in cleanup_atoms:
                 if atom in mp4:
                     del mp4[atom]
             for key, atom in text_atoms.items():
@@ -285,6 +414,10 @@ class MutagenTagWriter:
             for key, atom in freeform_atoms.items():
                 if value := tags.get(key):
                     mp4[atom] = [value.encode()]
+            if label := tags.get("label"):
+                mp4["----:com.apple.iTunes:LABEL"] = [label.encode()]
+            if artwork is not None:
+                mp4["covr"] = [MP4Cover(artwork.data, imageformat=_mp4_cover_format(artwork.mime))]
             mp4.save()
         else:
             return False
@@ -300,6 +433,9 @@ class MutagenTagWriter:
             "album",
             "album_artist",
             "date",
+            "release_date",
+            "genre",
+            "label",
             "tracknumber",
             "discnumber",
             "musicbrainz_trackid",
@@ -326,6 +462,8 @@ class MutagenTagWriter:
                 "album": "\xa9alb",
                 "album_artist": "aART",
                 "date": "\xa9day",
+                "release_date": "\xa9day",
+                "genre": "\xa9gen",
             }
             for key, atom in text_atoms.items():
                 if atom_values := mp4.get(atom):
@@ -334,6 +472,9 @@ class MutagenTagWriter:
                 mp4_values["tracknumber"] = str(track_values[0][0])
             if disc_values := mp4.get("disk"):
                 mp4_values["discnumber"] = str(disc_values[0][0])
+            if atom_values := mp4.get("----:com.apple.iTunes:LABEL"):
+                raw = atom_values[0]
+                mp4_values["label"] = raw.decode() if isinstance(raw, bytes) else str(raw)
             for key, atom in {
                 "musicbrainz_trackid": "----:com.apple.iTunes:MusicBrainz Track Id",
                 "musicbrainz_albumid": "----:com.apple.iTunes:MusicBrainz Album Id",
@@ -354,6 +495,9 @@ class MutagenTagWriter:
             "album": "TALB",
             "album_artist": "TPE2",
             "date": "TDRC",
+            "release_date": "TDRL",
+            "genre": "TCON",
+            "label": "TPUB",
             "tracknumber": "TRCK",
             "discnumber": "TPOS",
         }
@@ -380,17 +524,20 @@ class AlbumRetagResult:
 
 
 def _catalog_tags(
-    album: CatalogAlbum, catalog_track: CatalogAlbumTrack, track: Track
+    album: CatalogAlbum, catalog_track: CatalogAlbumTrack, track: Track | None
 ) -> dict[str, str]:
     values = {
         "title": catalog_track.title,
-        "artist": track.artist or album.artist.name,
+        "artist": (track.artist if track is not None else None) or album.artist.name,
         "album": album.title,
         "album_artist": album.artist.name,
         "date": album.year or "",
+        "release_date": album.year or "",
         "tracknumber": str(catalog_track.position),
         "discnumber": str(catalog_track.disc),
-        "musicbrainz_trackid": catalog_track.recording_mbid or track.mbid or "",
+        "musicbrainz_trackid": catalog_track.recording_mbid
+        or (track.mbid if track is not None else "")
+        or "",
         "musicbrainz_releasegroupid": album.mbid or "",
         "musicbrainz_albumartistid": album.artist.mbid or "",
     }
@@ -399,6 +546,35 @@ def _catalog_tags(
     if catalog_track.position < 1 or catalog_track.disc < 1:
         raise ImportExecutionError("stored track numbering is invalid")
     return {key: value for key, value in values.items() if value}
+
+
+def _discover_legacy_album_files(
+    album: CatalogAlbum, library_root: Path
+) -> list[tuple[Path, None, CatalogAlbumTrack]]:
+    folder = library_root.resolve() / album.artist.name / f"{album.title} ({album.year or ''})"
+    if not folder.is_dir() or folder.is_symlink():
+        return []
+    catalog_by_position = {(track.disc, track.position): track for track in album.tracks}
+    catalog_by_title = {_normalized_title(track.title): track for track in album.tracks}
+    targets: list[tuple[Path, None, CatalogAlbumTrack]] = []
+    used_catalog_ids: set[int] = set()
+    for path in sorted(folder.iterdir()):
+        if path.is_symlink() or not path.is_file() or not is_importable_audio(path):
+            continue
+        track_no = _track_number_from_filename(path)
+        catalog_track = catalog_by_position.get((1, track_no or 0))
+        if catalog_track is None:
+            stripped = path.stem
+            if track_no is not None:
+                stripped = stripped[len(str(track_no)) :].lstrip(" .-_")
+            catalog_track = catalog_by_title.get(_normalized_title(stripped))
+        if catalog_track is None or catalog_track.id in used_catalog_ids:
+            raise ImportExecutionError(
+                "album folder contains audio not linked to stored track metadata"
+            )
+        used_catalog_ids.add(catalog_track.id)
+        targets.append((path, None, catalog_track))
+    return targets
 
 
 async def retag_catalog_album(
@@ -443,7 +619,9 @@ async def retag_catalog_album(
             ):
                 continue
         latest[track.id] = (track, plan)
-    if not latest:
+    artwork = await _fetch_canonical_artwork(album.artwork_url)
+    legacy_targets = [] if latest else _discover_legacy_album_files(album, library_root)
+    if not latest and not legacy_targets:
         raise ImportExecutionError("album has no imported files to retag")
 
     return await asyncio.to_thread(
@@ -452,6 +630,8 @@ async def retag_catalog_album(
         list(latest.values()),
         library_root=library_root,
         tag_writer=tag_writer,
+        artwork=artwork,
+        legacy_targets=legacy_targets,
     )
 
 
@@ -461,11 +641,13 @@ def _retag_catalog_album_files(
     *,
     library_root: Path,
     tag_writer: MutagenTagWriter | None,
+    artwork: CanonicalArtwork | None = None,
+    legacy_targets: list[tuple[Path, None, CatalogAlbumTrack]] | None = None,
 ) -> AlbumRetagResult:
     catalog_tracks = {item.id: item for item in album.tracks}
     catalog_tracks_by_position = {(item.disc, item.position): item for item in album.tracks}
     root = library_root.resolve()
-    targets: list[tuple[Path, Track, CatalogAlbumTrack]] = []
+    targets: list[tuple[Path, Track | None, CatalogAlbumTrack]] = list(legacy_targets or [])
     folders: set[Path] = set()
     mapped_destinations: set[Path] = set()
     for track, plan in imported:
@@ -491,6 +673,16 @@ def _retag_catalog_album_files(
         mapped_destinations.add(resolved_destination)
         targets.append((destination, track, catalog_track))
         folders.add(destination.parent.resolve())
+    for destination, _track, _catalog_track in targets:
+        try:
+            _destination_inside_root(root, destination)
+        except ImportPlanningError as exc:
+            raise ImportExecutionError(str(exc)) from exc
+        if _existing_parent_symlink(root, destination) is not None:
+            raise ImportExecutionError("album folder contains a symlinked path")
+        if not _is_regular_non_symlink(destination):
+            raise ImportExecutionError(f"imported file is missing or unsafe: {destination.name}")
+        folders.add(destination.parent.resolve())
     if len(folders) != 1:
         raise ImportExecutionError("imported album files do not share one album folder")
     folder = next(iter(folders))
@@ -512,7 +704,7 @@ def _retag_catalog_album_files(
     backup_paths: list[tuple[PinnedDestination, str, str]] = []
     prepared: list[tuple[PinnedDestination, str, str]] = []
     try:
-        for destination, track, catalog_track in targets:
+        for destination, target_track, catalog_track in targets:
             pinned = PinnedDestination.open(root, destination)
             pinned_destinations.append(pinned)
             if not pinned.is_regular_non_symlink():
@@ -520,7 +712,9 @@ def _retag_catalog_album_files(
             expected_hash = _sha256_regular_source_no_follow(destination)
             temp_name, temp_path = _copy_to_temp(destination, pinned, expected_hash)
             temp_paths.append((pinned, temp_name))
-            if not writer.write_and_verify(temp_path, _catalog_tags(album, catalog_track, track)):
+            if not writer.write_and_verify(
+                temp_path, _catalog_tags(album, catalog_track, target_track), artwork=artwork
+            ):
                 raise ImportExecutionError("tag readback failed")
             with pinned.open_read(temp_name) as tagged_temp:
                 os.fsync(tagged_temp.fileno())

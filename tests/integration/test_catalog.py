@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest_asyncio
 from httpx import AsyncClient
+from sqlalchemy import select
 
 import app.database as db_module
 from app.models.catalog_entities import (
@@ -865,3 +867,78 @@ async def test_catalog_album_shows_total_and_per_track_downloaded_wanted_states(
     assert 'aria-label="Not in library"' in missing_row
     assert "Wanted" not in missing_row
     assert f'action="/albums/{partial_id}/tracks/{missing_id}/download"' in missing_row
+
+
+async def test_album_download_queues_only_missing_catalog_tracks(
+    client: AsyncClient, tmp_path: Path, monkeypatch
+) -> None:
+    import app.routers.catalog as catalog_router
+
+    dispatched: list[int] = []
+
+    async def fake_dispatch(job_id: int):
+        dispatched.append(job_id)
+
+    monkeypatch.setattr(catalog_router.job_dispatcher, "dispatch", fake_dispatch)
+    factory = db_module.get_session_factory()
+    existing_path = tmp_path / "01 - Already Owned.flac"
+    existing_path.write_bytes(b"audio")
+    async with factory() as session:
+        artist = CatalogArtist(name="Juice WRLD")
+        album = CatalogAlbum(title="The Party Never Ends 2.0", track_count=3)
+        artist.albums.append(album)
+        album.tracks.extend(
+            [
+                CatalogAlbumTrack(position=1, disc=1, title="Already Owned"),
+                CatalogAlbumTrack(position=2, disc=1, title="Actually Missing"),
+                CatalogAlbumTrack(position=3, disc=1, title="Also Missing"),
+            ]
+        )
+        done_job = Job(source="slskd", query="old", status=JobStatus.done)
+        release = Release(
+            job=done_job, source="slskd", title=album.title, album_artist=artist.name
+        )
+        session.add_all([artist, done_job, release])
+        await session.flush()
+        owned = Track(
+            job=done_job,
+            release=release,
+            source="slskd",
+            title="Already Owned",
+            catalog_album_id=album.id,
+            catalog_track_id=album.tracks[0].id,
+            acquisition_state=AcquisitionState.downloaded,
+            import_state=ImportWorkflowState.imported,
+        )
+        owned.import_plans.append(
+            ImportPlan(
+                release=release,
+                source_path=str(existing_path),
+                destination_path=str(existing_path),
+                status=ImportWorkflowState.imported,
+            )
+        )
+        session.add(owned)
+        await session.commit()
+        album_id = album.id
+
+    response = await client.post(f"/albums/{album_id}/download", follow_redirects=False)
+
+    assert response.status_code == 303
+    async with factory() as session:
+        jobs = list(
+            (
+                await session.scalars(
+                    select(Job).where(
+                        Job.catalog_album_id == album_id,
+                        Job.status == JobStatus.pending,
+                    )
+                )
+            ).all()
+        )
+    assert [job.query for job in jobs] == [
+        "Juice WRLD Actually Missing",
+        "Juice WRLD Also Missing",
+    ]
+    assert all(job.catalog_track_id is not None for job in jobs)
+    assert len(dispatched) == 2

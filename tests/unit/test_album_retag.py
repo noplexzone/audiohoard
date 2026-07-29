@@ -17,7 +17,12 @@ from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import Track
 from app.models.workflow import ImportWorkflowState
-from app.services.library_import import ImportExecutionError, MutagenTagWriter, retag_catalog_album
+from app.services.library_import import (
+    CanonicalArtwork,
+    ImportExecutionError,
+    MutagenTagWriter,
+    retag_catalog_album,
+)
 from app.services.pinned_destination import PinnedDestination
 
 
@@ -90,6 +95,10 @@ async def _seed_imported_album(
             "musicbrainz_albumid": f"wrong-release-{index}",
             "musicbrainz_albumartistid": f"wrong-artist-{index}",
             "musicbrainz_releasegroupid": f"stale-group-{index}",
+            "release_date": "",
+            "genre": "Hip Hop",
+            "organization": "Grade A Productions/Interscope Records",
+            "label": "Grade A Productions/Interscope Records",
         }.items():
             flac[key] = value
         flac.save()
@@ -143,6 +152,10 @@ async def test_retag_catalog_album_synchronizes_release_tags_without_changing_da
         assert tags["albumartist"] == [album.artist.name]
         assert tags["albumartists"] == [album.artist.name]
         assert tags["date"] == [album.year]
+        assert tags["release_date"] == [album.year]
+        assert "genre" not in tags
+        assert "organization" not in tags
+        assert "label" not in tags
         assert tags["musicbrainz_releasegroupid"] == [album.mbid]
         assert tags["musicbrainz_albumartistid"] == [album.artist.mbid]
         assert tags["musicbrainz_trackid"] == [catalog_track.recording_mbid]
@@ -155,13 +168,85 @@ async def test_retag_catalog_album_synchronizes_release_tags_without_changing_da
     ] == original_db_values
 
 
+async def test_retag_catalog_album_overwrites_flac_cover_art(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, _tracks = await _seed_imported_album(db_session, library_root)
+    album.artwork_url = "https://example.test/cover.jpg"
+    original = FLAC(paths[0])
+    original.clear_pictures()
+    original.save()
+
+    async def fake_fetch(url: str | None) -> CanonicalArtwork | None:
+        assert url == album.artwork_url
+        return CanonicalArtwork(data=b"\xff\xd8canonical-cover", mime="image/jpeg")
+
+    monkeypatch.setattr(library_import_module, "_fetch_canonical_artwork", fake_fetch)
+
+    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert result.files_retagged == 2
+    for path in paths:
+        repaired = FLAC(path)
+        assert len(repaired.pictures) == 1
+        assert repaired.pictures[0].mime == "image/jpeg"
+        assert repaired.pictures[0].data == b"\xff\xd8canonical-cover"
+
+
+async def test_retag_catalog_album_discovers_legacy_library_files_without_import_rows(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    library_root = tmp_path / "library"
+    artist = CatalogArtist(name="Juice WRLD", mbid="artist-mbid")
+    album = CatalogAlbum(
+        title="Goodbye & Good Riddance",
+        year="2018",
+        release_type="album",
+        mbid="release-group",
+        track_count=2,
+    )
+    artist.albums.append(album)
+    album.tracks.extend(
+        [
+            CatalogAlbumTrack(disc=1, position=1, title="Intro", recording_mbid="intro-mbid"),
+            CatalogAlbumTrack(
+                disc=1, position=2, title="All Girls Are the Same", recording_mbid="agats-mbid"
+            ),
+        ]
+    )
+    db_session.add(artist)
+    await db_session.flush()
+    folder = library_root / artist.name / f"{album.title} ({album.year})"
+    folder.mkdir(parents=True)
+    paths = [folder / "01 - Intro.flac", folder / "02 - All Girls Are the Same.flac"]
+    for path in paths:
+        path.write_bytes(_minimal_flac_bytes())
+        flac = FLAC(path)
+        flac["albumartist"] = "Juice Wrld"
+        flac["date"] = "2024"
+        flac.save()
+
+    async def no_artwork(url: str | None) -> CanonicalArtwork | None:
+        return None
+
+    monkeypatch.setattr(library_import_module, "_fetch_canonical_artwork", no_artwork)
+
+    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert result.files_retagged == 2
+    assert FLAC(paths[0])["albumartist"] == [artist.name]
+    assert FLAC(paths[0])["date"] == [album.year]
+    assert FLAC(paths[1])["musicbrainz_trackid"] == ["agats-mbid"]
+
+
 class _FailingSecondWriter(MutagenTagWriter):
     def __init__(self) -> None:
         self.calls = 0
 
-    def write_and_verify(self, path: Path, tags: dict[str, str]) -> bool:
+    def write_and_verify(self, path: Path, tags: dict[str, str], **kwargs) -> bool:
         self.calls += 1
-        return False if self.calls == 2 else super().write_and_verify(path, tags)
+        return False if self.calls == 2 else super().write_and_verify(path, tags, **kwargs)
 
 
 async def test_retag_catalog_album_leaves_every_original_untouched_when_preparation_fails(
@@ -258,8 +343,8 @@ class _AddsAudioDuringPreparation(MutagenTagWriter):
         self.folder = folder
         self.calls = 0
 
-    def write_and_verify(self, path: Path, tags: dict[str, str]) -> bool:
-        result = super().write_and_verify(path, tags)
+    def write_and_verify(self, path: Path, tags: dict[str, str], **kwargs) -> bool:
+        result = super().write_and_verify(path, tags, **kwargs)
         self.calls += 1
         if self.calls == 2:
             (self.folder / "18 - Added.flac").write_bytes(_minimal_flac_bytes())
