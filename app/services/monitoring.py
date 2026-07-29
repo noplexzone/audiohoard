@@ -386,7 +386,7 @@ class QualityUpgradeCycleScheduler:
     def __init__(self) -> None:
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
-        self._last_check = 0.0
+        self._last_check: float | None = None
 
     async def start(self) -> None:
         if self._task is None:
@@ -413,7 +413,7 @@ class QualityUpgradeCycleScheduler:
                 return 3600.0
             interval = runtime.upgrade_check_hours * 3600
             now = time.monotonic()
-            if now - self._last_check < interval:
+            if self._last_check is not None and now - self._last_check < interval:
                 return float(interval - (now - self._last_check))
             cfg = await build_effective_settings(db, get_settings())
             records = (

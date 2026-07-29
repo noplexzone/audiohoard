@@ -23,8 +23,8 @@ class MaintenanceScheduler:
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._state = maintenance_state
-        self._last_library_scan = 0.0
-        self._last_duplicate_scan = 0.0
+        self._last_library_scan: float | None = None
+        self._last_duplicate_scan: float | None = None
 
     async def start(self) -> None:
         if self._task is None:
@@ -53,17 +53,17 @@ class MaintenanceScheduler:
             if not enabled_intervals:
                 return 3600.0
 
-            if (
-                runtime.library_scan_hours > 0
-                and now - self._last_library_scan >= runtime.library_scan_hours * 3600
+            if runtime.library_scan_hours > 0 and (
+                self._last_library_scan is None
+                or now - self._last_library_scan >= runtime.library_scan_hours * 3600
             ):
                 result = await scan_library_filesystem(db, library_root=cfg.library_root)
                 self._state.store_library_scan(result)
                 self._last_library_scan = now
 
-            if (
-                runtime.duplicate_scan_hours > 0
-                and now - self._last_duplicate_scan >= runtime.duplicate_scan_hours * 3600
+            if runtime.duplicate_scan_hours > 0 and (
+                self._last_duplicate_scan is None
+                or now - self._last_duplicate_scan >= runtime.duplicate_scan_hours * 3600
             ):
                 duplicate_summary = await scan_library_duplicates(
                     db,

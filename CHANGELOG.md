@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-07-29
+
 ### Added
 - Wired quality-upgrade monitoring into album watch actions, maintenance approval, and a disabled-by-default scheduled check interval.
 - Added a background-backed Maintenance page with library filesystem verification, duplicate dry-run summaries, safe tie-free cleanup, and scheduling controls.
@@ -14,6 +16,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Added a confirmed album-detail action that transactionally retags every imported file in a release folder from Audiohoard's stored canonical metadata without changing database records or filenames.
 
 ### Fixed
+- Schedulers now run their first cycle at startup instead of waiting a full interval on freshly booted containers.
 - Dashboard provider readiness now uses cached health snapshots instead of live YouTube/TIDAL probes, and the staged-review quick action points directly at the import review rail.
 - Dashboard listening time now shows hour and minute remainders together.
 - Repair Metadata now handles flat multi-disc album folders where files are named with per-disc track numbers, preventing albums like `The Select (Deluxe)` from failing with unlinked-audio errors.
