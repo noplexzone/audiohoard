@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
 from app.config import get_settings
+from app.database import Base
 from app.models.job import Job, JobStatus
-from app.models.monitoring import MonitoringRecord
+from app.models.monitoring import MonitoringRecord, MonitoringStatus
 from app.models.release import Release
 from app.schemas.search import SearchResult
+from app.services.monitoring import run_monitoring_check
 from app.services.quality_discovery import build_upgrade_discovery
 
 
@@ -67,3 +72,114 @@ async def test_discovery_returns_empty_sequence_when_search_yields_nothing_bette
     monkeypatch.setattr("app.jobs.runner._call_fetch_results", fake_fetch)
 
     assert await build_upgrade_discovery(db_session, get_settings(), record)() == []
+
+
+async def test_monitoring_check_commits_before_provider_discovery(db_session, monkeypatch) -> None:
+    job = Job(source="slskd", query="Artist Album", status=JobStatus.done)
+    release = Release(job=job, source="slskd", title="Album")
+    record = MonitoringRecord(release=release)
+    db_session.add_all([job, release, record])
+    await db_session.flush()
+
+    checkpoints: list[str] = []
+
+    async def checkpoint() -> None:
+        checkpoints.append("committed")
+        await db_session.commit()
+
+    async def fake_fetch(job_arg, cfg_arg, db_arg, *, checkpoint=None):
+        assert checkpoints == ["committed"]
+        assert checkpoint is not None
+        return []
+
+    monkeypatch.setattr("app.jobs.runner._call_fetch_results", fake_fetch)
+    discover = build_upgrade_discovery(
+        db_session,
+        get_settings(),
+        record,
+        checkpoint=checkpoint,
+    )
+
+    await run_monitoring_check(
+        db_session,
+        record,
+        {},
+        discover,
+        checkpoint=checkpoint,
+    )
+
+    assert checkpoints == ["committed", "committed"]
+
+
+async def test_provider_discovery_allows_a_concurrent_sqlite_writer(tmp_path, monkeypatch) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'monitoring.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as setup:
+            job = Job(source="slskd", query="Artist Album", status=JobStatus.done)
+            release = Release(job=job, source="slskd", title="Album")
+            record = MonitoringRecord(release=release)
+            setup.add_all([job, release, record])
+            await setup.commit()
+            record_id = record.id
+
+        async with factory() as scan:
+            record = await scan.get(MonitoringRecord, record_id)
+            assert record is not None
+
+            async def fake_fetch(job_arg, cfg_arg, db_arg, *, checkpoint=None):
+                async with factory() as writer:
+                    writer.add(Job(source="slskd", query="concurrent UI write"))
+                    await writer.commit()
+                return []
+
+            monkeypatch.setattr("app.jobs.runner._call_fetch_results", fake_fetch)
+            discover = build_upgrade_discovery(
+                scan, get_settings(), record, checkpoint=scan.commit
+            )
+            await run_monitoring_check(scan, record, {}, discover, checkpoint=scan.commit)
+            await scan.commit()
+
+        async with factory() as verify:
+            concurrent = await verify.scalar(select(Job).where(Job.query == "concurrent UI write"))
+            assert concurrent is not None
+    finally:
+        await engine.dispose()
+
+
+async def test_provider_failure_persists_monitoring_terminal_state(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'failure.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as setup:
+            job = Job(source="slskd", query="Artist Album", status=JobStatus.done)
+            release = Release(job=job, source="slskd", title="Album")
+            record = MonitoringRecord(release=release, status=MonitoringStatus.active)
+            setup.add_all([job, release, record])
+            await setup.commit()
+            record_id = record.id
+
+        async with factory() as scan:
+            record = await scan.get(MonitoringRecord, record_id)
+            assert record is not None
+
+            async def failed_discovery():
+                raise RuntimeError("provider failed")
+
+            import pytest
+
+            with pytest.raises(RuntimeError, match="provider failed"):
+                await run_monitoring_check(
+                    scan, record, {}, failed_discovery, checkpoint=scan.commit
+                )
+
+        async with factory() as verify:
+            persisted = await verify.get(MonitoringRecord, record_id)
+            assert persisted is not None
+            assert persisted.status == MonitoringStatus.failed
+    finally:
+        await engine.dispose()

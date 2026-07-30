@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 import pytest_asyncio
 from httpx import AsyncClient
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.database as db_module
 from app.models.catalog_entities import (
@@ -1152,6 +1154,48 @@ async def test_album_download_fetch_returns_json_and_creates_job(
     assert [job.query for job in jobs] == ["Fetch Artist One", "Fetch Artist Two"]
     assert all(job.catalog_track_id is not None for job in jobs)
     assert dispatched == [job.id for job in jobs]
+
+
+async def test_album_download_retries_transient_sqlite_writer_lock(
+    client: AsyncClient, monkeypatch
+) -> None:
+    import app.routers.catalog as catalog_router
+
+    async def fake_dispatch(job_id: int):
+        return None
+
+    monkeypatch.setattr(catalog_router.job_dispatcher, "dispatch", fake_dispatch)
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        artist = CatalogArtist(name="Lock Retry Artist")
+        album = CatalogAlbum(title="Lock Retry Album", track_count=1)
+        artist.albums.append(album)
+        album.tracks.append(CatalogAlbumTrack(position=1, disc=1, title="Only"))
+        session.add(artist)
+        await session.commit()
+        album_id = album.id
+
+    original_flush = AsyncSession.flush
+    attempts = 0
+
+    async def lock_then_flush(self, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OperationalError("INSERT INTO jobs", {}, Exception("database is locked"))
+        return await original_flush(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "flush", lock_then_flush)
+
+    response = await client.post(f"/albums/{album_id}/download", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert attempts >= 2
+    async with factory() as session:
+        jobs = list(
+            (await session.scalars(select(Job).where(Job.catalog_album_id == album_id))).all()
+        )
+    assert len(jobs) == 1
 
 
 async def test_album_download_without_fetch_header_still_redirects(

@@ -136,6 +136,7 @@ def evaluate_quality_candidate(
 
 _active_checks: set[int] = set()
 CheckDiscovery = Callable[[], Awaitable[list[ReleaseCandidate]]]
+ProgressCheckpoint = Callable[[], Awaitable[None]]
 ScheduledCheck = Callable[[], Awaitable[None]]
 
 
@@ -184,12 +185,16 @@ async def run_monitoring_check(
     record: MonitoringRecord,
     current_quality: Mapping[str, Any],
     discover: CheckDiscovery,
+    *,
+    checkpoint: ProgressCheckpoint | None = None,
 ) -> ReleaseCandidate | None:
     if record.id is None or record.id in _active_checks:
         raise MonitoringCheckAlreadyRunning("monitoring check is already running")
     _active_checks.add(record.id)
     record.status = MonitoringStatus.checking
     await db.flush()
+    if checkpoint is not None:
+        await checkpoint()
     outcome = "no_upgrade"
     selected: ReleaseCandidate | None = None
     try:
@@ -233,8 +238,12 @@ async def run_monitoring_check(
             }
         )
         record.history_json = json.dumps(history[-100:])
-        await db.flush()
-        _active_checks.discard(record.id)
+        try:
+            await db.flush()
+            if checkpoint is not None:
+                await checkpoint()
+        finally:
+            _active_checks.discard(record.id)
 
 
 async def execute_quality_upgrade(
@@ -394,9 +403,9 @@ async def run_quality_upgrade_scan(db: AsyncSession) -> int:
     ).all()
     for record in records:
         current_quality = await current_release_quality(db, record.release_id)
-        discover = build_upgrade_discovery(db, cfg, record)
-        await run_monitoring_check(db, record, current_quality, discover)
-    await db.commit()
+        discover = build_upgrade_discovery(db, cfg, record, checkpoint=db.commit)
+        await run_monitoring_check(db, record, current_quality, discover, checkpoint=db.commit)
+        await db.commit()
     return len(records)
 
 

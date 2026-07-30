@@ -1285,7 +1285,7 @@ async def download_catalog_album(
     )
     for job_id in job_ids:
         await job_dispatcher.dispatch(job_id)
-    return _download_response(request, queued=len(job_ids), album_id=album.id)
+    return _download_response(request, queued=len(job_ids), album_id=album_id)
 
 
 @router.post("/albums/{album_id}/tracks/{track_id}/download", include_in_schema=False)

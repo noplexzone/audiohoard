@@ -74,7 +74,8 @@ async def test_run_quality_upgrade_scan_checks_active_records_once(
 
     calls: list[int] = []
 
-    async def fake_check(db, record, current_quality, discover):
+    async def fake_check(db, record, current_quality, discover, *, checkpoint=None):
+        assert checkpoint is not None
         calls.append(record.id)
 
     monkeypatch.setattr("app.services.monitoring.run_monitoring_check", fake_check)
