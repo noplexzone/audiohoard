@@ -367,6 +367,13 @@ def _mp4_cover_format(mime: str) -> int:
     return MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
 
 
+def _slash_number_pair(value: str) -> tuple[int, int]:
+    parts = str(value).split("/", 1)
+    current = int(parts[0])
+    total = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+    return current, total
+
+
 _TRACK_NUMBER_PREFIX = re.compile(r"^(?:(?P<disc>\d{1,2})[-_.])?(?P<track>\d{1,3})(?:\D|$)")
 _DISC_FOLDER = re.compile(r"^(?:cd|disc)[ _.-]?(\d{1,2})$", re.IGNORECASE)
 
@@ -547,9 +554,9 @@ class MutagenTagWriter:
                 if value := tags.get(key):
                     mp4[atom] = [value]
             if value := tags.get("tracknumber"):
-                mp4["trkn"] = [(int(value), 0)]
+                mp4["trkn"] = [_slash_number_pair(value)]
             if value := tags.get("discnumber"):
-                mp4["disk"] = [(int(value), 0)]
+                mp4["disk"] = [_slash_number_pair(value)]
             for key, atom in freeform_atoms.items():
                 if value := tags.get(key):
                     mp4[atom] = [value.encode()]
@@ -614,9 +621,11 @@ class MutagenTagWriter:
                 if atom_values := mp4.get(atom):
                     mp4_values[key] = str(atom_values[0])
             if track_values := mp4.get("trkn"):
-                mp4_values["tracknumber"] = str(track_values[0][0])
+                current, total = track_values[0]
+                mp4_values["tracknumber"] = f"{current}/{total}" if total else str(current)
             if disc_values := mp4.get("disk"):
-                mp4_values["discnumber"] = str(disc_values[0][0])
+                current, total = disc_values[0]
+                mp4_values["discnumber"] = f"{current}/{total}" if total else str(current)
             if atom_values := mp4.get("----:com.apple.iTunes:LABEL"):
                 raw = atom_values[0]
                 mp4_values["label"] = raw.decode() if isinstance(raw, bytes) else str(raw)
@@ -668,6 +677,7 @@ class MutagenTagWriter:
 class AlbumRetagResult:
     files_retagged: int
     folder: Path
+    files_renamed: int = 0
 
 
 def _catalog_disc_total(album: CatalogAlbum) -> int | None:
@@ -705,6 +715,52 @@ def _catalog_tags(
     if catalog_track.position < 1 or catalog_track.disc < 1:
         raise ImportExecutionError("stored track numbering is invalid")
     return {key: value for key, value in values.items() if value}
+
+
+def _sync_track_from_catalog(
+    track: Track, album: CatalogAlbum, catalog_track: CatalogAlbumTrack
+) -> None:
+    disc_total = _catalog_disc_total(album)
+    track.catalog_album_id = album.id
+    track.catalog_track_id = catalog_track.id
+    track.title = catalog_track.title
+    track.artist = album.artist.name
+    track.album_artist = album.artist.name
+    track.album = album.title
+    track.year = album.year
+    track.disc = catalog_track.disc
+    track.disc_total = disc_total
+    track.track_no = catalog_track.position
+    track.mbid = catalog_track.recording_mbid or track.mbid
+
+
+def _sync_track_numbering_from_catalog(
+    track: Track, album: CatalogAlbum, catalog_track: CatalogAlbumTrack
+) -> None:
+    track.catalog_album_id = album.id
+    track.catalog_track_id = catalog_track.id
+    track.disc = catalog_track.disc
+    track.disc_total = _catalog_disc_total(album)
+    track.track_no = catalog_track.position
+
+
+def _canonical_destination_for_catalog_track(
+    root: Path, album: CatalogAlbum, catalog_track: CatalogAlbumTrack, current_path: Path
+) -> Path:
+    rendered = render_path(
+        title=catalog_track.title,
+        artist=album.artist.name,
+        album_artist=album.artist.name,
+        album=album.title,
+        year=album.year,
+        disc=catalog_track.disc,
+        disc_total=_catalog_disc_total(album),
+        track_no=catalog_track.position,
+        ext=current_path.suffix.lower().lstrip("."),
+        template=_DESTINATION_TEMPLATE,
+        library_root=root,
+    )
+    return current_path.parent / Path(rendered).name
 
 
 def _discover_legacy_album_files(
@@ -788,6 +844,14 @@ async def retag_catalog_album(
                 continue
         latest[track.id] = (track, plan)
     artwork = await _fetch_canonical_artwork(album.artwork_url)
+    catalog_tracks = {item.id: item for item in album.tracks}
+    catalog_tracks_by_position = {(item.disc, item.position): item for item in album.tracks}
+    for track, _plan in latest.values():
+        catalog_track = catalog_tracks.get(track.catalog_track_id or 0)
+        if catalog_track is None:
+            catalog_track = catalog_tracks_by_position.get((track.disc or 1, track.track_no or 0))
+        if catalog_track is not None:
+            _sync_track_numbering_from_catalog(track, album, catalog_track)
     legacy_targets = _discover_legacy_album_files(album, library_root)
     if latest:
         imported_destinations = {plan.destination_path for _track, plan in latest.values()}
@@ -822,14 +886,26 @@ def _retag_catalog_album_files(
     catalog_tracks = {item.id: item for item in album.tracks}
     catalog_tracks_by_position = {(item.disc, item.position): item for item in album.tracks}
     root = library_root.resolve()
-    targets: list[tuple[Path, Track | None, CatalogAlbumTrack]] = list(legacy_targets or [])
+    targets: list[tuple[Path, Path, Track | None, CatalogAlbumTrack]] = []
+    for path, track, catalog_track in legacy_targets or []:
+        targets.append(
+            (
+                path,
+                _canonical_destination_for_catalog_track(root, album, catalog_track, path),
+                track,
+                catalog_track,
+            )
+        )
     folders: set[Path] = set()
     mapped_destinations: set[Path] = set()
+    current_destinations: set[Path] = set()
     for track, plan in imported:
-        catalog_track = catalog_tracks.get(track.catalog_track_id or 0)
-        if catalog_track is None:
-            catalog_track = catalog_tracks_by_position.get((track.disc or 1, track.track_no or 0))
-        if catalog_track is None:
+        imported_catalog_track = catalog_tracks.get(track.catalog_track_id or 0)
+        if imported_catalog_track is None:
+            imported_catalog_track = catalog_tracks_by_position.get(
+                (track.disc or 1, track.track_no or 0)
+            )
+        if imported_catalog_track is None:
             raise ImportExecutionError("imported file is not linked to stored track metadata")
         destination = Path(plan.destination_path)
         try:
@@ -843,12 +919,18 @@ def _retag_catalog_album_files(
         if not is_importable_audio(destination):
             raise ImportExecutionError(f"unsupported audio format: {destination.suffix}")
         resolved_destination = destination.resolve()
-        if resolved_destination in mapped_destinations:
+        if resolved_destination in current_destinations:
             raise ImportExecutionError("duplicate destination mapping in stored import metadata")
-        mapped_destinations.add(resolved_destination)
-        targets.append((destination, track, catalog_track))
+        current_destinations.add(resolved_destination)
+        canonical_destination = _canonical_destination_for_catalog_track(
+            root, album, imported_catalog_track, destination
+        )
+        if canonical_destination.resolve() in mapped_destinations:
+            raise ImportExecutionError("duplicate destination mapping in stored import metadata")
+        mapped_destinations.add(canonical_destination.resolve())
+        targets.append((destination, canonical_destination, track, imported_catalog_track))
         folders.add(destination.parent.resolve())
-    for destination, _track, _catalog_track in targets:
+    for destination, canonical_destination, _track, _catalog_track in targets:
         try:
             _destination_inside_root(root, destination)
         except ImportPlanningError as exc:
@@ -857,6 +939,9 @@ def _retag_catalog_album_files(
             raise ImportExecutionError("album folder contains a symlinked path")
         if not _is_regular_non_symlink(destination):
             raise ImportExecutionError(f"imported file is missing or unsafe: {destination.name}")
+        _destination_inside_root(root, canonical_destination)
+        if _existing_parent_symlink(root, canonical_destination) is not None:
+            raise ImportExecutionError("album folder contains a symlinked path")
         folders.add(destination.parent.resolve())
     if len(folders) != 1:
         raise ImportExecutionError("imported album files do not share one album folder")
@@ -866,7 +951,7 @@ def _retag_catalog_album_files(
         for item in folder.iterdir()
         if item.is_file() and not item.is_symlink() and is_importable_audio(item)
     }
-    tracked_audio = {path.resolve() for path, _track, _catalog_track in targets}
+    tracked_audio = {path.resolve() for path, _canonical, _track, _catalog_track in targets}
     if actual_audio != tracked_audio:
         raise ImportExecutionError(
             "album folder contains audio not linked to stored track metadata"
@@ -879,7 +964,8 @@ def _retag_catalog_album_files(
     backup_paths: list[tuple[PinnedDestination, str, str]] = []
     prepared: list[tuple[PinnedDestination, str, str]] = []
     try:
-        for destination, target_track, catalog_track in targets:
+        renamed = 0
+        for destination, _canonical_destination, target_track, catalog_track in targets:
             pinned = PinnedDestination.open(root, destination)
             pinned_destinations.append(pinned)
             if not pinned.is_regular_non_symlink():
@@ -907,19 +993,49 @@ def _retag_catalog_album_files(
         if current_audio != actual_audio:
             raise ImportExecutionError("album folder changed before retag commit")
 
-        for pinned, temp_name, expected_hash in prepared:
+        prepared_by_temp = {
+            temp_name: (pinned, expected_hash) for pinned, temp_name, expected_hash in prepared
+        }
+        for destination, canonical_destination, target_track, _catalog_track in targets:
+            pinned = next(item for item in pinned_destinations if item.destination == destination)
+            temp_name = next(name for item, name in temp_paths if item is pinned)
+            expected_hash = prepared_by_temp[temp_name][1]
             pinned.verify_attached()
             if not pinned.is_regular_non_symlink():
                 raise ImportExecutionError("album file changed before retag commit")
             with pinned.open_read(pinned.name) as current_file:
                 if _sha256_fileobj(current_file) != expected_hash:
                     raise ImportExecutionError("album file changed before retag commit")
-            backup_name = pinned.backup_existing(suffix=".retag-backup")
-            backup_paths.append((pinned, pinned.name, backup_name))
-            pinned.replace(temp_name, pinned.name)
-            pinned.fsync()
+            final_pinned = pinned
+            if canonical_destination != destination:
+                final_pinned = PinnedDestination.open(root, canonical_destination)
+                pinned_destinations.append(final_pinned)
+                if final_pinned.exists():
+                    raise ImportExecutionError(
+                        f"canonical retag destination already exists: {canonical_destination.name}"
+                    )
+                renamed += 1
+            backup_name = (
+                final_pinned.backup_existing(suffix=".retag-backup")
+                if final_pinned.exists()
+                else ""
+            )
+            if backup_name:
+                backup_paths.append((final_pinned, final_pinned.name, backup_name))
+            if final_pinned is not pinned:
+                backup_paths.append(
+                    (pinned, pinned.name, pinned.backup_existing(suffix=".retag-backup"))
+                )
+            final_pinned.replace(temp_name, final_pinned.name)
+            final_pinned.fsync()
             temp_paths.remove((pinned, temp_name))
-            created_destinations.append((pinned, pinned.name))
+            created_destinations.append((final_pinned, final_pinned.name))
+            if final_pinned is not pinned:
+                pinned.fsync()
+                if target_track is not None:
+                    for plan in target_track.import_plans:
+                        if plan.destination_path == str(destination):
+                            plan.destination_path = str(canonical_destination)
         for pinned, _destination_name, backup_name in backup_paths:
             try:
                 pinned.unlink(backup_name)
@@ -927,7 +1043,7 @@ def _retag_catalog_album_files(
             except OSError:
                 logger.warning("retag succeeded but a temporary backup could not be removed")
         _close_pinned_destinations_safely(pinned_destinations)
-        return AlbumRetagResult(files_retagged=len(targets), folder=folder)
+        return AlbumRetagResult(files_retagged=len(targets), folder=folder, files_renamed=renamed)
     except Exception as exc:
         _rollback_pinned_filesystem(temp_paths, created_destinations, backup_paths)
         _close_pinned_destinations_safely(pinned_destinations)
@@ -962,6 +1078,29 @@ async def plan_release_import(
         track_query = track_query.where(Track.id.in_(track_ids))
     tracks_result = await db.execute(track_query.order_by(Track.track_no, Track.id))
     tracks = list(tracks_result.scalars().all())
+    catalog_album_ids = {track.catalog_album_id for track in tracks if track.catalog_album_id}
+    if catalog_album_ids:
+        albums = {
+            album.id: album
+            for album in (
+                await db.scalars(
+                    select(CatalogAlbum)
+                    .where(CatalogAlbum.id.in_(catalog_album_ids))
+                    .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
+                )
+            ).all()
+        }
+        for track in tracks:
+            album = albums.get(track.catalog_album_id or 0)
+            if album is None:
+                continue
+            if track.catalog_track_id is None:
+                continue
+            catalog_track = next(
+                (item for item in album.tracks if item.id == track.catalog_track_id), None
+            )
+            if catalog_track is not None:
+                _sync_track_from_catalog(track, album, catalog_track)
 
     library_root = _resolved_path(library_root)
     plans: list[ImportPlan] = []

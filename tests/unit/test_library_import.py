@@ -652,6 +652,63 @@ async def test_catalog_scoped_import_without_catalog_track_id_stays_incomplete(
     assert "still require review" in (release.error_detail or "")
 
 
+async def test_plan_catalog_multidisc_import_uses_catalog_disc_total_for_destination(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    source = staging / "song.flac"
+    source.write_bytes(_minimal_flac_bytes())
+    job = Job(source="slskd", query="artist album", status=JobStatus.done)
+    artist = CatalogArtist(name="Morgan Wallen")
+    album = CatalogAlbum(title="I’m The Problem", year="2025", track_count=37)
+    artist.albums.append(album)
+    album.tracks.extend(
+        [
+            CatalogAlbumTrack(disc=1, position=1, title="I'm the Problem"),
+            CatalogAlbumTrack(disc=3, position=9, title="LA Night"),
+        ]
+    )
+    db_session.add_all([job, artist])
+    await db_session.flush()
+    release = Release(
+        job_id=job.id,
+        source="slskd",
+        title=album.title,
+        album_artist=artist.name,
+        year=album.year,
+        track_count=album.track_count,
+        import_state=ImportWorkflowState.ready,
+    )
+    track = Track(
+        job_id=job.id,
+        release=release,
+        catalog_album_id=album.id,
+        catalog_track_id=album.tracks[1].id,
+        title="wrong",
+        artist="wrong",
+        album_artist="wrong",
+        album="wrong",
+        disc=3,
+        disc_total=None,
+        track_no=9,
+        source="slskd",
+        source_path=str(source),
+        staging_path=str(source),
+        import_state=ImportWorkflowState.ready,
+    )
+    db_session.add_all([release, track])
+    await db_session.flush()
+
+    plans = await plan_release_import(db_session, release, library_root=tmp_path / "library")
+
+    assert plans[0].destination_path.endswith(
+        "/Morgan Wallen/I’m The Problem (2025)/3-09 - LA Night.flac"
+    )
+    assert track.disc_total == 3
+    assert track.title == "LA Night"
+
+
 def test_catalog_tags_include_disc_total_for_multidisc_albums() -> None:
     from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
     from app.services.library_import import _catalog_tags
