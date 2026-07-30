@@ -181,6 +181,8 @@ def _artist_page_url(
 
 
 def _release_needs_track_count_refresh(release: CatalogAlbumProvider) -> bool:
+    if release.content_rating in {None, "", "unknown"}:
+        return True
     if release.track_count is not None:
         return False
     try:

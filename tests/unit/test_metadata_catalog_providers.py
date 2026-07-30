@@ -174,10 +174,10 @@ async def test_deezer_catalog_provider(httpx_mock: HTTPXMock) -> None:
     assert album_detail.tracks[0].content_rating == "explicit"
 
 
-async def test_deezer_discography_backfills_counts_missing_from_artist_albums(
+async def test_deezer_discography_backfills_release_identity_missing_from_artist_albums(
     httpx_mock: HTTPXMock,
 ) -> None:
-    """Deezer's real artist-albums payload omits ``nb_tracks``."""
+    """Deezer's real artist-albums payload omits counts, explicitness, and UPC."""
     httpx_mock.add_response(
         url="https://api.deezer.com/artist/1/albums?limit=100",
         json={
@@ -198,12 +198,26 @@ async def test_deezer_discography_backfills_counts_missing_from_artist_albums(
         },
     )
     httpx_mock.add_response(
-        url="https://api.deezer.com/album/10/tracks?limit=1",
-        json={"data": [{"id": 100}], "total": 14},
+        url="https://api.deezer.com/album/10",
+        json={
+            "id": 10,
+            "title": "Discovery",
+            "nb_tracks": 14,
+            "explicit_lyrics": False,
+            "explicit_content_lyrics": 3,
+            "upc": "clean-upc",
+        },
     )
     httpx_mock.add_response(
-        url="https://api.deezer.com/album/11/tracks?limit=1",
-        json={"data": [{"id": 101}], "total": 1},
+        url="https://api.deezer.com/album/11",
+        json={
+            "id": 11,
+            "title": "One More Time",
+            "nb_tracks": 1,
+            "explicit_lyrics": True,
+            "explicit_content_lyrics": 1,
+            "upc": "explicit-upc",
+        },
     )
 
     albums = await DeezerClient().get_discography("1")
@@ -211,6 +225,14 @@ async def test_deezer_discography_backfills_counts_missing_from_artist_albums(
     assert {album.title: album.track_count for album in albums} == {
         "Discovery": 14,
         "One More Time": 1,
+    }
+    assert {album.title: album.content_rating for album in albums} == {
+        "Discovery": "clean",
+        "One More Time": "explicit",
+    }
+    assert {album.title: album.upc for album in albums} == {
+        "Discovery": "clean-upc",
+        "One More Time": "explicit-upc",
     }
 
 
@@ -226,7 +248,7 @@ async def test_deezer_count_backfill_has_an_overall_latency_budget(
     async def never_returns(self, http, album_id):
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(DeezerClient, "_get_album_track_count", never_returns)
+    monkeypatch.setattr(DeezerClient, "_get_album_identity_summary", never_returns)
 
     albums = await asyncio.wait_for(DeezerClient().get_discography("1"), timeout=0.25)
 
@@ -241,7 +263,7 @@ async def test_deezer_count_backfill_does_not_retry_rate_limits(
         json={"data": [{"id": 10, "title": "Limited Album", "record_type": "album"}]},
     )
     httpx_mock.add_response(
-        url="https://api.deezer.com/album/10/tracks?limit=1",
+        url="https://api.deezer.com/album/10",
         status_code=429,
         headers={"Retry-After": "60"},
     )
@@ -249,7 +271,7 @@ async def test_deezer_count_backfill_does_not_retry_rate_limits(
     albums = await DeezerClient().get_discography("1")
 
     count_requests = [
-        request for request in httpx_mock.get_requests() if request.url.path == "/album/10/tracks"
+        request for request in httpx_mock.get_requests() if request.url.path == "/album/10"
     ]
     assert albums[0].track_count is None
     assert len(count_requests) == 1

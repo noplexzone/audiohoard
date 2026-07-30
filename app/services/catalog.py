@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.media_formats import IMPORTABLE_AUDIO_SUFFIXES
+from app.metadata.content_rating import CONTENT_RATING_UNKNOWN, normalize_content_rating
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -375,6 +376,10 @@ def _directory_state(folder: Path) -> _DirectoryState:
     )
 
 
+def _catalog_progress_title_key(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", title.casefold()).strip()
+
+
 def _filesystem_release_evidence(
     library_root: Path,
     albums: list[tuple[int, int | None, str, str | None, str]],
@@ -475,12 +480,35 @@ async def get_release_progress(
                 CatalogAlbum.title,
                 CatalogAlbum.year,
                 CatalogArtist.name,
+                CatalogAlbum.artist_id,
+                CatalogAlbum.release_type,
+                CatalogAlbum.content_rating,
             )
             .join(CatalogArtist, CatalogArtist.id == CatalogAlbum.artist_id)
             .where(CatalogAlbum.id.in_(ids))
         )
     ).all()
     album_data = [(int(row[0]), row[1], row[2], row[3], row[4]) for row in album_rows]
+    album_identity = {
+        int(row[0]): (
+            int(row[5]),
+            _catalog_progress_title_key(str(row[2])),
+            row[3],
+            row[6],
+            normalize_content_rating(row[7]),
+        )
+        for row in album_rows
+    }
+    sibling_keys: dict[tuple[int, str, str | None, str | None], set[str]] = {}
+    for artist_id, title_key, year, release_type, rating in album_identity.values():
+        if rating == CONTENT_RATING_UNKNOWN:
+            continue
+        sibling_keys.setdefault((artist_id, title_key, year, release_type), set()).add(rating)
+    filesystem_ambiguous_album_ids = {
+        album_id
+        for album_id, (artist_id, title_key, year, release_type, _rating) in album_identity.items()
+        if len(sibling_keys.get((artist_id, title_key, year, release_type), set())) > 1
+    }
     manifest_tracks: dict[int, dict[tuple[int, int], int]] = {}
     manifest_rows = await db.execute(
         select(
@@ -518,7 +546,11 @@ async def get_release_progress(
         release_id = int(album_id)
         wanted = max(int(known_track_count or 0), manifest_counts.get(release_id, 0))
         downloaded_id_set = set(imported_by_album.get(release_id, set()))
-        release_evidence = filesystem_evidence.get(release_id)
+        release_evidence = (
+            None
+            if release_id in filesystem_ambiguous_album_ids
+            else filesystem_evidence.get(release_id)
+        )
         release_manifest = manifest_tracks.get(release_id, {})
         if release_evidence is not None:
             downloaded_id_set.update(
