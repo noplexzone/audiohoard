@@ -44,6 +44,10 @@ DEFAULT_DUPLICATE_SCAN_HOURS = 0
 DEFAULT_UPGRADE_CHECK_HOURS = 0
 DEFAULT_DUPLICATE_AUTO_CLEAN = False
 DEFAULT_AUTO_DOWNLOAD_WANTED = False
+DEFAULT_WATCHLIST_RELEASE_ALBUMS = True
+DEFAULT_WATCHLIST_RELEASE_SINGLES = False
+DEFAULT_WATCHLIST_RELEASE_EPS = False
+DEFAULT_WATCHLIST_MONITOR_UPGRADES = False
 DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS = 15
 SUPPORTED_FORMAT_PREFERENCES: tuple[str, ...] = ("flac", "mp3", "m4a/aac", "ogg", "opus")
 DEFAULT_FORMAT_PREFERENCE: list[str] = list(SUPPORTED_FORMAT_PREFERENCES)
@@ -91,6 +95,10 @@ class RuntimeSettings:
     upgrade_check_hours: int
     duplicate_auto_clean: bool
     auto_download_wanted: bool
+    default_watchlist_release_albums: bool
+    default_watchlist_release_singles: bool
+    default_watchlist_release_eps: bool
+    default_watchlist_monitor_upgrades: bool
     source_search_budget_seconds: int
     quality_profile: QualityProfile = dataclasses_field(
         default_factory=lambda: QualityProfile(
@@ -208,6 +216,22 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
         "yes",
         "on",
     }
+    default_release_albums = values.get(
+        "default_watchlist_release_albums",
+        "true" if DEFAULT_WATCHLIST_RELEASE_ALBUMS else "false",
+    ).lower() in {"1", "true", "yes", "on"}
+    default_release_singles = values.get(
+        "default_watchlist_release_singles",
+        "true" if DEFAULT_WATCHLIST_RELEASE_SINGLES else "false",
+    ).lower() in {"1", "true", "yes", "on"}
+    default_release_eps = values.get(
+        "default_watchlist_release_eps",
+        "true" if DEFAULT_WATCHLIST_RELEASE_EPS else "false",
+    ).lower() in {"1", "true", "yes", "on"}
+    default_monitor_upgrades = values.get(
+        "default_watchlist_monitor_upgrades",
+        "true" if DEFAULT_WATCHLIST_MONITOR_UPGRADES else "false",
+    ).lower() in {"1", "true", "yes", "on"}
     try:
         source_budget = int(
             values.get("source_search_budget_seconds", str(DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS))
@@ -259,6 +283,10 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
         max(0, min(upgrade_check_hours, 24 * 30)),
         duplicate_auto_clean,
         auto_download,
+        default_release_albums,
+        default_release_singles,
+        default_release_eps,
+        default_monitor_upgrades,
         max(3, min(source_budget, 60)),
         quality_profile=QualityProfile(
             format_preference=fmt_pref,
@@ -284,6 +312,10 @@ async def save_runtime_settings(
     upgrade_check_hours: int | None = None,
     auto_download_wanted: bool | None = None,
     source_search_budget_seconds: int | None = None,
+    default_watchlist_release_albums: bool | None = None,
+    default_watchlist_release_singles: bool | None = None,
+    default_watchlist_release_eps: bool | None = None,
+    default_watchlist_monitor_upgrades: bool | None = None,
     quality_profile: QualityProfile | None = None,
     max_partial_attempts: int | None = None,
     acoustid_acceptance_threshold: float | None = None,
@@ -332,6 +364,34 @@ async def save_runtime_settings(
         "upgrade_check_hours": str(max(0, min(upgrade_hours, 24 * 30))),
         "duplicate_auto_clean": "true" if bool(duplicate_auto_clean) else "false",
         "auto_download_wanted": "true" if bool(auto_download_wanted) else "false",
+        "default_watchlist_release_albums": "true"
+        if (
+            DEFAULT_WATCHLIST_RELEASE_ALBUMS
+            if default_watchlist_release_albums is None
+            else bool(default_watchlist_release_albums)
+        )
+        else "false",
+        "default_watchlist_release_singles": "true"
+        if (
+            DEFAULT_WATCHLIST_RELEASE_SINGLES
+            if default_watchlist_release_singles is None
+            else bool(default_watchlist_release_singles)
+        )
+        else "false",
+        "default_watchlist_release_eps": "true"
+        if (
+            DEFAULT_WATCHLIST_RELEASE_EPS
+            if default_watchlist_release_eps is None
+            else bool(default_watchlist_release_eps)
+        )
+        else "false",
+        "default_watchlist_monitor_upgrades": "true"
+        if (
+            DEFAULT_WATCHLIST_MONITOR_UPGRADES
+            if default_watchlist_monitor_upgrades is None
+            else bool(default_watchlist_monitor_upgrades)
+        )
+        else "false",
         "source_search_budget_seconds": str(
             max(3, min(source_search_budget_seconds or DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS, 60))
         ),

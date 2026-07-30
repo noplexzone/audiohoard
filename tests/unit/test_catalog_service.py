@@ -271,6 +271,201 @@ async def test_library_artist_release_count_for_catalog_and_legacy_rows(
     assert rows["Legacy Artist"].release_count == 0
 
 
+async def test_release_progress_uses_hydrated_manifest_as_denominator(
+    db_session: AsyncSession,
+) -> None:
+    artist = CatalogArtist(name="Juice WRLD")
+    album = CatalogAlbum(
+        artist=artist,
+        title="Goodbye & Good Riddance",
+        year="2018",
+        track_count=17,
+    )
+    album.tracks.extend(
+        CatalogAlbumTrack(position=position, disc=1, title=f"Track {position}")
+        for position in range(1, 16)
+    )
+    db_session.add(artist)
+    await db_session.flush()
+
+    progress = await get_release_progress(db_session, [album.id])
+
+    assert progress[album.id].wanted_track_count == 15
+    assert progress[album.id].downloaded_track_count == 0
+
+
+async def test_release_progress_counts_all_imported_catalog_tracks(
+    db_session: AsyncSession, job: Job
+) -> None:
+    artist = CatalogArtist(name="Juice WRLD & Future")
+    album = CatalogAlbum(
+        artist=artist,
+        title="WRLD ON DRUGS",
+        year="2018",
+        track_count=16,
+        in_library=True,
+    )
+    album.tracks.extend(
+        CatalogAlbumTrack(position=position, disc=1, title=f"Track {position}")
+        for position in range(1, 17)
+    )
+    db_session.add(artist)
+    await db_session.flush()
+    release = Release(job_id=job.id, source="slskd", title=album.title, year=album.year)
+    db_session.add(release)
+    await db_session.flush()
+    for catalog_track in album.tracks:
+        track = _make_track(
+            job.id,
+            title=catalog_track.title,
+            artist=artist.name,
+            album_artist=artist.name,
+            album=album.title,
+            year=album.year,
+            source_path=f"/music/{album.title}/{catalog_track.position:02d}.flac",
+            release_id=release.id,
+        )
+        track.catalog_album_id = album.id
+        track.catalog_track_id = catalog_track.id
+        db_session.add(track)
+    await db_session.flush()
+
+    progress = await get_release_progress(db_session, [album.id])
+
+    assert progress[album.id].wanted_track_count == 16
+    assert progress[album.id].downloaded_track_count == 16
+
+
+async def test_release_progress_keeps_clean_and_explicit_ownership_distinct(
+    db_session: AsyncSession, job: Job
+) -> None:
+    artist = CatalogArtist(name="Juice WRLD")
+    clean_album = CatalogAlbum(
+        artist=artist,
+        title="We Don't Get Along",
+        year="2024",
+        track_count=1,
+        content_rating="clean",
+    )
+    explicit_album = CatalogAlbum(
+        artist=artist,
+        title="We Don't Get Along",
+        year="2024",
+        track_count=1,
+        content_rating="explicit",
+        in_library=True,
+    )
+    clean_album.tracks.append(
+        CatalogAlbumTrack(position=1, disc=1, title="We Don't Get Along", content_rating="clean")
+    )
+    explicit_album.tracks.append(
+        CatalogAlbumTrack(
+            position=1,
+            disc=1,
+            title="We Don't Get Along",
+            content_rating="explicit",
+        )
+    )
+    db_session.add(artist)
+    await db_session.flush()
+    release = Release(
+        job_id=job.id, source="slskd", title=explicit_album.title, year=explicit_album.year
+    )
+    db_session.add(release)
+    await db_session.flush()
+    imported = _make_track(
+        job.id,
+        title="We Don't Get Along",
+        artist=artist.name,
+        album_artist=artist.name,
+        album=explicit_album.title,
+        year=explicit_album.year,
+        source_path="/music/Juice WRLD/We Don't Get Along (2024)/01.flac",
+        release_id=release.id,
+    )
+    imported.catalog_album_id = explicit_album.id
+    imported.catalog_track_id = explicit_album.tracks[0].id
+    db_session.add(imported)
+    await db_session.flush()
+
+    progress = await get_release_progress(db_session, [clean_album.id, explicit_album.id])
+
+    assert progress[clean_album.id].wanted_track_count == 1
+    assert progress[clean_album.id].downloaded_track_count == 0
+    assert progress[explicit_album.id].wanted_track_count == 1
+    assert progress[explicit_album.id].downloaded_track_count == 1
+
+
+async def test_library_artist_card_counts_watchlist_provider_releases_only(
+    db_session: AsyncSession, job: Job
+) -> None:
+    artist = CatalogArtist(name="Tyler Childers", monitored=True, watchlist_provider="deezer")
+    deezer_identity = CatalogArtistIdentity(
+        provider="deezer",
+        provider_artist_id="tyler-deezer",
+        name=artist.name,
+    )
+    musicbrainz_identity = CatalogArtistIdentity(
+        provider="musicbrainz",
+        provider_artist_id="tyler-mbid",
+        name=artist.name,
+    )
+    artist.identities.extend([deezer_identity, musicbrainz_identity])
+    deezer_albums = [
+        CatalogAlbum(artist=artist, title="Can I Take My Hounds to Heaven?", track_count=1),
+        CatalogAlbum(artist=artist, title="Rustin' in the Rain", track_count=1),
+    ]
+    catalog_tracks = [
+        CatalogAlbumTrack(album=album, position=1, disc=1, title=f"Song {index}")
+        for index, album in enumerate(deezer_albums, start=1)
+    ]
+    for index, album in enumerate(deezer_albums, start=1):
+        db_session.add(
+            CatalogAlbumProvider(
+                artist_identity=deezer_identity,
+                catalog_album=album,
+                provider_album_id=f"deezer-{index}",
+                title=album.title,
+                track_count=1,
+                release_kind="album",
+            )
+        )
+    for index in range(1, 3):
+        db_session.add(
+            CatalogAlbumProvider(
+                artist_identity=musicbrainz_identity,
+                provider_album_id=f"mb-{index}",
+                title=f"Secondary Provider Release {index}",
+                track_count=1,
+                release_kind="album",
+            )
+        )
+    db_session.add(artist)
+    await db_session.flush()
+    for index, (album, catalog_track) in enumerate(
+        zip(deezer_albums, catalog_tracks, strict=True), start=1
+    ):
+        track = _make_track(
+            job.id,
+            title=f"Song {index}",
+            artist=artist.name,
+            album_artist=artist.name,
+            album=album.title,
+            source_path=f"/music/Tyler Childers/{album.title}/01.flac",
+        )
+        track.catalog_album_id = album.id
+        track.catalog_track_id = catalog_track.id
+        db_session.add(track)
+    await db_session.flush()
+
+    page = await get_library_artists_page(db_session)
+    row = next(item for item in page.items if item.name == artist.name)
+
+    assert row.release_count == 2
+    assert row.wanted_release_count == 2
+    assert row.downloaded_file_count == 2
+
+
 async def test_library_stats_counts(db_session: AsyncSession, job: Job) -> None:
     tracks = [
         _make_track(

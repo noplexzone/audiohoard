@@ -20,7 +20,11 @@ from app.services.maintenance_workflows import (
     clean_safe_library_duplicates,
     scan_library_duplicates,
 )
-from app.services.monitoring import current_release_quality, execute_quality_upgrade
+from app.services.monitoring import (
+    current_release_quality,
+    execute_quality_upgrade,
+    run_quality_upgrade_scan,
+)
 from app.settings_service import effective_settings_dep, get_runtime_settings
 
 router = APIRouter(prefix="/maintenance", dependencies=[Depends(get_current_user)])
@@ -51,6 +55,12 @@ async def _run_duplicate_scan(app_state: Any, settings: Settings) -> None:
             quality_profile=runtime.quality_profile,
         )
     app_state.maintenance_state.store_duplicate_scan(summary)
+
+
+async def _run_upgrade_scan(app_state: Any, settings: Settings) -> None:
+    async with get_session_factory()() as db:
+        checked_records = await run_quality_upgrade_scan(db)
+    app_state.maintenance_state.store_quality_upgrade_scan(checked_records)
 
 
 @router.get("", response_class=HTMLResponse, include_in_schema=False)
@@ -105,6 +115,17 @@ async def duplicate_scan(
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
     background_tasks.add_task(_run_duplicate_scan, request.app.state, settings)
+    return RedirectResponse("/maintenance", status_code=303)
+
+
+@router.post("/upgrades/scan", include_in_schema=False)
+async def upgrade_scan(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    background_tasks.add_task(_run_upgrade_scan, request.app.state, settings)
     return RedirectResponse("/maintenance", status_code=303)
 
 

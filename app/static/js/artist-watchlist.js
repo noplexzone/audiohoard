@@ -25,6 +25,35 @@
     button.addEventListener("click", () => button.closest('[role="alert"]')?.remove());
   });
 
+
+
+  const region = document.getElementById('discography-region');
+  if (region && region.dataset.artistRefresh === 'true') {
+    const artistId = region.dataset.artistId;
+    const pollDiscography = async () => {
+      if (document.hidden) return;
+      try {
+        const stateResponse = await window.fetch(`/artists/catalog/${artistId}/state`, { credentials: 'same-origin' });
+        if (!stateResponse.ok) return;
+        const state = await stateResponse.json();
+        if (state.enrichment_state === 'queued' || state.enrichment_state === 'running') return;
+        const pageResponse = await window.fetch(window.location.href, { credentials: 'same-origin' });
+        if (!pageResponse.ok) return;
+        const html = await pageResponse.text();
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const fresh = doc.getElementById('discography-region');
+        if (fresh) {
+          region.innerHTML = fresh.innerHTML;
+          region.dataset.artistRefresh = fresh.dataset.artistRefresh || 'false';
+        }
+        window.clearInterval(discographyTimer);
+      } catch (_error) {
+        // Provider/background timing can race the first page. Keep polling.
+      }
+    };
+    const discographyTimer = window.setInterval(pollDiscography, 5000);
+  }
+
   document.querySelectorAll('form[data-download-form]').forEach((form) => {
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
