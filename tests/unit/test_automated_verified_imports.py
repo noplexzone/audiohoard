@@ -363,10 +363,12 @@ async def test_auto_import_starts_with_first_verified_track_of_partial_release(
 
     async def fake_plan(*args, **kwargs):
         calls.append(("plan", kwargs["track_ids"]))
+        first.title = "Persisted before execution"
+        await db_session.flush()
         return [SimpleNamespace(id=1, status=auto_import.ImportWorkflowState.ready)]
 
     async def fake_execute(*args, **kwargs):
-        calls.append("execute")
+        calls.append(("execute", db_session.in_transaction()))
         release.import_state = ImportWorkflowState.discovered
         first.import_state = ImportWorkflowState.imported
         return []
@@ -377,7 +379,7 @@ async def test_auto_import_starts_with_first_verified_track_of_partial_release(
     assert await try_auto_import_release(
         db_session, release, library_root=tmp_path, naming_template="{title}.{ext}"
     )
-    assert calls == [("plan", {first.id}), "execute"]
+    assert calls == [("plan", {first.id}), ("execute", False)]
     assert release.import_state != ImportWorkflowState.imported
 
 

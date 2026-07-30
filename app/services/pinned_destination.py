@@ -193,6 +193,10 @@ class PinnedDestination:
     def fsync(self) -> None:
         os.fsync(self.parent_fd)
 
+    def notify_changed(self, name: str | None = None) -> None:
+        """Emit one final audio-file change after a batch rewrite completes."""
+        os.utime(name or self.name, None, dir_fd=self.parent_fd, follow_symlinks=False)
+
     def close(self) -> None:
         if self.closed:
             return
