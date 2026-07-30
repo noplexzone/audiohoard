@@ -368,6 +368,20 @@ async def deny_review_item(
     return RedirectResponse("/downloads?notice=denied", status_code=303)
 
 
+@router.post("/release/{release_id}/dismiss", include_in_schema=False)
+async def dismiss_release_review(
+    release_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    release = await db.get(Release, release_id)
+    if release is None:
+        raise HTTPException(status_code=404, detail="Release not found")
+    release.review_dismissed_at = datetime.now(UTC).replace(tzinfo=None)
+    await db.commit()
+    return RedirectResponse("/downloads?notice=review_dismissed", status_code=303)
+
+
 @router.post("/release/{release_id}/reacquire", include_in_schema=False)
 async def reacquire_missing_release_sources(
     release_id: int,

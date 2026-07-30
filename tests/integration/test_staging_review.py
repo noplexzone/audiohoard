@@ -468,20 +468,39 @@ async def test_missing_source_review_exposes_reacquire_and_queues_continuation(
         assert continuation.catalog_track_id is None
 
 
-async def test_release_review_dismiss_route_is_removed(
+async def test_release_review_dismiss_hides_actionless_release_review(
     client: AsyncClient, test_settings: Settings
 ) -> None:
-    item_id, _, staged_path = await _review_fixture(test_settings, "release-dismiss")
     factory = get_session_factory()
     async with factory() as db:
-        item = await db.get(StagingReviewItem, item_id)
-        assert item is not None
-        release_id = item.release_id
+        job = Job(source="slskd", query="stale review", status=JobStatus.failed)
+        release = Release(
+            job=job,
+            source="slskd",
+            title="One Thing At A Time",
+            album_artist="Morgan Wallen",
+            import_state=ImportWorkflowState.rolled_back,
+            error_detail="import execution error: tag readback failed",
+        )
+        db.add_all([job, release])
+        await db.commit()
+        release_id = release.id
+
+    page = await client.get("/downloads")
+    assert f"/staging/release/{release_id}/dismiss" in page.text
+    assert ">Dismiss — hide<" in page.text
 
     response = await client.post(f"/staging/release/{release_id}/dismiss", follow_redirects=False)
 
-    assert response.status_code == 404
-    assert staged_path.exists()
+    assert response.status_code == 303
+    assert response.headers["location"] == "/downloads?notice=review_dismissed"
+    async with factory() as db:
+        release = await db.get(Release, release_id)
+        assert release is not None
+        assert release.review_dismissed_at is not None
+
+    page = await client.get("/downloads")
+    assert f"/staging/release/{release_id}/dismiss" not in page.text
 
 
 async def test_reacquire_stops_after_persisted_continuation_attempt_cap(

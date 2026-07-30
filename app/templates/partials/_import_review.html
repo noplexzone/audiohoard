@@ -35,6 +35,7 @@
       {% endfor %}
       <div class="review-actions review-release-actions">
         {% if review.missing_source %}<form method="post" action="/staging/release/{{ review.release.id }}/reacquire"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn" type="submit">Re-acquire</button></form>{% endif %}
+        {% if not review.review_items %}<form method="post" action="/staging/release/{{ review.release.id }}/dismiss" data-confirm="Hide this import-review entry without deleting staged files?"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Dismiss — hide</button></form>{% endif %}
       </div>
     </article>
     {% endfor %}

@@ -421,7 +421,10 @@ async def test_retag_catalog_album_renames_multidisc_files_to_disc_track_templat
     assert new_path.exists()
     assert plan.destination_path == str(new_path)
     assert track.disc_total == 3
-    assert FLAC(new_path)["discnumber"] == ["3/3"]
+    repaired = FLAC(new_path)
+    assert repaired["discnumber"] == ["3"]
+    assert repaired["disctotal"] == ["3"]
+    assert repaired["tracktotal"] == ["1"]
 
 
 async def test_retag_catalog_album_matches_flat_multidisc_files_by_title(
@@ -476,11 +479,11 @@ async def test_retag_catalog_album_matches_flat_multidisc_files_by_title(
     assert not acoustic.exists()
     assert not ends.exists()
     assert not love.exists()
-    assert FLAC(acoustic_new)["discnumber"] == ["1/2"]
+    assert FLAC(acoustic_new)["discnumber"] == ["1"]
     assert FLAC(acoustic_new)["musicbrainz_trackid"] == ["acoustic-mbid"]
-    assert FLAC(ends_new)["discnumber"] == ["2/2"]
+    assert FLAC(ends_new)["discnumber"] == ["2"]
     assert FLAC(ends_new)["musicbrainz_trackid"] == ["ends-mbid"]
-    assert FLAC(love_new)["discnumber"] == ["2/2"]
+    assert FLAC(love_new)["discnumber"] == ["2"]
     assert FLAC(love_new)["musicbrainz_trackid"] == ["love-mbid"]
 
 
@@ -515,9 +518,9 @@ async def test_retag_catalog_album_maps_multidisc_legacy_filenames(
 
     assert result.files_retagged == 2
     assert FLAC(disc_one)["musicbrainz_trackid"] == ["disc-one"]
-    assert FLAC(disc_one)["discnumber"] == ["1/2"]
+    assert FLAC(disc_one)["discnumber"] == ["1"]
     assert FLAC(disc_two)["musicbrainz_trackid"] == ["disc-two"]
-    assert FLAC(disc_two)["discnumber"] == ["2/2"]
+    assert FLAC(disc_two)["discnumber"] == ["2"]
 
 
 class _FailingSecondWriter(MutagenTagWriter):
