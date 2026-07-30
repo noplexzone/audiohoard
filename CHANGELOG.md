@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-29
+
+### Added
+- Added persisted artist watchlist defaults for Albums, Singles, EPs, and quality-upgrade monitoring, with runtime defaults applied when watchlisting artists.
+- Added reversible quality-upgrade monitoring toggles on watchlist and album pages.
+
+### Fixed
+- Catalog artist pages now show a loading discography state while enrichment/discography hydration is queued or running, then refresh the release section in place.
+
 ## [0.8.0] - 2026-07-29
 
 ### Fixed
