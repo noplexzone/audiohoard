@@ -5,6 +5,7 @@ import json
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+import app.services.monitoring as monitoring_service
 from app.config import get_settings
 from app.database import Base
 from app.models.job import Job, JobStatus
@@ -183,3 +184,32 @@ async def test_provider_failure_persists_monitoring_terminal_state(tmp_path) -> 
             assert persisted.status == MonitoringStatus.failed
     finally:
         await engine.dispose()
+
+
+async def test_initial_checkpoint_failure_releases_in_process_monitoring_claim(db_session) -> None:
+    job = Job(source="slskd", query="Artist Album", status=JobStatus.done)
+    release = Release(job=job, source="slskd", title="Album")
+    record = MonitoringRecord(release=release, status=MonitoringStatus.active)
+    db_session.add_all([job, release, record])
+    await db_session.commit()
+    record_id = record.id
+
+    async def failed_checkpoint() -> None:
+        raise RuntimeError("checkpoint failed")
+
+    async def no_candidates():
+        return []
+
+    import pytest
+
+    try:
+        with pytest.raises(RuntimeError, match="checkpoint failed"):
+            await run_monitoring_check(
+                db_session, record, {}, no_candidates, checkpoint=failed_checkpoint
+            )
+        await db_session.rollback()
+        record = await db_session.get(MonitoringRecord, record_id)
+        assert record is not None
+        await run_monitoring_check(db_session, record, {}, no_candidates)
+    finally:
+        monitoring_service._active_checks.discard(record_id)  # noqa: SLF001
