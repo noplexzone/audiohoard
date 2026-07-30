@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Dashboard — Audiohoard{% endblock %}
 {% block content %}
+{% set csrf_token = request.cookies.get('csrf', '') | e %}
 <header class="page-header dashboard-heading">
   <div><p class="eyebrow">Overview</p><h1>Your music, at a glance</h1><p>Real library and acquisition activity from this server.</p></div>
   <a class="btn" href="/search"><svg><use href="#i-search"/></svg>Find music</a>
@@ -17,10 +18,10 @@
   <section class="panel recent-panel" aria-labelledby="recent-heading">
     <div class="section-heading"><div><p class="eyebrow">Library</p><h2 id="recent-heading">Recent activity</h2></div><a href="/library">View library</a></div>
     {% if dashboard.recent_tracks %}
-    <div class="media-list">
+    <div class="media-list activity-list">
       {% for track in dashboard.recent_tracks %}
       <a class="media-row" href="/tracks/{{ track.id }}/ui">
-        <span class="cover-tile cover-{{ loop.index % 4 }}" aria-hidden="true">{{ track.artist[:1] | upper }}</span>
+        <span class="cover-tile cover-{{ loop.index % 4 }} media-thumb" aria-hidden="true">{% if track.artwork_url %}<img loading="lazy" width="46" height="46" decoding="async" src="/artwork?url={{ track.artwork_url | urlencode }}" alt="">{% else %}<span>{{ track.artist[:1] | upper }}</span>{% endif %}</span>
         <span class="media-copy"><strong>{{ track.title }}</strong><small>{{ track.artist }} · {{ track.album }}</small></span>
         <span class="badge {{ 'ok' if track.import_state == 'imported' else 'warn' }}">{{ track.import_state | replace('_', ' ') }}</span>
       </a>
@@ -32,16 +33,30 @@
   </section>
 
   <aside class="dashboard-side">
-    <section class="panel" aria-labelledby="jobs-heading">
-      <div class="section-heading"><div><p class="eyebrow">Pipeline</p><h2 id="jobs-heading">Jobs</h2></div><a href="/downloads">View all</a></div>
-      <div class="status-strip" aria-label="Job state counts">
+    <section class="panel quality-panel" aria-labelledby="quality-heading">
+      <div class="section-heading"><div><p class="eyebrow">Quality</p><h2 id="quality-heading">Library quality</h2></div><a href="/settings?section=automation">Profile</a></div>
+      <div class="quality-summary"><strong data-quality-upgrade-eligible="total">{{ dashboard.quality_upgrade_eligible }}</strong><span>upgrade-eligible tracks</span></div>
+      {% if dashboard.quality_tiers %}
+      <ul class="quality-tier-list">
+        {% for tier in dashboard.quality_tiers %}
+        <li data-quality-tier="{{ tier.name | lower }}"><span><strong>{{ tier.name }}</strong><small>{% if tier.formats %}{{ tier.formats | join(', ') }}{% else %}No format{% endif %}</small></span><span><b>{{ tier.count }}</b><small>{{ tier.upgrade_eligible }} eligible</small></span></li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <div class="empty-state mini"><h3>No quality data yet</h3><p>Imported library tracks will appear here after metadata is known.</p></div>
+      {% endif %}
+    </section>
+
+    <section class="panel jobs-panel" aria-labelledby="jobs-heading">
+      <div class="section-heading"><div><p class="eyebrow">Pipeline</p><h2 id="jobs-heading">Recent jobs</h2></div><a href="/downloads">Details</a></div>
+      <div class="status-strip compact" aria-label="Job state counts">
         {% for status in ['running', 'pending', 'partial', 'done', 'failed', 'cancelled'] %}
         <a href="/downloads?status={{ status }}"><span class="status-dot {{ status }}"></span><strong data-job-status="{{ status }}">{{ dashboard.job_counts[status] }}</strong><small>{{ status | title }}</small></a>
         {% endfor %}
       </div>
       {% if dashboard.recent_jobs %}
-      <ul class="job-list">
-        {% for job in dashboard.recent_jobs[:4] %}
+      <ul class="job-list compact">
+        {% for job in dashboard.recent_jobs %}
         <li><a href="/downloads?status={{ job.status.value }}"><span class="status-dot {{ job.status.value }}"></span><span><strong>{{ job.query }}</strong><small>{{ job.source }} · {{ job.status.value | title }}</small></span></a></li>
         {% endfor %}
       </ul>
@@ -61,12 +76,21 @@
   </aside>
 </div>
 
-<section class="quick-actions" aria-labelledby="quick-heading">
-  <div class="section-heading"><div><p class="eyebrow">Shortcuts</p><h2 id="quick-heading">Quick actions</h2></div></div>
-  <div class="action-grid">
-    <a class="action-card" href="/search"><svg><use href="#i-search"/></svg><span><strong>Search providers</strong><small>Find tracks and releases</small></span><span aria-hidden="true">→</span></a>
-    <a class="action-card" href="/downloads"><svg><use href="#i-jobs"/></svg><span><strong>Queue a job</strong><small>Start an acquisition</small></span><span aria-hidden="true">→</span></a>
-    <a class="action-card" href="/downloads#import-review"><svg><use href="#i-jobs"/></svg><span><strong>Review staged audio</strong><small>Resolve fingerprint exceptions</small></span><span aria-hidden="true">→</span></a>
+<section class="workflows-panel" aria-labelledby="workflows-heading">
+  <div class="section-heading"><div><p class="eyebrow">Tasks</p><h2 id="workflows-heading">Workflows</h2></div><a href="/maintenance">Maintenance log</a></div>
+  <div class="workflow-grid">
+    <form method="post" action="/maintenance/upgrades/scan" class="workflow-card">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <svg><use href="#i-library"/></svg>
+      <span><strong>Start quality upgrade scan</strong><small>Schedules upgrade checks for monitored releases.</small></span>
+      <button type="submit" class="btn secondary">Start</button>
+    </form>
+    <form method="post" action="/maintenance/duplicates/scan" class="workflow-card">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <svg><use href="#i-jobs"/></svg>
+      <span><strong>Start duplicate cleanup scan</strong><small>Schedules a dry-run duplicate scan for safe cleanup.</small></span>
+      <button type="submit" class="btn secondary">Start</button>
+    </form>
   </div>
 </section>
 {% endblock %}

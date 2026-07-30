@@ -48,14 +48,49 @@ def apply_monitor_policy(
             elif artist.monitor_policy == "albums_only":
                 release.monitored = release_bucket(release.release_type) == "album"
             else:
-                release.monitored = True
+                bucket = release_bucket(release.release_type)
+                watch_albums = (
+                    True
+                    if artist.watchlist_release_albums is None
+                    else artist.watchlist_release_albums
+                )
+                watch_singles = (
+                    False
+                    if artist.watchlist_release_singles is None
+                    else artist.watchlist_release_singles
+                )
+                watch_eps = (
+                    False if artist.watchlist_release_eps is None else artist.watchlist_release_eps
+                )
+                release.monitored = (
+                    (bucket == "album" and watch_albums)
+                    or (bucket == "single" and watch_singles)
+                    or (bucket == "ep" and watch_eps)
+                )
             continue
         if artist.monitor_policy == "none_new":
             release.monitored = False
         elif artist.monitor_policy == "albums_only":
             release.monitored = release.release_kind == "album"
         else:
-            release.monitored = True
+            watch_albums = (
+                True
+                if artist.watchlist_release_albums is None
+                else artist.watchlist_release_albums
+            )
+            watch_singles = (
+                False
+                if artist.watchlist_release_singles is None
+                else artist.watchlist_release_singles
+            )
+            watch_eps = (
+                False if artist.watchlist_release_eps is None else artist.watchlist_release_eps
+            )
+            release.monitored = (
+                (release.release_kind == "album" and watch_albums)
+                or (release.release_kind == "single" and watch_singles)
+                or (release.release_kind == "ep" and watch_eps)
+            )
 
 
 def _sync_canonical_monitoring(

@@ -95,6 +95,7 @@ a.metric-card:hover {
   width: 46px;
   height: 46px;
   place-items: end start;
+  overflow: hidden;
   padding: .4rem;
   border-radius: 9px;
   background: linear-gradient(145deg, #325d45, #18261d);
@@ -292,6 +293,134 @@ a.metric-card:hover {
 }
 
 .action-card small {
+  color: var(--muted);
+  font-size: .7rem;
+}
+
+.media-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.media-thumb span {
+  align-self: end;
+}
+
+.activity-list {
+  grid-template-rows: repeat(auto-fill, minmax(50px, auto));
+}
+
+.quality-summary {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: .65rem;
+  align-items: baseline;
+  margin: .35rem 0 .75rem;
+  padding: .75rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+
+.quality-summary strong {
+  font-size: 1.55rem;
+  line-height: 1;
+}
+
+.quality-summary span {
+  color: var(--muted);
+  font-size: .76rem;
+}
+
+.quality-tier-list {
+  display: grid;
+  gap: .45rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.quality-tier-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: .75rem;
+  align-items: center;
+  padding: .55rem 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.quality-tier-list strong,
+.quality-tier-list small,
+.quality-tier-list b {
+  display: block;
+}
+
+.quality-tier-list small {
+  color: var(--muted);
+  font-size: .68rem;
+}
+
+.quality-tier-list b {
+  font-size: .95rem;
+  text-align: right;
+}
+
+.status-strip.compact {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  padding: .55rem 0;
+}
+
+.job-list.compact {
+  margin-top: .5rem;
+}
+
+.job-list.compact li > a {
+  min-height: 34px;
+  padding-block: .3rem;
+}
+
+.workflows-panel {
+  margin-top: 1.35rem;
+  padding: 1rem;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.workflow-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: .75rem;
+}
+
+.workflow-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: .75rem;
+  align-items: center;
+  min-width: 0;
+  margin: 0;
+  padding: .85rem 1rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+
+.workflow-card > svg {
+  color: var(--accent);
+}
+
+.workflow-card strong,
+.workflow-card small {
+  display: block;
+}
+
+.workflow-card strong {
+  font-size: .82rem;
+}
+
+.workflow-card small {
   color: var(--muted);
   font-size: .7rem;
 }
@@ -561,8 +690,18 @@ a.metric-card:hover {
     width: 100%;
   }
 
-  .action-grid {
+  .action-grid,
+  .workflow-grid {
     grid-template-columns: 1fr;
+  }
+
+  .workflow-card {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .workflow-card .btn {
+    grid-column: 1 / -1;
+    justify-self: start;
   }
 
   .dashboard-side {

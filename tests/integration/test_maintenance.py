@@ -3,11 +3,16 @@ from __future__ import annotations
 import pytest
 from httpx import AsyncClient
 
+import app.database as db_module
+from app.models.job import Job, JobStatus
+from app.models.monitoring import MonitoringRecord, MonitoringStatus
+from app.models.release import Release
 from app.services.maintenance_state import (
     DuplicateAlbumSummary,
     DuplicateScanSummary,
     empty_maintenance_state,
 )
+from app.services.monitoring import QualityProfile, run_quality_upgrade_scan
 from app.services.quality_upgrade import QualityDuplicateResult
 
 
@@ -22,6 +27,62 @@ async def test_maintenance_page_renders_before_scan(client: AsyncClient) -> None
     assert response.status_code == 200
     assert "Library scan" in response.text
     assert "No upgrade candidates" in response.text
+
+
+@pytest.mark.asyncio
+async def test_upgrade_scan_redirects_and_queues_without_running_inline(
+    client: AsyncClient, monkeypatch
+) -> None:
+    calls = 0
+    queued_tasks = []
+
+    async def unexpected_scan(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+
+    def capture_task(self, func, *args, **kwargs):
+        queued_tasks.append((func, args, kwargs))
+
+    monkeypatch.setattr("app.routers.maintenance.run_quality_upgrade_scan", unexpected_scan)
+    monkeypatch.setattr("app.routers.maintenance.BackgroundTasks.add_task", capture_task)
+
+    response = await client.post("/maintenance/upgrades/scan", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/maintenance"
+    assert calls == 0
+    assert len(queued_tasks) == 1
+    assert queued_tasks[0][0].__name__ == "_run_upgrade_scan"
+
+
+@pytest.mark.asyncio
+async def test_run_quality_upgrade_scan_checks_active_records_once(
+    client: AsyncClient, monkeypatch
+) -> None:
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        job = Job(source="slskd", query="Artist Album", status=JobStatus.done)
+        release = Release(job=job, source="slskd", title="Album", album_artist="Artist")
+        record = MonitoringRecord(
+            release=release,
+            status=MonitoringStatus.active,
+            desired_quality_json=QualityProfile(preferred_codecs=("flac", "mp3")).to_json(),
+        )
+        session.add_all([job, release, record])
+        await session.commit()
+        record_id = record.id
+
+    calls: list[int] = []
+
+    async def fake_check(db, record, current_quality, discover):
+        calls.append(record.id)
+
+    monkeypatch.setattr("app.services.monitoring.run_monitoring_check", fake_check)
+    async with factory() as session:
+        checked = await run_quality_upgrade_scan(session)
+
+    assert checked == 1
+    assert calls == [record_id]
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
 
 from app.database import get_session_factory
 from app.jobs.runner import _catalog_track_for_result
@@ -15,6 +16,7 @@ from app.models.catalog_entities import (
     CatalogArtistIdentity,
 )
 from app.models.job import Job
+from app.models.monitoring import MonitoringRecord, MonitoringStatus
 from app.schemas.search import SearchResult
 
 
@@ -84,9 +86,9 @@ async def test_catalog_artist_album_pages_and_album_download_create_linked_job(
     assert response.headers["location"] == "/downloads"
 
     async with factory() as db:
-        job = (await db.scalars(select(Job).where(Job.catalog_album_id == album_id))).first()
-        assert job is not None
-        assert job.query == "Daft Punk Discovery"
+        jobs = list((await db.scalars(select(Job).where(Job.catalog_album_id == album_id))).all())
+        assert [job.query for job in jobs] == ["Daft Punk One More Time", "Daft Punk Aerodynamic"]
+        assert all(job.catalog_track_id is not None for job in jobs)
 
 
 def test_catalog_track_matching_requires_title_or_explicit_selection() -> None:
@@ -383,6 +385,196 @@ async def test_switching_watchlist_provider_preserves_target_provider_choices(
     assert refreshed_artist.watchlist_provider == "deezer"
     assert refreshed_mb is not None and refreshed_mb.monitored is True
     assert refreshed_dz is not None and refreshed_dz.monitored is True
+
+
+async def test_watchlist_defaults_monitor_all_release_types_and_upgrade_records(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        from app.models.catalog_entities import CatalogAlbumTrack
+        from app.models.job import Job, JobStatus
+        from app.models.release import Release
+        from app.models.track import Track
+        from app.models.workflow import AcquisitionState, ImportWorkflowState
+        from app.settings_service import save_runtime_settings
+
+        await save_runtime_settings(
+            db,
+            [{"name": "slskd", "enabled": True}],
+            10,
+            metadata_providers=[{"name": "deezer", "enabled": True}],
+            primary_metadata_provider="deezer",
+            default_watchlist_release_albums=True,
+            default_watchlist_release_singles=True,
+            default_watchlist_release_eps=True,
+            default_watchlist_monitor_upgrades=True,
+        )
+        artist = CatalogArtist(
+            name="Default Artist",
+            monitored=False,
+            watchlist_provider="deezer",
+            last_enriched_at=datetime.now(tz=UTC),
+        )
+        db.add(artist)
+        await db.flush()
+        identity = CatalogArtistIdentity(
+            artist_id=artist.id,
+            provider="deezer",
+            provider_artist_id="default-dz",
+            name="Default Artist",
+        )
+        db.add(identity)
+        await db.flush()
+        releases = [
+            ("Default Album", "album"),
+            ("Default Single", "single"),
+            ("Default EP", "ep"),
+        ]
+        for title, kind in releases:
+            album = CatalogAlbum(artist=artist, title=title, release_type=kind, in_library=True)
+            provider_release = CatalogAlbumProvider(
+                artist_identity_id=identity.id,
+                catalog_album=album,
+                provider_album_id=f"{kind}-id",
+                title=title,
+                release_kind=kind,
+            )
+            catalog_track = CatalogAlbumTrack(
+                album=album, position=1, disc=1, title=f"{title} Song"
+            )
+            job = Job(source="slskd", query=title, status=JobStatus.done, catalog_album=album)
+            imported = Release(job=job, source="slskd", title=title, album_artist="Default Artist")
+            Track(
+                job=job,
+                release=imported,
+                catalog_album=album,
+                catalog_track=catalog_track,
+                source="slskd",
+                title=f"{title} Song",
+                file_format="mp3",
+                acquisition_state=AcquisitionState.downloaded,
+                import_state=ImportWorkflowState.imported,
+            )
+            db.add(provider_release)
+        await db.commit()
+        artist_id = artist.id
+
+    response = await client.post(
+        f"/artists/catalog/{artist_id}/monitor",
+        data={"quick": "1", "provider": "deezer", "csrf_token": client.cookies.get("csrf", "")},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    async with factory() as db:
+        refreshed = (
+            await db.execute(
+                select(CatalogArtist)
+                .where(CatalogArtist.id == artist_id)
+                .options(
+                    selectinload(CatalogArtist.identities).selectinload(
+                        CatalogArtistIdentity.releases
+                    )
+                )
+            )
+        ).scalar_one()
+        provider_releases = refreshed.identities[0].releases
+        upgrade_count = await db.scalar(select(func.count(MonitoringRecord.id)))
+
+    assert refreshed.watchlist_release_albums is True
+    assert refreshed.watchlist_release_singles is True
+    assert refreshed.watchlist_release_eps is True
+    assert refreshed.watchlist_monitor_upgrades is True
+    assert {release.release_kind: release.monitored for release in provider_releases} == {
+        "album": True,
+        "single": True,
+        "ep": True,
+    }
+    assert upgrade_count == 3
+
+
+async def test_watchlist_upgrade_toggle_off_deactivates_monitoring_record(
+    client: AsyncClient,
+) -> None:
+    from app.models.catalog_entities import CatalogAlbumTrack
+    from app.models.job import Job, JobStatus
+    from app.models.release import Release
+    from app.models.track import Track
+    from app.models.workflow import AcquisitionState, ImportWorkflowState
+
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Toggle Artist",
+            monitored=True,
+            watchlist_provider="deezer",
+            watchlist_monitor_upgrades=True,
+            last_enriched_at=datetime.now(tz=UTC),
+        )
+        album = CatalogAlbum(
+            artist=artist, title="Toggle Album", release_type="Album", in_library=True
+        )
+        catalog_track = CatalogAlbumTrack(album=album, position=1, disc=1, title="Song")
+        job = Job(source="slskd", query="Toggle Album", status=JobStatus.done, catalog_album=album)
+        release = Release(
+            job=job, source="slskd", title="Toggle Album", album_artist="Toggle Artist"
+        )
+        Track(
+            job=job,
+            release=release,
+            catalog_album=album,
+            catalog_track=catalog_track,
+            source="slskd",
+            title="Song",
+            file_format="mp3",
+            acquisition_state=AcquisitionState.downloaded,
+            import_state=ImportWorkflowState.imported,
+        )
+        record = MonitoringRecord(release=release, status=MonitoringStatus.active)
+        db.add(record)
+        await db.commit()
+        album_id = album.id
+        record_id = record.id
+
+    response = await client.post(
+        f"/albums/{album_id}/watch-upgrade",
+        data={"monitor_for_upgrades": "false", "csrf_token": client.cookies.get("csrf", "")},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    async with factory() as db:
+        refreshed = await db.get(MonitoringRecord, record_id)
+    assert refreshed is not None
+    assert refreshed.status == MonitoringStatus.paused
+
+
+async def test_artist_page_renders_loading_state_for_queued_enrichment(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Hydrating Artist",
+            watchlist_provider="deezer",
+            enrichment_state="queued",
+        )
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="deezer",
+            provider_artist_id="hydrating-dz",
+            name="Hydrating Artist",
+        )
+        db.add(identity)
+        await db.commit()
+        artist_id = artist.id
+
+    response = await client.get(f"/artists/catalog/{artist_id}?provider=deezer")
+
+    assert response.status_code == 200
+    assert "Loading discography" in response.text
+    assert 'data-artist-refresh="true"' in response.text
 
 
 async def test_album_page_links_to_catalog_artist(client: AsyncClient) -> None:

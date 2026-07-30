@@ -684,3 +684,17 @@ async def test_quality_profile_rejects_invalid_bitrate_instead_of_clamping(
     page = await client.get("/settings/quality")
     assert 'value="255"' not in page.text
     assert all(f'<option value="{value}"' in page.text for value in (192, 256, 320))
+
+
+@pytest.mark.asyncio
+async def test_library_settings_naming_template_renders_default_placeholder(
+    client: AsyncClient,
+) -> None:
+    response = await client.get("/settings/library")
+
+    assert response.status_code == 200
+    assert (
+        'placeholder="{album_artist}/{album} ({year})/{disc_track} - {title}.{ext}"'
+        in response.text
+    )
+    assert "<strong>Preview:</strong>" in response.text

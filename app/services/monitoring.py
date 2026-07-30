@@ -382,6 +382,24 @@ async def current_release_quality(db: AsyncSession, release_id: int) -> dict[str
     return {"codec": codec, "lossless": codec in _LOSSLESS_FILE_FORMATS, "reliability": 1.0}
 
 
+async def run_quality_upgrade_scan(db: AsyncSession) -> int:
+    """Run one upgrade check across all active monitoring records."""
+    from app.services.quality_discovery import build_upgrade_discovery
+
+    cfg = await build_effective_settings(db, get_settings())
+    records = (
+        await db.scalars(
+            select(MonitoringRecord).where(MonitoringRecord.status == MonitoringStatus.active)
+        )
+    ).all()
+    for record in records:
+        current_quality = await current_release_quality(db, record.release_id)
+        discover = build_upgrade_discovery(db, cfg, record)
+        await run_monitoring_check(db, record, current_quality, discover)
+    await db.commit()
+    return len(records)
+
+
 class QualityUpgradeCycleScheduler:
     def __init__(self) -> None:
         self._task: asyncio.Task[None] | None = None
@@ -404,8 +422,6 @@ class QualityUpgradeCycleScheduler:
     async def _refresh_cycle(self) -> float:
         import time
 
-        from app.services.quality_discovery import build_upgrade_discovery
-
         factory = get_session_factory()
         async with factory() as db:
             runtime = await get_runtime_settings(db)
@@ -415,19 +431,7 @@ class QualityUpgradeCycleScheduler:
             now = time.monotonic()
             if self._last_check is not None and now - self._last_check < interval:
                 return float(interval - (now - self._last_check))
-            cfg = await build_effective_settings(db, get_settings())
-            records = (
-                await db.scalars(
-                    select(MonitoringRecord).where(
-                        MonitoringRecord.status == MonitoringStatus.active
-                    )
-                )
-            ).all()
-            for record in records:
-                current_quality = await current_release_quality(db, record.release_id)
-                discover = build_upgrade_discovery(db, cfg, record)
-                await run_monitoring_check(db, record, current_quality, discover)
-            await db.commit()
+            await run_quality_upgrade_scan(db)
             self._last_check = now
             return float(interval)
 

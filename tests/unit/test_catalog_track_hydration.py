@@ -722,7 +722,7 @@ async def test_dispatch_hydrates_catalog_tracks_before_creating_job(
         album.id, db_session, settings, object()
     )
     assert response.status_code == 303
-    assert len(dispatched) == 1
+    assert len(dispatched) == 16
 
     # After hydration and dispatch, the album must have tracks persisted
     fresh = await db_session.scalar(select(CatalogAlbum).where(CatalogAlbum.id == album.id))

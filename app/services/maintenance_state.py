@@ -27,9 +27,18 @@ class DuplicateScanSummary:
 
 
 @dataclass
+class QualityUpgradeScanSummary:
+    checked_records: int = 0
+    scanned_at: datetime | None = None
+
+
+@dataclass
 class MaintenanceState:
     library_scan: LibraryScanResult | None = None
     duplicate_scan: DuplicateScanSummary = field(default_factory=DuplicateScanSummary)
+    quality_upgrade_scan: QualityUpgradeScanSummary = field(
+        default_factory=QualityUpgradeScanSummary
+    )
     ignored_orphans: set[str] = field(default_factory=set)
     library_scanned_at: datetime | None = None
 
@@ -39,6 +48,11 @@ class MaintenanceState:
 
     def store_duplicate_scan(self, result: DuplicateScanSummary) -> None:
         self.duplicate_scan = result
+
+    def store_quality_upgrade_scan(self, checked_records: int) -> None:
+        self.quality_upgrade_scan = QualityUpgradeScanSummary(
+            checked_records=checked_records, scanned_at=datetime.now(UTC)
+        )
 
 
 def empty_maintenance_state() -> MaintenanceState:

@@ -6,26 +6,37 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
-- Combine sibling `CD1`/`CD2` slskd album folders and preserve multi-disc totals in import/metadata-repair tags.
-- Treat denied slskd review artifacts as blocked candidates so the same peer/file is not downloaded again after denial.
-- Backfill Deezer release explicitness/UPC from album summaries and stop filesystem-only progress from crediting same-title clean/explicit sibling releases.
-- Ignore `.lrc` lyrics files from slskd search/acquisition so lyric sidecars cannot enter import review as zero-duration tracks.
-- Keep clean and explicit provider releases as separate catalog entries so one imported file does not credit both versions.
-- Keep artist-page monitored-download submissions on the current page for fetch requests.
-- Bind catalog-scoped one-track releases to their sole catalog track so approved single imports count as complete.
-- Reconcile partial catalog album jobs after continuation imports complete the album.
+## [0.8.0] - 2026-07-29
 
 ### Added
+- Added persisted artist watchlist defaults for Albums, Singles, EPs, and quality-upgrade monitoring, with runtime defaults applied when watchlisting artists.
+- Added reversible quality-upgrade monitoring toggles on watchlist and album pages.
+- Added bulk Wanted-page queue actions for selected or all listed incomplete releases.
+- Added a bounded job dispatcher concurrency setting to keep download bursts from exhausting the SQLite connection pool.
+- Added a dashboard library-quality card that groups imported tracks by quality tier and reports tracks below the runtime quality profile.
+- Added an on-demand background quality-upgrade scan trigger and dashboard workflow buttons for quality-upgrade and duplicate-cleanup scans.
 - Store provider release and track content ratings/UPCs and show rating labels on catalog release pages.
 - Download buttons on catalog album pages and artist release cards now queue work in place with a brief confirmation while preserving native form redirects without JavaScript.
-- Added a bounded job dispatcher concurrency setting to keep download bursts from exhausting the SQLite connection pool.
 
 ### Changed
 - Album downloads now queue missing catalog tracks and imported tracks that are positively known to be below the configured quality profile, while skipping already acceptable or unknown-bitrate imports.
+- Rebuilt the dashboard with a compact recent-jobs summary and expanded recent library activity with album artwork thumbnails.
+- Settings navigation is reorganized into clearer sections, and the naming-template field now shows the documented default template as its placeholder when unset.
+- Wanted release counts now prefer hydrated catalog track manifests so fully owned releases stay off `/wanted`.
 
 ### Fixed
+- Backfill Deezer release explicitness/UPC from album summaries and stop filesystem-only progress from crediting same-title clean/explicit sibling releases.
+- Bind catalog-scoped one-track releases to their sole catalog track so approved single imports count as complete.
+- Bulk watchlisted artist downloads now queue only missing or sub-quality tracks for partial albums instead of reacquiring the full album.
+- Catalog artist pages now show a loading discography state while enrichment/discography hydration is queued or running, then refresh the release section in place.
+- Combine sibling `CD1`/`CD2` slskd album folders and preserve multi-disc totals in import/metadata-repair tags.
 - Filesystem release-progress caching now notices new files inside nested disc folders even when directory timestamp resolution is too coarse.
+- Ignore `.lrc` lyrics files from slskd search/acquisition so lyric sidecars cannot enter import review as zero-duration tracks.
+- Keep artist-page monitored-download submissions on the current page for fetch requests.
+- Keep clean and explicit provider releases as separate catalog entries so one imported file does not credit both versions.
+- Reconcile partial catalog album jobs after continuation imports complete the album.
+- Treat denied slskd review artifacts as blocked candidates so the same peer/file is not downloaded again after denial.
+- Wanted bulk queueing reuses album download per-track acquisition so partial releases never enqueue a whole-album job.
 
 ## [0.7.2] - 2026-07-29
 

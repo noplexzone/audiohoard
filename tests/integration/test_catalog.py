@@ -221,43 +221,86 @@ async def test_legacy_artist_routes_redirect_to_library(client: AsyncClient) -> 
         assert resp.headers["location"] == "/library"
 
 
-async def _seed_wanted_view_releases() -> None:
+async def _seed_wanted_view_releases() -> dict[str, int]:
     factory = db_module.get_session_factory()
     async with factory() as session:
         job = Job(source="slskd", query="wanted view", status=JobStatus.done)
         release = Release(job=job, source="slskd", title="Complete Wanted Album")
         watched = CatalogArtist(name="Wanted View Artist", monitored=True)
-        incomplete = CatalogAlbum(
-            title="Incomplete Wanted Album", year="2026", track_count=2, monitored=True
-        )
         complete = CatalogAlbum(
-            title="Complete Wanted Album", year="2025", track_count=1, monitored=True
+            title="Complete Wanted Album", year="2025", track_count=3, monitored=True
+        )
+        partial = CatalogAlbum(
+            title="Partial Wanted Album", year="2026", track_count=2, monitored=True
+        )
+        second_partial = CatalogAlbum(
+            title="Second Partial Wanted Album", year="2027", track_count=2, monitored=True
         )
         hidden_artist = CatalogArtist(name="Hidden Wanted Artist", monitored=False)
         hidden = CatalogAlbum(title="Nonwatchlisted Missing Album", year="2024", track_count=2)
         excluded = CatalogAlbum(
             title="Explicitly Unwatched Album", year="2023", track_count=2, monitored=False
         )
-        watched.albums.extend([incomplete, complete, excluded])
+        watched.albums.extend([complete, partial, second_partial, excluded])
         hidden_artist.albums.append(hidden)
-        complete_track = CatalogAlbumTrack(album=complete, position=1, disc=1, title="Complete")
-        session.add_all([job, release, watched, hidden_artist, complete_track])
+        complete_tracks = [
+            CatalogAlbumTrack(
+                album=complete, position=position, disc=1, title=f"Complete {position}"
+            )
+            for position in range(1, 3)
+        ]
+        partial_tracks = [
+            CatalogAlbumTrack(
+                album=partial, position=position, disc=1, title=f"Partial {position}"
+            )
+            for position in range(1, 3)
+        ]
+        second_partial_tracks = [
+            CatalogAlbumTrack(
+                album=second_partial, position=position, disc=1, title=f"Second Partial {position}"
+            )
+            for position in range(1, 3)
+        ]
+        session.add_all([job, release, watched, hidden_artist])
         await session.flush()
-        imported = _make_track(
-            job.id,
-            title="Complete",
-            artist=watched.name,
-            album=complete.title,
-            file_size_bytes=1024,
-            release_id=release.id,
-        )
-        imported.catalog_album_id = complete.id
-        imported.catalog_track_id = complete_track.id
-        session.add(imported)
+        for catalog_track in complete_tracks:
+            imported = _make_track(
+                job.id,
+                title=catalog_track.title,
+                artist=watched.name,
+                album=complete.title,
+                file_size_bytes=1024,
+                release_id=release.id,
+            )
+            imported.catalog_album_id = complete.id
+            imported.catalog_track_id = catalog_track.id
+            session.add(imported)
+        for album, catalog_track in (
+            (partial, partial_tracks[0]),
+            (second_partial, second_partial_tracks[0]),
+        ):
+            imported = _make_track(
+                job.id,
+                title=catalog_track.title,
+                artist=watched.name,
+                album=album.title,
+                file_size_bytes=1024,
+                release_id=release.id,
+            )
+            imported.catalog_album_id = album.id
+            imported.catalog_track_id = catalog_track.id
+            session.add(imported)
         await session.commit()
+        return {
+            "complete": complete.id,
+            "partial": partial.id,
+            "second_partial": second_partial.id,
+            "partial_missing": partial_tracks[1].id,
+            "second_partial_missing": second_partial_tracks[1].id,
+        }
 
 
-async def test_wanted_lists_incomplete_release_of_watchlisted_artist(
+async def test_wanted_page_shows_partial_release_and_hides_fully_owned_release(
     client: AsyncClient,
 ) -> None:
     await _seed_wanted_view_releases()
@@ -265,21 +308,85 @@ async def test_wanted_lists_incomplete_release_of_watchlisted_artist(
     response = await client.get("/wanted")
 
     assert response.status_code == 200
-    assert "Incomplete Wanted Album" in response.text
-    assert "Wanted View Artist" in response.text
-
-
-async def test_wanted_excludes_complete_and_nonwatchlisted_releases(
-    client: AsyncClient,
-) -> None:
-    await _seed_wanted_view_releases()
-
-    response = await client.get("/wanted")
-
-    assert response.status_code == 200
+    assert "Partial Wanted Album" in response.text
+    assert "Second Partial Wanted Album" in response.text
     assert "Complete Wanted Album" not in response.text
     assert "Nonwatchlisted Missing Album" not in response.text
     assert "Explicitly Unwatched Album" not in response.text
+
+
+async def test_wanted_queue_two_ids_queues_only_missing_tracks(
+    client: AsyncClient, monkeypatch
+) -> None:
+    ids = await _seed_wanted_view_releases()
+    dispatched: list[int] = []
+
+    async def fake_dispatch(job_id: int) -> None:
+        dispatched.append(job_id)
+
+    monkeypatch.setattr("app.routers.catalog.job_dispatcher.dispatch", fake_dispatch)
+
+    response = await client.post(
+        "/wanted/queue",
+        data={"catalog_album_ids": [ids["partial"], ids["second_partial"]]},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/downloads"
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        jobs = list(
+            (
+                await session.execute(
+                    select(Job).where(Job.id.in_(dispatched)).order_by(Job.catalog_album_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(jobs) == 2
+    assert {job.catalog_album_id for job in jobs} == {ids["partial"], ids["second_partial"]}
+    assert {job.catalog_track_id for job in jobs} == {
+        ids["partial_missing"],
+        ids["second_partial_missing"],
+    }
+    assert all(job.catalog_track_id is not None for job in jobs)
+    assert all(job.query != "Wanted View Artist Partial Wanted Album" for job in jobs)
+    assert all(job.query != "Wanted View Artist Second Partial Wanted Album" for job in jobs)
+
+
+async def test_wanted_queue_all_enqueues_every_listed_release(
+    client: AsyncClient, monkeypatch
+) -> None:
+    ids = await _seed_wanted_view_releases()
+    page = await client.get("/wanted")
+    assert page.status_code == 200
+    assert f'value="{ids["partial"]}"' in page.text
+    assert f'value="{ids["second_partial"]}"' in page.text
+    assert f'value="{ids["complete"]}"' not in page.text
+    dispatched: list[int] = []
+
+    async def fake_dispatch(job_id: int) -> None:
+        dispatched.append(job_id)
+
+    monkeypatch.setattr("app.routers.catalog.job_dispatcher.dispatch", fake_dispatch)
+
+    response = await client.post(
+        "/wanted/queue",
+        data={"catalog_album_ids": [ids["partial"], ids["second_partial"]]},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        jobs = list((await session.execute(select(Job).where(Job.id.in_(dispatched)))).scalars())
+    assert {job.catalog_album_id for job in jobs} == {ids["partial"], ids["second_partial"]}
+    assert {job.catalog_track_id for job in jobs} == {
+        ids["partial_missing"],
+        ids["second_partial_missing"],
+    }
 
 
 async def test_settings_icon_is_a_conventional_gear(client: AsyncClient) -> None:
@@ -1030,7 +1137,7 @@ async def test_album_download_fetch_returns_json_and_creates_job(
     )
 
     assert response.status_code == 200
-    assert response.json() == {"queued": 1, "album_id": album_id}
+    assert response.json() == {"queued": 2, "album_id": album_id}
     async with factory() as session:
         jobs = list(
             (
@@ -1042,9 +1149,9 @@ async def test_album_download_fetch_returns_json_and_creates_job(
                 )
             ).all()
         )
-    assert len(jobs) == 1
-    assert jobs[0].catalog_track_id is None
-    assert dispatched == [jobs[0].id]
+    assert [job.query for job in jobs] == ["Fetch Artist One", "Fetch Artist Two"]
+    assert all(job.catalog_track_id is not None for job in jobs)
+    assert dispatched == [job.id for job in jobs]
 
 
 async def test_album_download_without_fetch_header_still_redirects(
@@ -1070,6 +1177,120 @@ async def test_album_download_without_fetch_header_still_redirects(
 
     assert response.status_code == 303
     assert response.headers["location"] == "/downloads"
+
+
+async def test_artist_download_monitored_queues_only_missing_partial_album_tracks(
+    client: AsyncClient, test_settings, monkeypatch
+) -> None:
+    import app.routers.catalog as catalog_router
+
+    dispatched: list[int] = []
+
+    async def fake_dispatch(job_id: int):
+        dispatched.append(job_id)
+
+    monkeypatch.setattr(catalog_router.job_dispatcher, "dispatch", fake_dispatch)
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        artist = CatalogArtist(
+            name="Bulk Partial Artist",
+            monitored=True,
+            watchlist_provider="deezer",
+            last_enriched_at=datetime.now(tz=UTC),
+        )
+        complete = CatalogAlbum(title="Complete Monitored Album", track_count=12, in_library=True)
+        partial = CatalogAlbum(title="Partial Monitored Album", track_count=12, in_library=False)
+        complete.tracks.extend(
+            CatalogAlbumTrack(position=index, disc=1, title=f"Complete Track {index:02d}")
+            for index in range(1, 13)
+        )
+        partial.tracks.extend(
+            CatalogAlbumTrack(position=index, disc=1, title=f"Partial Track {index:02d}")
+            for index in range(1, 13)
+        )
+        identity = CatalogArtistIdentity(
+            provider="deezer", provider_artist_id="bulk-partial", name=artist.name
+        )
+        identity.releases.extend(
+            [
+                CatalogAlbumProvider(
+                    provider_album_id="complete-monitored",
+                    title=complete.title,
+                    release_kind="album",
+                    monitored=True,
+                    catalog_album=complete,
+                ),
+                CatalogAlbumProvider(
+                    provider_album_id="partial-monitored",
+                    title=partial.title,
+                    release_kind="album",
+                    monitored=True,
+                    catalog_album=partial,
+                ),
+            ]
+        )
+        artist.albums.extend([complete, partial])
+        artist.identities.append(identity)
+        done_job = Job(source="slskd", query="old", status=JobStatus.done)
+        release = Release(
+            job=done_job, source="slskd", title=partial.title, album_artist=artist.name
+        )
+        session.add_all([artist, done_job, release])
+        await session.flush()
+
+        release_folder = test_settings.library_root / artist.name / partial.title
+        release_folder.mkdir(parents=True)
+        for index, catalog_track in enumerate(partial.tracks[:10], start=1):
+            existing_path = release_folder / f"{index:02d} - {catalog_track.title}.flac"
+            existing_path.write_bytes(b"audio")
+            track = Track(
+                job=done_job,
+                release=release,
+                source="slskd",
+                title=catalog_track.title,
+                catalog_album_id=partial.id,
+                catalog_track_id=catalog_track.id,
+                acquisition_state=AcquisitionState.downloaded,
+                import_state=ImportWorkflowState.imported,
+            )
+            track.import_plans.append(
+                ImportPlan(
+                    release=release,
+                    source_path=str(existing_path),
+                    destination_path=str(existing_path),
+                    status=ImportWorkflowState.imported,
+                )
+            )
+            session.add(track)
+        await session.commit()
+        artist_id = artist.id
+        partial_id = partial.id
+        partial_track_ids = [track.id for track in partial.tracks]
+
+    response = await client.post(
+        f"/artists/catalog/{artist_id}/download-monitored",
+        headers={"X-Requested-With": "fetch"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"queued": 2, "artist_id": artist_id}
+    async with factory() as session:
+        jobs = list(
+            (
+                await session.scalars(
+                    select(Job).where(Job.status == JobStatus.pending).order_by(Job.id)
+                )
+            ).all()
+        )
+    assert [job.query for job in jobs] == [
+        "Bulk Partial Artist Partial Track 11",
+        "Bulk Partial Artist Partial Track 12",
+    ]
+    assert [job.catalog_album_id for job in jobs] == [partial_id, partial_id]
+    assert [job.catalog_track_id for job in jobs] == partial_track_ids[10:]
+    assert all(job.query != "Bulk Partial Artist Partial Monitored Album" for job in jobs)
+    assert len(dispatched) == 2
 
 
 async def test_artist_download_monitored_fetch_returns_json_and_stays_put(
