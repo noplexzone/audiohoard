@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sqlite3
 from collections.abc import AsyncGenerator, Sequence
 from datetime import UTC, datetime, timedelta
 
@@ -452,6 +453,93 @@ async def test_priority_job_falls_back_when_first_source_unhealthy(
     assert job.source == "youtube"
     assert results[0].source == "youtube"
     assert '"status": "unhealthy"' in (job.result_json or "")
+
+
+async def test_provider_fallback_releases_sqlite_writer_before_next_network_call(
+    tmp_path,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.settings_service import save_runtime_settings
+
+    database_path = tmp_path / "provider-fallback.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as session:
+            await save_runtime_settings(
+                session,
+                [
+                    {"name": "slskd", "enabled": True},
+                    {"name": "youtube", "enabled": True},
+                ],
+                10,
+                metadata_providers=[{"name": "musicbrainz", "enabled": True}],
+                primary_metadata_provider="musicbrainz",
+            )
+            job = Job(source="priority", query="artist album", status=JobStatus.running)
+            session.add(job)
+            await session.commit()
+
+            class FakeAdapter:
+                def __init__(self, source: str) -> None:
+                    self.source = source
+
+                async def health(self) -> CapabilityState:
+                    if self.source == "youtube":
+                        with sqlite3.connect(database_path, timeout=0.1) as concurrent:
+                            concurrent.execute("BEGIN IMMEDIATE")
+                            concurrent.rollback()
+                    return CapabilityState(available=True)
+
+                async def search(self, request: object) -> Sequence[SearchResult]:
+                    if self.source == "slskd":
+                        return []
+                    return [
+                        SearchResult(source="youtube", title="Served", url="https://youtu.be/1")
+                    ]
+
+            monkeypatch.setattr(runner, "_source_adapter", lambda source, cfg: FakeAdapter(source))
+
+            results = await runner._fetch_results(
+                job,
+                test_settings,
+                session,
+                checkpoint=session.commit,
+            )
+
+            assert results[0].source == "youtube"
+    finally:
+        await engine.dispose()
+
+
+async def test_fetch_hook_internal_typeerror_is_not_retried(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    async def failing_hook(
+        job: Job,
+        cfg: Settings,
+        db: AsyncSession,
+        *,
+        checkpoint=None,
+    ) -> list[SearchResult]:
+        nonlocal calls
+        calls += 1
+        raise TypeError("argument of type 'NoneType' is not iterable")
+
+    monkeypatch.setattr(runner, "_fetch_results", failing_hook)
+    job = Job(source="priority", query="artist album", status=JobStatus.running)
+
+    with pytest.raises(TypeError, match="NoneType"):
+        await runner._call_fetch_results(
+            job, test_settings, db_session, checkpoint=db_session.commit
+        )
+
+    assert calls == 1
 
 
 async def test_priority_job_records_clear_failure_when_all_sources_exhausted(

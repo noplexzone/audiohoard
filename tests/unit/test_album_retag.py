@@ -596,6 +596,11 @@ def test_tag_writer_clears_nav_grouping_txxx_fields_that_split_mp3_albums(
     original = ID3()
     original.add(TXXX(encoding=3, desc="BARCODE", text="602445694884"))
     original.add(TXXX(encoding=3, desc="ALBUMVERSION", text="explicit, bonus"))
+    original.add(TXXX(encoding=3, desc="MusicBrainz Album Comment", text="explicit, bonus"))
+    original.add(TXXX(encoding=3, desc="DISC", text="1"))
+    original.add(TXXX(encoding=3, desc="DISCC", text="1"))
+    original.add(TXXX(encoding=3, desc="TRACK", text="16"))
+    original.add(TXXX(encoding=3, desc="TRACKC", text="37"))
     original.add(TXXX(encoding=3, desc="MEDIA", text="Digital Media"))
     original.add(TXXX(encoding=3, desc="MusicBrainz Album Status", text="official"))
     original.add(TXXX(encoding=3, desc="MusicBrainz Album Type", text="album"))
@@ -624,6 +629,11 @@ def test_tag_writer_clears_nav_grouping_txxx_fields_that_split_mp3_albums(
         {
             "barcode",
             "albumversion",
+            "musicbrainz album comment",
+            "disc",
+            "discc",
+            "track",
+            "trackc",
             "media",
             "musicbrainz album status",
             "musicbrainz album type",
@@ -646,6 +656,11 @@ def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: 
     original["originalyear"] = "2021"
     original["recordlabel"] = "Grade A Productions/Interscope Records"
     original["albumversion"] = "explicit, bonus"
+    original["musicbrainz_albumcomment"] = "explicit, bonus"
+    original["disc"] = "1"
+    original["discc"] = "1"
+    original["track"] = "16"
+    original["trackc"] = "37"
     original["musicbrainz_albumstatus"] = "official"
     original["musicbrainz_albumtype"] = "album"
     original["musicbrainz_artistid"] = "stale-artist"
@@ -682,6 +697,11 @@ def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: 
         "originalyear",
         "recordlabel",
         "albumversion",
+        "musicbrainz_albumcomment",
+        "disc",
+        "discc",
+        "track",
+        "trackc",
         "musicbrainz_albumstatus",
         "musicbrainz_albumtype",
         "musicbrainz_artistid",
