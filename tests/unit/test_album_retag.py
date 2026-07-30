@@ -9,6 +9,7 @@ import httpx
 import pytest
 from mutagen.flac import FLAC
 from mutagen.id3 import APIC, ID3, TXXX
+from mutagen.oggvorbis import OggVorbis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.services.library_import as library_import_module
@@ -717,6 +718,48 @@ def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: 
     }:
         assert key not in tags
     assert tags["releasedate"] == ["2022"]
+
+
+def test_tag_writer_clears_nav_grouping_fields_from_ogg_vorbis(tmp_path: Path) -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "audio" / "minimal.ogg"
+    path = tmp_path / "track.ogg"
+    path.write_bytes(fixture.read_bytes())
+    original = OggVorbis(path)
+    original["albumversion"] = "explicit, bonus"
+    original["musicbrainz_albumcomment"] = "explicit, bonus"
+    original["disc"] = "1"
+    original["discc"] = "1"
+    original["track"] = "16"
+    original["trackc"] = "37"
+    original.save()
+
+    assert MutagenTagWriter().write_and_verify(
+        path,
+        {
+            "title": "Revelation",
+            "artist": "Morgan Wallen",
+            "album": "I’m The Problem",
+            "album_artist": "Morgan Wallen",
+            "date": "2025",
+            "tracknumber": "3",
+            "discnumber": "2",
+            "tracktotal": "12",
+            "disctotal": "3",
+        },
+    )
+
+    tags = {key.casefold(): values for key, values in OggVorbis(path).tags.items()}
+    for key in {
+        "albumversion",
+        "musicbrainz_albumcomment",
+        "disc",
+        "discc",
+        "track",
+        "trackc",
+    }:
+        assert key not in tags
+    assert tags["discnumber"] == ["2"]
+    assert tags["tracknumber"] == ["3"]
 
 
 async def test_retag_catalog_album_repairs_mixed_imported_and_legacy_files(
