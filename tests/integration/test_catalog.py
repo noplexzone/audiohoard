@@ -358,6 +358,48 @@ async def test_wanted_queue_two_ids_queues_only_missing_tracks(
     assert all(job.query != "Wanted View Artist Second Partial Wanted Album" for job in jobs)
 
 
+async def test_wanted_queue_retry_does_not_expire_later_album_rows(
+    client: AsyncClient, monkeypatch
+) -> None:
+    ids = await _seed_wanted_view_releases()
+    dispatched: list[int] = []
+
+    async def fake_dispatch(job_id: int) -> None:
+        dispatched.append(job_id)
+
+    original_flush = AsyncSession.flush
+    injected_lock = False
+
+    async def lock_first_job_flush(self, *args, **kwargs):
+        nonlocal injected_lock
+        if not injected_lock and any(isinstance(obj, Job) for obj in self.new):
+            injected_lock = True
+            raise OperationalError("INSERT INTO jobs", {}, Exception("database is locked"))
+        return await original_flush(self, *args, **kwargs)
+
+    monkeypatch.setattr("app.routers.catalog.job_dispatcher.dispatch", fake_dispatch)
+    monkeypatch.setattr(AsyncSession, "flush", lock_first_job_flush)
+
+    response = await client.post(
+        "/wanted/queue",
+        data={"catalog_album_ids": [ids["partial"], ids["second_partial"]]},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert injected_lock is True
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        jobs = list(
+            (
+                await session.scalars(
+                    select(Job).where(Job.id.in_(dispatched)).order_by(Job.catalog_album_id)
+                )
+            ).all()
+        )
+    assert {job.catalog_album_id for job in jobs} == {ids["partial"], ids["second_partial"]}
+
+
 async def test_wanted_queue_all_enqueues_every_listed_release(
     client: AsyncClient, monkeypatch
 ) -> None:

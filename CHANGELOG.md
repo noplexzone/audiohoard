@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.9] - 2026-07-30
+
+### Fixed
+- Release quality-monitoring in-process claims if the initial database checkpoint fails, allowing later checks to retry normally.
+- Re-fetch each album during wanted and monitored-artist bulk queue operations so a transient SQLite retry rollback cannot expire retained ORM rows and skip or crash later albums.
+
 ## [0.8.8] - 2026-07-30
 
 ### Fixed

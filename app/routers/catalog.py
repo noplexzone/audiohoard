@@ -955,22 +955,16 @@ async def queue_wanted_releases(
     if not selected_ids:
         return _wanted_queue_response(request, queued=0, album_ids=[])
     runtime = await get_runtime_settings(db)
-    albums = list(
-        (
-            await db.execute(
-                select(CatalogAlbum)
-                .where(CatalogAlbum.id.in_(selected_ids))
-                .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
-            )
-        )
-        .scalars()
-        .all()
-    )
-    albums_by_id = {album.id: album for album in albums}
     job_ids: list[int] = []
     queued_album_ids: list[int] = []
     for album_id in selected_ids:
-        album = albums_by_id.get(album_id)
+        album = (
+            await db.execute(
+                select(CatalogAlbum)
+                .where(CatalogAlbum.id == album_id)
+                .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
+            )
+        ).scalar_one_or_none()
         if album is None:
             continue
         try:
@@ -1181,18 +1175,24 @@ async def download_monitored_catalog_albums(
         (item for item in artist.identities if item.provider == artist.watchlist_provider),
         None,
     )
-    canonical: dict[int, CatalogAlbum] = {}
+    canonical: dict[int, str] = {}
     if identity is not None:
         for release in identity.releases:
             album = release.catalog_album
             if release.monitored and album is not None and not album.in_library:
-                canonical[album.id] = album
+                canonical[album.id] = album.title
+    artist_name = artist.name
     runtime = await get_runtime_settings(db)
     job_ids: list[int] = []
-    for album in canonical.values():
-        album_id = album.id
-        album_title = album.title
-        album_query = f"{artist.name} {album_title}".strip()
+    for album_id, album_title in canonical.items():
+        album_query = f"{artist_name} {album_title}".strip()
+        album = (
+            await db.execute(
+                select(CatalogAlbum)
+                .where(CatalogAlbum.id == album_id)
+                .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
+            )
+        ).scalar_one()
         # Hydrate catalog tracks before dispatching so the runner has a complete
         # manifest. A failed hydration is retained as an actionable failed job
         # instead of silently disappearing from the bulk request.

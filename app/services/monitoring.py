@@ -191,10 +191,14 @@ async def run_monitoring_check(
     if record.id is None or record.id in _active_checks:
         raise MonitoringCheckAlreadyRunning("monitoring check is already running")
     _active_checks.add(record.id)
-    record.status = MonitoringStatus.checking
-    await db.flush()
-    if checkpoint is not None:
-        await checkpoint()
+    try:
+        record.status = MonitoringStatus.checking
+        await db.flush()
+        if checkpoint is not None:
+            await checkpoint()
+    except BaseException:
+        _active_checks.discard(record.id)
+        raise
     outcome = "no_upgrade"
     selected: ReleaseCandidate | None = None
     try:
