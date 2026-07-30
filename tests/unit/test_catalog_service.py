@@ -6,7 +6,9 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.catalog_entities import (
+    CatalogAlbum,
     CatalogAlbumProvider,
+    CatalogAlbumTrack,
     CatalogArtist,
     CatalogArtistIdentity,
 )
@@ -26,6 +28,7 @@ from app.services.catalog import (
     get_artists_page,
     get_library_artists_page,
     get_library_stats,
+    get_release_progress,
     list_distinct_formats,
     list_library_tracks,
     track_meets_quality,
@@ -779,3 +782,82 @@ def test_filesystem_release_evidence_rewalks_changed_nested_directory(tmp_path) 
 
     assert first[1].file_count == 1
     assert second[1].file_count == 2
+
+
+async def test_release_progress_ignores_filesystem_fallback_for_rated_siblings(
+    db_session: AsyncSession, job: Job, tmp_path: Path
+) -> None:
+    artist = CatalogArtist(name="Juice WRLD")
+    clean = CatalogAlbum(
+        artist=artist,
+        title="We Don’t Get Along",
+        year="2026",
+        release_type="single",
+        track_count=1,
+        content_rating="clean",
+    )
+    explicit = CatalogAlbum(
+        artist=artist,
+        title="We Don’t Get Along",
+        year="2026",
+        release_type="single",
+        track_count=1,
+        content_rating="explicit",
+    )
+    db_session.add_all([artist, clean, explicit])
+    await db_session.flush()
+
+    folder = tmp_path / "Juice WRLD" / "We Don’t Get Along (2026)"
+    folder.mkdir(parents=True)
+    (folder / "01 - We Don’t Get Along.flac").write_bytes(b"audio")
+
+    progress = await get_release_progress(
+        db_session, [clean.id, explicit.id], library_root=tmp_path
+    )
+
+    assert progress[clean.id].downloaded_track_count == 0
+    assert progress[explicit.id].downloaded_track_count == 0
+
+
+async def test_release_progress_uses_explicit_import_binding_not_clean_sibling(
+    db_session: AsyncSession, job: Job, tmp_path: Path
+) -> None:
+    artist = CatalogArtist(name="Juice WRLD")
+    clean = CatalogAlbum(
+        artist=artist,
+        title="AGATS2 (Insecure)",
+        year="2024",
+        release_type="single",
+        track_count=1,
+        content_rating="clean",
+    )
+    explicit = CatalogAlbum(
+        artist=artist,
+        title="AGATS2 (Insecure)",
+        year="2024",
+        release_type="single",
+        track_count=1,
+        content_rating="explicit",
+    )
+    clean_track = CatalogAlbumTrack(album=clean, position=1, title="AGATS2 (Insecure)")
+    explicit_track = CatalogAlbumTrack(album=explicit, position=1, title="AGATS2 (Insecure)")
+    db_session.add_all([artist, clean, explicit, clean_track, explicit_track])
+    await db_session.flush()
+    track = _make_track(
+        job.id,
+        title="AGATS2 (Insecure)",
+        album="AGATS2 (Insecure)",
+        source_path="/music/Juice WRLD/AGATS2 (Insecure) (2024)/01 - AGATS2 (Insecure).flac",
+        release_id=1,
+    )
+    track.catalog_album_id = explicit.id
+    track.catalog_track_id = explicit_track.id
+    db_session.add(track)
+    await db_session.flush()
+
+    progress = await get_release_progress(
+        db_session, [clean.id, explicit.id], library_root=tmp_path
+    )
+
+    assert progress[clean.id].downloaded_track_count == 0
+    assert progress[explicit.id].downloaded_track_count == 1

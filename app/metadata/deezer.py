@@ -96,13 +96,15 @@ class DeezerClient:
         self._cache.set(cache_key, albums, 24 * 60 * 60)
         return albums
 
-    async def _get_album_track_count(self, http: httpx.AsyncClient, album_id: str) -> int | None:
-        # Count enrichment is optional page metadata. Do not amplify 429s or
-        # hold rendering through the general three-attempt retry policy.
-        resp = await http.get(f"/album/{album_id}/tracks", params={"limit": 1})
+    async def _get_album_identity_summary(
+        self, http: httpx.AsyncClient, album_id: str
+    ) -> dict[str, object] | None:
+        # Release identity enrichment is optional page metadata. Do not amplify 429s
+        # or hold rendering through the general three-attempt retry policy.
+        resp = await http.get(f"/album/{album_id}")
         resp.raise_for_status()
         payload = resp.json()
-        return _to_int(payload.get("total")) if isinstance(payload, dict) else None
+        return payload if isinstance(payload, dict) else None
 
     async def get_album(self, id: str) -> AlbumDetail:
         cache_key = f"album:{id}"
@@ -226,32 +228,52 @@ def _same_deezer_origin(base_url: str, candidate: str) -> bool:
 async def _backfill_discography_track_counts(
     client: DeezerClient, album_rows: list[dict[str, object]]
 ) -> None:
-    """Fill counts omitted by Deezer's artist-albums endpoint with bounded I/O."""
+    """Fill release identity fields omitted by Deezer's artist-albums endpoint.
+
+    The artist-albums endpoint can omit track counts, UPCs, and explicitness fields.
+    Fetch the bounded album summary so clean and explicit singles do not remain
+    indistinguishable legacy ``unknown`` releases after enrichment.
+    """
     semaphore = asyncio.Semaphore(8)
 
     async with client._count_client() as http:
 
         async def fill(row: dict[str, object]) -> None:
-            if _to_int(row.get("nb_tracks")) is not None:
+            if (
+                _to_int(row.get("nb_tracks")) is not None
+                and row.get("upc")
+                and deezer_content_rating(row) != "unknown"
+            ):
                 return
             album_id = str(row.get("id") or "")
             if not album_id:
                 return
             try:
                 async with semaphore:
-                    count = await client._get_album_track_count(http, album_id)
+                    summary = await client._get_album_identity_summary(http, album_id)
             except httpx.HTTPError:
-                logger.warning("Could not load Deezer track count for album %s", album_id)
+                logger.warning("Could not load Deezer release identity for album %s", album_id)
                 return
-            if count is not None:
-                row["nb_tracks"] = count
+            if summary is None:
+                return
+            for key in (
+                "nb_tracks",
+                "explicit_lyrics",
+                "explicit_content_lyrics",
+                "explicit_content_cover",
+                "upc",
+                "release_date",
+                "record_type",
+            ):
+                if row.get(key) in (None, "") and summary.get(key) not in (None, ""):
+                    row[key] = summary[key]
 
         try:
             async with asyncio.timeout(_DISCOGRAPHY_COUNT_BUDGET_SECONDS):
                 await asyncio.gather(*(fill(row) for row in album_rows))
         except TimeoutError:
             logger.warning(
-                "Deezer discography track-count backfill exceeded %.1f seconds",
+                "Deezer discography release identity backfill exceeded %.1f seconds",
                 _DISCOGRAPHY_COUNT_BUDGET_SECONDS,
             )
 
