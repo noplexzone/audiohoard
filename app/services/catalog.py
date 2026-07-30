@@ -142,6 +142,7 @@ class TrackRow:
     deezer_id: str | None
     acoustid: str | None
     release_id: int | None
+    artwork_url: str | None = None
 
 
 @dataclass
@@ -298,6 +299,7 @@ def to_track_row(t: Track) -> TrackRow:
         deezer_id=t.deezer_id,
         acoustid=t.acoustid,
         release_id=t.release_id,
+        artwork_url=t.catalog_album.artwork_url if t.catalog_album else None,
     )
 
 
@@ -757,7 +759,9 @@ async def list_library_tracks(
 
     page = _clamp_page(page, total, per_page)
 
-    data_stmt = select(Track).options(selectinload(Track.import_plans))
+    data_stmt = select(Track).options(
+        selectinload(Track.import_plans), selectinload(Track.catalog_album)
+    )
     if filters:
         data_stmt = data_stmt.where(and_(*filters))
 

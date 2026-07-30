@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-29
+
+### Added
+- Added a dashboard library-quality card that groups imported tracks by quality tier and reports tracks below the runtime quality profile.
+- Added an on-demand background quality-upgrade scan trigger and dashboard workflow buttons for quality-upgrade and duplicate-cleanup scans.
+
+### Changed
+- Rebuilt the dashboard with a compact recent-jobs summary and expanded recent library activity with album artwork thumbnails.
+
 ## [0.9.1] - 2026-07-29
 
 ### Fixed
