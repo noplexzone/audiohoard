@@ -374,10 +374,6 @@ async def dismiss_release_review(
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
-    release = await db.get(Release, release_id)
-    if release is None:
-        raise HTTPException(status_code=404, detail="Release not found")
-
     async def dismiss_release() -> None:
         current = await db.get(Release, release_id)
         if current is None:
@@ -385,7 +381,7 @@ async def dismiss_release_review(
         current.review_dismissed_at = datetime.now(UTC).replace(tzinfo=None)
         await db.commit()
 
-    await run_with_sqlite_lock_retry(db, dismiss_release)
+    await run_with_sqlite_lock_retry(db, dismiss_release, attempts=6, delay_seconds=0.2)
     return RedirectResponse("/downloads?notice=review_dismissed", status_code=303)
 
 

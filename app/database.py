@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
 
@@ -38,7 +39,13 @@ async def run_with_sqlite_lock_retry(
     last_locked: OperationalError | None = None
     for attempt in range(max(1, attempts)):
         try:
-            await operation()
+            connection = await session.connection()
+            await connection.exec_driver_sql("PRAGMA busy_timeout=1000")
+            try:
+                await operation()
+            finally:
+                with contextlib.suppress(Exception):
+                    await connection.exec_driver_sql("PRAGMA busy_timeout=30000")
             return
         except OperationalError as exc:
             if not is_sqlite_database_locked(exc):
