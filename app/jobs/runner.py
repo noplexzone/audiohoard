@@ -17,7 +17,7 @@ from sqlalchemy.orm import selectinload
 from app.config import Settings, get_settings
 from app.database import get_session_factory
 from app.fingerprint.acoustid import fingerprint_file
-from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS
+from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS, is_importable_audio
 from app.metadata.deezer import DeezerClient
 from app.metadata.filename_parse import (
     normalize_for_catalog_match,
@@ -184,6 +184,12 @@ async def _poll_slskd_transfer(
             acq_state = map_slskd_transfer_state(state)
             if acq_state == AcquisitionState.downloaded:
                 staged = await _locate_slskd_artifact(filename, state.extra, staging_root)
+                if not is_importable_audio(staged):
+                    raise ProviderError(
+                        "artifact_invalid",
+                        "slskd transfer completed with a non-audio artifact",
+                        "acquire",
+                    )
                 return staged, transfer_id
             if acq_state == AcquisitionState.failed:
                 raise ProviderError(
@@ -1266,6 +1272,10 @@ async def _prepare_acquisition(
     if source == "slskd":
         username = str(result.metadata.get("username") or "")
         filename = str(result.metadata.get("filename") or "")
+        if not is_importable_audio(filename):
+            raise ProviderError(
+                "invalid_result", "slskd result is not an importable audio file", "acquire"
+            )
         adapter = SlskdAdapter(cfg.slskd_url, cfg.slskd_api_key)
         transfer_id: str | None = None
         if track is not None and track.source_job_id:

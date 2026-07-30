@@ -76,6 +76,37 @@ class TestSlskdSearch:
         assert results[0].format == "flac"
         assert results[0].size_bytes == 30000000
 
+    async def test_search_ignores_lrc_lyrics_files(self, httpx_mock: HTTPXMock) -> None:
+        search_id = "lyrics123"
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/searches",
+            method="POST",
+            json={"id": search_id},
+        )
+        httpx_mock.add_response(
+            url=f"http://slskd.local/api/v0/searches/{search_id}",
+            json={"state": "Completed", "id": search_id},
+        )
+        httpx_mock.add_response(
+            url=f"http://slskd.local/api/v0/searches/{search_id}/responses",
+            json=[
+                {
+                    "username": "peer1",
+                    "files": [
+                        {"filename": "music/Artist/Album/01 Song.lrc", "size": 3000},
+                        {"filename": "music/Artist/Album/01 Song.flac", "size": 30000000},
+                    ],
+                }
+            ],
+        )
+
+        results = await SlskdAdapter("http://slskd.local", "key123").search(
+            SearchRequest(query="Artist Album Song")
+        )
+
+        assert [result.format for result in results] == ["flac"]
+        assert results[0].metadata["filename"].endswith(".flac")
+
 
 class TestSlskdTransfers:
     async def test_enqueue_posts_queue_download_request_array(self, httpx_mock: HTTPXMock) -> None:

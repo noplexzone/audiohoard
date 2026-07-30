@@ -1216,6 +1216,38 @@ async def test_background_enqueue_checkpoint_is_visible_before_poll(
         await run_task
 
 
+async def test_slskd_acquisition_rejects_lrc_result_before_enqueue(
+    test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    enqueued: list[str] = []
+
+    class FakeSlskd:
+        def __init__(self, url: str, key: str) -> None:
+            pass
+
+        async def enqueue(self, username: str, filename: str, size: int | None = None) -> str:
+            enqueued.append(filename)
+            return "should-not-enqueue"
+
+    monkeypatch.setattr(runner, "SlskdAdapter", FakeSlskd)
+
+    with pytest.raises(ProviderError) as exc_info:
+        await runner._prepare_acquisition(
+            SearchResult(
+                source="slskd",
+                title="Song",
+                artist="Artist",
+                format="lrc",
+                metadata={"username": "peer", "filename": "Artist - Song.lrc"},
+            ),
+            "slskd",
+            test_settings,
+        )
+
+    assert exc_info.value.code == "invalid_result"
+    assert enqueued == []
+
+
 async def test_first_complete_album_run_is_done_not_partial(
     db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:

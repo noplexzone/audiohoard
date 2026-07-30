@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Ignore `.lrc` lyrics files from slskd search/acquisition so lyric sidecars cannot enter import review as zero-duration tracks.
 - Keep clean and explicit provider releases as separate catalog entries so one imported file does not credit both versions.
 - Keep artist-page monitored-download submissions on the current page for fetch requests.
 - Bind catalog-scoped one-track releases to their sole catalog track so approved single imports count as complete.
