@@ -3,7 +3,7 @@ FROM python:3.12-slim
 LABEL org.opencontainers.image.title="Audiohoard" \
       org.opencontainers.image.description="Self-hosted music acquisition, metadata enrichment, and library naming" \
       org.opencontainers.image.source="https://github.com/noplexzone/audiohoard" \
-      org.opencontainers.image.version="0.8.0"
+      org.opencontainers.image.version="0.8.1"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg \

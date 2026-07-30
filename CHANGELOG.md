@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-30
+
+### Fixed
+- Import planning and metadata repair now apply catalog multi-disc totals before rendering paths, so imported and repaired files use `{disc}-{track}` names such as `3-09` when Deezer/catalog metadata identifies multi-disc releases.
+- Metadata repair now renames repaired multi-disc album files to the canonical naming-template filename while retagging them, preventing duplicate per-disc track numbers from splitting albums in Navidrome.
+- Removed the API Docs link from the sidebar and kept it only in Settings → About.
+
 ## [0.8.0] - 2026-07-29
 
 ### Added

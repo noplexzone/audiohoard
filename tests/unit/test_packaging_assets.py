@@ -103,7 +103,7 @@ def test_favicon_ico_uses_the_requested_artwork_at_every_size() -> None:
 
 def test_dockerfile_version_and_healthcheck_match_current_runtime_contract() -> None:
     dockerfile = Path("docker/Dockerfile").read_text(encoding="utf-8")
-    assert 'org.opencontainers.image.version="0.8.0"' in dockerfile
+    assert 'org.opencontainers.image.version="0.8.1"' in dockerfile
     assert "http://localhost:8000/health/ready" in dockerfile
 
 
@@ -120,3 +120,12 @@ def test_templates_are_compatible_with_the_html_content_security_policy() -> Non
         assert not re.search(r"\b(?:style|on[a-z]+)\s*=", text, re.IGNORECASE), template
         for script in re.findall(r"<script\b[^>]*>", text, re.IGNORECASE):
             assert re.search(r"\bsrc\s*=", script, re.IGNORECASE), (template, script)
+
+
+def test_api_docs_link_is_about_only_not_sidebar() -> None:
+    templates = Path("app/templates")
+    base = (templates / "base.html").read_text()
+    settings = (templates / "settings.html").read_text()
+
+    assert "/api/docs" not in base
+    assert '<a class="btn secondary" href="/api/docs">API docs</a>' in settings
