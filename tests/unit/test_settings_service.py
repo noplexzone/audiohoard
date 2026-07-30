@@ -279,6 +279,10 @@ async def test_runtime_settings_persist_monitoring_defaults_and_primary_provider
         discography_refresh_hours=12,
         auto_download_wanted=True,
         source_search_budget_seconds=9,
+        default_watchlist_release_albums=True,
+        default_watchlist_release_singles=False,
+        default_watchlist_release_eps=True,
+        default_watchlist_monitor_upgrades=True,
     )
 
     runtime = await get_runtime_settings(db_session)
@@ -289,3 +293,7 @@ async def test_runtime_settings_persist_monitoring_defaults_and_primary_provider
     assert runtime.discography_refresh_hours == 12
     assert runtime.auto_download_wanted is True
     assert runtime.source_search_budget_seconds == 9
+    assert runtime.default_watchlist_release_albums is True
+    assert runtime.default_watchlist_release_singles is False
+    assert runtime.default_watchlist_release_eps is True
+    assert runtime.default_watchlist_monitor_upgrades is True

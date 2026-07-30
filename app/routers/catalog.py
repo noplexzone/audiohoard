@@ -42,7 +42,7 @@ from app.services.catalog import (
     list_distinct_formats,
     list_distinct_sources,
     list_library_tracks,
-    track_meets_quality,
+    queue_catalog_album_missing_track_jobs,
 )
 from app.services.catalog_metadata import (
     VALID_METADATA_PROVIDERS,
@@ -59,7 +59,7 @@ from app.services.monitoring import (
     current_release_quality,
 )
 from app.services.quality_upgrade import reconcile_album_quality_duplicates
-from app.settings_service import effective_settings_dep, get_runtime_settings
+from app.settings_service import RuntimeSettings, effective_settings_dep, get_runtime_settings
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 logger = logging.getLogger(__name__)
@@ -80,6 +80,14 @@ def _download_response(request: Request | None, *, queued: int, album_id: int) -
 def _download_many_response(request: Request | None, *, queued: int, artist_id: int) -> Response:
     if _is_fetch_request(request):
         return JSONResponse({"queued": queued, "artist_id": artist_id})
+    return RedirectResponse("/downloads", status_code=303)
+
+
+def _wanted_queue_response(
+    request: Request | None, *, queued: int, album_ids: list[int]
+) -> Response:
+    if _is_fetch_request(request):
+        return JSONResponse({"queued": queued, "catalog_album_ids": album_ids})
     return RedirectResponse("/downloads", status_code=303)
 
 
@@ -198,6 +206,99 @@ def _sanitize_error_class(exc: BaseException) -> str:
     return raw[:200]
 
 
+def _form_bool(value: object) -> bool:
+    return str(value or "").lower() in {"1", "true", "yes", "on"}
+
+
+def _artist_release_kind_default(artist: CatalogArtist, release_kind: str) -> bool:
+    watch_albums = (
+        True if artist.watchlist_release_albums is None else artist.watchlist_release_albums
+    )
+    watch_singles = (
+        False if artist.watchlist_release_singles is None else artist.watchlist_release_singles
+    )
+    watch_eps = False if artist.watchlist_release_eps is None else artist.watchlist_release_eps
+    return (
+        (release_kind == "album" and watch_albums)
+        or (release_kind == "single" and watch_singles)
+        or (release_kind == "ep" and watch_eps)
+    )
+
+
+def _apply_runtime_watchlist_defaults(artist: CatalogArtist, runtime: RuntimeSettings) -> None:
+    artist.watchlist_release_albums = bool(runtime.default_watchlist_release_albums)
+    artist.watchlist_release_singles = bool(runtime.default_watchlist_release_singles)
+    artist.watchlist_release_eps = bool(runtime.default_watchlist_release_eps)
+    artist.watchlist_monitor_upgrades = bool(runtime.default_watchlist_monitor_upgrades)
+    artist.monitor_policy = "all"
+
+
+async def _latest_imported_release_id_for_album(db: AsyncSession, album_id: int) -> int | None:
+    return (
+        await db.scalars(
+            select(Release.id)
+            .join(Track, Track.release_id == Release.id)
+            .where(
+                Track.catalog_album_id == album_id,
+                Track.import_state == ImportWorkflowState.imported,
+            )
+            .order_by(Release.id.desc())
+            .limit(1)
+        )
+    ).first()
+
+
+async def _set_release_upgrade_monitoring(
+    db: AsyncSession, release_id: int, enabled: bool
+) -> None:
+    record = (
+        await db.scalars(
+            select(MonitoringRecord).where(MonitoringRecord.release_id == release_id).limit(1)
+        )
+    ).first()
+    if not enabled:
+        if record is not None:
+            record.status = MonitoringStatus.paused
+            record.candidate_id = None
+        return
+    runtime = await get_runtime_settings(db)
+    profile = _monitoring_profile_from_runtime(runtime)
+    baseline_quality = await current_release_quality(db, release_id)
+    history = json.dumps([{"outcome": "watch_created", "baseline_quality": baseline_quality}])
+    if record is None:
+        db.add(
+            MonitoringRecord(
+                release_id=release_id,
+                status=MonitoringStatus.active,
+                desired_quality_json=profile.to_json(),
+                history_json=history,
+            )
+        )
+    else:
+        record.status = MonitoringStatus.active
+        record.desired_quality_json = profile.to_json()
+        record.history_json = history
+        record.candidate_id = None
+
+
+async def _sync_album_upgrade_monitoring(db: AsyncSession, album_id: int, enabled: bool) -> None:
+    release_id = await _latest_imported_release_id_for_album(db, album_id)
+    if release_id is not None:
+        await _set_release_upgrade_monitoring(db, release_id, enabled)
+
+
+async def _sync_artist_upgrade_monitoring(
+    db: AsyncSession, artist: CatalogArtist, releases: list[CatalogAlbumProvider]
+) -> None:
+    for release in releases:
+        if release.catalog_album_id is None:
+            continue
+        enabled = bool(
+            artist.monitored and artist.watchlist_monitor_upgrades and release.monitored
+        )
+        await _sync_album_upgrade_monitoring(db, release.catalog_album_id, enabled)
+
+
 async def _queue_artist_enrichment(db: AsyncSession, artist_id: int) -> bool:
     result = await db.execute(
         update(CatalogArtist)
@@ -274,15 +375,22 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
         if artist is None:
             return
         try:
+            artist.enrichment_state = "running"
+            await session.commit()
             await fetch_and_store_discography(
                 session,
                 cfg,
                 artist,
                 provider_name=provider_name,
             )
+            artist.enrichment_state = "idle"
             await session.commit()
         except Exception:
             await session.rollback()
+            failed = await session.get(CatalogArtist, artist_id)
+            if failed is not None:
+                failed.enrichment_state = "failed"
+                await session.commit()
             logger.error(
                 "Catalog discography refresh failed for artist %s via %s",
                 artist_id,
@@ -414,7 +522,7 @@ async def open_catalog_artist_page(
     runtime = await get_runtime_settings(db)
     if monitor:
         artist.monitored = True
-        artist.monitor_policy = "all"
+        _apply_runtime_watchlist_defaults(artist, runtime)
         available = [provider] if provider in VALID_METADATA_PROVIDERS else []
         artist.watchlist_provider = _selected_provider(
             runtime.primary_metadata_provider,
@@ -493,6 +601,9 @@ async def catalog_artist_page(
         not selected_identity.releases
         or any(_release_needs_track_count_refresh(item) for item in selected_identity.releases)
     ):
+        if artist.enrichment_state not in {"queued", "running"}:
+            artist.enrichment_state = "queued"
+            await db.commit()
         background_tasks.add_task(_refresh_discography_task, artist.id, selected_provider)
     artist = (
         await db.execute(
@@ -511,6 +622,7 @@ async def catalog_artist_page(
         None,
     )
     provider_albums = list(selected_identity.releases) if selected_identity is not None else []
+    discography_loading = artist.enrichment_state in {"queued", "running"} and not provider_albums
     canonical_progress = await get_release_progress(
         db,
         {
@@ -623,6 +735,7 @@ async def catalog_artist_page(
             "sort_url": sort_url,
             "enrichment": enrichment,
             "release_progress": release_progress,
+            "discography_loading": discography_loading,
         },
     )
 
@@ -696,10 +809,12 @@ async def monitor_catalog_artist_page(
     release_type = str(form.get("release_type", ""))
     sort = str(form.get("sort", "desc"))
 
-    quick = str(form.get("quick", "")).lower() in {"1", "true", "on", "yes"}
+    quick = _form_bool(form.get("quick", ""))
     if quick:
+        was_monitored = artist.monitored
         artist.monitored = not artist.monitored
-        artist.monitor_policy = "all"
+        if artist.monitored and not was_monitored:
+            _apply_runtime_watchlist_defaults(artist, runtime)
         if artist.monitored:
             artist.watchlist_provider = _selected_provider(
                 runtime.primary_metadata_provider,
@@ -708,7 +823,11 @@ async def monitor_catalog_artist_page(
                 artist.watchlist_provider,
             )
     else:
-        artist.monitored = str(form.get("monitored", "")).lower() in {"1", "true", "on", "yes"}
+        artist.monitored = _form_bool(form.get("monitored", ""))
+        artist.watchlist_release_albums = _form_bool(form.get("watchlist_release_albums", ""))
+        artist.watchlist_release_singles = _form_bool(form.get("watchlist_release_singles", ""))
+        artist.watchlist_release_eps = _form_bool(form.get("watchlist_release_eps", ""))
+        artist.watchlist_monitor_upgrades = _form_bool(form.get("watchlist_monitor_upgrades", ""))
         policy = str(form.get("monitor_policy", artist.monitor_policy or "all"))
         artist.monitor_policy = policy if policy in {"all", "albums_only", "none_new"} else "all"
         requested_watchlist = str(form.get("watchlist_provider", ""))
@@ -731,12 +850,25 @@ async def monitor_catalog_artist_page(
         int(str(value)) for value in form.getlist("album_monitored") if str(value).isdigit()
     }
     bulk = "all" if quick and artist.monitored else "none" if quick else str(form.get("bulk", ""))
+    if bulk == "all":
+        artist.watchlist_release_albums = True
+        artist.watchlist_release_singles = True
+        artist.watchlist_release_eps = True
+    elif bulk == "albums_only" or bulk == "singles_off":
+        artist.watchlist_release_albums = True
+        artist.watchlist_release_singles = False
+        artist.watchlist_release_eps = False
+    elif bulk == "none":
+        artist.watchlist_release_albums = False
+        artist.watchlist_release_singles = False
+        artist.watchlist_release_eps = False
+
     if selected_identity is not None:
         for release in selected_identity.releases:
             if not artist.monitored or bulk == "none":
                 release.monitored = False
             elif bulk == "all":
-                release.monitored = True
+                release.monitored = _artist_release_kind_default(artist, release.release_kind)
             elif bulk == "albums_only":
                 release.monitored = release.release_kind == "album"
             elif bulk == "singles_off":
@@ -750,11 +882,24 @@ async def monitor_catalog_artist_page(
         for release in selected_identity.releases:
             if release.monitored and release.catalog_album is not None:
                 release.catalog_album.monitored = True
+    if selected_identity is not None:
+        await _sync_artist_upgrade_monitoring(db, artist, list(selected_identity.releases))
     await db.commit()
     return RedirectResponse(
         _artist_page_url(artist.id, provider=view_provider, release_type=release_type, sort=sort),
         status_code=303,
     )
+
+
+@router.get("/artists/catalog/{artist_id}/state", include_in_schema=False)
+async def catalog_artist_state(
+    artist_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    artist = await db.get(CatalogArtist, artist_id)
+    if artist is None:
+        raise HTTPException(status_code=404, detail="Catalog artist not found")
+    return JSONResponse({"enrichment_state": artist.enrichment_state})
 
 
 @router.get("/artists/monitored", include_in_schema=False)
@@ -786,6 +931,64 @@ async def wanted_page(
             "filter_qs": urlencode(filter_params),
         },
     )
+
+
+@router.post("/wanted/queue", include_in_schema=False)
+async def queue_wanted_releases(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    _user: Annotated[object, Depends(require_mutation)],
+    catalog_album_ids: Annotated[list[int] | None, Form()] = None,
+    request: Request = None,  # type: ignore[assignment]
+) -> Response:
+    selected_ids = list(dict.fromkeys(catalog_album_ids or []))
+    if not selected_ids:
+        return _wanted_queue_response(request, queued=0, album_ids=[])
+    runtime = await get_runtime_settings(db)
+    albums = list(
+        (
+            await db.execute(
+                select(CatalogAlbum)
+                .where(CatalogAlbum.id.in_(selected_ids))
+                .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    albums_by_id = {album.id: album for album in albums}
+    job_ids: list[int] = []
+    queued_album_ids: list[int] = []
+    for album_id in selected_ids:
+        album = albums_by_id.get(album_id)
+        if album is None:
+            continue
+        try:
+            await _ensure_catalog_tracks(db, settings, album)
+            refreshed = (
+                await db.execute(
+                    select(CatalogAlbum)
+                    .where(CatalogAlbum.id == album.id)
+                    .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one()
+            ids = await queue_catalog_album_missing_track_jobs(
+                db,
+                refreshed,
+                library_root=settings.library_root,
+                quality_profile=runtime.quality_profile,
+            )
+        except Exception:
+            logger.warning("Wanted queue failed for album %d", album_id, exc_info=True)
+            await db.rollback()
+            continue
+        if ids:
+            queued_album_ids.append(album_id)
+            job_ids.extend(ids)
+    for job_id in job_ids:
+        await job_dispatcher.dispatch(job_id)
+    return _wanted_queue_response(request, queued=len(job_ids), album_ids=queued_album_ids)
 
 
 @router.get("/albums/{album_id}", response_class=HTMLResponse)
@@ -825,7 +1028,10 @@ async def catalog_album_page(
                 select(MonitoringRecord.release_id)
                 .join(Release, Release.id == MonitoringRecord.release_id)
                 .join(Track, Track.release_id == Release.id)
-                .where(Track.catalog_album_id == album.id)
+                .where(
+                    Track.catalog_album_id == album.id,
+                    MonitoringRecord.status != MonitoringStatus.paused,
+                )
                 .distinct()
             )
         ).all()
@@ -876,46 +1082,17 @@ async def catalog_album_page(
 @router.post("/albums/{album_id}/watch-upgrade", include_in_schema=False)
 async def watch_album_quality_upgrade(
     album_id: int,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
-    release = (
-        await db.scalars(
-            select(Release)
-            .join(Track, Track.release_id == Release.id)
-            .where(
-                Track.catalog_album_id == album_id,
-                Track.import_state == ImportWorkflowState.imported,
-            )
-            .order_by(Release.id.desc())
-            .limit(1)
-        )
-    ).first()
-    if release is None:
-        raise HTTPException(status_code=404, detail="No imported release found for album")
-    runtime = await get_runtime_settings(db)
-    profile = _monitoring_profile_from_runtime(runtime)
-    baseline_quality = await current_release_quality(db, release.id)
-    history = json.dumps([{"outcome": "watch_created", "baseline_quality": baseline_quality}])
-    record = (
-        await db.scalars(
-            select(MonitoringRecord).where(MonitoringRecord.release_id == release.id).limit(1)
-        )
-    ).first()
-    if record is None:
-        db.add(
-            MonitoringRecord(
-                release_id=release.id,
-                status=MonitoringStatus.active,
-                desired_quality_json=profile.to_json(),
-                history_json=history,
-            )
-        )
-    else:
-        record.status = MonitoringStatus.active
-        record.desired_quality_json = profile.to_json()
-        record.history_json = history
-        record.candidate_id = None
+    form = await request.form()
+    values = [str(value).lower() for value in form.getlist("monitor_for_upgrades")]
+    enabled = True if not values else any(value in {"1", "true", "yes", "on"} for value in values)
+    album = await db.get(CatalogAlbum, album_id)
+    if album is None:
+        raise HTTPException(status_code=404, detail="Catalog album not found")
+    await _sync_album_upgrade_monitoring(db, album_id, enabled)
     await db.commit()
     return RedirectResponse(f"/albums/{album_id}", status_code=303)
 
@@ -1000,6 +1177,7 @@ async def download_monitored_catalog_albums(
             album = release.catalog_album
             if release.monitored and album is not None and not album.in_library:
                 canonical[album.id] = album
+    runtime = await get_runtime_settings(db)
     job_ids: list[int] = []
     for album in canonical.values():
         album_id = album.id
@@ -1036,15 +1214,21 @@ async def download_monitored_catalog_albums(
             db.add(failed_job)
             await db.commit()
             continue
-        job = Job(
-            source="priority",
-            query=f"{artist.name} {album.title}".strip(),
-            status=JobStatus.pending,
-            catalog_album_id=album.id,
+        refreshed = (
+            await db.execute(
+                select(CatalogAlbum)
+                .where(CatalogAlbum.id == album_id)
+                .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        ids = await queue_catalog_album_missing_track_jobs(
+            db,
+            refreshed,
+            library_root=settings.library_root,
+            quality_profile=runtime.quality_profile,
         )
-        db.add(job)
-        await db.commit()
-        job_ids.append(job.id)
+        job_ids.extend(ids)
     for job_id in job_ids:
         await job_dispatcher.dispatch(job_id)
     return _download_many_response(request, queued=len(job_ids), artist_id=artist_id)
@@ -1074,66 +1258,21 @@ async def download_catalog_album(
             status_code=502,
             detail="Could not load album tracklist from provider; download not started",
         ) from None
-    progress = (await get_release_progress(db, [album.id], library_root=settings.library_root))[
-        album.id
-    ]
-    imported_ids = set(progress.downloaded_catalog_track_ids)
-    query = f"{album.artist.name} {album.title}".strip()
-    if not imported_ids:
-        job = Job(
-            source="priority", query=query, status=JobStatus.pending, catalog_album_id=album.id
-        )
-        db.add(job)
-        await db.commit()
-        await db.refresh(job)
-        await job_dispatcher.dispatch(job.id)
-        return _download_response(request, queued=1, album_id=album.id)
-
-    runtime = await get_runtime_settings(db)
-    quality_rows = (
+    refreshed = (
         await db.execute(
-            select(Track.catalog_track_id, Track.file_format, ImportPlan.destination_path)
-            .join(ImportPlan, ImportPlan.track_id == Track.id)
-            .where(
-                Track.catalog_album_id == album.id,
-                Track.catalog_track_id.is_not(None),
-                Track.import_state == ImportWorkflowState.imported,
-                ImportPlan.status == ImportWorkflowState.imported,
-                ImportPlan.destination_path != "",
-            )
+            select(CatalogAlbum)
+            .where(CatalogAlbum.id == album.id)
+            .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
+            .execution_options(populate_existing=True)
         )
-    ).all()
-    subquality_ids: set[int] = set()
-    for catalog_track_id, file_format, destination_path in quality_rows:
-        if (
-            catalog_track_id is not None
-            and int(catalog_track_id) in imported_ids
-            and await asyncio.to_thread(Path(destination_path).is_file)
-            and not track_meets_quality(file_format, runtime.quality_profile)
-        ):
-            subquality_ids.add(int(catalog_track_id))
-
-    tracks_to_queue = [
-        track
-        for track in album.tracks
-        if track.id not in imported_ids or track.id in subquality_ids
-    ]
-    if not tracks_to_queue:
-        return _download_response(request, queued=0, album_id=album.id)
-    job_ids: list[int] = []
-    for track in tracks_to_queue:
-        track_query = f"{album.artist.name} {track.title}".strip()
-        job = Job(
-            source="priority",
-            query=track_query,
-            status=JobStatus.pending,
-            catalog_album_id=album.id,
-            catalog_track_id=track.id,
-        )
-        db.add(job)
-        await db.flush()
-        job_ids.append(job.id)
-    await db.commit()
+    ).scalar_one()
+    runtime = await get_runtime_settings(db)
+    job_ids = await queue_catalog_album_missing_track_jobs(
+        db,
+        refreshed,
+        library_root=settings.library_root,
+        quality_profile=runtime.quality_profile,
+    )
     for job_id in job_ids:
         await job_dispatcher.dispatch(job_id)
     return _download_response(request, queued=len(job_ids), album_id=album.id)

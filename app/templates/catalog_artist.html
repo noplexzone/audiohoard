@@ -80,11 +80,18 @@
     </label>
     <label>New release policy
       <select name="monitor_policy">
-        <option value="all" {% if artist.monitor_policy == "all" %}selected{% endif %}>All</option>
+        <option value="all" {% if artist.monitor_policy == "all" %}selected{% endif %}>Use release-type defaults</option>
         <option value="albums_only" {% if artist.monitor_policy == "albums_only" %}selected{% endif %}>Albums only</option>
         <option value="none_new" {% if artist.monitor_policy == "none_new" %}selected{% endif %}>None new</option>
       </select>
     </label>
+    <fieldset class="field-block">
+      <legend>Auto-watchlist release types</legend>
+      <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_albums" value="true" {% if artist.watchlist_release_albums %}checked{% endif %}> Albums</label>
+      <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_singles" value="true" {% if artist.watchlist_release_singles %}checked{% endif %}> Singles</label>
+      <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_eps" value="true" {% if artist.watchlist_release_eps %}checked{% endif %}> EPs</label>
+    </fieldset>
+    <label class="check-label switch-label"><input type="checkbox" name="watchlist_monitor_upgrades" value="true" {% if artist.watchlist_monitor_upgrades %}checked{% endif %}> <span>Monitor watchlisted releases for quality upgrades</span></label>
     <div class="form-row">
       <button class="btn secondary" name="bulk" value="all">All</button>
       <button class="btn secondary" name="bulk" value="albums_only">Albums only</button>
@@ -95,6 +102,7 @@
   </form>
 </details>
 
+<section id="discography-region" data-artist-id="{{ artist.id }}" data-artist-refresh="{{ 'true' if discography_loading else 'false' }}">
 {% if albums %}
   {% for heading, section_albums in grouped_albums %}
     {% if section_albums %}
@@ -129,8 +137,13 @@
     {% endif %}
   {% endfor %}
 {% else %}
-  <div class="empty-state"><h3>No releases found</h3><p>Try another filter or provider result.</p></div>
+  {% if discography_loading %}
+    <div class="empty-state loading-state"><h3>Loading discography…</h3><p>Audiohoard is fetching this artist’s releases. This section will update automatically.</p></div>
+  {% else %}
+    <div class="empty-state"><h3>No releases found</h3><p>Try another filter or provider result.</p></div>
+  {% endif %}
 {% endif %}
+</section>
 
 <details class="card maintenance-options">
   <summary>Maintenance</summary>

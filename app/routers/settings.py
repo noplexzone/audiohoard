@@ -358,6 +358,28 @@ async def save_runtime_settings_page(
         if section == "behavior"
         else runtime.duplicate_auto_clean
     )
+    default_watchlist_release_albums = (
+        str(form.get("default_watchlist_release_albums", "")).lower() in {"1", "true", "yes", "on"}
+        if section == "behavior"
+        else runtime.default_watchlist_release_albums
+    )
+    default_watchlist_release_singles = (
+        str(form.get("default_watchlist_release_singles", "")).lower()
+        in {"1", "true", "yes", "on"}
+        if section == "behavior"
+        else runtime.default_watchlist_release_singles
+    )
+    default_watchlist_release_eps = (
+        str(form.get("default_watchlist_release_eps", "")).lower() in {"1", "true", "yes", "on"}
+        if section == "behavior"
+        else runtime.default_watchlist_release_eps
+    )
+    default_watchlist_monitor_upgrades = (
+        str(form.get("default_watchlist_monitor_upgrades", "")).lower()
+        in {"1", "true", "yes", "on"}
+        if section == "behavior"
+        else runtime.default_watchlist_monitor_upgrades
+    )
     if section == "quality":
         fmt_order = [str(v) for v in form.getlist("format_order")]
         if len(fmt_order) != len(DEFAULT_FORMAT_PREFERENCE) or set(fmt_order) != set(
@@ -424,7 +446,11 @@ async def save_runtime_settings_page(
         duplicate_auto_clean,
         upgrade_check_hours,
         auto_download,
-        source_budget,
+        source_search_budget_seconds=source_budget,
+        default_watchlist_release_albums=default_watchlist_release_albums,
+        default_watchlist_release_singles=default_watchlist_release_singles,
+        default_watchlist_release_eps=default_watchlist_release_eps,
+        default_watchlist_monitor_upgrades=default_watchlist_monitor_upgrades,
         quality_profile=quality_profile,
         max_partial_attempts=max_partial_val,
         acoustid_acceptance_threshold=acoustid_threshold,

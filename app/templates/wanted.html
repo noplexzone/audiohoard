@@ -19,9 +19,30 @@
   {% if q %}<a href="/wanted" class="btn secondary">Clear</a>{% endif %}
 </form>
 {% if releases.items %}
+<div class="bulk-actions" aria-label="Wanted release bulk actions">
+  <form id="wanted-selected-form" method="post" action="/wanted/queue" class="wanted-bulk-form" data-wanted-bulk-form>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="checkbox-control" for="wanted-select-all">
+      <input id="wanted-select-all" type="checkbox" data-wanted-select-all>
+      <span>Select all</span>
+    </label>
+    <button type="submit" class="btn secondary" data-queue-selected>Queue selected</button>
+  </form>
+  <form id="wanted-all-form" method="post" action="/wanted/queue">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    {% for release in releases.items %}
+    <input type="hidden" name="catalog_album_ids" value="{{ release.id }}">
+    {% endfor %}
+    <button type="submit" class="btn" data-queue-all>Queue all</button>
+  </form>
+</div>
 <div class="album-grid" role="list" aria-label="Wanted releases">
   {% for release in releases.items %}
   <article class="album-card" role="listitem">
+    <label class="album-select checkbox-control">
+      <input type="checkbox" name="catalog_album_ids" value="{{ release.id }}" form="wanted-selected-form" data-wanted-release-checkbox>
+      <span>Select {{ release.title }}</span>
+    </label>
     <a class="album-art" href="/albums/{{ release.id }}" aria-label="Open {{ release.title }}">
       {% if release.artwork_url %}<img loading="lazy" src="/artwork?url={{ release.artwork_url | urlencode }}" alt="">{% else %}<span>{{ release.title[:2] | upper }}</span>{% endif %}
     </a>
@@ -30,10 +51,7 @@
       <p class="muted-line">{{ release.artist_name }}{% if release.year %} · {{ release.year }}{% endif %}</p>
       <p class="release-progress">{{ release.downloaded_track_count }} / {{ release.wanted_track_count }} downloaded</p>
       <div class="album-card-actions">
-        <form method="post" action="/albums/{{ release.id }}/download">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <button type="submit" class="btn secondary album-download">Download missing</button>
-        </form>
+        <button type="submit" class="btn secondary album-download" form="wanted-selected-form" formaction="/albums/{{ release.id }}/download">Queue missing</button>
       </div>
     </div>
   </article>
@@ -50,4 +68,7 @@
   {% else %}<p>No incomplete releases from watchlisted artists.</p>{% endif %}
 </div>
 {% endif %}
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/wanted.js?v={{ app_version }}" defer></script>
 {% endblock %}
