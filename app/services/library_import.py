@@ -398,6 +398,13 @@ def _normalized_title(value: str) -> str:
     return " ".join(value.casefold().replace("_", " ").replace("-", " ").split())
 
 
+def _ensure_library_file_readable(path: Path) -> None:
+    """Keep imported/retagged media readable by scanners such as Navidrome."""
+    with contextlib.suppress(OSError):
+        mode = stat.S_IMODE(path.stat().st_mode)
+        path.chmod(mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+
+
 def _tags_for(release: Release, track: Track) -> dict[str, str]:
     tags = {
         "title": track.title or "",
@@ -408,14 +415,13 @@ def _tags_for(release: Release, track: Track) -> dict[str, str]:
         "release_date": track.year or release.year or "",
         "releasedate": track.year or release.year or "",
         "tracknumber": str(track.track_no or ""),
-        "discnumber": (
-            f"{track.disc}/{track.disc_total}"
-            if track.disc and track.disc_total and track.disc_total > 1
-            else str(track.disc or "")
-        ),
+        "discnumber": str(track.disc or ""),
         "musicbrainz_trackid": track.mbid or "",
         "musicbrainz_albumid": release.release_mbid or "",
     }
+    if track.disc_total and track.disc_total > 1:
+        tags["disctotal"] = str(track.disc_total)
+        tags["totaldiscs"] = str(track.disc_total)
     return {key: value for key, value in tags.items() if value}
 
 
@@ -479,6 +485,10 @@ class MutagenTagWriter:
                     APIC(encoding=3, mime=artwork.mime, type=3, desc="Cover", data=artwork.data)
                 )
             for key, description in {
+                "tracktotal": "Track Total",
+                "disctotal": "Disc Total",
+                "totaltracks": "MusicBrainz Track Total",
+                "totaldiscs": "MusicBrainz Disc Total",
                 "musicbrainz_trackid": "MusicBrainz Track Id",
                 "musicbrainz_albumid": "MusicBrainz Album Id",
                 "musicbrainz_albumartistid": "MusicBrainz Album Artist Id",
@@ -529,6 +539,10 @@ class MutagenTagWriter:
                 "genre": "\xa9gen",
             }
             freeform_atoms = {
+                "disctotal": "----:com.apple.iTunes:Disc Total",
+                "tracktotal": "----:com.apple.iTunes:Track Total",
+                "totaldiscs": "----:com.apple.iTunes:MusicBrainz Disc Total",
+                "totaltracks": "----:com.apple.iTunes:MusicBrainz Track Total",
                 "musicbrainz_trackid": "----:com.apple.iTunes:MusicBrainz Track Id",
                 "musicbrainz_albumid": "----:com.apple.iTunes:MusicBrainz Album Id",
                 "musicbrainz_albumartistid": "----:com.apple.iTunes:MusicBrainz Album Artist Id",
@@ -554,9 +568,15 @@ class MutagenTagWriter:
                 if value := tags.get(key):
                     mp4[atom] = [value]
             if value := tags.get("tracknumber"):
-                mp4["trkn"] = [_slash_number_pair(value)]
+                current, total = _slash_number_pair(value)
+                if track_total := tags.get("tracktotal"):
+                    total = _slash_number_pair(track_total)[0]
+                mp4["trkn"] = [(current, total)]
             if value := tags.get("discnumber"):
-                mp4["disk"] = [_slash_number_pair(value)]
+                current, total = _slash_number_pair(value)
+                if disc_total := tags.get("disctotal"):
+                    total = _slash_number_pair(disc_total)[0]
+                mp4["disk"] = [(current, total)]
             for key, atom in freeform_atoms.items():
                 if value := tags.get(key):
                     mp4[atom] = [value.encode()]
@@ -567,6 +587,7 @@ class MutagenTagWriter:
             mp4.save()
         else:
             return False
+        _ensure_library_file_readable(path)
         readback = self.read_tags(path)
         return all(readback.get(key) == value for key, value in tags.items())
 
@@ -586,6 +607,10 @@ class MutagenTagWriter:
             "isrc",
             "tracknumber",
             "discnumber",
+            "tracktotal",
+            "disctotal",
+            "totaltracks",
+            "totaldiscs",
             "musicbrainz_trackid",
             "musicbrainz_albumid",
             "musicbrainz_albumartistid",
@@ -622,14 +647,22 @@ class MutagenTagWriter:
                     mp4_values[key] = str(atom_values[0])
             if track_values := mp4.get("trkn"):
                 current, total = track_values[0]
-                mp4_values["tracknumber"] = f"{current}/{total}" if total else str(current)
+                mp4_values["tracknumber"] = str(current)
+                if total:
+                    mp4_values["tracktotal"] = str(total)
             if disc_values := mp4.get("disk"):
                 current, total = disc_values[0]
-                mp4_values["discnumber"] = f"{current}/{total}" if total else str(current)
+                mp4_values["discnumber"] = str(current)
+                if total:
+                    mp4_values["disctotal"] = str(total)
             if atom_values := mp4.get("----:com.apple.iTunes:LABEL"):
                 raw = atom_values[0]
                 mp4_values["label"] = raw.decode() if isinstance(raw, bytes) else str(raw)
             for key, atom in {
+                "disctotal": "----:com.apple.iTunes:Disc Total",
+                "tracktotal": "----:com.apple.iTunes:Track Total",
+                "totaldiscs": "----:com.apple.iTunes:MusicBrainz Disc Total",
+                "totaltracks": "----:com.apple.iTunes:MusicBrainz Track Total",
                 "musicbrainz_trackid": "----:com.apple.iTunes:MusicBrainz Track Id",
                 "musicbrainz_albumid": "----:com.apple.iTunes:MusicBrainz Album Id",
                 "musicbrainz_albumartistid": "----:com.apple.iTunes:MusicBrainz Album Artist Id",
@@ -662,6 +695,10 @@ class MutagenTagWriter:
             if frame is not None and getattr(frame, "text", None):
                 values[key] = str(frame.text[0])
         descriptions = {
+            "track total": "tracktotal",
+            "disc total": "disctotal",
+            "musicbrainz track total": "totaltracks",
+            "musicbrainz disc total": "totaldiscs",
             "musicbrainz track id": "musicbrainz_trackid",
             "musicbrainz album id": "musicbrainz_albumid",
             "musicbrainz album artist id": "musicbrainz_albumartistid",
@@ -686,9 +723,20 @@ def _catalog_disc_total(album: CatalogAlbum) -> int | None:
     return total if total > 1 else None
 
 
-def _discnumber_value(album: CatalogAlbum, disc: int) -> str:
+def _catalog_disc_total_values(album: CatalogAlbum) -> dict[str, str]:
     disc_total = _catalog_disc_total(album)
-    return f"{disc}/{disc_total}" if disc_total else str(disc)
+    if not disc_total:
+        return {}
+    value = str(disc_total)
+    return {"disctotal": value, "totaldiscs": value}
+
+
+def _catalog_track_total_values(album: CatalogAlbum, disc: int) -> dict[str, str]:
+    total = sum(1 for track in album.tracks if track.disc == disc)
+    if total <= 0:
+        return {}
+    value = str(total)
+    return {"tracktotal": value, "totaltracks": value}
 
 
 def _catalog_tags(
@@ -703,7 +751,9 @@ def _catalog_tags(
         "releasedate": album.year or "",
         "release_date": album.year or "",
         "tracknumber": str(catalog_track.position),
-        "discnumber": _discnumber_value(album, catalog_track.disc),
+        "discnumber": str(catalog_track.disc),
+        **_catalog_disc_total_values(album),
+        **_catalog_track_total_values(album, catalog_track.disc),
         "musicbrainz_trackid": catalog_track.recording_mbid
         or (track.mbid if track is not None else "")
         or "",

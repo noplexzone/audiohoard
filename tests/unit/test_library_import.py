@@ -725,7 +725,9 @@ def test_catalog_tags_include_disc_total_for_multidisc_albums() -> None:
 
     tags = _catalog_tags(album, album.tracks[1], None)
 
-    assert tags["discnumber"] == "2/3"
+    assert tags["discnumber"] == "2"
+    assert tags["disctotal"] == "3"
+    assert tags["totaldiscs"] == "3"
 
 
 def test_import_tags_include_track_disc_total() -> None:
@@ -747,4 +749,6 @@ def test_import_tags_include_track_disc_total() -> None:
 
     tags = _tags_for(release, track)
 
-    assert tags["discnumber"] == "2/3"
+    assert tags["discnumber"] == "2"
+    assert tags["disctotal"] == "3"
+    assert tags["totaldiscs"] == "3"

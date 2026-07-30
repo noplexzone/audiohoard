@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-07-30
+
+### Fixed
+- Write FLAC/Ogg disc numbers as plain `DISCNUMBER` plus separate `DISCTOTAL`/`TOTALDISCS` fields so Navidrome parses multi-disc repairs correctly.
+- Keep retagged library files group/world-readable for downstream scanners after metadata repair.
+- Add a release-level dismiss action for actionless import-review cards with no per-track Deny button.
+
 ## [0.8.2] - 2026-07-30
 
 ### Fixed
