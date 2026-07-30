@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from httpx import AsyncClient
 
@@ -579,6 +581,87 @@ async def test_saving_download_sources_preserves_auto_download_behavior(
     async with factory() as db:
         runtime = await get_runtime_settings(db)
     assert runtime.auto_download_wanted is True
+
+
+@pytest.mark.asyncio
+async def test_behavior_parallel_acquisition_limit_renders_and_persists(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.jobs.dispatcher import job_dispatcher
+
+    configured: list[int] = []
+
+    async def capture_limit(value: int) -> None:
+        configured.append(value)
+
+    monkeypatch.setattr(job_dispatcher, "set_max_concurrent_jobs", capture_limit)
+    page = await client.get("/settings/behavior")
+    assert 'name="max_parallel_acquisitions"' in page.text
+
+    response = await client.post(
+        "/settings",
+        data={"section": "behavior", "max_parallel_acquisitions": "7"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert configured == [7]
+
+    from app.database import get_session_factory
+    from app.settings_service import get_runtime_settings
+
+    async with get_session_factory()() as db:
+        runtime = await get_runtime_settings(db)
+    assert runtime.max_parallel_acquisitions == 7
+
+
+async def test_concurrent_settings_saves_serialize_runtime_payload_and_live_limit(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.routers import settings as settings_router
+
+    original_save = settings_router.save_runtime_settings
+    active = 0
+    peak = 0
+
+    async def observed_save(*args: object, **kwargs: object) -> None:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.05)
+        try:
+            await original_save(*args, **kwargs)  # type: ignore[arg-type]
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(settings_router, "save_runtime_settings", observed_save)
+    responses = await asyncio.gather(
+        client.post(
+            "/settings",
+            data={"section": "behavior", "max_parallel_acquisitions": "5"},
+            follow_redirects=False,
+        ),
+        client.post(
+            "/settings",
+            data={"section": "behavior", "max_parallel_acquisitions": "9"},
+            follow_redirects=False,
+        ),
+    )
+
+    assert [response.status_code for response in responses] == [303, 303]
+    assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_behavior_rejects_parallel_acquisition_limit_outside_range(
+    client: AsyncClient,
+) -> None:
+    response = await client.post(
+        "/settings",
+        data={"section": "behavior", "max_parallel_acquisitions": "17"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/settings/behavior?error=")
 
 
 @pytest.mark.asyncio

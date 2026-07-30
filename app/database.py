@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase, Session
 
-from app.config import get_settings
+from app.config import MAX_PARALLEL_ACQUISITIONS, get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +111,7 @@ def _make_engine(url: str | None = None) -> AsyncEngine:
         "connect_args": {"check_same_thread": False, "timeout": 30.0},
     }
     if not is_memory:
-        max_concurrent = get_settings().max_concurrent_jobs
+        max_concurrent = max(get_settings().max_concurrent_jobs, MAX_PARALLEL_ACQUISITIONS)
         engine_kwargs["pool_size"] = max(8, max_concurrent + 4)
         engine_kwargs["max_overflow"] = max(4, max_concurrent)
     engine = create_async_engine(db_url, **engine_kwargs)

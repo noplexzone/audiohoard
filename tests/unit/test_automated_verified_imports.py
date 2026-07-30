@@ -419,7 +419,7 @@ async def test_missing_track_continuations_are_targeted_and_idempotent(
         ).all()
     )
     assert len(children) == 1
-    assert children[0].query == "Artist Album Two"
+    assert children[0].query == "Artist Two"
     assert children[0].source == "priority"
     assert dispatched == [children[0].id]
 
