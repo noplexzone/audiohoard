@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 
 from sqlalchemy import event
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -15,6 +17,38 @@ from sqlalchemy.orm import DeclarativeBase, Session
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def is_sqlite_database_locked(exc: BaseException) -> bool:
+    return isinstance(exc, OperationalError) and "database is locked" in str(exc).casefold()
+
+
+async def run_with_sqlite_lock_retry(
+    session: AsyncSession,
+    operation: Callable[[], Awaitable[None]],
+    *,
+    attempts: int = 4,
+    delay_seconds: float = 0.25,
+) -> None:
+    """Run a small DB write operation, retrying transient SQLite writer locks.
+
+    A failed SQLite write rolls back the transaction, so callers pass the complete
+    operation instead of just retrying ``commit()`` with expired pending changes.
+    """
+    last_locked: OperationalError | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            await operation()
+            return
+        except OperationalError as exc:
+            if not is_sqlite_database_locked(exc):
+                raise
+            last_locked = exc
+            await session.rollback()
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay_seconds * (attempt + 1))
+    assert last_locked is not None
+    raise last_locked
 
 
 class Base(DeclarativeBase):

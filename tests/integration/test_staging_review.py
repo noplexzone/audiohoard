@@ -503,6 +503,51 @@ async def test_release_review_dismiss_hides_actionless_release_review(
     assert f"/staging/release/{release_id}/dismiss" not in page.text
 
 
+async def test_release_review_dismiss_retries_sqlite_lock_before_hiding(
+    client: AsyncClient, monkeypatch
+) -> None:
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    factory = get_session_factory()
+    async with factory() as db:
+        job = Job(source="slskd", query="locked stale review", status=JobStatus.failed)
+        release = Release(
+            job=job,
+            source="slskd",
+            title="Locked Review",
+            album_artist="Artist",
+            import_state=ImportWorkflowState.rolled_back,
+            error_detail="import execution error: tag readback failed",
+        )
+        db.add_all([job, release])
+        await db.commit()
+        release_id = release.id
+
+    original_commit = AsyncSession.commit
+    attempts = 0
+
+    async def lock_then_commit(self) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OperationalError("UPDATE releases", {}, Exception("database is locked"))
+        await original_commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", lock_then_commit)
+
+    response = await client.post(f"/staging/release/{release_id}/dismiss", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/downloads?notice=review_dismissed"
+    assert attempts >= 2
+
+    async with factory() as db:
+        release = await db.get(Release, release_id)
+        assert release is not None
+        assert release.review_dismissed_at is not None
+
+
 async def test_reacquire_stops_after_persisted_continuation_attempt_cap(
     client: AsyncClient, test_settings: Settings, monkeypatch
 ) -> None:

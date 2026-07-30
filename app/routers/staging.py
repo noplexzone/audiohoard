@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, require_mutation
 from app.config import Settings
-from app.database import get_db
+from app.database import get_db, run_with_sqlite_lock_retry
 from app.jobs.dispatcher import job_dispatcher
 from app.media_formats import IMPORTABLE_AUDIO_SUFFIXES
 from app.models.import_plan import ImportPlan
@@ -377,8 +377,15 @@ async def dismiss_release_review(
     release = await db.get(Release, release_id)
     if release is None:
         raise HTTPException(status_code=404, detail="Release not found")
-    release.review_dismissed_at = datetime.now(UTC).replace(tzinfo=None)
-    await db.commit()
+
+    async def dismiss_release() -> None:
+        current = await db.get(Release, release_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Release not found")
+        current.review_dismissed_at = datetime.now(UTC).replace(tzinfo=None)
+        await db.commit()
+
+    await run_with_sqlite_lock_retry(db, dismiss_release)
     return RedirectResponse("/downloads?notice=review_dismissed", status_code=303)
 
 

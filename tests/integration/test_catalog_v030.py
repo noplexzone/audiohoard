@@ -91,6 +91,28 @@ async def test_catalog_artist_album_pages_and_album_download_create_linked_job(
         assert all(job.catalog_track_id is not None for job in jobs)
 
 
+async def test_catalog_artist_page_skips_refresh_queue_when_sqlite_is_locked(
+    client: AsyncClient, monkeypatch
+) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    from app.routers import catalog as catalog_router
+
+    artist_id = await _seed_catalog()
+
+    async def locked_queue(*args, **kwargs):
+        del args, kwargs
+        raise OperationalError("UPDATE catalog_artists", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(catalog_router, "_queue_artist_enrichment", locked_queue)
+
+    response = await client.get(f"/artists/catalog/{artist_id}")
+
+    assert response.status_code == 200
+    assert "Discovery" in response.text
+    assert "OperationalError" not in response.text
+
+
 def test_catalog_track_matching_requires_title_or_explicit_selection() -> None:
     tracks = [
         CatalogAlbumTrack(id=1, album_id=1, position=1, disc=1, title="One More Time"),

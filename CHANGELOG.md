@@ -6,6 +6,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-07-30
+
+### Fixed
+- Prevent artist pages and actionless review dismissal from returning 500 errors when background jobs briefly hold the SQLite writer lock.
+
 ## [0.8.3] - 2026-07-30
 
 ### Fixed

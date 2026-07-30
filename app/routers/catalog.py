@@ -17,7 +17,7 @@ from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user, require_mutation
 from app.config import Settings
-from app.database import get_db
+from app.database import get_db, is_sqlite_database_locked, run_with_sqlite_lock_retry
 from app.jobs.dispatcher import job_dispatcher
 from app.models.catalog_entities import (
     CatalogAlbum,
@@ -300,16 +300,23 @@ async def _sync_artist_upgrade_monitoring(
 
 
 async def _queue_artist_enrichment(db: AsyncSession, artist_id: int) -> bool:
-    result = await db.execute(
-        update(CatalogArtist)
-        .where(
-            CatalogArtist.id == artist_id,
-            CatalogArtist.enrichment_state.not_in(("queued", "running")),
+    queued = False
+
+    async def operation() -> None:
+        nonlocal queued
+        result = await db.execute(
+            update(CatalogArtist)
+            .where(
+                CatalogArtist.id == artist_id,
+                CatalogArtist.enrichment_state.not_in(("queued", "running")),
+            )
+            .values(enrichment_state="queued")
         )
-        .values(enrichment_state="queued")
-    )
-    await db.commit()
-    return bool(getattr(result, "rowcount", 0))
+        queued = bool(getattr(result, "rowcount", 0))
+        await db.commit()
+
+    await run_with_sqlite_lock_retry(db, operation)
+    return queued
 
 
 async def _enrich_artist_task(artist_id: int, providers: list[str]) -> None:
@@ -575,8 +582,22 @@ async def catalog_artist_page(
     if artist is None:
         raise HTTPException(status_code=404, detail="Catalog artist not found")
     runtime = await get_runtime_settings(db)
-    await ensure_legacy_provider_snapshots(db, artist)
-    await db.commit()
+    snapshot_artist = artist
+
+    async def repair_legacy_snapshots() -> None:
+        await ensure_legacy_provider_snapshots(db, snapshot_artist)
+        await db.commit()
+
+    try:
+        await run_with_sqlite_lock_retry(db, repair_legacy_snapshots)
+    except Exception as exc:
+        if not is_sqlite_database_locked(exc):
+            raise
+        logger.warning(
+            "Skipping legacy provider snapshot repair for artist %s because SQLite is busy",
+            artist_id,
+        )
+        await db.rollback()
     artist = (
         await db.execute(
             select(CatalogArtist)
@@ -585,10 +606,22 @@ async def catalog_artist_page(
             .execution_options(populate_existing=True)
         )
     ).scalar_one()
-    if artist.last_enriched_at is None and await _queue_artist_enrichment(db, artist.id):
-        background_tasks.add_task(
-            _enrich_artist_task, artist.id, runtime.enabled_metadata_providers
-        )
+    if artist.last_enriched_at is None:
+        try:
+            queued_enrichment = await _queue_artist_enrichment(db, artist.id)
+        except Exception as exc:
+            if not is_sqlite_database_locked(exc):
+                raise
+            logger.warning(
+                "Skipping artist enrichment queue for artist %s because SQLite is busy",
+                artist.id,
+            )
+            await db.rollback()
+            queued_enrichment = False
+        if queued_enrichment:
+            background_tasks.add_task(
+                _enrich_artist_task, artist.id, runtime.enabled_metadata_providers
+            )
     available_providers = available_artist_providers(artist)
     selected_provider = _selected_provider(
         provider, available_providers, runtime.primary_metadata_provider, artist.watchlist_provider
@@ -602,9 +635,30 @@ async def catalog_artist_page(
         or any(_release_needs_track_count_refresh(item) for item in selected_identity.releases)
     ):
         if artist.enrichment_state not in {"queued", "running"}:
-            artist.enrichment_state = "queued"
-            await db.commit()
-        background_tasks.add_task(_refresh_discography_task, artist.id, selected_provider)
+            refresh_artist_id = artist.id
+            try:
+
+                async def queue_discography_refresh() -> None:
+                    await db.execute(
+                        update(CatalogArtist)
+                        .where(CatalogArtist.id == refresh_artist_id)
+                        .values(enrichment_state="queued")
+                    )
+                    await db.commit()
+
+                await run_with_sqlite_lock_retry(db, queue_discography_refresh)
+            except Exception as exc:
+                if not is_sqlite_database_locked(exc):
+                    raise
+                logger.warning(
+                    "Skipping discography refresh queue for artist %s because SQLite is busy",
+                    artist.id,
+                )
+                await db.rollback()
+            else:
+                background_tasks.add_task(_refresh_discography_task, artist.id, selected_provider)
+        else:
+            background_tasks.add_task(_refresh_discography_task, artist.id, selected_provider)
     artist = (
         await db.execute(
             select(CatalogArtist)
