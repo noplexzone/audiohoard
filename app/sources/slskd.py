@@ -8,6 +8,7 @@ from urllib.parse import quote
 import httpx
 
 from app.http import request_with_retry
+from app.media_formats import is_importable_audio
 from app.metadata.filename_parse import (
     compose_search_query,
     parse_filename,
@@ -211,6 +212,8 @@ class SlskdAdapter:
                 for f in response.get("files", []):
                     filename: str = f.get("filename", "")
                     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+                    if not is_importable_audio(filename):
+                        continue
                     guess = parse_filename(filename)
                     results.append(
                         SearchResult(
@@ -238,6 +241,10 @@ class SlskdAdapter:
         if not username or not filename:
             raise ProviderError(
                 "invalid_result", "slskd result is missing username or filename", "acquire"
+            )
+        if not is_importable_audio(filename):
+            raise ProviderError(
+                "invalid_result", "slskd result is not an importable audio file", "acquire"
             )
         payload: dict[str, object] = {"filename": filename}
         if size is not None:
