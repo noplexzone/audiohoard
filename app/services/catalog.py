@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from sqlalchemy import and_, exists, func, literal, or_, select
+from sqlalchemy import and_, case, exists, func, literal, or_, select
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -23,6 +23,7 @@ from app.models.catalog_entities import (
     CatalogArtistIdentity,
 )
 from app.models.import_plan import ImportPlan
+from app.models.job import Job, JobStatus
 from app.models.track import Track
 from app.models.workflow import AcquisitionState, ImportWorkflowState
 from app.naming.convention import _sanitize_segment
@@ -544,7 +545,8 @@ async def get_release_progress(
     progress: dict[int, ReleaseProgress] = {}
     for album_id, known_track_count, _title, _year, _artist_name in album_data:
         release_id = int(album_id)
-        wanted = max(int(known_track_count or 0), manifest_counts.get(release_id, 0))
+        manifest_count = manifest_counts.get(release_id, 0)
+        wanted = manifest_count if manifest_count > 0 else int(known_track_count or 0)
         downloaded_id_set = set(imported_by_album.get(release_id, set()))
         release_evidence = (
             None
@@ -573,6 +575,81 @@ async def get_release_progress(
             downloaded_catalog_track_ids=downloaded_ids,
         )
     return progress
+
+
+async def queue_catalog_album_missing_track_jobs(
+    db: AsyncSession,
+    album: CatalogAlbum,
+    *,
+    library_root: Path | None = None,
+    quality_profile: QualityProfile,
+) -> list[int]:
+    """Create per-track priority jobs for missing or sub-quality catalog album tracks.
+
+    This intentionally never creates an album-level job. Every queued job is scoped
+    to a concrete ``catalog_track_id`` so partial releases do not reacquire complete albums.
+    """
+    progress = (await get_release_progress(db, [album.id], library_root=library_root))[album.id]
+    imported_ids = set(progress.downloaded_catalog_track_ids)
+    quality_rows = (
+        await db.execute(
+            select(Track.catalog_track_id, Track.file_format, ImportPlan.destination_path)
+            .join(ImportPlan, ImportPlan.track_id == Track.id)
+            .where(
+                Track.catalog_album_id == album.id,
+                Track.catalog_track_id.is_not(None),
+                Track.import_state == ImportWorkflowState.imported,
+                ImportPlan.status == ImportWorkflowState.imported,
+                ImportPlan.destination_path != "",
+            )
+        )
+    ).all()
+    subquality_ids: set[int] = set()
+    for catalog_track_id, file_format, destination_path in quality_rows:
+        if (
+            catalog_track_id is not None
+            and int(catalog_track_id) in imported_ids
+            and await asyncio.to_thread(Path(destination_path).is_file)
+            and not track_meets_quality(file_format, quality_profile)
+        ):
+            subquality_ids.add(int(catalog_track_id))
+
+    tracks_to_queue = list(
+        (
+            await db.scalars(
+                select(CatalogAlbumTrack)
+                .where(CatalogAlbumTrack.album_id == album.id)
+                .order_by(CatalogAlbumTrack.disc, CatalogAlbumTrack.position, CatalogAlbumTrack.id)
+            )
+        ).all()
+    )
+    tracks_to_queue = [
+        track
+        for track in tracks_to_queue
+        if track.id is not None and (track.id not in imported_ids or track.id in subquality_ids)
+    ]
+    job_ids: list[int] = []
+    artist_name = (
+        await db.scalar(
+            select(CatalogArtist.name)
+            .join(CatalogAlbum, CatalogAlbum.artist_id == CatalogArtist.id)
+            .where(CatalogAlbum.id == album.id)
+        )
+        or ""
+    )
+    for track in tracks_to_queue:
+        job = Job(
+            source="priority",
+            query=" ".join(part for part in (artist_name, track.title) if part),
+            status=JobStatus.pending,
+            catalog_album_id=album.id,
+            catalog_track_id=track.id,
+        )
+        db.add(job)
+        await db.flush()
+        job_ids.append(job.id)
+    await db.commit()
+    return job_ids
 
 
 async def get_library_stats(db: AsyncSession) -> LibraryStats:
@@ -757,15 +834,29 @@ async def get_library_artists_page(
         .correlate(CatalogArtist)
         .scalar_subquery()
     )
-    wanted_count = (
-        select(func.count(CatalogAlbumProvider.id))
-        .join(
-            CatalogArtistIdentity,
-            CatalogArtistIdentity.id == CatalogAlbumProvider.artist_identity_id,
-        )
-        .outerjoin(CatalogAlbum, CatalogAlbum.id == CatalogAlbumProvider.catalog_album_id)
+    watchlist_identity_id = (
+        select(CatalogArtistIdentity.id)
         .where(
             CatalogArtistIdentity.artist_id == CatalogArtist.id,
+            CatalogArtistIdentity.provider == CatalogArtist.watchlist_provider,
+        )
+        .order_by(CatalogArtistIdentity.id)
+        .limit(1)
+        .correlate(CatalogArtist)
+        .scalar_subquery()
+    )
+    primary_identity_id = (
+        select(func.min(CatalogArtistIdentity.id))
+        .where(CatalogArtistIdentity.artist_id == CatalogArtist.id)
+        .correlate(CatalogArtist)
+        .scalar_subquery()
+    )
+    canonical_identity_id = func.coalesce(watchlist_identity_id, primary_identity_id)
+    wanted_count = (
+        select(func.count(CatalogAlbumProvider.id))
+        .outerjoin(CatalogAlbum, CatalogAlbum.id == CatalogAlbumProvider.catalog_album_id)
+        .where(
+            CatalogAlbumProvider.artist_identity_id == canonical_identity_id,
             or_(
                 CatalogAlbumProvider.catalog_album_id.is_(None),
                 CatalogAlbum.in_library.is_(False),
@@ -776,11 +867,7 @@ async def get_library_artists_page(
     )
     release_count = (
         select(func.count(CatalogAlbumProvider.id))
-        .join(
-            CatalogArtistIdentity,
-            CatalogArtistIdentity.id == CatalogAlbumProvider.artist_identity_id,
-        )
-        .where(CatalogArtistIdentity.artist_id == CatalogArtist.id)
+        .where(CatalogAlbumProvider.artist_identity_id == canonical_identity_id)
         .correlate(CatalogArtist)
         .scalar_subquery()
     )
@@ -885,7 +972,9 @@ async def get_missing_releases_page(
         .correlate(CatalogAlbum)
         .scalar_subquery()
     )
-    wanted_count = func.max(func.coalesce(CatalogAlbum.track_count, 0), manifest_count)
+    wanted_count = case(
+        (manifest_count > 0, manifest_count), else_=func.coalesce(CatalogAlbum.track_count, 0)
+    )
     downloaded_count = (
         select(func.count(func.distinct(Track.catalog_track_id)))
         .where(

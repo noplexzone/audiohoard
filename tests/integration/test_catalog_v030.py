@@ -84,9 +84,9 @@ async def test_catalog_artist_album_pages_and_album_download_create_linked_job(
     assert response.headers["location"] == "/downloads"
 
     async with factory() as db:
-        job = (await db.scalars(select(Job).where(Job.catalog_album_id == album_id))).first()
-        assert job is not None
-        assert job.query == "Daft Punk Discovery"
+        jobs = list((await db.scalars(select(Job).where(Job.catalog_album_id == album_id))).all())
+        assert [job.query for job in jobs] == ["Daft Punk One More Time", "Daft Punk Aerodynamic"]
+        assert all(job.catalog_track_id is not None for job in jobs)
 
 
 def test_catalog_track_matching_requires_title_or_explicit_selection() -> None:

@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-29
+
 ### Fixed
 - Treat denied slskd review artifacts as blocked candidates so the same peer/file is not downloaded again after denial.
 - Backfill Deezer release explicitness/UPC from album summaries and stop filesystem-only progress from crediting same-title clean/explicit sibling releases.
@@ -16,14 +18,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Reconcile partial catalog album jobs after continuation imports complete the album.
 
 ### Added
+- Added bulk Wanted-page queue actions for selected or all listed incomplete releases.
 - Store provider release and track content ratings/UPCs and show rating labels on catalog release pages.
 - Download buttons on catalog album pages and artist release cards now queue work in place with a brief confirmation while preserving native form redirects without JavaScript.
 - Added a bounded job dispatcher concurrency setting to keep download bursts from exhausting the SQLite connection pool.
 
 ### Changed
+- Wanted release counts now prefer hydrated catalog track manifests so fully owned releases stay off `/wanted`.
 - Album downloads now queue missing catalog tracks and imported tracks that are positively known to be below the configured quality profile, while skipping already acceptable or unknown-bitrate imports.
 
 ### Fixed
+- Wanted bulk queueing reuses album download per-track acquisition so partial releases never enqueue a whole-album job.
 - Filesystem release-progress caching now notices new files inside nested disc folders even when directory timestamp resolution is too coarse.
 
 ## [0.7.2] - 2026-07-29

@@ -42,7 +42,7 @@ from app.services.catalog import (
     list_distinct_formats,
     list_distinct_sources,
     list_library_tracks,
-    track_meets_quality,
+    queue_catalog_album_missing_track_jobs,
 )
 from app.services.catalog_metadata import (
     VALID_METADATA_PROVIDERS,
@@ -80,6 +80,14 @@ def _download_response(request: Request | None, *, queued: int, album_id: int) -
 def _download_many_response(request: Request | None, *, queued: int, artist_id: int) -> Response:
     if _is_fetch_request(request):
         return JSONResponse({"queued": queued, "artist_id": artist_id})
+    return RedirectResponse("/downloads", status_code=303)
+
+
+def _wanted_queue_response(
+    request: Request | None, *, queued: int, album_ids: list[int]
+) -> Response:
+    if _is_fetch_request(request):
+        return JSONResponse({"queued": queued, "catalog_album_ids": album_ids})
     return RedirectResponse("/downloads", status_code=303)
 
 
@@ -788,6 +796,64 @@ async def wanted_page(
     )
 
 
+@router.post("/wanted/queue", include_in_schema=False)
+async def queue_wanted_releases(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    _user: Annotated[object, Depends(require_mutation)],
+    catalog_album_ids: Annotated[list[int] | None, Form()] = None,
+    request: Request = None,  # type: ignore[assignment]
+) -> Response:
+    selected_ids = list(dict.fromkeys(catalog_album_ids or []))
+    if not selected_ids:
+        return _wanted_queue_response(request, queued=0, album_ids=[])
+    runtime = await get_runtime_settings(db)
+    albums = list(
+        (
+            await db.execute(
+                select(CatalogAlbum)
+                .where(CatalogAlbum.id.in_(selected_ids))
+                .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    albums_by_id = {album.id: album for album in albums}
+    job_ids: list[int] = []
+    queued_album_ids: list[int] = []
+    for album_id in selected_ids:
+        album = albums_by_id.get(album_id)
+        if album is None:
+            continue
+        try:
+            await _ensure_catalog_tracks(db, settings, album)
+            refreshed = (
+                await db.execute(
+                    select(CatalogAlbum)
+                    .where(CatalogAlbum.id == album.id)
+                    .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one()
+            ids = await queue_catalog_album_missing_track_jobs(
+                db,
+                refreshed,
+                library_root=settings.library_root,
+                quality_profile=runtime.quality_profile,
+            )
+        except Exception:
+            logger.warning("Wanted queue failed for album %d", album_id, exc_info=True)
+            await db.rollback()
+            continue
+        if ids:
+            queued_album_ids.append(album_id)
+            job_ids.extend(ids)
+    for job_id in job_ids:
+        await job_dispatcher.dispatch(job_id)
+    return _wanted_queue_response(request, queued=len(job_ids), album_ids=queued_album_ids)
+
+
 @router.get("/albums/{album_id}", response_class=HTMLResponse)
 async def catalog_album_page(
     request: Request,
@@ -1074,66 +1140,21 @@ async def download_catalog_album(
             status_code=502,
             detail="Could not load album tracklist from provider; download not started",
         ) from None
-    progress = (await get_release_progress(db, [album.id], library_root=settings.library_root))[
-        album.id
-    ]
-    imported_ids = set(progress.downloaded_catalog_track_ids)
-    query = f"{album.artist.name} {album.title}".strip()
-    if not imported_ids:
-        job = Job(
-            source="priority", query=query, status=JobStatus.pending, catalog_album_id=album.id
-        )
-        db.add(job)
-        await db.commit()
-        await db.refresh(job)
-        await job_dispatcher.dispatch(job.id)
-        return _download_response(request, queued=1, album_id=album.id)
-
-    runtime = await get_runtime_settings(db)
-    quality_rows = (
+    refreshed = (
         await db.execute(
-            select(Track.catalog_track_id, Track.file_format, ImportPlan.destination_path)
-            .join(ImportPlan, ImportPlan.track_id == Track.id)
-            .where(
-                Track.catalog_album_id == album.id,
-                Track.catalog_track_id.is_not(None),
-                Track.import_state == ImportWorkflowState.imported,
-                ImportPlan.status == ImportWorkflowState.imported,
-                ImportPlan.destination_path != "",
-            )
+            select(CatalogAlbum)
+            .where(CatalogAlbum.id == album.id)
+            .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
+            .execution_options(populate_existing=True)
         )
-    ).all()
-    subquality_ids: set[int] = set()
-    for catalog_track_id, file_format, destination_path in quality_rows:
-        if (
-            catalog_track_id is not None
-            and int(catalog_track_id) in imported_ids
-            and await asyncio.to_thread(Path(destination_path).is_file)
-            and not track_meets_quality(file_format, runtime.quality_profile)
-        ):
-            subquality_ids.add(int(catalog_track_id))
-
-    tracks_to_queue = [
-        track
-        for track in album.tracks
-        if track.id not in imported_ids or track.id in subquality_ids
-    ]
-    if not tracks_to_queue:
-        return _download_response(request, queued=0, album_id=album.id)
-    job_ids: list[int] = []
-    for track in tracks_to_queue:
-        track_query = f"{album.artist.name} {track.title}".strip()
-        job = Job(
-            source="priority",
-            query=track_query,
-            status=JobStatus.pending,
-            catalog_album_id=album.id,
-            catalog_track_id=track.id,
-        )
-        db.add(job)
-        await db.flush()
-        job_ids.append(job.id)
-    await db.commit()
+    ).scalar_one()
+    runtime = await get_runtime_settings(db)
+    job_ids = await queue_catalog_album_missing_track_jobs(
+        db,
+        refreshed,
+        library_root=settings.library_root,
+        quality_profile=runtime.quality_profile,
+    )
     for job_id in job_ids:
         await job_dispatcher.dispatch(job_id)
     return _download_response(request, queued=len(job_ids), album_id=album.id)
