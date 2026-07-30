@@ -1177,6 +1177,7 @@ async def download_monitored_catalog_albums(
             album = release.catalog_album
             if release.monitored and album is not None and not album.in_library:
                 canonical[album.id] = album
+    runtime = await get_runtime_settings(db)
     job_ids: list[int] = []
     for album in canonical.values():
         album_id = album.id
@@ -1213,15 +1214,21 @@ async def download_monitored_catalog_albums(
             db.add(failed_job)
             await db.commit()
             continue
-        job = Job(
-            source="priority",
-            query=f"{artist.name} {album.title}".strip(),
-            status=JobStatus.pending,
-            catalog_album_id=album.id,
+        refreshed = (
+            await db.execute(
+                select(CatalogAlbum)
+                .where(CatalogAlbum.id == album_id)
+                .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        ids = await queue_catalog_album_missing_track_jobs(
+            db,
+            refreshed,
+            library_root=settings.library_root,
+            quality_profile=runtime.quality_profile,
         )
-        db.add(job)
-        await db.commit()
-        job_ids.append(job.id)
+        job_ids.extend(ids)
     for job_id in job_ids:
         await job_dispatcher.dispatch(job_id)
     return _download_many_response(request, queued=len(job_ids), artist_id=artist_id)

@@ -1179,6 +1179,120 @@ async def test_album_download_without_fetch_header_still_redirects(
     assert response.headers["location"] == "/downloads"
 
 
+async def test_artist_download_monitored_queues_only_missing_partial_album_tracks(
+    client: AsyncClient, test_settings, monkeypatch
+) -> None:
+    import app.routers.catalog as catalog_router
+
+    dispatched: list[int] = []
+
+    async def fake_dispatch(job_id: int):
+        dispatched.append(job_id)
+
+    monkeypatch.setattr(catalog_router.job_dispatcher, "dispatch", fake_dispatch)
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        artist = CatalogArtist(
+            name="Bulk Partial Artist",
+            monitored=True,
+            watchlist_provider="deezer",
+            last_enriched_at=datetime.now(tz=UTC),
+        )
+        complete = CatalogAlbum(title="Complete Monitored Album", track_count=12, in_library=True)
+        partial = CatalogAlbum(title="Partial Monitored Album", track_count=12, in_library=False)
+        complete.tracks.extend(
+            CatalogAlbumTrack(position=index, disc=1, title=f"Complete Track {index:02d}")
+            for index in range(1, 13)
+        )
+        partial.tracks.extend(
+            CatalogAlbumTrack(position=index, disc=1, title=f"Partial Track {index:02d}")
+            for index in range(1, 13)
+        )
+        identity = CatalogArtistIdentity(
+            provider="deezer", provider_artist_id="bulk-partial", name=artist.name
+        )
+        identity.releases.extend(
+            [
+                CatalogAlbumProvider(
+                    provider_album_id="complete-monitored",
+                    title=complete.title,
+                    release_kind="album",
+                    monitored=True,
+                    catalog_album=complete,
+                ),
+                CatalogAlbumProvider(
+                    provider_album_id="partial-monitored",
+                    title=partial.title,
+                    release_kind="album",
+                    monitored=True,
+                    catalog_album=partial,
+                ),
+            ]
+        )
+        artist.albums.extend([complete, partial])
+        artist.identities.append(identity)
+        done_job = Job(source="slskd", query="old", status=JobStatus.done)
+        release = Release(
+            job=done_job, source="slskd", title=partial.title, album_artist=artist.name
+        )
+        session.add_all([artist, done_job, release])
+        await session.flush()
+
+        release_folder = test_settings.library_root / artist.name / partial.title
+        release_folder.mkdir(parents=True)
+        for index, catalog_track in enumerate(partial.tracks[:10], start=1):
+            existing_path = release_folder / f"{index:02d} - {catalog_track.title}.flac"
+            existing_path.write_bytes(b"audio")
+            track = Track(
+                job=done_job,
+                release=release,
+                source="slskd",
+                title=catalog_track.title,
+                catalog_album_id=partial.id,
+                catalog_track_id=catalog_track.id,
+                acquisition_state=AcquisitionState.downloaded,
+                import_state=ImportWorkflowState.imported,
+            )
+            track.import_plans.append(
+                ImportPlan(
+                    release=release,
+                    source_path=str(existing_path),
+                    destination_path=str(existing_path),
+                    status=ImportWorkflowState.imported,
+                )
+            )
+            session.add(track)
+        await session.commit()
+        artist_id = artist.id
+        partial_id = partial.id
+        partial_track_ids = [track.id for track in partial.tracks]
+
+    response = await client.post(
+        f"/artists/catalog/{artist_id}/download-monitored",
+        headers={"X-Requested-With": "fetch"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"queued": 2, "artist_id": artist_id}
+    async with factory() as session:
+        jobs = list(
+            (
+                await session.scalars(
+                    select(Job).where(Job.status == JobStatus.pending).order_by(Job.id)
+                )
+            ).all()
+        )
+    assert [job.query for job in jobs] == [
+        "Bulk Partial Artist Partial Track 11",
+        "Bulk Partial Artist Partial Track 12",
+    ]
+    assert [job.catalog_album_id for job in jobs] == [partial_id, partial_id]
+    assert [job.catalog_track_id for job in jobs] == partial_track_ids[10:]
+    assert all(job.query != "Bulk Partial Artist Partial Monitored Album" for job in jobs)
+    assert len(dispatched) == 2
+
+
 async def test_artist_download_monitored_fetch_returns_json_and_stays_put(
     client: AsyncClient, monkeypatch
 ) -> None:

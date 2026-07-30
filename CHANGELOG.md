@@ -6,6 +6,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-29
+
+### Fixed
+- Bulk watchlisted artist downloads now queue only missing or sub-quality tracks for partial albums instead of reacquiring the full album.
+
 ## [0.9.0] - 2026-07-29
 
 ### Added
