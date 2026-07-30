@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -71,6 +74,70 @@ async def test_staged_audio_requires_auth_and_supports_ranges(
     assert unauthenticated.status_code in {302, 303, 307, 401}
     if session_cookie:
         client.cookies.set("session", session_cookie)
+
+
+async def test_staged_m4a_is_transcoded_to_seekable_browser_preview(
+    client: AsyncClient, test_settings: Settings
+) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("ffmpeg is required for browser-preview transcoding")
+    test_settings.staging_root.mkdir(parents=True, exist_ok=True)
+    audio = test_settings.staging_root / "atmos.m4a"
+    await asyncio.to_thread(
+        subprocess.run,
+        [
+            ffmpeg,
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=0.3",
+            "-c:a",
+            "eac3",
+            "-tag:a",
+            "ec-3",
+            "-f",
+            "mp4",
+            str(audio),
+        ],
+        check=True,
+        timeout=30,
+    )
+    factory = get_session_factory()
+    async with factory() as db:
+        job = Job(source="slskd", query="atmos", status=JobStatus.done)
+        release = Release(job=job, source="slskd", title="Album", album_artist="Artist")
+        track = Track(
+            job=job,
+            release=release,
+            source="slskd",
+            title="Atmos",
+            source_path=str(audio),
+            staging_path=str(audio),
+            acquisition_state=AcquisitionState.downloaded,
+        )
+        item = StagingReviewItem(
+            track=track,
+            release=release,
+            expected_title="Atmos",
+            verification_reason="unavailable",
+            review_state=ReviewDecision.pending,
+        )
+        db.add_all([job, release, track, item])
+        await db.commit()
+        item_id = item.id
+
+    response = await client.get(f"/staging/audio/{item_id}")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("audio/mpeg")
+    assert len(response.content) > 100
+    ranged = await client.get(f"/staging/audio/{item_id}", headers={"Range": "bytes=2-20"})
+    assert ranged.status_code == 206
+    assert ranged.headers["accept-ranges"] == "bytes"
+    assert len(ranged.content) == 19
 
 
 async def test_review_approve_resumes_import_and_deny_removes_staged_item(

@@ -69,6 +69,12 @@ _DISC_TRACK_PREFIX_RE = re.compile(
 _SINGLE_TRACK_PREFIX_RE = re.compile(
     r"^(?:cd\s*\d+\s*[-_.]?\s*)?(\d{1,2})\s*[-_. ]",
 )
+_BRACKET_CONTENT_RE = re.compile(r"[\(\[\{]([^\)\]\}]+)[\)\]\}]")
+_TECHNICAL_QUALIFIER_RE = re.compile(
+    r"^(?:flac|mp3|aac|m4a|alac|lossless|hi-?res|web(?:rip)?|cd(?:rip)?|"
+    r"(?:19|20)\d{2}|\d+(?:\.\d+)?\s*(?:khz|kbps|bit))$",
+    re.IGNORECASE,
+)
 
 
 def _now() -> datetime:
@@ -560,7 +566,23 @@ async def _run_job_in_session(
             )
         existing_tracks = list((await db.scalars(track_query)).all())
         catalog_disc_total = _catalog_disc_total(catalog_tracks)
+        selected_catalog_track = next(
+            (track for track in catalog_tracks if track.id == job.catalog_track_id), None
+        )
         for result in results:
+            if (
+                result.source == "slskd"
+                and selected_catalog_track is not None
+                and not _targeted_catalog_result_matches(result, selected_catalog_track)
+            ):
+                failures.append(
+                    {
+                        "code": "candidate_identity_mismatch",
+                        "operation": "search",
+                        "retryable": False,
+                    }
+                )
+                continue
             catalog_track = _catalog_track_for_result(result, catalog_tracks, job.catalog_track_id)
             track_title = catalog_track.title if catalog_track is not None else result.title
             track_album = catalog_album.title if catalog_album is not None else result.album
@@ -958,6 +980,35 @@ def _catalog_track_for_result(
         return tracks[0]
 
     return None
+
+
+def _targeted_catalog_result_matches(result: SearchResult, target: CatalogAlbumTrack) -> bool:
+    """Require title identity before binding a slskd result to a targeted catalog track."""
+    observed = normalize_for_catalog_match(strip_non_identity_descriptors(result.title or ""))
+    expected_core = parse_filename(target.title).title
+    expected = normalize_for_catalog_match(strip_non_identity_descriptors(expected_core))
+    filename = result.metadata.get("filename")
+    observed_source = str(filename) if isinstance(filename, str) else result.title or ""
+    return bool(
+        observed
+        and expected
+        and observed == expected
+        and _identity_qualifiers(observed_source) == _identity_qualifiers(target.title)
+    )
+
+
+def _identity_qualifiers(value: str) -> set[str]:
+    """Keep bracketed recording-version qualifiers while ignoring technical/non-identity tags."""
+    qualifiers: set[str] = set()
+    tail = value.replace("\\", "/").rsplit("/", 1)[-1]
+    for match in _BRACKET_CONTENT_RE.finditer(tail):
+        raw = match.group(1).strip()
+        if not raw or _TECHNICAL_QUALIFIER_RE.fullmatch(raw):
+            continue
+        if strip_non_identity_descriptors(f"x ({raw})") == "x":
+            continue
+        qualifiers.add(normalize_for_catalog_match(raw))
+    return qualifiers
 
 
 def _existing_track_for_result(
@@ -1615,14 +1666,14 @@ async def _enrich_deezer(track: Track, cfg: Settings) -> None:
         logger.warning("Deezer enrichment failed for track %d: %s", track.id, exc)
 
 
-async def _run_fingerprint(track: Track, cfg: Settings) -> None:
+async def _run_fingerprint(track: Track, cfg: Settings) -> int | None:
     if not track.source_path:
         track.fingerprint_state = FingerprintState.skipped
-        return
+        return None
     path = Path(track.source_path)
     if not await asyncio.to_thread(path.exists):
         track.fingerprint_state = FingerprintState.skipped
-        return
+        return None
 
     result = await fingerprint_file(path)
     if result is None:
@@ -1632,19 +1683,19 @@ async def _run_fingerprint(track: Track, cfg: Settings) -> None:
             track.fingerprint_state = FingerprintState.skipped
         else:
             track.fingerprint_state = FingerprintState.failed
-        return
+        return None
 
     duration, fingerprint = result
     track.acoustid = fingerprint
     if not track.duration_sec:
         track.duration_sec = duration
     track.fingerprint_state = FingerprintState.done
+    return duration
 
 
 async def _run_fingerprint_and_verify(track: Track, cfg: Settings, db: AsyncSession) -> None:
     """Fingerprint a download and require AcoustID confirmation or human review."""
-    await _run_fingerprint(track, cfg)
-    duration = track.duration_sec
+    duration = await _run_fingerprint(track, cfg)
     fingerprint = track.acoustid
     raw_results: list[dict[str, object]] = []
     if (

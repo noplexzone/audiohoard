@@ -549,6 +549,7 @@ class MutagenTagWriter:
                 "album_artist": "aART",
                 "date": "\xa9day",
                 "release_date": "\xa9day",
+                "releasedate": "\xa9day",
                 "genre": "\xa9gen",
             }
             freeform_atoms = {
@@ -653,6 +654,7 @@ class MutagenTagWriter:
                 "album_artist": "aART",
                 "date": "\xa9day",
                 "release_date": "\xa9day",
+                "releasedate": "\xa9day",
                 "genre": "\xa9gen",
             }
             for key, atom in text_atoms.items():

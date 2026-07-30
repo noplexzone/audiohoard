@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-30
+
+### Fixed
+- Transcode staged M4A/MP4 review audio into bounded, source-versioned MP3 previews so E-AC-3/Atmos files have browser duration and seeking without modifying the downloaded source.
+- Use fpcalc's measured duration for AcoustID lookup and review evidence instead of substituting the catalog's expected duration.
+- Reject contradictory slskd titles before targeted catalog-track enqueueing so unrelated files cannot be bound to the requested recording.
+- Round-trip the `releasedate` alias through MP4's canonical date atom so M4A imports no longer fail tag readback verification.
+
 ## [0.9.0] - 2026-07-30
 
 ### Added

@@ -53,6 +53,166 @@ def test_targeted_query_variants_normalize_and_simplify_titles() -> None:
     ]
 
 
+def test_targeted_catalog_result_rejects_contradictory_titles() -> None:
+    target = CatalogAlbumTrack(id=7, position=11, disc=1, title="Me to Me")
+    wrong = SearchResult(
+        source="slskd",
+        title="Whiskey Glasses",
+        artist="Morgan Wallen",
+        metadata={"filename": "Billboard Top 100 2019\\52 Whiskey Glasses.mp3"},
+    )
+    valid = SearchResult(
+        source="slskd",
+        title="Me to Me",
+        artist="Morgan Wallen",
+        metadata={"filename": "11 - Morgan Wallen - Me To Me.mp3"},
+    )
+
+    assert runner._targeted_catalog_result_matches(wrong, target) is False
+    assert runner._targeted_catalog_result_matches(valid, target) is True
+
+
+def test_targeted_catalog_result_rejects_different_track_from_same_album() -> None:
+    target = CatalogAlbumTrack(id=9, position=3, disc=1, title="Dangerous")
+    wrong = SearchResult(
+        source="slskd",
+        title="Sand in My Boots",
+        artist="Morgan Wallen",
+        metadata={"filename": "Dangerous_ The Double Album\\1-01 Sand in My Boots.mp3"},
+    )
+
+    assert runner._targeted_catalog_result_matches(wrong, target) is False
+
+
+def test_targeted_catalog_result_preserves_identity_changing_versions() -> None:
+    studio = CatalogAlbumTrack(id=10, position=1, disc=1, title="Song")
+    live = CatalogAlbumTrack(id=11, position=1, disc=1, title="Song (Live)")
+    live_result = SearchResult(
+        source="slskd",
+        title="Song",
+        artist="Artist",
+        metadata={"filename": "01 - Artist - Song (Live).flac"},
+    )
+    studio_result = SearchResult(
+        source="slskd",
+        title="Song",
+        artist="Artist",
+        metadata={"filename": "01 - Artist - Song [FLAC].flac"},
+    )
+
+    assert runner._targeted_catalog_result_matches(live_result, studio) is False
+    assert runner._targeted_catalog_result_matches(live_result, live) is True
+    assert runner._targeted_catalog_result_matches(studio_result, studio) is True
+
+
+async def test_fingerprint_verification_uses_measured_not_catalog_duration(
+    db_session: AsyncSession,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    source = tmp_path / "wrong.mp3"
+    source.write_bytes(b"audio")
+    job = Job(source="slskd", query="target", status=JobStatus.running)
+    release = Release(job=job, source="slskd", title="Album", album_artist="Artist")
+    track = Track(
+        job=job,
+        release=release,
+        source="slskd",
+        title="Target",
+        duration_sec=139,
+        source_path=str(source),
+        mbid="expected-mbid",
+        identity_state=IdentityResolutionState.resolved,
+    )
+    db_session.add_all([job, release, track])
+    await db_session.flush()
+    observed: dict[str, object] = {}
+
+    async def fake_fingerprint(path):
+        assert path == source
+        return 234, "fingerprint"
+
+    async def fake_lookup(duration: int, fingerprint: str, api_key: str):
+        observed["lookup_duration"] = duration
+        assert fingerprint == "fingerprint"
+        assert api_key
+        return []
+
+    async def fake_verify(track_arg, *, fingerprint_duration_sec, **kwargs):
+        observed["review_duration"] = fingerprint_duration_sec
+        return AcoustIDVerificationState.unavailable
+
+    monkeypatch.setattr(runner, "fingerprint_file", fake_fingerprint)
+    monkeypatch.setattr(runner, "_lookup_acoustid_raw", fake_lookup)
+    monkeypatch.setattr(
+        "app.services.acoustid_verification.run_acoustid_verification", fake_verify
+    )
+    test_settings.acoustid_api_key = "configured"
+
+    await runner._run_fingerprint_and_verify(track, test_settings, db_session)
+
+    assert track.duration_sec == 139
+    assert observed == {"lookup_duration": 234, "review_duration": 234}
+
+
+async def test_targeted_catalog_mismatch_is_rejected_before_acquisition(
+    db_session: AsyncSession,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artist = CatalogArtist(name="Morgan Wallen")
+    album = CatalogAlbum(title="Dangerous: The Double Album", track_count=1)
+    target = CatalogAlbumTrack(position=3, disc=1, title="Dangerous")
+    artist.albums.append(album)
+    album.tracks.append(target)
+    db_session.add(artist)
+    await db_session.flush()
+    job = Job(
+        source="slskd",
+        query="Morgan Wallen Dangerous",
+        status=JobStatus.pending,
+        catalog_album_id=album.id,
+        catalog_track_id=target.id,
+    )
+    db_session.add(job)
+    await db_session.flush()
+    acquisition_calls = 0
+
+    async def fake_fetch(*args: object, **kwargs: object) -> Sequence[SearchResult]:
+        return [
+            SearchResult(
+                source="slskd",
+                title="Sand in My Boots",
+                artist="Morgan Wallen",
+                album="Dangerous: The Double Album",
+                metadata={
+                    "username": "peer",
+                    "filename": "Dangerous_ The Double Album\\1-01 Sand in My Boots.mp3",
+                },
+            )
+        ]
+
+    async def fail_if_acquired(*args: object, **kwargs: object) -> tuple[None, None]:
+        nonlocal acquisition_calls
+        acquisition_calls += 1
+        return None, None
+
+    async def no_continuation(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(runner, "_prepare_acquisition", fail_if_acquired)
+    monkeypatch.setattr(runner, "_spawn_continuation_jobs", no_continuation)
+
+    await runner.run_job(job.id, db_session, test_settings)
+
+    tracks = list((await db_session.scalars(select(Track).where(Track.job_id == job.id))).all())
+    assert acquisition_calls == 0
+    assert tracks == []
+    assert job.status == JobStatus.partial
+
+
 async def test_run_job_marks_failed_when_result_processing_fails(
     db_session: AsyncSession, test_settings: Settings, monkeypatch: object
 ) -> None:

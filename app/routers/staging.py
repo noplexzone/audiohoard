@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
+import shutil
+import subprocess
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -45,6 +50,81 @@ _MIME_MAP: dict[str, str] = {
     ".wav": "audio/wav",
     ".aac": "audio/aac",
 }
+_PREVIEW_CACHE_LIMIT = 128
+_PREVIEW_CACHE_MAX_BYTES = 512 * 1024 * 1024
+_PREVIEW_MAX_OUTPUT_BYTES = 64 * 1024 * 1024
+_PREVIEW_MAX_DURATION_SECONDS = 30 * 60
+_PREVIEW_TRANSCODE_LIMIT = asyncio.Semaphore(2)
+_PREVIEW_ITEM_LOCKS: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
+
+
+def _browser_preview_path(source: Path, item_id: int, cache_root: Path) -> Path:
+    """Return a cached MP3 preview for MP4-family audio without changing the source."""
+    source_stat = source.stat()
+    cache_key = hashlib.sha256(
+        f"{source.resolve()}:{source_stat.st_size}:{source_stat.st_mtime_ns}".encode()
+    ).hexdigest()[:20]
+    cache_root.mkdir(parents=True, exist_ok=True)
+    destination = cache_root / f"{item_id}-{cache_key}.mp3"
+    if destination.is_file() and destination.stat().st_size > 0:
+        return destination
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg is not available")
+    temporary = cache_root / f".{destination.name}.{uuid4().hex}.tmp.mp3"
+    try:
+        completed = subprocess.run(
+            [
+                ffmpeg,
+                "-nostdin",
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                str(source),
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-t",
+                str(_PREVIEW_MAX_DURATION_SECONDS),
+                "-ac",
+                "2",
+                "-c:a",
+                "libmp3lame",
+                "-q:a",
+                "4",
+                str(temporary),
+            ],
+            capture_output=True,
+            check=False,
+            timeout=180,
+        )
+        output_size = temporary.stat().st_size if temporary.is_file() else 0
+        if (
+            completed.returncode != 0
+            or output_size == 0
+            or output_size > _PREVIEW_MAX_OUTPUT_BYTES
+        ):
+            raise RuntimeError("ffmpeg could not create a browser preview")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    for stale in cache_root.glob(f"{item_id}-*.mp3"):
+        if stale != destination:
+            stale.unlink(missing_ok=True)
+    cached = sorted(
+        cache_root.glob("*.mp3"), key=lambda path: path.stat().st_mtime_ns, reverse=True
+    )
+    retained_bytes = 0
+    for index, stale in enumerate(cached):
+        size = stale.stat().st_size
+        if index >= _PREVIEW_CACHE_LIMIT or retained_bytes + size > _PREVIEW_CACHE_MAX_BYTES:
+            stale.unlink(missing_ok=True)
+        else:
+            retained_bytes += size
+    return destination
 
 
 def _validate_audio_path(
@@ -121,8 +201,23 @@ async def serve_staged_audio(
     resolved = await asyncio.to_thread(
         _validate_audio_path, track.staging_path, settings.staging_root
     )
-    file_size = resolved.stat().st_size
     suffix = resolved.suffix.casefold()
+    if suffix in {".m4a", ".mp4"}:
+        try:
+            item_lock = _PREVIEW_ITEM_LOCKS.setdefault(item_id, asyncio.Lock())
+            async with item_lock, _PREVIEW_TRANSCODE_LIMIT:
+                resolved = await asyncio.to_thread(
+                    _browser_preview_path,
+                    resolved,
+                    item_id,
+                    settings.artwork_cache_root.parent / "review-audio",
+                )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            raise HTTPException(
+                status_code=422, detail="Browser-compatible audio preview could not be created"
+            ) from None
+        suffix = ".mp3"
+    file_size = resolved.stat().st_size
     mime = _MIME_MAP.get(suffix, "application/octet-stream")
 
     range_header = request.headers.get("range")
