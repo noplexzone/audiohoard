@@ -40,7 +40,7 @@
     <div class="field-block"><label for="max_partial_attempts">Max partial completion attempts</label><input id="max_partial_attempts" type="number" name="max_partial_attempts" min="1" max="10" value="{{ runtime.max_partial_attempts }}"><div class="hint">Maximum follow-up jobs spawned to fill in missing tracks on a partial album download.</div></div>
     <button class="btn" type="submit">Save quality profile</button></form>
     {% elif section == 'about' %}
-    <h2>About</h2><p class="hint">Current version and release history.</p><p><strong>Running version:</strong> {{ app_version }}</p><p><a class="btn secondary" href="/changelog">View changelog</a></p>
+    <h2>About</h2><p class="hint">Current version, release history, and local API reference.</p><p><strong>Running version:</strong> {{ app_version }}</p><p><a class="btn secondary" href="/changelog">View changelog</a> <a class="btn secondary" href="/api/docs">API docs</a></p>
     {% endif %}
   </section>
 </div>

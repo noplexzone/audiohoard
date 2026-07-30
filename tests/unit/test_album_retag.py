@@ -361,6 +361,68 @@ async def test_retag_catalog_album_discovers_legacy_library_files_without_import
     assert FLAC(paths[1])["musicbrainz_trackid"] == ["agats-mbid"]
 
 
+async def test_retag_catalog_album_renames_multidisc_files_to_disc_track_template(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    library_root = tmp_path / "library"
+    artist = CatalogArtist(name="Morgan Wallen", mbid="artist-mbid")
+    album = CatalogAlbum(title="I’m The Problem", year="2025", release_type="album", track_count=2)
+    artist.albums.append(album)
+    album.tracks.extend(
+        [
+            CatalogAlbumTrack(disc=1, position=1, title="I'm the Problem", recording_mbid="one"),
+            CatalogAlbumTrack(disc=3, position=9, title="LA Night", recording_mbid="la"),
+        ]
+    )
+    job = Job(source="slskd", query="morgan", status=JobStatus.done)
+    release = Release(job=job, source="slskd", title=album.title, album_artist=artist.name)
+    db_session.add_all([artist, job, release])
+    await db_session.flush()
+    folder = library_root / artist.name / f"{album.title} ({album.year})"
+    folder.mkdir(parents=True)
+    old_path = folder / "09 - LA Night.flac"
+    old_path.write_bytes(_minimal_flac_bytes())
+    track = Track(
+        job=job,
+        release=release,
+        source="slskd",
+        title="LA Night",
+        album=album.title,
+        album_artist=artist.name,
+        catalog_album_id=album.id,
+        catalog_track_id=album.tracks[1].id,
+        disc=3,
+        disc_total=None,
+        track_no=9,
+        import_state=ImportWorkflowState.imported,
+    )
+    plan = ImportPlan(
+        release=release,
+        track=track,
+        source_path=str(old_path),
+        destination_path=str(old_path),
+        status=ImportWorkflowState.imported,
+    )
+    db_session.add_all([track, plan])
+    await db_session.flush()
+
+    async def no_artwork(url: str | None) -> CanonicalArtwork | None:
+        return None
+
+    monkeypatch.setattr(library_import_module, "_fetch_canonical_artwork", no_artwork)
+
+    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    new_path = folder / "3-09 - LA Night.flac"
+    assert result.files_retagged == 1
+    assert result.files_renamed == 1
+    assert not old_path.exists()
+    assert new_path.exists()
+    assert plan.destination_path == str(new_path)
+    assert track.disc_total == 3
+    assert FLAC(new_path)["discnumber"] == ["3/3"]
+
+
 async def test_retag_catalog_album_matches_flat_multidisc_files_by_title(
     db_session: AsyncSession, tmp_path: Path, monkeypatch
 ) -> None:
@@ -407,12 +469,18 @@ async def test_retag_catalog_album_matches_flat_multidisc_files_by_title(
     result = await retag_catalog_album(db_session, album.id, library_root=library_root)
 
     assert result.files_retagged == 3
-    assert FLAC(acoustic)["discnumber"] == ["1/2"]
-    assert FLAC(acoustic)["musicbrainz_trackid"] == ["acoustic-mbid"]
-    assert FLAC(ends)["discnumber"] == ["2/2"]
-    assert FLAC(ends)["musicbrainz_trackid"] == ["ends-mbid"]
-    assert FLAC(love)["discnumber"] == ["2/2"]
-    assert FLAC(love)["musicbrainz_trackid"] == ["love-mbid"]
+    acoustic_new = folder / "1-05 - Worry is a Sickness (Acoustic).flac"
+    ends_new = folder / "2-01 - Ends of the Earth.flac"
+    love_new = folder / "2-05 - Love Is Two Faced.flac"
+    assert not acoustic.exists()
+    assert not ends.exists()
+    assert not love.exists()
+    assert FLAC(acoustic_new)["discnumber"] == ["1/2"]
+    assert FLAC(acoustic_new)["musicbrainz_trackid"] == ["acoustic-mbid"]
+    assert FLAC(ends_new)["discnumber"] == ["2/2"]
+    assert FLAC(ends_new)["musicbrainz_trackid"] == ["ends-mbid"]
+    assert FLAC(love_new)["discnumber"] == ["2/2"]
+    assert FLAC(love_new)["musicbrainz_trackid"] == ["love-mbid"]
 
 
 async def test_retag_catalog_album_maps_multidisc_legacy_filenames(
