@@ -6,7 +6,12 @@ from types import SimpleNamespace
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.jobs.runner import _catalog_track_for_result, _spawn_continuation_jobs
+from app.jobs.runner import (
+    _catalog_disc_total,
+    _catalog_track_for_result,
+    _fetch_slskd_album_results,
+    _spawn_continuation_jobs,
+)
 from app.metadata.filename_parse import parsed_position_evidence
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
@@ -19,7 +24,7 @@ from app.models.workflow import (
     ImportWorkflowState,
     ReviewDecision,
 )
-from app.schemas.search import SearchResult
+from app.schemas.search import SearchRequest, SearchResult
 from app.services.acoustid_verification import run_acoustid_verification
 from app.services.auto_import import try_auto_import_release
 from app.services.slskd_scoring import (
@@ -63,6 +68,67 @@ def test_slskd_album_folder_selection_keeps_complete_15_track_candidate() -> Non
     assert selected is not None
     assert selected.username == "complete"
     assert len(selected.files) == 15
+
+
+def test_slskd_album_folder_grouping_combines_sibling_disc_directories() -> None:
+    folders = group_slskd_files_into_folders(
+        [
+            _folder_response("peer", "Morgan Wallen\\Dangerous\\CD1", "flac", 15, 0),
+            _folder_response("peer", "Morgan Wallen\\Dangerous\\CD2", "flac", 18, 0),
+        ]
+    )
+
+    assert len(folders) == 1
+    assert folders[0].parent_dir == "Morgan Wallen/Dangerous"
+    assert len(folders[0].files) == 33
+    assert {item.disc for item in folders[0].files} == {1, 2}
+
+
+async def test_slskd_album_fetch_preserves_disc_directory_position_metadata(
+    db_session: AsyncSession,
+) -> None:
+    artist = CatalogArtist(name="Morgan Wallen")
+    album = CatalogAlbum(artist=artist, title="Dangerous: The Double Album (Bonus)", track_count=4)
+    album.tracks.extend(
+        [
+            CatalogAlbumTrack(id=1, album_id=1, position=1, disc=1, title="Sand In My Boots"),
+            CatalogAlbumTrack(id=2, album_id=1, position=2, disc=1, title="Wasted On You"),
+            CatalogAlbumTrack(id=3, album_id=1, position=1, disc=2, title="Still Goin Down"),
+            CatalogAlbumTrack(
+                id=4, album_id=1, position=2, disc=2, title="Rednecks, Red Letters, Red Dirt"
+            ),
+        ]
+    )
+
+    class Adapter:
+        async def search_album_folders(self, request: SearchRequest):
+            return group_slskd_files_into_folders(
+                [
+                    _folder_response("peer", "Morgan Wallen\\Dangerous\\CD1", "flac", 2, 0),
+                    _folder_response("peer", "Morgan Wallen\\Dangerous\\CD2", "flac", 2, 0),
+                ]
+            ), []
+
+    runtime = SimpleNamespace(
+        quality_profile=SimpleNamespace(
+            format_preference=["flac", "mp3"],
+            min_mp3_bitrate=320,
+            allow_lower_quality_fallback=True,
+        )
+    )
+
+    results = await _fetch_slskd_album_results(
+        Adapter(),
+        SearchRequest(query="Dangerous"),
+        Job(source="slskd"),
+        album,
+        runtime,
+        db_session,
+    )
+
+    assert len(results) == 4
+    assert [item.metadata.get("disc") for item in results] == [1, 1, 2, 2]
+    assert _catalog_track_for_result(results[2], album.tracks, None).title == "Still Goin Down"
 
 
 def test_quality_profile_prefers_complete_flac_over_complete_mp3() -> None:
@@ -177,6 +243,16 @@ def test_catalog_matching_uses_scene_packed_disc_track_metadata() -> None:
 
     assert _catalog_track_for_result(first, catalog, None).id == 1
     assert _catalog_track_for_result(second, catalog, None).id == 10
+
+
+def test_catalog_disc_total_detects_multidisc_manifest() -> None:
+    tracks = [
+        CatalogAlbumTrack(position=1, disc=1, title="One"),
+        CatalogAlbumTrack(position=1, disc=2, title="Two"),
+        CatalogAlbumTrack(position=1, disc=3, title="Three"),
+    ]
+
+    assert _catalog_disc_total(tracks) == 3
 
 
 async def test_acoustid_mismatch_creates_one_durable_review_item(

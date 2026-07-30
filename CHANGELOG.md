@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Combine sibling `CD1`/`CD2` slskd album folders and preserve multi-disc totals in import/metadata-repair tags.
 - Treat denied slskd review artifacts as blocked candidates so the same peer/file is not downloaded again after denial.
 - Backfill Deezer release explicitness/UPC from album summaries and stop filesystem-only progress from crediting same-title clean/explicit sibling releases.
 - Ignore `.lrc` lyrics files from slskd search/acquisition so lyric sidecars cannot enter import review as zero-duration tracks.

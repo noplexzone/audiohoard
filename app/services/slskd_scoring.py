@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
@@ -7,6 +8,7 @@ from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS
 from app.metadata.filename_parse import normalize_for_catalog_match
 
 _AUDIO_EXTS: frozenset[str] = IMPORTABLE_AUDIO_EXTENSIONS
+_DISC_FOLDER_RE = re.compile(r"^(?:cd|disc)[ _.-]?(\d{1,2})$", re.IGNORECASE)
 
 
 def _normalize_slash(path: str) -> str:
@@ -18,6 +20,19 @@ def _parent_dir(filename: str) -> str:
     norm = _normalize_slash(filename)
     parent = str(PurePosixPath(norm).parent)
     return parent if parent != "." else ""
+
+
+def _album_parent_and_disc(filename: str) -> tuple[str, int | None]:
+    """Return grouping parent and disc number implied by a CD/Disc subfolder."""
+    norm = _normalize_slash(filename)
+    parent = PurePosixPath(norm).parent
+    if parent == PurePosixPath("."):
+        return "", None
+    disc_match = _DISC_FOLDER_RE.match(parent.name)
+    if disc_match is None:
+        return str(parent), None
+    album_parent = str(parent.parent)
+    return ("" if album_parent == "." else album_parent), int(disc_match.group(1))
 
 
 def _audio_ext(filename: str) -> str:
@@ -32,6 +47,7 @@ class SlskdFile:
     size_bytes: int | None
     bit_rate: int | None
     sample_rate: int | None
+    disc: int | None = None
 
 
 @dataclass
@@ -64,7 +80,7 @@ def group_slskd_files_into_folders(
             ext = _audio_ext(filename)
             if not ext:
                 continue
-            parent = _parent_dir(filename)
+            parent, disc = _album_parent_and_disc(filename)
             key = (username, parent, ext)
             if key not in folders:
                 folders[key] = AlbumFolder(username=username, parent_dir=parent, audio_format=ext)
@@ -76,8 +92,11 @@ def group_slskd_files_into_folders(
                     sample_rate=f.get("sampleRate")
                     if isinstance(f.get("sampleRate"), int)
                     else None,
+                    disc=disc,
                 )
             )
+    for folder in folders.values():
+        folder.files.sort(key=lambda item: (item.disc or 1, item.filename))
     return list(folders.values())
 
 

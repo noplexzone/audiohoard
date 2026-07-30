@@ -407,11 +407,11 @@ async def test_retag_catalog_album_matches_flat_multidisc_files_by_title(
     result = await retag_catalog_album(db_session, album.id, library_root=library_root)
 
     assert result.files_retagged == 3
-    assert FLAC(acoustic)["discnumber"] == ["1"]
+    assert FLAC(acoustic)["discnumber"] == ["1/2"]
     assert FLAC(acoustic)["musicbrainz_trackid"] == ["acoustic-mbid"]
-    assert FLAC(ends)["discnumber"] == ["2"]
+    assert FLAC(ends)["discnumber"] == ["2/2"]
     assert FLAC(ends)["musicbrainz_trackid"] == ["ends-mbid"]
-    assert FLAC(love)["discnumber"] == ["2"]
+    assert FLAC(love)["discnumber"] == ["2/2"]
     assert FLAC(love)["musicbrainz_trackid"] == ["love-mbid"]
 
 
@@ -446,9 +446,9 @@ async def test_retag_catalog_album_maps_multidisc_legacy_filenames(
 
     assert result.files_retagged == 2
     assert FLAC(disc_one)["musicbrainz_trackid"] == ["disc-one"]
-    assert FLAC(disc_one)["discnumber"] == ["1"]
+    assert FLAC(disc_one)["discnumber"] == ["1/2"]
     assert FLAC(disc_two)["musicbrainz_trackid"] == ["disc-two"]
-    assert FLAC(disc_two)["discnumber"] == ["2"]
+    assert FLAC(disc_two)["discnumber"] == ["2/2"]
 
 
 class _FailingSecondWriter(MutagenTagWriter):

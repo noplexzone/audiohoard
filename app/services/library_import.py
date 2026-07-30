@@ -401,7 +401,11 @@ def _tags_for(release: Release, track: Track) -> dict[str, str]:
         "release_date": track.year or release.year or "",
         "releasedate": track.year or release.year or "",
         "tracknumber": str(track.track_no or ""),
-        "discnumber": str(track.disc or ""),
+        "discnumber": (
+            f"{track.disc}/{track.disc_total}"
+            if track.disc and track.disc_total and track.disc_total > 1
+            else str(track.disc or "")
+        ),
         "musicbrainz_trackid": track.mbid or "",
         "musicbrainz_albumid": release.release_mbid or "",
     }
@@ -666,6 +670,17 @@ class AlbumRetagResult:
     folder: Path
 
 
+def _catalog_disc_total(album: CatalogAlbum) -> int | None:
+    discs = [track.disc for track in album.tracks if track.disc and track.disc > 0]
+    total = max(discs, default=1)
+    return total if total > 1 else None
+
+
+def _discnumber_value(album: CatalogAlbum, disc: int) -> str:
+    disc_total = _catalog_disc_total(album)
+    return f"{disc}/{disc_total}" if disc_total else str(disc)
+
+
 def _catalog_tags(
     album: CatalogAlbum, catalog_track: CatalogAlbumTrack, track: Track | None
 ) -> dict[str, str]:
@@ -678,7 +693,7 @@ def _catalog_tags(
         "releasedate": album.year or "",
         "release_date": album.year or "",
         "tracknumber": str(catalog_track.position),
-        "discnumber": str(catalog_track.disc),
+        "discnumber": _discnumber_value(album, catalog_track.disc),
         "musicbrainz_trackid": catalog_track.recording_mbid
         or (track.mbid if track is not None else "")
         or "",

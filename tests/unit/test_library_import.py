@@ -650,3 +650,44 @@ async def test_catalog_scoped_import_without_catalog_track_id_stays_incomplete(
     assert tracks[0].import_state == ImportWorkflowState.imported
     assert release.import_state == ImportWorkflowState.needs_review
     assert "still require review" in (release.error_detail or "")
+
+
+def test_catalog_tags_include_disc_total_for_multidisc_albums() -> None:
+    from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
+    from app.services.library_import import _catalog_tags
+
+    artist = CatalogArtist(name="Morgan Wallen")
+    album = CatalogAlbum(artist=artist, title="I’m The Problem", year="2025")
+    album.tracks.extend(
+        [
+            CatalogAlbumTrack(position=1, disc=1, title="Disc One"),
+            CatalogAlbumTrack(position=1, disc=2, title="Disc Two"),
+            CatalogAlbumTrack(position=1, disc=3, title="Disc Three"),
+        ]
+    )
+
+    tags = _catalog_tags(album, album.tracks[1], None)
+
+    assert tags["discnumber"] == "2/3"
+
+
+def test_import_tags_include_track_disc_total() -> None:
+    from app.models.release import Release
+    from app.models.track import Track
+    from app.services.library_import import _tags_for
+
+    release = Release(title="I’m The Problem", album_artist="Morgan Wallen", year="2025")
+    track = Track(
+        title="If You Were Mine",
+        artist="Morgan Wallen",
+        album_artist="Morgan Wallen",
+        album="I’m The Problem",
+        year="2025",
+        disc=2,
+        disc_total=3,
+        track_no=6,
+    )
+
+    tags = _tags_for(release, track)
+
+    assert tags["discnumber"] == "2/3"

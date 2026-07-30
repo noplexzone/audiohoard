@@ -538,6 +538,7 @@ async def _run_job_in_session(
                 (Track.job_id == job_id) | Track.release_id.in_(release_ids)
             )
         existing_tracks = list((await db.scalars(track_query)).all())
+        catalog_disc_total = _catalog_disc_total(catalog_tracks)
         for result in results:
             catalog_track = _catalog_track_for_result(result, catalog_tracks, job.catalog_track_id)
             track_title = catalog_track.title if catalog_track is not None else result.title
@@ -601,6 +602,7 @@ async def _run_job_in_session(
                         album=track_album,
                         year=catalog_album.year if catalog_album is not None else None,
                         disc=catalog_track.disc if catalog_track is not None else None,
+                        disc_total=catalog_disc_total if catalog_track is not None else None,
                         track_no=catalog_track.position if catalog_track is not None else None,
                         duration_sec=catalog_track.duration_sec
                         if catalog_track is not None
@@ -619,6 +621,10 @@ async def _run_job_in_session(
                     db.add(track)
                     await db.flush()
                     existing_tracks.append(track)
+                elif catalog_track is not None:
+                    track.disc = catalog_track.disc
+                    track.disc_total = catalog_disc_total
+                    track.track_no = catalog_track.position
                 if commit_progress:
                     job.updated_at = _now()
                     await db.commit()
@@ -809,6 +815,12 @@ async def _load_catalog_album(db: AsyncSession, album_id: int | None) -> Catalog
         .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
     )
     return result.scalar_one_or_none()
+
+
+def _catalog_disc_total(tracks: list[CatalogAlbumTrack]) -> int | None:
+    discs = [track.disc for track in tracks if track.disc and track.disc > 0]
+    total = max(discs, default=1)
+    return total if total > 1 else None
 
 
 def _catalog_manifest_issue(
@@ -1222,6 +1234,9 @@ async def _fetch_slskd_album_results(
         filename = slskd_file.filename
         ext = best.audio_format
         guess = parse_filename(filename)
+        position_evidence = parsed_position_evidence(filename)
+        if slskd_file.disc is not None:
+            position_evidence["disc"] = slskd_file.disc
         results.append(
             SearchResult(
                 source="slskd",
@@ -1240,7 +1255,7 @@ async def _fetch_slskd_album_results(
                     "sample_rate": slskd_file.sample_rate,
                     "folder_score": best.score,
                     "parent_dir": best.parent_dir,
-                    **parsed_position_evidence(filename),
+                    **position_evidence,
                 },
             )
         )
