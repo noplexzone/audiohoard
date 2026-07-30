@@ -312,6 +312,51 @@ async def test_deny_removes_non_audio_review_artifact(
         assert denied_track.acoustid_verification_state == AcoustIDVerificationState.denied
 
 
+async def test_deny_clears_review_with_unsafe_stale_staging_path(
+    client: AsyncClient, test_settings: Settings
+) -> None:
+    outside = test_settings.staging_root.parent / "outside-review.mp3"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_bytes(b"outside")  # noqa: ASYNC240
+    factory = get_session_factory()
+    async with factory() as db:
+        job = Job(source="slskd", query="unsafe", status=JobStatus.done)
+        release = Release(job=job, source="slskd", title="Album", album_artist="Artist")
+        track = Track(
+            job=job,
+            release=release,
+            source="slskd",
+            title="Unsafe",
+            source_path=str(outside),
+            staging_path=str(outside),
+            acquisition_state=AcquisitionState.downloaded,
+            acoustid_verification_state=AcoustIDVerificationState.mismatch,
+        )
+        item = StagingReviewItem(
+            track=track,
+            release=release,
+            expected_title="Unsafe",
+            verification_reason="mismatch",
+            review_state=ReviewDecision.pending,
+        )
+        db.add_all([job, release, track, item])
+        await db.commit()
+        item_id = item.id
+        track_id = track.id
+
+    response = await client.post(f"/staging/review/{item_id}/deny", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert outside.exists()
+    async with factory() as db:
+        assert await db.get(StagingReviewItem, item_id) is None
+        denied_track = await db.get(Track, track_id)
+        assert denied_track is not None
+        assert denied_track.source_path is None
+        assert denied_track.staging_path is None
+        assert denied_track.acoustid_verification_state == AcoustIDVerificationState.denied
+
+
 async def test_review_page_has_only_approve_and_deny_actions(
     client: AsyncClient, test_settings: Settings
 ) -> None:

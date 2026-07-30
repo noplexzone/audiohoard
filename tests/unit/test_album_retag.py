@@ -410,6 +410,7 @@ async def test_retag_catalog_album_renames_multidisc_files_to_disc_track_templat
         return None
 
     monkeypatch.setattr(library_import_module, "_fetch_canonical_artwork", no_artwork)
+    db_session.expire(track, ["import_plans"])
 
     result = await retag_catalog_album(db_session, album.id, library_root=library_root)
 
