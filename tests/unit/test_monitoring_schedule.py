@@ -79,13 +79,16 @@ async def test_upgrade_check_hours_runs_active_record_and_persists_result(
 
     calls = []
 
-    def fake_discovery(db, cfg, record_arg):
+    def fake_discovery(db, cfg, record_arg, *, checkpoint=None):
+        assert checkpoint is not None
+
         async def discover():
             return []
 
         return discover
 
-    async def fake_check(db, record_arg, current_quality, discover):
+    async def fake_check(db, record_arg, current_quality, discover, *, checkpoint=None):
+        assert checkpoint is not None
         calls.append((record_arg.id, current_quality))
         record_arg.status = MonitoringStatus.failed
         await db.flush()

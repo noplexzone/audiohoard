@@ -12,7 +12,7 @@ from app.models.monitoring import MonitoringRecord
 from app.models.release import Release
 from app.models.release_candidate import MatchReviewState, ReleaseCandidate
 from app.schemas.search import SearchResult
-from app.services.monitoring import CheckDiscovery
+from app.services.monitoring import CheckDiscovery, ProgressCheckpoint
 
 _LOSSLESS_FORMATS = {"flac", "alac", "wav", "aiff", "aif"}
 
@@ -107,7 +107,11 @@ def _candidate_from_result(release_id: int, result: SearchResult) -> ReleaseCand
 
 
 def build_upgrade_discovery(
-    db: AsyncSession, cfg: Settings, record: MonitoringRecord
+    db: AsyncSession,
+    cfg: Settings,
+    record: MonitoringRecord,
+    *,
+    checkpoint: ProgressCheckpoint | None = None,
 ) -> CheckDiscovery:
     async def discover() -> list[ReleaseCandidate]:
         release = await db.get(
@@ -117,7 +121,12 @@ def build_upgrade_discovery(
         )
         if release is None:
             return []
-        results = await runner._call_fetch_results(release.job, cfg, db)  # noqa: SLF001
+        if checkpoint is None:
+            results = await runner._call_fetch_results(release.job, cfg, db)  # noqa: SLF001
+        else:
+            results = await runner._call_fetch_results(  # noqa: SLF001
+                release.job, cfg, db, checkpoint=checkpoint
+            )
         candidates = [_candidate_from_result(release.id, result) for result in results]
         db.add_all(candidates)
         await db.flush()

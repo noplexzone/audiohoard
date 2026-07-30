@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.8] - 2026-07-30
+
+### Fixed
+- Commit each quality-monitoring status checkpoint before provider search and polling so the scheduler cannot hold SQLite's writer lock across sequential 60-second searches.
+- Persist quality-monitoring failure and cancellation states after provider I/O so records cannot remain permanently stuck as `checking`.
+- Retry album download job creation after transient SQLite writer contention without duplicating jobs or reusing expired ORM state.
+
 ## [0.8.7] - 2026-07-30
 
 ### Fixed

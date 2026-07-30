@@ -13,6 +13,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.database import run_with_sqlite_lock_retry
 from app.media_formats import IMPORTABLE_AUDIO_SUFFIXES
 from app.metadata.content_rating import CONTENT_RATING_UNKNOWN, normalize_content_rating
 from app.models.catalog_entities import (
@@ -630,7 +631,6 @@ async def queue_catalog_album_missing_track_jobs(
         for track in tracks_to_queue
         if track.id is not None and (track.id not in imported_ids or track.id in subquality_ids)
     ]
-    job_ids: list[int] = []
     artist_name = (
         await db.scalar(
             select(CatalogArtist.name)
@@ -639,18 +639,34 @@ async def queue_catalog_album_missing_track_jobs(
         )
         or ""
     )
-    for track in tracks_to_queue:
-        job = Job(
-            source="priority",
-            query=" ".join(part for part in (artist_name, track.title) if part),
-            status=JobStatus.pending,
-            catalog_album_id=album.id,
-            catalog_track_id=track.id,
+    job_specs = [
+        (
+            " ".join(part for part in (artist_name, track.title) if part),
+            album.id,
+            track.id,
         )
-        db.add(job)
-        await db.flush()
-        job_ids.append(job.id)
-    await db.commit()
+        for track in tracks_to_queue
+    ]
+    job_ids: list[int] = []
+
+    async def insert_jobs() -> None:
+        nonlocal job_ids
+        attempt_ids: list[int] = []
+        for query, album_id, track_id in job_specs:
+            job = Job(
+                source="priority",
+                query=query,
+                status=JobStatus.pending,
+                catalog_album_id=album_id,
+                catalog_track_id=track_id,
+            )
+            db.add(job)
+            await db.flush()
+            attempt_ids.append(job.id)
+        await db.commit()
+        job_ids = attempt_ids
+
+    await run_with_sqlite_lock_retry(db, insert_jobs, attempts=6, delay_seconds=0.2)
     return job_ids
 
 
