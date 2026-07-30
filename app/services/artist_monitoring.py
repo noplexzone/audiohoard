@@ -24,6 +24,7 @@ from app.services.catalog_metadata import (
     fetch_and_store_discography,
     release_bucket,
 )
+from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
 from app.settings_service import build_effective_settings, get_runtime_settings
 
 logger = logging.getLogger(__name__)
@@ -280,6 +281,12 @@ class DiscographyRefreshScheduler:
                         auto_download=runtime.auto_download_wanted,
                     )
                     await db.commit()
+                try:
+                    await reconcile_deezer_catalog_ownership(factory, cfg, artist_id=artist_id)
+                except Exception:
+                    logger.exception(
+                        "Catalog ownership reconciliation failed for artist %s", artist_id
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:

@@ -56,6 +56,7 @@ from app.services.catalog_metadata import (
     open_catalog_artist,
     release_bucket,
 )
+from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
 from app.services.library_import import ImportExecutionError, retag_catalog_album
 from app.services.monitoring import (
     _monitoring_profile_from_runtime,
@@ -422,6 +423,14 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
             )
             artist.enrichment_state = "idle"
             await session.commit()
+            try:
+                await reconcile_deezer_catalog_ownership(
+                    get_session_factory(), cfg, artist_id=artist_id
+                )
+            except Exception:
+                logger.exception(
+                    "Catalog ownership reconciliation failed for artist %s", artist_id
+                )
         except Exception:
             await session.rollback()
             failed = await session.get(CatalogArtist, artist_id)

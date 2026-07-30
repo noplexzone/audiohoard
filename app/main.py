@@ -50,6 +50,7 @@ from app.services.acquisition_cleanup import (
 from app.services.acquisition_recovery import recover_approved_downloads
 from app.services.artist_monitoring import DiscographyRefreshScheduler
 from app.services.catalog_metadata import reconcile_duplicate_catalog_artists
+from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
 from app.services.dashboard import get_dashboard_data
 from app.services.health_status import get_health_status_service
 from app.services.maintenance_scheduler import MaintenanceScheduler
@@ -99,12 +100,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await db.commit()
         if n:
             logger.info("Reconciled %d duplicate catalog artist(s) at startup", n)
-        repaired = await recover_approved_downloads(
-            db, await build_effective_settings(db, get_settings())
-        )
+        effective_settings = await build_effective_settings(db, get_settings())
+        repaired = await recover_approved_downloads(db, effective_settings)
         await db.commit()
         if repaired:
             logger.info("Recovered and imported %d approved release(s) at startup", repaired)
+    try:
+        ownership_repairs = await reconcile_deezer_catalog_ownership(
+            get_session_factory(), effective_settings
+        )
+    except Exception:
+        logger.exception("Catalog ownership reconciliation failed at startup")
+    else:
+        if ownership_repairs:
+            logger.info(
+                "Reconciled %d imported track catalog ownership record(s) at startup",
+                ownership_repairs,
+            )
     await cleanup_imported_sources(pending_cleanups)
     await job_dispatcher.recover()
     settings = get_settings()

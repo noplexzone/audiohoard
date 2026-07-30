@@ -17,9 +17,10 @@ _TRACK_DATA = {
     "gain": -12.5,
     "preview": "https://cdns-preview-d.dzcdn.net/stream/fake.mp3",
     "explicit_lyrics": False,
+    "explicit_content_lyrics": 3,
     "rank": 900000,
     "artist": {"name": "Daft Punk"},
-    "album": {"title": "Random Access Memories"},
+    "album": {"id": 67890, "title": "Random Access Memories"},
 }
 
 
@@ -54,6 +55,8 @@ class TestDeezerSearch:
         assert t.bpm == 116.0
         assert t.gain == -12.5
         assert t.duration_sec == 248
+        assert t.album_id == "67890"
+        assert t.content_rating == "clean"
 
     async def test_search_empty_results(self, httpx_mock: HTTPXMock) -> None:
         httpx_mock.add_response(
