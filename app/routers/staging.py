@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from app.media_formats import IMPORTABLE_AUDIO_SUFFIXES
 from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
 from app.models.release import Release
+from app.models.source_candidate_block import SourceCandidateBlock
 from app.models.staging_review import StagingReviewItem
 from app.models.track import Track
 from app.models.workflow import (
@@ -194,6 +196,38 @@ async def approve_review_item(
     return RedirectResponse("/downloads?notice=approved", status_code=303)
 
 
+async def _block_denied_slskd_candidate(db: AsyncSession, track: Track) -> None:
+    """Block the exact slskd artifact that produced a denied review item."""
+    if track.source != "slskd" or not track.acquisition_provenance_json:
+        return
+    try:
+        provenance = json.loads(track.acquisition_provenance_json)
+    except (json.JSONDecodeError, TypeError):
+        return
+    if not isinstance(provenance, dict) or provenance.get("source") != "slskd":
+        return
+    peer = str(provenance.get("username") or "")
+    filename = str(provenance.get("filename") or "")
+    if not peer or not filename:
+        return
+    existing_block = await db.scalar(
+        select(SourceCandidateBlock.id).where(
+            SourceCandidateBlock.provider == "slskd",
+            SourceCandidateBlock.peer == peer,
+            SourceCandidateBlock.filename == filename,
+        )
+    )
+    if existing_block is None:
+        db.add(
+            SourceCandidateBlock(
+                provider="slskd",
+                peer=peer,
+                filename=filename,
+                reason="denied",
+            )
+        )
+
+
 @router.post("/review/{item_id}/deny", include_in_schema=False)
 async def deny_review_item(
     item_id: int,
@@ -228,6 +262,7 @@ async def deny_review_item(
             track.staging_path = None
             if track.source_path == staged_path:
                 track.source_path = None
+        await _block_denied_slskd_candidate(db, track)
         track.acoustid_verification_state = AcoustIDVerificationState.denied
         track.acquisition_state = AcquisitionState.failed
         release = await db.get(Release, item.release_id)

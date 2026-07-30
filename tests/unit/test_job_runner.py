@@ -19,7 +19,11 @@ from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, Catalog
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import IdentityResolutionState, Track
-from app.models.workflow import AcquisitionState, ImportWorkflowState
+from app.models.workflow import (
+    AcoustIDVerificationState,
+    AcquisitionState,
+    ImportWorkflowState,
+)
 from app.naming.convention import NamingError
 from app.schemas.search import SearchResult
 from app.sources.base import CapabilityState
@@ -1214,6 +1218,50 @@ async def test_background_enqueue_checkpoint_is_visible_before_poll(
     run_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await run_task
+
+
+async def test_denied_slskd_provenance_filters_future_results(
+    db_session: AsyncSession, test_settings: Settings
+) -> None:
+    job = await _create_job(db_session, source="slskd")
+    blocked_filename = "music\\done\\country\\44 - Ty Myers - Valerie (Amazon Music Original).mp3"
+    denied = Track(
+        job_id=job.id,
+        source="slskd",
+        title="Valerie",
+        acquisition_state=AcquisitionState.failed,
+        acoustid_verification_state=AcoustIDVerificationState.denied,
+        acquisition_provenance_json=json.dumps(
+            {
+                "source": "slskd",
+                "username": "StarCaller",
+                "filename": blocked_filename,
+            }
+        ),
+    )
+    db_session.add(denied)
+    await db_session.flush()
+
+    results = [
+        SearchResult(
+            source="slskd",
+            title="Valerie",
+            artist="Ty Myers",
+            url="slskd://blocked",
+            metadata={"username": "StarCaller", "filename": blocked_filename},
+        ),
+        SearchResult(
+            source="slskd",
+            title="Valerie",
+            artist="Ty Myers",
+            url="slskd://other",
+            metadata={"username": "OtherPeer", "filename": "Ty Myers - Valerie.flac"},
+        ),
+    ]
+
+    filtered = await runner._without_blocked_slskd_results(results, db_session)
+
+    assert [result.url for result in filtered] == ["slskd://other"]
 
 
 async def test_slskd_acquisition_rejects_lrc_result_before_enqueue(

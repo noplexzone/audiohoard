@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from app.database import get_session_factory
 from app.models.import_plan import CollisionState, ImportPlan, TagVerificationState
 from app.models.job import Job, JobStatus
 from app.models.release import Release
+from app.models.source_candidate_block import SourceCandidateBlock
 from app.models.staging_review import StagingReviewItem
 from app.models.track import Track
 from app.models.workflow import (
@@ -107,6 +109,44 @@ async def test_review_approve_resumes_import_and_deny_removes_staged_item(
         assert denied_row.staging_path is None
         assert denied_row.source_path is None
         assert await db.get(StagingReviewItem, denied_item) is None
+
+
+async def test_deny_blocks_slskd_candidate_from_track_provenance(
+    client: AsyncClient, test_settings: Settings
+) -> None:
+    item_id, track_id, denied_path = await _review_fixture(test_settings, "deny-slskd-block")
+    blocked_filename = (
+        "music\\done\\country\\VA - Country Heat - 05.09.2026"
+        "\\44 - Ty Myers - Valerie (Amazon Music Original).mp3"
+    )
+    factory = get_session_factory()
+    async with factory() as db:
+        track = await db.get(Track, track_id)
+        assert track is not None
+        track.acquisition_provenance_json = json.dumps(
+            {
+                "source": "slskd",
+                "username": "StarCaller",
+                "filename": blocked_filename,
+            }
+        )
+        await db.commit()
+
+    denied = await client.post(f"/staging/review/{item_id}/deny", follow_redirects=False)
+
+    assert denied.status_code == 303
+    assert not denied_path.exists()
+    async with factory() as db:
+        blocked = (
+            await db.scalars(
+                select(SourceCandidateBlock).where(
+                    SourceCandidateBlock.provider == "slskd",
+                    SourceCandidateBlock.peer == "StarCaller",
+                )
+            )
+        ).one()
+        assert blocked.filename == blocked_filename
+        assert blocked.reason == "denied"
 
 
 async def test_deny_restores_staged_file_when_database_commit_fails(
