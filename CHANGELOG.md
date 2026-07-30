@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-29
+
 ### Fixed
 - Combine sibling `CD1`/`CD2` slskd album folders and preserve multi-disc totals in import/metadata-repair tags.
 - Treat denied slskd review artifacts as blocked candidates so the same peer/file is not downloaded again after denial.
@@ -22,6 +24,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Added a bounded job dispatcher concurrency setting to keep download bursts from exhausting the SQLite connection pool.
 
 ### Changed
+- Moved API docs from the sidebar into the Settings About section, grouped Settings into clearer cards, and exposed the default naming template as the empty-field placeholder.
 - Album downloads now queue missing catalog tracks and imported tracks that are positively known to be below the configured quality profile, while skipping already acceptable or unknown-bitrate imports.
 
 ### Fixed

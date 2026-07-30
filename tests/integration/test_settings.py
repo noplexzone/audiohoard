@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from httpx import AsyncClient
 
@@ -684,3 +686,27 @@ async def test_quality_profile_rejects_invalid_bitrate_instead_of_clamping(
     page = await client.get("/settings/quality")
     assert 'value="255"' not in page.text
     assert all(f'<option value="{value}"' in page.text for value in (192, 256, 320))
+
+
+@pytest.mark.asyncio
+async def test_naming_template_input_renders_default_as_placeholder(
+    client: AsyncClient, tmp_path: Path
+) -> None:
+    from app.config import Settings, override_settings
+
+    default_template = "{album_artist}/{album} ({year})/{disc_track} - {title}.{ext}"
+    override_settings(
+        Settings(
+            database_url="sqlite+aiosqlite:///:memory:",
+            secret_key="test-secret",
+            auth_cookie_secure=False,
+            library_root=tmp_path / "library",
+            staging_root=tmp_path / "staging",
+        )
+    )
+
+    response = await client.get("/settings/library")
+
+    assert response.status_code == 200
+    assert 'id="naming_template"' in response.text
+    assert f'placeholder="{default_template}"' in response.text

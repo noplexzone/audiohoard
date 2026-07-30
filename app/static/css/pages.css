@@ -1235,6 +1235,127 @@ a.metric-card:hover {
   margin-top: .5rem;
 }
 
+.settings-section {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.settings-panel {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.settings-panel-wide {
+  max-width: 980px;
+}
+
+.settings-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: .85rem;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.settings-panel-header h2,
+.settings-panel h2,
+.settings-panel h3 {
+  margin-top: 0;
+}
+
+.settings-form-stack {
+  display: grid;
+  gap: 1rem;
+}
+
+.settings-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1rem;
+}
+
+.settings-card-grid.two-col {
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+
+.provider-settings-card {
+  align-content: start;
+}
+
+.settings-field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  column-gap: 1rem;
+  row-gap: .25rem;
+}
+
+.settings-actions {
+  display: flex;
+  gap: .6rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.settings-check-list {
+  display: grid;
+  gap: .65rem;
+}
+
+.settings-check-list label,
+.inline-checks label {
+  display: flex;
+  gap: .55rem;
+  align-items: flex-start;
+  margin: 0;
+}
+
+.inline-checks {
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  padding: .85rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+
+.settings-diagnostic,
+.settings-preview {
+  margin-top: -.65rem;
+  color: var(--muted);
+  font-size: .78rem;
+}
+
+.settings-preview code {
+  color: var(--text);
+}
+
+.about-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: .75rem;
+  margin: 0;
+}
+
+.about-meta > div {
+  padding: .8rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+
+.about-meta dt {
+  margin-bottom: .2rem;
+  color: var(--muted);
+  font-size: .72rem;
+}
+
+.about-meta dd {
+  margin: 0;
+  font-weight: 750;
+}
+
 .settings-subheading,
 .settings-spaced {
   margin-top: 1rem;
