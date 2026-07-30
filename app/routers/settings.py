@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import require_admin, require_admin_read, require_mutation
 from app.config import Settings, get_settings
 from app.database import get_db
+from app.jobs.dispatcher import job_dispatcher
 from app.models.auth import AppUser
 from app.naming.convention import render_path
 from app.schemas.health import SourceStatus
@@ -322,6 +323,9 @@ async def save_runtime_settings_page(
             str(form.get("slskd_download_timeout_seconds", runtime.slskd_download_timeout_seconds))
             or "1800"
         )
+        max_parallel = int(
+            str(form.get("max_parallel_acquisitions", runtime.max_parallel_acquisitions)) or "3"
+        )
         acoustid_threshold = float(
             str(form.get("acoustid_acceptance_threshold", runtime.acoustid_acceptance_threshold))
             or "0.90"
@@ -338,6 +342,7 @@ async def save_runtime_settings_page(
         and 0 <= upgrade_check_hours <= 720
         and 3 <= source_budget <= 60
         and 10 <= slskd_timeout <= 86400
+        and 1 <= max_parallel <= 16
         and 0.5 <= acoustid_threshold <= 0.9999
     ):
         return RedirectResponse(
@@ -434,29 +439,70 @@ async def save_runtime_settings_page(
     else:
         quality_profile = runtime.quality_profile
         max_partial_val = runtime.max_partial_attempts
-    await save_runtime_settings(
-        db,
-        source_priority or runtime.source_priority,
-        limit,
-        metadata_providers,
-        primary,
-        refresh_hours,
-        library_scan_hours,
-        duplicate_scan_hours,
-        duplicate_auto_clean,
-        upgrade_check_hours,
-        auto_download,
-        source_search_budget_seconds=source_budget,
-        default_watchlist_release_albums=default_watchlist_release_albums,
-        default_watchlist_release_singles=default_watchlist_release_singles,
-        default_watchlist_release_eps=default_watchlist_release_eps,
-        default_watchlist_monitor_upgrades=default_watchlist_monitor_upgrades,
-        quality_profile=quality_profile,
-        max_partial_attempts=max_partial_val,
-        acoustid_acceptance_threshold=acoustid_threshold,
-        slskd_download_timeout_seconds=slskd_timeout,
-    )
-    await db.commit()
+    settings_lock = getattr(request.app.state, "runtime_settings_write_lock", None)
+    if settings_lock is None:
+        settings_lock = asyncio.Lock()
+        request.app.state.runtime_settings_write_lock = settings_lock
+    async with settings_lock:
+        current = await get_runtime_settings(db)
+        await save_runtime_settings(
+            db,
+            (source_priority or current.source_priority)
+            if section == "download-sources"
+            else current.source_priority,
+            limit if section == "behavior" else current.free_text_result_limit,
+            metadata_providers if section == "metadata" else current.metadata_providers,
+            primary if section == "metadata" else current.primary_metadata_provider,
+            refresh_hours if section == "behavior" else current.discography_refresh_hours,
+            library_scan_hours if section == "behavior" else current.library_scan_hours,
+            duplicate_scan_hours if section == "behavior" else current.duplicate_scan_hours,
+            duplicate_auto_clean if section == "behavior" else current.duplicate_auto_clean,
+            upgrade_check_hours if section == "behavior" else current.upgrade_check_hours,
+            auto_download if section == "behavior" else current.auto_download_wanted,
+            source_search_budget_seconds=(
+                source_budget if section == "behavior" else current.source_search_budget_seconds
+            ),
+            default_watchlist_release_albums=(
+                default_watchlist_release_albums
+                if section == "behavior"
+                else current.default_watchlist_release_albums
+            ),
+            default_watchlist_release_singles=(
+                default_watchlist_release_singles
+                if section == "behavior"
+                else current.default_watchlist_release_singles
+            ),
+            default_watchlist_release_eps=(
+                default_watchlist_release_eps
+                if section == "behavior"
+                else current.default_watchlist_release_eps
+            ),
+            default_watchlist_monitor_upgrades=(
+                default_watchlist_monitor_upgrades
+                if section == "behavior"
+                else current.default_watchlist_monitor_upgrades
+            ),
+            quality_profile=quality_profile if section == "quality" else current.quality_profile,
+            max_partial_attempts=(
+                max_partial_val if section == "quality" else current.max_partial_attempts
+            ),
+            acoustid_acceptance_threshold=(
+                acoustid_threshold
+                if section == "behavior"
+                else current.acoustid_acceptance_threshold
+            ),
+            slskd_download_timeout_seconds=(
+                slskd_timeout
+                if section == "download-sources"
+                else current.slskd_download_timeout_seconds
+            ),
+            max_parallel_acquisitions=(
+                max_parallel if section == "behavior" else current.max_parallel_acquisitions
+            ),
+        )
+        await db.commit()
+        persisted = await get_runtime_settings(db)
+        await job_dispatcher.set_max_concurrent_jobs(persisted.max_parallel_acquisitions)
     redirect_target = section if section in SETTINGS_SECTIONS else "download-sources"
     return RedirectResponse(f"/settings/{redirect_target}?saved=1", status_code=303)
 

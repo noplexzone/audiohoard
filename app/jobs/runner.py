@@ -18,6 +18,10 @@ from sqlalchemy.orm import selectinload
 from app.config import Settings, get_settings
 from app.database import get_session_factory
 from app.fingerprint.acoustid import fingerprint_file
+from app.jobs.dispatcher import (
+    reacquire_current_acquisition_slot,
+    release_current_acquisition_slot,
+)
 from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS, is_importable_audio
 from app.metadata.deezer import DeezerClient
 from app.metadata.filename_parse import (
@@ -171,6 +175,7 @@ async def _poll_slskd_transfer(
     import time as _time
 
     deadline = _time.monotonic() + poll_timeout
+    slot_released = False
     try:
         while True:
             remaining = deadline - _time.monotonic()
@@ -187,6 +192,12 @@ async def _poll_slskd_transfer(
                     await on_provider_id(transfer_id)
 
             acq_state = map_slskd_transfer_state(state)
+            if acq_state == AcquisitionState.queued and not slot_released:
+                slot_released = await release_current_acquisition_slot()
+            elif acq_state != AcquisitionState.queued and slot_released:
+                await reacquire_current_acquisition_slot()
+                slot_released = False
+
             if acq_state == AcquisitionState.downloaded:
                 staged = await _locate_slskd_artifact(filename, state.extra, staging_root)
                 if not is_importable_audio(staged):
@@ -209,6 +220,10 @@ async def _poll_slskd_transfer(
     except asyncio.CancelledError:
         with contextlib.suppress(Exception):
             await adapter.cancel(username, filename, transfer_id)
+        raise
+    except Exception:
+        if slot_released:
+            await reacquire_current_acquisition_slot()
         raise
 
 
@@ -783,7 +798,9 @@ async def _run_job_in_session(
     except ProviderError as exc:
         logger.warning("Job %d provider failure code %s", job_id, exc.code)
         job.status = JobStatus.failed
-        job.result_json = json.dumps({"error": exc.details()})
+        payload = _job_payload(job)
+        payload["error"] = exc.details()
+        job.result_json = json.dumps(payload, sort_keys=True)
         job.updated_at = _now()
     except asyncio.CancelledError:
         job.status = JobStatus.cancelled
@@ -1105,6 +1122,41 @@ async def _reconcile_catalog_album_jobs(
         album_job.updated_at = _now()
 
 
+_PROVIDER_PUNCTUATION = str.maketrans(
+    {"‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-", "\u00a0": " "}
+)
+_EDITION_SUFFIX = re.compile(
+    r"\s*\((?:acoustic|live(?:\s+from\s+[^)]*)?|deluxe|remaster(?:ed)?(?:\s+\d{4})?|radio\s+edit|single\s+version)\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _provider_safe_text(value: str) -> str:
+    return " ".join(value.translate(_PROVIDER_PUNCTUATION).split())
+
+
+def _targeted_query_variants(artist: str, album: str, track: str) -> list[str]:
+    safe_artist = _provider_safe_text(artist)
+    safe_album = _provider_safe_text(album)
+    safe_track = _provider_safe_text(track)
+    title = safe_track or safe_album
+    variants = [" ".join(part for part in (safe_artist, title) if part)]
+    simplified = _EDITION_SUFFIX.sub("", title).strip()
+    if simplified and simplified.casefold() != title.casefold():
+        variants.append(" ".join(part for part in (safe_artist, simplified) if part))
+    return list(dict.fromkeys(variant for variant in variants if variant))
+
+
+def _queries_for_job(job: Job, album: CatalogAlbum | None) -> list[str]:
+    if album is None or job.catalog_track_id is None:
+        return [_provider_safe_text(job.query)]
+    track = next((item for item in album.tracks if item.id == job.catalog_track_id), None)
+    if track is None:
+        return [_provider_safe_text(job.query)]
+    artist = album.artist.name if album.artist is not None else ""
+    return _targeted_query_variants(artist, album.title, track.title)
+
+
 def _set_acquisition_provenance(
     job: Job, attempted: list[dict[str, object]], served_source: str | None = None
 ) -> None:
@@ -1150,9 +1202,9 @@ async def _fetch_results(
     _scoring_album = (
         await _load_catalog_album(db, job.catalog_album_id) if job.catalog_album_id else None
     )
+    query_variants = _queries_for_job(job, _scoring_album)
 
     for source in priority:
-        req = SearchRequest(query=job.query, sources=[source])
         try:
             adapter = _source_adapter(source, cfg)
             if priority_job:
@@ -1176,19 +1228,41 @@ async def _fetch_results(
                 and job.catalog_track_id is None
                 and isinstance(adapter, SlskdAdapter)
             ):
+                req = SearchRequest(query=query_variants[0], sources=[source])
                 results = await _fetch_slskd_album_results(
                     adapter, req, job, _scoring_album, runtime, db
                 )
+                results = (await _without_blocked_slskd_results(results, db))[:limit]
+                attempted.append(
+                    {
+                        "source": source,
+                        "status": "served" if results else "empty",
+                        "results": len(results),
+                        "query": query_variants[0],
+                    }
+                )
             else:
-                results = await adapter.search(req)
+                results = []
+                for provider_query in query_variants:
+                    req = SearchRequest(query=provider_query, sources=[source])
+                    results = (
+                        await _without_blocked_slskd_results(await adapter.search(req), db)
+                    )[:limit]
+                    attempted.append(
+                        {
+                            "source": source,
+                            "status": "served" if results else "empty",
+                            "results": len(results),
+                            "query": provider_query,
+                        }
+                    )
+                    if results:
+                        break
 
-            results = (await _without_blocked_slskd_results(results, db))[:limit]
             if not results:
-                attempted.append({"source": source, "status": "empty", "reason": "zero results"})
                 _set_acquisition_provenance(job, attempted)
                 await _persist_provider_progress(db, checkpoint)
                 continue
-            attempted.append({"source": source, "status": "served", "results": len(results)})
             job.source = source
             _set_acquisition_provenance(job, attempted, source)
             await _persist_provider_progress(db, checkpoint)
@@ -1672,9 +1746,7 @@ async def _spawn_continuation_jobs(
             continue
         continuation = Job(
             source="priority",
-            query=" ".join(
-                part for part in (artist, catalog_album.title, catalog_track.title) if part
-            ),
+            query=_targeted_query_variants(artist, catalog_album.title, catalog_track.title)[0],
             status=JobStatus.pending,
             catalog_album_id=catalog_album.id,
             catalog_track_id=track_id,

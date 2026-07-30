@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-30
+
+### Added
+- Add a live, persisted Behavior setting for 1–16 parallel acquisition jobs. slskd transfers that are waiting in the remote queue now yield their local dispatcher slot so later searches can proceed while the transfer remains supervised.
+
+### Fixed
+- Build targeted single-track searches from artist and track identity instead of repeating same-title album names, normalize smart punctuation for providers, and retry bounded edition-suffix variants such as acoustic and live titles.
+- Preserve per-source and per-query attempt provenance when all configured acquisition sources are exhausted.
+
 ## [0.8.9] - 2026-07-30
 
 ### Fixed

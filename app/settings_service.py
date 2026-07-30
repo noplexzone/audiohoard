@@ -49,6 +49,7 @@ DEFAULT_WATCHLIST_RELEASE_SINGLES = False
 DEFAULT_WATCHLIST_RELEASE_EPS = False
 DEFAULT_WATCHLIST_MONITOR_UPGRADES = False
 DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS = 15
+DEFAULT_MAX_PARALLEL_ACQUISITIONS = 3
 SUPPORTED_FORMAT_PREFERENCES: tuple[str, ...] = ("flac", "mp3", "m4a/aac", "ogg", "opus")
 DEFAULT_FORMAT_PREFERENCE: list[str] = list(SUPPORTED_FORMAT_PREFERENCES)
 ALLOWED_MIN_MP3_BITRATES: frozenset[int] = frozenset({192, 256, 320})
@@ -100,6 +101,7 @@ class RuntimeSettings:
     default_watchlist_release_eps: bool
     default_watchlist_monitor_upgrades: bool
     source_search_budget_seconds: int
+    max_parallel_acquisitions: int
     quality_profile: QualityProfile = dataclasses_field(
         default_factory=lambda: QualityProfile(
             format_preference=list(DEFAULT_FORMAT_PREFERENCE),
@@ -239,6 +241,12 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
     except ValueError:
         source_budget = DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS
     try:
+        max_parallel = int(
+            values.get("max_parallel_acquisitions", str(DEFAULT_MAX_PARALLEL_ACQUISITIONS))
+        )
+    except ValueError:
+        max_parallel = DEFAULT_MAX_PARALLEL_ACQUISITIONS
+    try:
         quality_raw = json.loads(values.get("quality_profile", "{}"))
     except json.JSONDecodeError:
         quality_raw = {}
@@ -288,6 +296,7 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
         default_release_eps,
         default_monitor_upgrades,
         max(3, min(source_budget, 60)),
+        max(1, min(max_parallel, 16)),
         quality_profile=QualityProfile(
             format_preference=fmt_pref,
             min_mp3_bitrate=min_mp3,
@@ -320,6 +329,7 @@ async def save_runtime_settings(
     max_partial_attempts: int | None = None,
     acoustid_acceptance_threshold: float | None = None,
     slskd_download_timeout_seconds: int | None = None,
+    max_parallel_acquisitions: int | None = None,
 ) -> None:
     global _cache
     normalized = _normalize_priority(source_priority)
@@ -394,6 +404,17 @@ async def save_runtime_settings(
         else "false",
         "source_search_budget_seconds": str(
             max(3, min(source_search_budget_seconds or DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS, 60))
+        ),
+        "max_parallel_acquisitions": str(
+            max(
+                1,
+                min(
+                    DEFAULT_MAX_PARALLEL_ACQUISITIONS
+                    if max_parallel_acquisitions is None
+                    else max_parallel_acquisitions,
+                    16,
+                ),
+            )
         ),
         "quality_profile": json.dumps(
             {

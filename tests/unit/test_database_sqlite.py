@@ -19,3 +19,11 @@ async def test_file_sqlite_connections_enable_integrity_and_concurrency_pragmas(
             assert journal_mode.scalar_one().casefold() == "wal"
     finally:
         await engine.dispose()
+
+
+def test_file_sqlite_pool_covers_max_runtime_acquisition_limit(tmp_path: Path) -> None:
+    engine = _make_engine(f"sqlite+aiosqlite:///{tmp_path / 'pool.db'}")
+    try:
+        assert engine.pool.size() >= 16  # type: ignore[attr-defined]
+    finally:
+        engine.sync_engine.dispose()

@@ -55,7 +55,11 @@ from app.services.health_status import get_health_status_service
 from app.services.maintenance_scheduler import MaintenanceScheduler
 from app.services.maintenance_state import empty_maintenance_state
 from app.services.monitoring import MonitoringScheduler, QualityUpgradeCycleScheduler
-from app.settings_service import build_effective_settings, effective_settings_dep
+from app.settings_service import (
+    build_effective_settings,
+    effective_settings_dep,
+    get_runtime_settings,
+)
 from app.version import APP_VERSION
 
 _TEMPLATES_DIR = files("app") / "templates"
@@ -79,6 +83,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.monitoring_scheduler = monitoring_scheduler
     app.state.quality_upgrade_scheduler = quality_upgrade_scheduler
     async with get_session_factory()() as db:
+        runtime = await get_runtime_settings(db)
+        await job_dispatcher.set_max_concurrent_jobs(runtime.max_parallel_acquisitions)
         pending_cleanups = await pending_imported_source_cleanups(db)
         pruned = await prune_orphaned_terminal_records(db)
         if pruned.tracks or pruned.releases or pruned.jobs:

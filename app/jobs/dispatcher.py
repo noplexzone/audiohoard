@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Callable, Coroutine
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -34,6 +35,41 @@ class JobNotRetryableError(JobStateError):
     pass
 
 
+class _AcquisitionSlotLease:
+    def __init__(self, dispatcher: JobDispatcher) -> None:
+        self._dispatcher = dispatcher
+        self.held = False
+
+    async def acquire(self) -> bool:
+        if self.held:
+            return False
+        await self._dispatcher._acquire_slot()
+        self.held = True
+        return True
+
+    async def release(self) -> bool:
+        if not self.held:
+            return False
+        await self._dispatcher._release_slot()
+        self.held = False
+        return True
+
+
+_current_acquisition_lease: ContextVar[_AcquisitionSlotLease | None] = ContextVar(
+    "current_acquisition_lease", default=None
+)
+
+
+async def release_current_acquisition_slot() -> bool:
+    lease = _current_acquisition_lease.get()
+    return await lease.release() if lease is not None else False
+
+
+async def reacquire_current_acquisition_slot() -> bool:
+    lease = _current_acquisition_lease.get()
+    return await lease.acquire() if lease is not None else False
+
+
 def _default_runner(job_id: int) -> Coroutine[Any, Any, None]:  # pragma: no cover
     from app.jobs.runner import run_job
 
@@ -52,7 +88,8 @@ class JobDispatcher:
         )
         self._session_factory = session_factory
         self._max_concurrent_jobs = max_concurrent_jobs
-        self._semaphore: asyncio.Semaphore | None = None
+        self._active_jobs = 0
+        self._limit_condition = asyncio.Condition()
         self._tasks: dict[int, asyncio.Task[None]] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
@@ -60,18 +97,41 @@ class JobDispatcher:
     def _factory(self) -> async_sessionmaker[AsyncSession]:
         return self._session_factory or get_session_factory()
 
-    def _job_semaphore(self) -> asyncio.Semaphore:
-        if self._semaphore is None:
-            if self._max_concurrent_jobs is None:
-                from app.config import get_settings
+    def _configured_limit(self) -> int:
+        if self._max_concurrent_jobs is None:
+            from app.config import get_settings
 
-                self._max_concurrent_jobs = get_settings().max_concurrent_jobs
-            self._semaphore = asyncio.Semaphore(self._max_concurrent_jobs)
-        return self._semaphore
+            self._max_concurrent_jobs = get_settings().max_concurrent_jobs
+        return self._max_concurrent_jobs
+
+    async def set_max_concurrent_jobs(self, value: int) -> None:
+        if not 1 <= value <= 16:
+            raise ValueError("Parallel acquisition limit must be between 1 and 16")
+        async with self._limit_condition:
+            self._max_concurrent_jobs = value
+            self._limit_condition.notify_all()
+
+    async def _acquire_slot(self) -> None:
+        async with self._limit_condition:
+            await self._limit_condition.wait_for(
+                lambda: self._active_jobs < self._configured_limit()
+            )
+            self._active_jobs += 1
+
+    async def _release_slot(self) -> None:
+        async with self._limit_condition:
+            self._active_jobs -= 1
+            self._limit_condition.notify_all()
 
     async def _run_with_limit(self, job_id: int) -> None:
-        async with self._job_semaphore():
+        lease = _AcquisitionSlotLease(self)
+        await lease.acquire()
+        token = _current_acquisition_lease.set(lease)
+        try:
             await self._runner(job_id)
+        finally:
+            _current_acquisition_lease.reset(token)
+            await lease.release()
 
     async def dispatch(self, job_id: int) -> asyncio.Task[None]:
         existing = self._tasks.get(job_id)

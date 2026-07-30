@@ -240,6 +240,80 @@ async def test_slskd_success_waits_for_completed_state(staging_root: Path) -> No
     assert result == (staged.resolve(), "t1")
 
 
+async def test_slskd_queued_transfer_yields_and_reacquires_dispatch_slot(
+    staging_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staged = staging_root / "song.flac"
+    staged.write_bytes(b"flacdata")
+    adapter = _FakeSlskdAdapter(
+        [
+            CapabilityState(True, "Queued"),
+            CapabilityState(True, "InProgress"),
+            CapabilityState(True, "Completed"),
+        ]
+    )
+    events: list[str] = []
+
+    async def release_slot() -> bool:
+        events.append("release")
+        return True
+
+    async def reacquire_slot() -> bool:
+        events.append("reacquire")
+        return True
+
+    monkeypatch.setattr(runner, "release_current_acquisition_slot", release_slot)
+    monkeypatch.setattr(runner, "reacquire_current_acquisition_slot", reacquire_slot)
+
+    result = await runner._poll_slskd_transfer(
+        transfer_id="t1",
+        username="peer",
+        filename="song.flac",
+        adapter=adapter,
+        staging_root=staging_root,
+        poll_interval=0.001,
+        poll_timeout=1,
+    )
+
+    assert result[0] == staged
+    assert events == ["release", "reacquire"]
+
+
+async def test_slskd_queued_timeout_reacquires_dispatcher_slot_before_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+
+    async def release_slot() -> bool:
+        events.append("release")
+        return True
+
+    async def reacquire_slot() -> bool:
+        events.append("reacquire")
+        return True
+
+    class QueuedAdapter:
+        async def status(self, _transfer_id: str) -> CapabilityState:
+            return CapabilityState(available=True, reason="Queued")
+
+    monkeypatch.setattr(runner, "release_current_acquisition_slot", release_slot)
+    monkeypatch.setattr(runner, "reacquire_current_acquisition_slot", reacquire_slot)
+
+    with pytest.raises(ProviderError) as exc_info:
+        await runner._poll_slskd_transfer(
+            transfer_id="transfer-queued-timeout",
+            username="alice",
+            filename="song.flac",
+            adapter=QueuedAdapter(),  # type: ignore[arg-type]
+            staging_root=tmp_path,
+            poll_interval=0.01,
+            poll_timeout=0.02,
+        )
+
+    assert exc_info.value.code == "transfer_timeout"
+    assert events == ["release", "reacquire"]
+
+
 async def test_slskd_success_finds_nested_completed_file(staging_root: Path) -> None:
     nested = staging_root / "peer" / "Artist" / "Album"
     nested.mkdir(parents=True)

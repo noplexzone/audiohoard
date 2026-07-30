@@ -17,7 +17,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 os.environ.setdefault("SECRET_KEY", "test-secret")
 
 from app.database import Base
-from app.jobs.dispatcher import JobDispatcher, JobNotFoundError, JobNotRetryableError
+from app.jobs.dispatcher import (
+    JobDispatcher,
+    JobNotFoundError,
+    JobNotRetryableError,
+    reacquire_current_acquisition_slot,
+    release_current_acquisition_slot,
+)
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.track import Track
@@ -746,6 +752,93 @@ async def test_dispatcher_respects_max_concurrent_jobs() -> None:
     assert current == 2
 
     release.set()
+    await asyncio.gather(*tasks)
+    await dispatcher.shutdown()
+
+
+async def test_increasing_parallel_limit_starts_waiting_jobs() -> None:
+    started: list[int] = []
+    two_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_runner(job_id: int) -> None:
+        started.append(job_id)
+        if len(started) == 2:
+            two_started.set()
+        await release.wait()
+
+    dispatcher = JobDispatcher(runner=slow_runner, max_concurrent_jobs=1)
+    tasks = [await dispatcher.dispatch(job_id) for job_id in (1, 2)]
+    await asyncio.sleep(0.05)
+    assert started == [1]
+
+    await dispatcher.set_max_concurrent_jobs(2)
+    await asyncio.wait_for(two_started.wait(), timeout=1)
+    assert started == [1, 2]
+
+    release.set()
+    await asyncio.gather(*tasks)
+    await dispatcher.shutdown()
+
+
+async def test_external_queue_wait_releases_slot_for_later_job() -> None:
+    first_queued = asyncio.Event()
+    allow_first_to_finish = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def runner(job_id: int) -> None:
+        if job_id == 1:
+            assert await release_current_acquisition_slot() is True
+            first_queued.set()
+            await allow_first_to_finish.wait()
+            assert await reacquire_current_acquisition_slot() is True
+        else:
+            second_started.set()
+
+    dispatcher = JobDispatcher(runner=runner, max_concurrent_jobs=1)
+    first = await dispatcher.dispatch(1)
+    second = await dispatcher.dispatch(2)
+
+    await asyncio.wait_for(first_queued.wait(), timeout=1)
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+    assert not first.done()
+
+    allow_first_to_finish.set()
+    await asyncio.gather(first, second)
+    await dispatcher.shutdown()
+
+
+async def test_decreasing_parallel_limit_does_not_cancel_active_jobs() -> None:
+    current = 0
+    peak_after_decrease = 0
+    first_two_started = asyncio.Event()
+    release_first_two = asyncio.Event()
+    third_started = asyncio.Event()
+
+    async def controlled_runner(job_id: int) -> None:
+        nonlocal current, peak_after_decrease
+        current += 1
+        if job_id in {1, 2} and current == 2:
+            first_two_started.set()
+        if job_id == 3:
+            peak_after_decrease = current
+            third_started.set()
+        if job_id in {1, 2}:
+            await release_first_two.wait()
+        current -= 1
+
+    dispatcher = JobDispatcher(runner=controlled_runner, max_concurrent_jobs=2)
+    tasks = [await dispatcher.dispatch(job_id) for job_id in (1, 2, 3)]
+    await asyncio.wait_for(first_two_started.wait(), timeout=1)
+
+    await dispatcher.set_max_concurrent_jobs(1)
+    assert current == 2
+    assert not third_started.is_set()
+
+    release_first_two.set()
+    await asyncio.wait_for(third_started.wait(), timeout=1)
+    assert peak_after_decrease == 1
+
     await asyncio.gather(*tasks)
     await dispatcher.shutdown()
 

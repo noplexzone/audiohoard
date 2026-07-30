@@ -26,7 +26,7 @@ from app.models.workflow import (
     ImportWorkflowState,
 )
 from app.naming.convention import NamingError
-from app.schemas.search import SearchResult
+from app.schemas.search import SearchRequest, SearchResult
 from app.sources.base import CapabilityState
 from app.sources.youtube import ProviderError
 
@@ -36,6 +36,21 @@ async def _create_job(db_session: AsyncSession, source: str = "youtube") -> Job:
     db_session.add(job)
     await db_session.flush()
     return job
+
+
+def test_targeted_query_variants_normalize_and_simplify_titles() -> None:
+    assert runner._targeted_query_variants(
+        "Colter Wall", "You're Lucky She's Lonely", "You’re Lucky She’s Lonely"
+    ) == ["Colter Wall You're Lucky She's Lonely"]
+    assert runner._targeted_query_variants("Ty Myers", "Valerie", "Valerie") == [
+        "Ty Myers Valerie"
+    ]
+    assert runner._targeted_query_variants(
+        "Ty Myers", "The Select (Deluxe)", "Thought It Was Love (Acoustic)"
+    ) == [
+        "Ty Myers Thought It Was Love (Acoustic)",
+        "Ty Myers Thought It Was Love",
+    ]
 
 
 async def test_run_job_marks_failed_when_result_processing_fails(
@@ -575,12 +590,58 @@ async def test_priority_job_records_clear_failure_when_all_sources_exhausted(
 
     monkeypatch.setattr(runner, "_source_adapter", lambda source, cfg: FakeAdapter(source))
 
-    with pytest.raises(ProviderError, match="All configured download sources were exhausted"):
-        await runner._fetch_results(job, test_settings, db_session)
+    await runner.run_job(job.id, db_session, test_settings)
 
+    assert job.status == JobStatus.failed
     assert job.source == "priority"
     assert '"status": "empty"' in (job.result_json or "")
     assert '"code": "timeout"' in (job.result_json or "")
+    assert '"code": "sources_exhausted"' in (job.result_json or "")
+
+
+async def test_targeted_search_uses_simplified_fallback_after_empty_result(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.settings_service import save_runtime_settings
+
+    await save_runtime_settings(
+        db_session,
+        [{"name": "youtube", "enabled": True}],
+        10,
+        metadata_providers=[{"name": "musicbrainz", "enabled": True}],
+        primary_metadata_provider="musicbrainz",
+    )
+    artist = CatalogArtist(name="Ty Myers")
+    album = CatalogAlbum(artist=artist, title="The Select (Deluxe)", track_count=1)
+    track = CatalogAlbumTrack(album=album, position=1, disc=1, title="Firefly (Acoustic)")
+    db_session.add_all([artist, album, track])
+    await db_session.flush()
+    job = Job(
+        source="youtube",
+        query="legacy query",
+        status=JobStatus.pending,
+        catalog_album_id=album.id,
+        catalog_track_id=track.id,
+    )
+    db_session.add(job)
+    await db_session.flush()
+    queries: list[str] = []
+
+    class FakeAdapter:
+        async def search(self, request: SearchRequest) -> Sequence[SearchResult]:
+            query = request.query
+            queries.append(query)
+            if query.endswith("(Acoustic)"):
+                return []
+            return [SearchResult(source="youtube", title="Firefly", url="https://example.test")]
+
+    monkeypatch.setattr(runner, "_source_adapter", lambda source, cfg: FakeAdapter())
+    results = await runner._fetch_results(job, test_settings, db_session)
+
+    assert queries == ["Ty Myers Firefly (Acoustic)", "Ty Myers Firefly"]
+    assert len(results) == 1
+    assert '"query": "Ty Myers Firefly (Acoustic)"' in (job.result_json or "")
+    assert '"query": "Ty Myers Firefly"' in (job.result_json or "")
 
 
 async def test_album_prowlarr_results_are_candidates_not_tracks(
