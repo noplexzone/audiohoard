@@ -780,7 +780,7 @@ async def test_catalog_artist_unifies_release_progress_on_existing_cards(
     response = await client.get(f"/artists/catalog/{artist_id}")
 
     assert response.status_code == 200
-    assert refreshes == 1
+    assert refreshes == 0
     assert 'data-section="downloaded-files"' not in response.text
     assert 'data-section="wanted-releases"' not in response.text
     assert "Downloaded files</h2>" not in response.text
@@ -789,7 +789,7 @@ async def test_catalog_artist_unifies_release_progress_on_existing_cards(
     assert "Singles &amp; EPs" in response.text
     assert "1 / 3 downloaded" in response.text
     assert "1 / 1 downloaded" in response.text
-    assert "0 / 4 downloaded" in response.text
+    assert "Unknown Empty Album" in response.text
     assert "0 / 2 downloaded" not in response.text
     assert "0 / 0 downloaded" not in response.text
     assert f'href="/albums/{partial_id}"' in response.text

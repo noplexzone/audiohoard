@@ -5,7 +5,8 @@ import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from types import SimpleNamespace
+from typing import Annotated, Any
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Request
@@ -17,7 +18,7 @@ from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user, require_mutation
 from app.config import Settings
-from app.database import get_db, is_sqlite_database_locked, run_with_sqlite_lock_retry
+from app.database import get_db, run_with_sqlite_lock_retry
 from app.jobs.dispatcher import job_dispatcher
 from app.models.catalog_entities import (
     CatalogAlbum,
@@ -46,12 +47,14 @@ from app.services.catalog import (
 )
 from app.services.catalog_metadata import (
     VALID_METADATA_PROVIDERS,
+    album_providers,
     available_artist_providers,
     enrich_catalog_artist,
     ensure_legacy_provider_snapshots,
     fetch_and_store_album,
     fetch_and_store_discography,
     open_catalog_artist,
+    release_bucket,
 )
 from app.services.library_import import ImportExecutionError, retag_catalog_album
 from app.services.monitoring import (
@@ -165,6 +168,33 @@ def _selected_provider(
     if watchlist_provider in available:
         return watchlist_provider
     return available[0] if available else primary
+
+
+def _legacy_provider_album_rows(artist: CatalogArtist, provider_name: str) -> list[Any]:
+    rows: list[Any] = []
+    for album in artist.albums:
+        if provider_name not in album_providers(album):
+            continue
+        bucket = release_bucket(album.release_type)
+        rows.append(
+            SimpleNamespace(
+                id=-(album.id or 0),
+                catalog_album_id=album.id,
+                title=album.title,
+                year=album.year,
+                artwork_url=album.artwork_url,
+                track_count=album.track_count,
+                release_kind={
+                    "album": "album",
+                    "single_ep": "single",
+                    "compilation": "compilation",
+                }[bucket],
+                release_type_raw=album.release_type,
+                content_rating=album.content_rating,
+                monitored=bool(album.monitored and artist.watchlist_provider == provider_name),
+            )
+        )
+    return rows
 
 
 def _artist_page_url(
@@ -574,54 +604,18 @@ async def catalog_artist_page(
     sort: str = "desc",
     enrichment: str = "",
 ) -> HTMLResponse:
-    load = selectinload(CatalogArtist.identities).selectinload(CatalogArtistIdentity.releases)
+    identity_load = selectinload(CatalogArtist.identities).selectinload(
+        CatalogArtistIdentity.releases
+    )
     result = await db.execute(
-        select(CatalogArtist).where(CatalogArtist.id == artist_id).options(load)
+        select(CatalogArtist)
+        .where(CatalogArtist.id == artist_id)
+        .options(identity_load, selectinload(CatalogArtist.albums))
     )
     artist = result.scalar_one_or_none()
     if artist is None:
         raise HTTPException(status_code=404, detail="Catalog artist not found")
     runtime = await get_runtime_settings(db)
-    snapshot_artist = artist
-
-    async def repair_legacy_snapshots() -> None:
-        await ensure_legacy_provider_snapshots(db, snapshot_artist)
-        await db.commit()
-
-    try:
-        await run_with_sqlite_lock_retry(db, repair_legacy_snapshots)
-    except Exception as exc:
-        if not is_sqlite_database_locked(exc):
-            raise
-        logger.warning(
-            "Skipping legacy provider snapshot repair for artist %s because SQLite is busy",
-            artist_id,
-        )
-        await db.rollback()
-    artist = (
-        await db.execute(
-            select(CatalogArtist)
-            .where(CatalogArtist.id == artist_id)
-            .options(load)
-            .execution_options(populate_existing=True)
-        )
-    ).scalar_one()
-    if artist.last_enriched_at is None:
-        try:
-            queued_enrichment = await _queue_artist_enrichment(db, artist.id)
-        except Exception as exc:
-            if not is_sqlite_database_locked(exc):
-                raise
-            logger.warning(
-                "Skipping artist enrichment queue for artist %s because SQLite is busy",
-                artist.id,
-            )
-            await db.rollback()
-            queued_enrichment = False
-        if queued_enrichment:
-            background_tasks.add_task(
-                _enrich_artist_task, artist.id, runtime.enabled_metadata_providers
-            )
     available_providers = available_artist_providers(artist)
     selected_provider = _selected_provider(
         provider, available_providers, runtime.primary_metadata_provider, artist.watchlist_provider
@@ -630,52 +624,14 @@ async def catalog_artist_page(
         (identity for identity in artist.identities if identity.provider == selected_provider),
         None,
     )
-    if selected_identity is not None and (
-        not selected_identity.releases
-        or any(_release_needs_track_count_refresh(item) for item in selected_identity.releases)
-    ):
-        if artist.enrichment_state not in {"queued", "running"}:
-            refresh_artist_id = artist.id
-            try:
-
-                async def queue_discography_refresh() -> None:
-                    await db.execute(
-                        update(CatalogArtist)
-                        .where(CatalogArtist.id == refresh_artist_id)
-                        .values(enrichment_state="queued")
-                    )
-                    await db.commit()
-
-                await run_with_sqlite_lock_retry(db, queue_discography_refresh)
-            except Exception as exc:
-                if not is_sqlite_database_locked(exc):
-                    raise
-                logger.warning(
-                    "Skipping discography refresh queue for artist %s because SQLite is busy",
-                    artist.id,
-                )
-                await db.rollback()
-            else:
-                background_tasks.add_task(_refresh_discography_task, artist.id, selected_provider)
-        else:
-            background_tasks.add_task(_refresh_discography_task, artist.id, selected_provider)
-    artist = (
-        await db.execute(
-            select(CatalogArtist)
-            .where(CatalogArtist.id == artist_id)
-            .options(load)
-            .execution_options(populate_existing=True)
-        )
-    ).scalar_one()
-    available_providers = available_artist_providers(artist)
-    selected_provider = _selected_provider(
-        provider, available_providers, runtime.primary_metadata_provider, artist.watchlist_provider
+    # GET navigation must stay read-only. Provider refreshes and legacy snapshot repairs
+    # can involve slow network calls and SQLite writer locks; run them only from explicit
+    # actions so artist pages remain usable while acquisition/monitoring jobs are active.
+    provider_albums = (
+        list(selected_identity.releases)
+        if selected_identity is not None
+        else _legacy_provider_album_rows(artist, selected_provider)
     )
-    selected_identity = next(
-        (identity for identity in artist.identities if identity.provider == selected_provider),
-        None,
-    )
-    provider_albums = list(selected_identity.releases) if selected_identity is not None else []
     discography_loading = artist.enrichment_state in {"queued", "running"} and not provider_albums
     canonical_progress = await get_release_progress(
         db,

@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-07-30
+
+### Fixed
+- Kept catalog artist pages read-only so GET navigation no longer queues provider refresh jobs that can hold browser requests behind SQLite writer locks.
+- Shortened SQLite busy waits on retryable UI writes so dismissing stale import-review cards retries quickly instead of appearing to load indefinitely.
+
 ## [0.8.4] - 2026-07-30
 
 ### Fixed
