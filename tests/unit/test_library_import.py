@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,7 @@ from app.models.workflow import ImportWorkflowState
 from app.services.library_import import (
     ImportExecutionError,
     MutagenTagWriter,
+    _tags_for,
     execute_release_import,
     plan_release_import,
 )
@@ -511,6 +514,112 @@ def test_audio_format_contract_excludes_unverifiable_formats() -> None:
         assert is_importable_audio(f"track.{extension}")
     for extension in {"aac", "wav", "webm", "aiff", "wv"}:
         assert not is_importable_audio(f"track.{extension}")
+
+
+def test_m4a_normal_import_tags_round_trip(tmp_path: Path) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("ffmpeg is required for a real M4A fixture")
+    path = tmp_path / "source.m4a"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=0.2",
+            "-c:a",
+            "eac3",
+            "-tag:a",
+            "ec-3",
+            "-f",
+            "mp4",
+            str(path),
+        ],
+        check=True,
+        timeout=30,
+    )
+    release = Release(
+        source="slskd",
+        title="Album",
+        album_artist="Artist",
+        year="1999",
+        release_mbid="release-mbid",
+    )
+    track = Track(
+        source="slskd",
+        title="Song",
+        artist="Artist",
+        album_artist="Artist",
+        album="Album",
+        year="1999",
+        disc=1,
+        disc_total=2,
+        track_no=3,
+        mbid="recording-mbid",
+    )
+    tags = _tags_for(release, track)
+
+    assert MutagenTagWriter().write_and_verify(path, tags)
+    readback = MutagenTagWriter().read_tags(path)
+    assert readback["date"] == "1999"
+    assert readback["release_date"] == "1999"
+    assert readback["releasedate"] == "1999"
+    assert readback["tracknumber"] == "3"
+    assert readback["discnumber"] == "1"
+    assert readback["musicbrainz_trackid"] == "recording-mbid"
+
+
+async def test_m4a_plan_and_execute_import_verifies_real_tag_readback(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("ffmpeg is required for a real M4A fixture")
+    release, tracks = await _release_with_staged_tracks(
+        db_session, tmp_path, count=1, suffix=".m4a"
+    )
+    source = Path(tracks[0].staging_path or "")
+    await asyncio.to_thread(
+        subprocess.run,
+        [
+            ffmpeg,
+            "-nostdin",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=0.2",
+            "-c:a",
+            "eac3",
+            "-tag:a",
+            "ec-3",
+            "-f",
+            "mp4",
+            str(source),
+        ],
+        check=True,
+        timeout=30,
+    )
+    library = tmp_path / "library"
+
+    plans = await plan_release_import(db_session, release, library_root=library)
+    imported = await execute_release_import(
+        db_session, release, library_root=library, tag_writer=MutagenTagWriter()
+    )
+
+    destination = Path(imported[0].destination_path)
+    assert plans[0].destination_path.endswith(".m4a")
+    assert imported[0].tag_verification_state == TagVerificationState.verified
+    assert imported[0].status == ImportWorkflowState.imported
+    readback = MutagenTagWriter().read_tags(destination)
+    assert readback["releasedate"] == "1999"
+    assert readback["musicbrainz_trackid"] == "recording-1"
 
 
 async def _link_catalog_album(
