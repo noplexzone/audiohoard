@@ -33,7 +33,11 @@ from app.models.path_preview import PathPreview
 from app.models.release import Release
 from app.models.source_candidate_block import SourceCandidateBlock
 from app.models.track import FingerprintState, IdentityResolutionState, Track
-from app.models.workflow import AcquisitionState, ImportWorkflowState
+from app.models.workflow import (
+    AcoustIDVerificationState,
+    AcquisitionState,
+    ImportWorkflowState,
+)
 from app.naming.convention import NamingError, render_path
 from app.schemas.search import SearchRequest, SearchResult
 from app.services.monitoring import map_slskd_transfer_state
@@ -948,20 +952,51 @@ def _selected_result(job: Job) -> list[SearchResult] | None:
     return [SearchResult.model_validate(json.loads(job.selected_result_json))]
 
 
+def _slskd_identity_from_provenance(provenance_json: str | None) -> tuple[str, str] | None:
+    if not provenance_json:
+        return None
+    try:
+        provenance = json.loads(provenance_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(provenance, dict) or provenance.get("source") != "slskd":
+        return None
+    peer = str(provenance.get("username") or "")
+    filename = str(provenance.get("filename") or "")
+    return (peer, filename) if peer and filename else None
+
+
+async def _blocked_slskd_identities(db: AsyncSession) -> set[tuple[str, str]]:
+    block_rows = (
+        await db.execute(
+            select(SourceCandidateBlock.peer, SourceCandidateBlock.filename).where(
+                SourceCandidateBlock.provider == "slskd"
+            )
+        )
+    ).all()
+    blocked = {(str(peer), str(filename)) for peer, filename in block_rows}
+    denied_rows = (
+        await db.scalars(
+            select(Track.acquisition_provenance_json).where(
+                Track.source == "slskd",
+                Track.acoustid_verification_state == AcoustIDVerificationState.denied,
+                Track.acquisition_provenance_json.is_not(None),
+            )
+        )
+    ).all()
+    for provenance_json in denied_rows:
+        identity = _slskd_identity_from_provenance(provenance_json)
+        if identity is not None:
+            blocked.add(identity)
+    return blocked
+
+
 async def _without_blocked_slskd_results(
     results: list[SearchResult], db: AsyncSession
 ) -> list[SearchResult]:
     if not any(result.source == "slskd" for result in results):
         return results
-    blocked = set(
-        (
-            await db.execute(
-                select(SourceCandidateBlock.peer, SourceCandidateBlock.filename).where(
-                    SourceCandidateBlock.provider == "slskd"
-                )
-            )
-        ).all()
-    )
+    blocked = await _blocked_slskd_identities(db)
     return [
         result
         for result in results
@@ -1149,15 +1184,7 @@ async def _fetch_slskd_album_results(
     folders, _raw = await adapter.search_album_folders(req)
     if not folders:
         return []
-    blocked = set(
-        (
-            await db.execute(
-                select(SourceCandidateBlock.peer, SourceCandidateBlock.filename).where(
-                    SourceCandidateBlock.provider == "slskd"
-                )
-            )
-        ).all()
-    )
+    blocked = await _blocked_slskd_identities(db)
     # Reject an entire folder if any member is blocked; selecting the remainder
     # would turn a coherent album into an incomplete candidate.
     folders = [
