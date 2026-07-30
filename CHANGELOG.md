@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-07-30
+
+### Fixed
+- Remove legacy `DISC`/`DISCC` and `TRACK`/`TRACKC` aliases during import and Repair Metadata so Navidrome cannot prefer stale global positions over canonical multi-disc tags.
+- Remove Picard `MUSICBRAINZ_ALBUMCOMMENT` metadata, including MP3 TXXX variants, so Navidrome does not derive a stale `albumversion` that splits otherwise-identical tracks into duplicate albums.
+- Commit acquisition provenance checkpoints before provider fallback and polling so background searches release SQLite's writer lock before network I/O and cannot block orphan-review dismissal.
+
 ## [0.8.6] - 2026-07-30
 
 ### Fixed

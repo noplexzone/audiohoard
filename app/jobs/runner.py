@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import re
@@ -428,7 +429,12 @@ async def _run_job_in_session(
         selected_results = _selected_result(job)
         if selected_results:
             selected_results = await _without_blocked_slskd_results(selected_results, db)
-        results = selected_results or await _call_fetch_results(job, cfg, db)
+        results = selected_results or await _call_fetch_results(
+            job,
+            cfg,
+            db,
+            checkpoint=db.commit if commit_progress else None,
+        )
         catalog_album = await _load_catalog_album(db, job.catalog_album_id)
         catalog_tracks = list(catalog_album.tracks) if catalog_album is not None else []
 
@@ -1021,15 +1027,29 @@ async def _without_blocked_slskd_results(
     ]
 
 
-async def _call_fetch_results(job: Job, cfg: Settings, db: AsyncSession) -> list[SearchResult]:
-    try:
-        return await _fetch_results(job, cfg, db)
-    except TypeError as exc:
-        # Backward-compatible test/plugin hook: older _fetch_results monkeypatches
-        # accepted only (job, cfg). Do not swallow TypeError raised inside the hook.
-        if "positional" not in str(exc) and "argument" not in str(exc):
-            raise
-        return list(await _fetch_results(job, cfg))  # type: ignore[call-arg]
+async def _call_fetch_results(
+    job: Job,
+    cfg: Settings,
+    db: AsyncSession,
+    *,
+    checkpoint: Callable[[], Awaitable[None]] | None = None,
+) -> list[SearchResult]:
+    parameters = inspect.signature(_fetch_results).parameters
+    values = tuple(parameters.values())
+    accepts_keywords = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in values)
+    if "checkpoint" in parameters or accepts_keywords:
+        return await _fetch_results(job, cfg, db, checkpoint=checkpoint)
+    accepts_varargs = any(
+        parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in values
+    )
+    positional_count = sum(
+        parameter.kind
+        in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+        for parameter in values
+    )
+    if accepts_varargs or positional_count >= 3:
+        return list(await _fetch_results(job, cfg, db))
+    return list(await _fetch_results(job, cfg))  # type: ignore[call-arg]
 
 
 def _source_adapter(source: str, cfg: Settings) -> SourceAdapter:
@@ -1096,8 +1116,22 @@ def _set_acquisition_provenance(
     job.result_json = json.dumps(payload, sort_keys=True)
 
 
+async def _persist_provider_progress(
+    db: AsyncSession, checkpoint: Callable[[], Awaitable[None]] | None
+) -> None:
+    if checkpoint is not None:
+        await checkpoint()
+    else:
+        await db.flush()
+
+
 async def _fetch_results(
-    job: Job, cfg: Settings, db: AsyncSession, limit: int = DEFAULT_FREE_TEXT_RESULT_LIMIT
+    job: Job,
+    cfg: Settings,
+    db: AsyncSession,
+    limit: int = DEFAULT_FREE_TEXT_RESULT_LIMIT,
+    *,
+    checkpoint: Callable[[], Awaitable[None]] | None = None,
 ) -> list[SearchResult]:
     runtime = await get_runtime_settings(db)
     configured = [
@@ -1132,7 +1166,7 @@ async def _fetch_results(
                         }
                     )
                     _set_acquisition_provenance(job, attempted)
-                    await db.flush()
+                    await _persist_provider_progress(db, checkpoint)
                     continue
 
             # For slskd album downloads: group files by folder and select the best one.
@@ -1152,12 +1186,12 @@ async def _fetch_results(
             if not results:
                 attempted.append({"source": source, "status": "empty", "reason": "zero results"})
                 _set_acquisition_provenance(job, attempted)
-                await db.flush()
+                await _persist_provider_progress(db, checkpoint)
                 continue
             attempted.append({"source": source, "status": "served", "results": len(results)})
             job.source = source
             _set_acquisition_provenance(job, attempted, source)
-            await db.flush()
+            await _persist_provider_progress(db, checkpoint)
             return results
         except ProviderError as exc:
             attempted.append(
@@ -1168,7 +1202,7 @@ async def _fetch_results(
                 {"source": source, "status": "failed", "reason": exc.__class__.__name__}
             )
         _set_acquisition_provenance(job, attempted)
-        await db.flush()
+        await _persist_provider_progress(db, checkpoint)
     raise ProviderError(
         "sources_exhausted",
         "All configured download sources were exhausted",
