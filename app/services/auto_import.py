@@ -97,6 +97,11 @@ async def try_auto_import_release(
         await db.flush()
         return False
 
+    # Planning flushes import-plan writes. Commit that checkpoint before execution
+    # fetches artwork or performs other external I/O so SQLite does not retain a
+    # writer lock for the duration of a provider timeout.
+    await db.commit()
+
     logger.info(
         "auto_import: executing %d ready track import(s) for release %d", len(ready), release.id
     )

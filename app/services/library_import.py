@@ -70,6 +70,7 @@ _MANAGED_TAG_KEYS = frozenset(
         "album_artist",
         "albumartist",
         "albumartists",
+        "albumversion",
         "date",
         "year",
         "releasedate",
@@ -108,6 +109,8 @@ _MANAGED_TAG_KEYS = frozenset(
 _MANAGED_ID3_TXXX_DESCRIPTIONS = frozenset(
     {
         "barcode",
+        "album version",
+        "albumversion",
         "media",
         "release country",
         "release status",
@@ -1097,6 +1100,13 @@ def _retag_catalog_album_files(
                 pinned.fsync()
             except OSError:
                 logger.warning("retag succeeded but a temporary backup could not be removed")
+        if created_destinations:
+            scanner_pinned, scanner_name = created_destinations[0]
+            try:
+                scanner_pinned.notify_changed(scanner_name)
+                scanner_pinned.fsync()
+            except OSError:
+                logger.warning("retag succeeded but the library scanner notification failed")
         _close_pinned_destinations_safely(pinned_destinations)
         return AlbumRetagResult(files_retagged=len(targets), folder=folder, files_renamed=renamed)
     except Exception as exc:
@@ -1402,10 +1412,14 @@ async def execute_release_import(
     created_destinations: list[tuple[PinnedDestination, str]] = []
     temp_paths: list[tuple[PinnedDestination, str]] = []
     backup_paths: list[tuple[PinnedDestination, str, str]] = []
+    # Persist any ready-plan work before copying, hashing, and retagging files.
+    # Those operations can take seconds per release and must not hold SQLite's
+    # single writer lock against interactive actions. The importing states remain
+    # part of the final transaction so a failed commit restores the ready state.
+    await db.commit()
     release.import_state = ImportWorkflowState.importing
     for plan in plans:
         plan.status = ImportWorkflowState.importing
-    await db.flush()
 
     try:
         for plan in plans:

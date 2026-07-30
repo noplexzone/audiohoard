@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -155,6 +156,36 @@ async def test_execute_import_copies_to_destination_temp_writes_verified_tags_an
     await asyncio.sleep(0)
     assert not source.exists()  # noqa: ASYNC240
     assert destination.exists()  # noqa: ASYNC240
+
+
+async def test_execute_import_releases_sqlite_writer_lock_before_filesystem_work(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    release, _tracks = await _release_with_staged_tracks(db_session, tmp_path)
+    library = tmp_path / "library"
+    await plan_release_import(db_session, release, library_root=library)
+    bind = db_session.bind
+    assert bind is not None
+    database_path = bind.url.database
+    assert database_path is not None
+    writer_checks = 0
+
+    def assert_writer_available(_destination: Path) -> None:
+        nonlocal writer_checks
+        with sqlite3.connect(database_path, timeout=0.1) as concurrent:
+            concurrent.execute("BEGIN IMMEDIATE")
+            concurrent.rollback()
+        writer_checks += 1
+
+    await execute_release_import(
+        db_session,
+        release,
+        library_root=library,
+        tag_writer=MutagenTagWriter(),
+        before_commit=assert_writer_available,
+    )
+
+    assert writer_checks == 1
 
 
 async def test_execute_import_rejects_source_symlink_swap_after_planning(

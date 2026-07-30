@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-07-30
+
+### Fixed
+- Clear stale `ALBUMVERSION` metadata during import and Repair Metadata so otherwise-identical tracks no longer split into duplicate Navidrome albums.
+- Emit a final scanner-visible file change after batch metadata repair so Navidrome rescans the completed album instead of retaining a mixed mid-repair snapshot.
+- Commit auto-import planning before artwork/provider I/O so background imports do not hold SQLite writer locks long enough to break orphan-review dismissal.
+
 ## [0.8.5] - 2026-07-30
 
 ### Fixed

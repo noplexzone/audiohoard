@@ -595,6 +595,7 @@ def test_tag_writer_clears_nav_grouping_txxx_fields_that_split_mp3_albums(
     path = tmp_path / "track.mp3"
     original = ID3()
     original.add(TXXX(encoding=3, desc="BARCODE", text="602445694884"))
+    original.add(TXXX(encoding=3, desc="ALBUMVERSION", text="explicit, bonus"))
     original.add(TXXX(encoding=3, desc="MEDIA", text="Digital Media"))
     original.add(TXXX(encoding=3, desc="MusicBrainz Album Status", text="official"))
     original.add(TXXX(encoding=3, desc="MusicBrainz Album Type", text="album"))
@@ -622,6 +623,7 @@ def test_tag_writer_clears_nav_grouping_txxx_fields_that_split_mp3_albums(
     assert stale_descriptions.isdisjoint(
         {
             "barcode",
+            "albumversion",
             "media",
             "musicbrainz album status",
             "musicbrainz album type",
@@ -643,6 +645,7 @@ def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: 
     original["originaldate"] = "2021"
     original["originalyear"] = "2021"
     original["recordlabel"] = "Grade A Productions/Interscope Records"
+    original["albumversion"] = "explicit, bonus"
     original["musicbrainz_albumstatus"] = "official"
     original["musicbrainz_albumtype"] = "album"
     original["musicbrainz_artistid"] = "stale-artist"
@@ -678,6 +681,7 @@ def test_tag_writer_clears_nav_grouping_fields_that_split_flac_albums(tmp_path: 
         "originaldate",
         "originalyear",
         "recordlabel",
+        "albumversion",
         "musicbrainz_albumstatus",
         "musicbrainz_albumtype",
         "musicbrainz_artistid",
@@ -730,6 +734,24 @@ async def test_retag_catalog_album_repairs_mixed_imported_and_legacy_files(
     assert "originalyear" not in repaired
     assert "musicbrainz_albumtype" not in repaired
     assert all(path.exists() for path in paths)
+
+
+async def test_retag_catalog_album_emits_final_scanner_notification(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    library_root = tmp_path / "library"
+    album, _paths, _tracks = await _seed_imported_album(db_session, library_root)
+    notifications: list[str] = []
+
+    def notify_changed(self: PinnedDestination, name: str | None = None) -> None:
+        notifications.append(name or self.name)
+
+    monkeypatch.setattr(PinnedDestination, "notify_changed", notify_changed, raising=False)
+
+    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert result.files_retagged == 2
+    assert len(notifications) == 1
 
 
 async def test_retag_catalog_album_supports_legacy_unmapped_imports(
