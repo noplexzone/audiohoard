@@ -143,6 +143,16 @@ _MANAGED_ID3_TXXX_DESCRIPTIONS = frozenset(
 )
 
 
+def _normalized_id3_txxx_description(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+_MANAGED_ID3_TXXX_NORMALIZED = frozenset(
+    _normalized_id3_txxx_description(description)
+    for description in _MANAGED_TAG_KEYS | _MANAGED_ID3_TXXX_DESCRIPTIONS
+)
+
+
 @dataclass(frozen=True)
 class CanonicalArtwork:
     data: bytes
@@ -469,7 +479,7 @@ class MutagenTagWriter:
             if artwork is not None:
                 id3.delall("APIC")
             for frame in list(id3.getall("TXXX")):
-                if frame.desc.casefold() in _MANAGED_ID3_TXXX_DESCRIPTIONS:
+                if _normalized_id3_txxx_description(frame.desc) in _MANAGED_ID3_TXXX_NORMALIZED:
                     id3.delall(f"TXXX:{frame.desc}")
             if title := tags.get("title"):
                 id3.add(TIT2(encoding=3, text=title))

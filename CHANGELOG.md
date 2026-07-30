@@ -6,6 +6,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-07-30
+
+### Fixed
+- Normalize compact and separator-style MP3 `TXXX` metadata keys during import and Repair Metadata so stale per-source MusicBrainz release identity, dates, release type/status/country, and track/disc totals cannot split one track into a separate Navidrome album.
+
 ## [0.9.1] - 2026-07-30
 
 ### Fixed
