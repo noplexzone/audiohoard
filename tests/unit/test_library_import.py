@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from mutagen.id3 import ID3, TXXX
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -90,6 +91,55 @@ def _minimal_flac_bytes() -> bytes:
         + bytes(16)
     )
     return b"fLaC" + bytes([0x80, 0, 0, 34]) + stream_info
+
+
+def test_mp3_writer_clears_compact_managed_txxx_descriptions(tmp_path: Path) -> None:
+    path = tmp_path / "source.mp3"
+    id3 = ID3()
+    stale_descriptions = {
+        "DISCTOTAL": "1",
+        "TOTALDISCS": "1",
+        "TRACKTOTAL": "13",
+        "TOTALTRACKS": "13",
+        "ORIGINALDATE": "2015-01-01",
+        "ORIGINALYEAR": "2015",
+        "RELEASECOUNTRY": "US",
+        "RELEASESTATUS": "official",
+        "RELEASETYPE": "ep",
+        "MUSICBRAINZ_ALBUMID": "stale-release",
+        "MUSICBRAINZ_ALBUMARTISTID": "stale-album-artist",
+        "MUSICBRAINZ_ARTISTID": "stale-artist",
+        "MUSICBRAINZ_RELEASEGROUPID": "stale-release-group",
+        "MUSICBRAINZ_RELEASETRACKID": "stale-release-track",
+        "MUSICBRAINZ_ALBUMSTATUS": "official",
+        "MUSICBRAINZ_ALBUMTYPE": "ep",
+    }
+    for description, value in stale_descriptions.items():
+        id3.add(TXXX(encoding=3, desc=description, text=value))
+    id3.add(TXXX(encoding=3, desc="REPLAYGAIN_TRACK_GAIN", text="-7.0 dB"))
+    id3.save(path)
+
+    assert MutagenTagWriter().write_and_verify(
+        path,
+        {
+            "title": "Spin You Around",
+            "artist": "Morgan Wallen",
+            "album": "Stand Alone (10th Anniversary Deluxe Edition)",
+            "album_artist": "Morgan Wallen",
+            "date": "2024",
+            "release_date": "2024",
+            "tracknumber": "6",
+            "discnumber": "1",
+            "musicbrainz_trackid": "canonical-recording",
+        },
+    )
+
+    rewritten = ID3(path)
+    descriptions = {frame.desc: str(frame.text[0]) for frame in rewritten.getall("TXXX")}
+    assert descriptions["MusicBrainz Track Id"] == "canonical-recording"
+    assert descriptions["REPLAYGAIN_TRACK_GAIN"] == "-7.0 dB"
+    for description in stale_descriptions:
+        assert description not in descriptions
 
 
 async def test_plan_detects_same_path_conflict_and_same_bytes_duplicate(
