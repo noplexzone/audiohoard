@@ -256,9 +256,11 @@ async def deny_review_item(
                     settings.staging_root,
                     require_importable_audio=False,
                 )
-            except HTTPException as exc:
-                if exc.status_code != 404:
-                    raise
+            except HTTPException:
+                # Denying a review is the user's escape hatch for stale or unsafe
+                # staged paths. Refuse to serve/delete the file, but still clear
+                # the review row and reset the track state below.
+                resolved_staged_path = None
             track.staging_path = None
             if track.source_path == staged_path:
                 track.source_path = None

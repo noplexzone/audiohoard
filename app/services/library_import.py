@@ -886,13 +886,14 @@ def _retag_catalog_album_files(
     catalog_tracks = {item.id: item for item in album.tracks}
     catalog_tracks_by_position = {(item.disc, item.position): item for item in album.tracks}
     root = library_root.resolve()
-    targets: list[tuple[Path, Path, Track | None, CatalogAlbumTrack]] = []
+    targets: list[tuple[Path, Path, Track | None, ImportPlan | None, CatalogAlbumTrack]] = []
     for path, track, catalog_track in legacy_targets or []:
         targets.append(
             (
                 path,
                 _canonical_destination_for_catalog_track(root, album, catalog_track, path),
                 track,
+                None,
                 catalog_track,
             )
         )
@@ -928,9 +929,9 @@ def _retag_catalog_album_files(
         if canonical_destination.resolve() in mapped_destinations:
             raise ImportExecutionError("duplicate destination mapping in stored import metadata")
         mapped_destinations.add(canonical_destination.resolve())
-        targets.append((destination, canonical_destination, track, imported_catalog_track))
+        targets.append((destination, canonical_destination, track, plan, imported_catalog_track))
         folders.add(destination.parent.resolve())
-    for destination, canonical_destination, _track, _catalog_track in targets:
+    for destination, canonical_destination, _track, _plan, _catalog_track in targets:
         try:
             _destination_inside_root(root, destination)
         except ImportPlanningError as exc:
@@ -951,7 +952,7 @@ def _retag_catalog_album_files(
         for item in folder.iterdir()
         if item.is_file() and not item.is_symlink() and is_importable_audio(item)
     }
-    tracked_audio = {path.resolve() for path, _canonical, _track, _catalog_track in targets}
+    tracked_audio = {path.resolve() for path, _canonical, _track, _plan, _catalog_track in targets}
     if actual_audio != tracked_audio:
         raise ImportExecutionError(
             "album folder contains audio not linked to stored track metadata"
@@ -965,7 +966,7 @@ def _retag_catalog_album_files(
     prepared: list[tuple[PinnedDestination, str, str]] = []
     try:
         renamed = 0
-        for destination, _canonical_destination, target_track, catalog_track in targets:
+        for destination, _canonical_destination, target_track, _plan, catalog_track in targets:
             pinned = PinnedDestination.open(root, destination)
             pinned_destinations.append(pinned)
             if not pinned.is_regular_non_symlink():
@@ -996,7 +997,13 @@ def _retag_catalog_album_files(
         prepared_by_temp = {
             temp_name: (pinned, expected_hash) for pinned, temp_name, expected_hash in prepared
         }
-        for destination, canonical_destination, target_track, _catalog_track in targets:
+        for (
+            destination,
+            canonical_destination,
+            _target_track,
+            target_plan,
+            _catalog_track,
+        ) in targets:
             pinned = next(item for item in pinned_destinations if item.destination == destination)
             temp_name = next(name for item, name in temp_paths if item is pinned)
             expected_hash = prepared_by_temp[temp_name][1]
@@ -1032,10 +1039,8 @@ def _retag_catalog_album_files(
             created_destinations.append((final_pinned, final_pinned.name))
             if final_pinned is not pinned:
                 pinned.fsync()
-                if target_track is not None:
-                    for plan in target_track.import_plans:
-                        if plan.destination_path == str(destination):
-                            plan.destination_path = str(canonical_destination)
+                if target_plan is not None:
+                    target_plan.destination_path = str(canonical_destination)
         for pinned, _destination_name, backup_name in backup_paths:
             try:
                 pinned.unlink(backup_name)
