@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
@@ -10,15 +10,53 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user
+from app.config import Settings
 from app.database import get_db
 from app.models.track import Track
 from app.schemas.track import TrackRead
+from app.services.media_streaming import (
+    MediaAssetError,
+    TranscodeError,
+    media_response,
+    open_imported_track,
+    open_or_create_mp3_preview,
+)
+from app.settings_service import effective_settings_dep
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 def _get_templates(request: Request) -> Jinja2Templates:
     return request.app.state.templates  # type: ignore[no-any-return]
+
+
+@router.api_route("/tracks/{track_id}/audio", methods=["GET", "HEAD"], include_in_schema=False)
+@router.api_route(
+    "/library/tracks/{track_id}/audio", methods=["GET", "HEAD"], include_in_schema=False
+)
+async def stream_imported_track(
+    track_id: int,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    transcode: Annotated[str | None, Query(pattern="^mp3$")] = None,
+) -> Response:
+    try:
+        asset = await open_imported_track(db, track_id, library_root=settings.library_root)
+    except MediaAssetError:
+        raise HTTPException(status_code=404, detail="Imported audio is unavailable") from None
+    if transcode == "mp3":
+        try:
+            asset = await open_or_create_mp3_preview(
+                asset,
+                track_id=track_id,
+                cache_root=settings.artwork_cache_root.parent / "library-audio",
+            )
+        except TranscodeError:
+            raise HTTPException(
+                status_code=422, detail="Browser-compatible audio could not be created"
+            ) from None
+    return media_response(request, asset)
 
 
 @router.get("/tracks", response_model=list[TrackRead])
