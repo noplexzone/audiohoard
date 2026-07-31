@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-31
+
 ### Added
 - Redesign the artist library, unified discographies, and album/single/EP details around truthful ownership, direct playback, autosaving upgrade monitoring, and confirmation-gated file removal.
 - Add authenticated range streaming with bounded MP3 transcoding, a navigation-persistent global player, durable track/catalog/imported-release deletion, and external-file reconciliation.
