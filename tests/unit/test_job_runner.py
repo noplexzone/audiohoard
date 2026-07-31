@@ -114,6 +114,68 @@ def test_collaborator_terms_require_featured_artist_not_other_lead() -> None:
     ) == ["Julia Michaels"]
 
 
+def test_targeted_catalog_result_accepts_promo_filename_with_mix_suffixes() -> None:
+    target = CatalogAlbumTrack(id=13, position=1, disc=1, title="Miami")
+    promo = SearchResult(
+        source="slskd",
+        title="11A - 136",
+        artist="MORGAN WALLEN FT LIL WAYNE & RICK ROSS",
+        metadata={
+            "filename": (
+                "PROMO ONLY SERIES\\MORGAN WALLEN FT LIL WAYNE & RICK ROSS "
+                "- MIAMI (CLEAN) (2025) - 11A - 136.mp3"
+            )
+        },
+    )
+
+    assert runner._targeted_catalog_result_matches(
+        promo, target, required_terms=("Lil Wayne", "Rick Ross")
+    )
+
+
+def test_targeted_catalog_result_accepts_numeric_version_separator_variants() -> None:
+    target = CatalogAlbumTrack(id=14, position=1, disc=1, title="Spin You Around (1/24)")
+    folder_result = SearchResult(
+        source="slskd",
+        title="Spin You Around 1 24",
+        artist="Morgan Wallen",
+        metadata={
+            "filename": (
+                "Morgan Wallen - Single - 2024 - Spin You Around 1 24\\"
+                "0101 - Spin You Around 1 24.flac"
+            )
+        },
+    )
+    bracket_result = SearchResult(
+        source="slskd",
+        title="Spin You Around",
+        artist="Morgan Wallen",
+        metadata={"filename": "095. Morgan Wallen - Spin You Around (1_24).mp3"},
+    )
+    plain_result = SearchResult(
+        source="slskd",
+        title="Spin You Around",
+        artist="Morgan Wallen",
+        metadata={"filename": "Morgan Wallen - Spin You Around.mp3"},
+    )
+
+    assert runner._targeted_catalog_result_matches(folder_result, target)
+    assert runner._targeted_catalog_result_matches(bracket_result, target)
+    assert not runner._targeted_catalog_result_matches(plain_result, target)
+
+
+def test_targeted_catalog_result_rejects_unrequested_amazon_original() -> None:
+    target = CatalogAlbumTrack(id=15, position=1, disc=1, title="Valerie")
+    result = SearchResult(
+        source="slskd",
+        title="50 Ty Myers Valerie",
+        artist=None,
+        metadata={"filename": "50 Ty Myers Valerie (Amazon Music Original).mp3"},
+    )
+
+    assert not runner._targeted_catalog_result_matches(result, target)
+
+
 async def test_queries_for_job_uses_recording_artist_credit_collaborators(
     test_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
