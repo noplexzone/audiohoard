@@ -21,9 +21,11 @@ from app.services.catalog import (
     UNKNOWN,
     LibraryStats,
     Page,
+    ReleaseProgress,
     _clear_release_evidence_cache,
     _filesystem_release_evidence,
     _normalize_artist,
+    aggregate_artist_release_rollup,
     get_artist_detail,
     get_artists_page,
     get_library_artists_page,
@@ -34,6 +36,22 @@ from app.services.catalog import (
     track_meets_quality,
 )
 from app.settings_service import QualityProfile
+
+
+def test_artist_release_rollup_excludes_manifest_unknown_track_totals() -> None:
+    rollup = aggregate_artist_release_rollup(
+        [
+            ReleaseProgress(wanted_track_count=10, downloaded_track_count=10, manifest_known=True),
+            ReleaseProgress(wanted_track_count=8, downloaded_track_count=3, manifest_known=True),
+            ReleaseProgress(wanted_track_count=0, downloaded_track_count=2, manifest_known=False),
+            ReleaseProgress(wanted_track_count=0, downloaded_track_count=0, manifest_known=True),
+        ]
+    )
+
+    assert rollup.tracks_in_library == 13
+    assert rollup.tracks_total == 18
+    assert rollup.releases_complete == 1
+    assert rollup.releases_total == 3
 
 
 def _make_track(

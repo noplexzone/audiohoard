@@ -212,6 +212,10 @@ class CatalogAlbumProvider(Base):
         "CatalogAlbum", back_populates="provider_releases", lazy="joined"
     )
 
+    @property
+    def provider(self) -> str:
+        return self.artist_identity.provider
+
 
 class CatalogAlbumTrack(Base):
     __tablename__ = "catalog_album_tracks"

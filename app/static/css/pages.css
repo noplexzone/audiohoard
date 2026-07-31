@@ -803,11 +803,41 @@ a.metric-card:hover {
   font-size: .86rem;
 }
 
-.artist-actions {
+.artist-rollup {
+  margin: -.35rem 0 .85rem;
+  color: var(--muted);
+  font-size: .82rem;
+}
+
+.artist-rollup strong {
+  color: var(--accent);
+}
+
+.artist-actions,
+.artist-actions-primary,
+.artist-actions-secondary {
   display: flex;
   align-items: center;
   gap: .6rem;
   flex-wrap: wrap;
+}
+
+.artist-actions {
+  justify-content: space-between;
+}
+
+.artist-actions-primary {
+  gap: .5rem;
+}
+
+.artist-actions-secondary {
+  gap: .45rem;
+  opacity: .82;
+}
+
+.artist-actions-secondary .btn,
+.artist-actions-secondary .inline-select {
+  font-size: .74rem;
 }
 
 .artist-actions form {
@@ -866,7 +896,7 @@ a.metric-card:hover {
 
 .album-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(210px, 100%), 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(200px, 100%), 1fr));
   gap: .9rem;
 }
 
@@ -918,6 +948,23 @@ a.metric-card:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.card-progress-bar {
+  width: 100%;
+  height: 5px;
+  margin: .45rem 0 .35rem;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+}
+
+.card-progress-fill {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width .18s ease;
 }
 
 .provider-badges {
@@ -1017,7 +1064,9 @@ a.metric-card:hover {
     font-size: 1.35rem;
   }
 
-  .artist-actions {
+  .artist-actions,
+  .artist-actions-primary,
+  .artist-actions-secondary {
     align-items: stretch;
     flex-direction: column;
   }

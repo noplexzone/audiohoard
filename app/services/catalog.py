@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -207,6 +208,14 @@ class ReleaseLibraryFile:
 
 
 @dataclass(frozen=True)
+class ArtistReleaseRollup:
+    tracks_in_library: int
+    tracks_total: int
+    releases_complete: int
+    releases_total: int
+
+
+@dataclass(frozen=True)
 class ReleaseProgress:
     wanted_track_count: int
     downloaded_track_count: int
@@ -238,6 +247,23 @@ class ReleaseProgress:
             (item for item in self.library_files if item.catalog_track_id == catalog_track_id),
             None,
         )
+
+
+def aggregate_artist_release_rollup(
+    release_progress: Iterable[ReleaseProgress],
+) -> ArtistReleaseRollup:
+    manifest_known = [progress for progress in release_progress if progress.manifest_known]
+    return ArtistReleaseRollup(
+        tracks_in_library=sum(progress.downloaded_track_count for progress in manifest_known),
+        tracks_total=sum(progress.wanted_track_count for progress in manifest_known),
+        releases_complete=sum(
+            1
+            for progress in manifest_known
+            if progress.downloaded_track_count >= progress.wanted_track_count
+            and progress.wanted_track_count > 0
+        ),
+        releases_total=len(manifest_known),
+    )
 
 
 @dataclass

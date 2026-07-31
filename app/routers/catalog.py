@@ -35,6 +35,7 @@ from app.models.track import Track
 from app.models.workflow import ImportWorkflowState
 from app.services.catalog import (
     ReleaseProgress,
+    aggregate_artist_release_rollup,
     get_artist_detail,
     get_library_artists_page,
     get_library_stats,
@@ -209,6 +210,7 @@ def _legacy_provider_album_rows(artist: CatalogArtist, provider_name: str) -> li
                 release_type_raw=album.release_type,
                 content_rating=album.content_rating,
                 monitored=bool(album.monitored and artist.watchlist_provider == provider_name),
+                provider=provider_name,
             )
         )
     return rows
@@ -746,6 +748,7 @@ async def catalog_artist_page(
             ReleaseProgress(wanted_track_count=0, downloaded_track_count=0),
         )
         release_progress[release.id] = projected
+    artist_rollup = aggregate_artist_release_rollup(release_progress.values())
     albums = sorted(
         provider_albums,
         key=lambda release: (release.year or "0000", release.title.casefold()),
@@ -838,6 +841,7 @@ async def catalog_artist_page(
             "sort_url": sort_url,
             "enrichment": enrichment,
             "release_progress": release_progress,
+            "artist_rollup": artist_rollup,
             "discography_loading": discography_loading,
         },
     )
