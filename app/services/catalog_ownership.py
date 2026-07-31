@@ -39,6 +39,10 @@ class _OwnershipCandidate:
     destination_paths: tuple[str, ...]
 
 
+class CatalogOwnershipEvidenceError(RuntimeError):
+    """Strict reconciliation could not obtain authoritative provider evidence."""
+
+
 def _provenance_payload(track: Track) -> dict[str, object] | None:
     if not track.acquisition_provenance_json:
         return {}
@@ -168,7 +172,10 @@ async def _existing_candidate_ids(candidates: list[_OwnershipCandidate]) -> list
 
 
 async def _resolve_evidence(
-    settings: Settings, candidates: list[_OwnershipCandidate]
+    settings: Settings,
+    candidates: list[_OwnershipCandidate],
+    *,
+    fail_fast: bool = False,
 ) -> dict[str, DeezerReleaseEvidence]:
     client = DeezerClient(settings.deezer_api_url)
     semaphore = asyncio.Semaphore(8)
@@ -178,6 +185,10 @@ async def _resolve_evidence(
             async with semaphore:
                 track = await client.get_track(deezer_id)
         except Exception as exc:
+            if fail_fast:
+                raise CatalogOwnershipEvidenceError(
+                    f"Could not resolve Deezer ownership for track {deezer_id}"
+                ) from exc
             logger.warning("Could not resolve Deezer ownership for track %s: %s", deezer_id, exc)
             return None
         if track is None:
@@ -421,6 +432,7 @@ async def reconcile_deezer_catalog_ownership(
     settings: Settings,
     *,
     artist_id: int | None = None,
+    fail_on_provider_error: bool = False,
 ) -> int:
     """Resolve provider evidence outside transactions, then repair ownership idempotently."""
     async with session_factory() as db:
@@ -429,7 +441,10 @@ async def reconcile_deezer_catalog_ownership(
     candidates = [candidate for candidate in candidates if candidate.track_id in existing_ids]
     if not candidates:
         return 0
-    evidence = await _resolve_evidence(settings, candidates)
+    if fail_on_provider_error:
+        evidence = await _resolve_evidence(settings, candidates, fail_fast=True)
+    else:
+        evidence = await _resolve_evidence(settings, candidates)
     async with session_factory() as db:
         changed, affected, verified = await apply_catalog_ownership_evidence(
             db, evidence, track_ids=[candidate.track_id for candidate in candidates]

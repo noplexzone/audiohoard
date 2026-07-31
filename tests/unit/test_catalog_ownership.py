@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
@@ -271,6 +272,29 @@ async def test_reconcile_does_not_query_provider_when_imported_file_is_missing(
 
     monkeypatch.setattr(catalog_ownership, "_resolve_evidence", evidence)
     assert await catalog_ownership.reconcile_deezer_catalog_ownership(factory, test_settings) == 0
+
+
+async def test_strict_evidence_resolution_propagates_provider_failure(
+    test_settings: Settings,
+    monkeypatch,
+) -> None:
+    class BrokenDeezerClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        async def get_track(self, _track_id: str):
+            raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(catalog_ownership, "DeezerClient", BrokenDeezerClient)
+    candidate = catalog_ownership._OwnershipCandidate(1, "123", ("/tmp/existing.flac",))
+
+    assert await catalog_ownership._resolve_evidence(test_settings, [candidate]) == {}
+    with pytest.raises(catalog_ownership.CatalogOwnershipEvidenceError):
+        await catalog_ownership._resolve_evidence(
+            test_settings,
+            [candidate],
+            fail_fast=True,
+        )
 
 
 async def test_reconcile_ignores_unknown_rating_and_non_imported_track(

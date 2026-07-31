@@ -125,6 +125,7 @@ async def test_scheduler_isolates_artist_failures_and_dispatches_after_commit(
         return [], []
 
     async def fake_reconcile(*args: object, **kwargs: object) -> int:
+        assert kwargs["fail_on_provider_error"] is True
         events.append("reconcile")
         return 0
 

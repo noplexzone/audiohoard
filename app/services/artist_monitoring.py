@@ -295,7 +295,12 @@ class DiscographyRefreshScheduler:
                     )
                     await db.commit()
                 try:
-                    await reconcile_deezer_catalog_ownership(factory, cfg, artist_id=artist_id)
+                    await reconcile_deezer_catalog_ownership(
+                        factory,
+                        cfg,
+                        artist_id=artist_id,
+                        fail_on_provider_error=True,
+                    )
                 except Exception:
                     logger.exception(
                         "Catalog ownership reconciliation failed for artist %s", artist_id
