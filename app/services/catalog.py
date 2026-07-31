@@ -1399,7 +1399,11 @@ async def get_artist_detail(
 
     stmt = (
         select(Track)
-        .options(selectinload(Track.release), selectinload(Track.import_plans))
+        .options(
+            selectinload(Track.release),
+            selectinload(Track.import_plans),
+            selectinload(Track.catalog_album),
+        )
         .where(artist_expr == artist_name, _present_library_artifact_filter())
         .order_by(Track.year, Track.album, Track.disc, Track.track_no, Track.title, Track.id)
         .offset(_page_offset(page, per_page))

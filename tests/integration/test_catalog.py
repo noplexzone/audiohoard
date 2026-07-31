@@ -147,7 +147,9 @@ async def seeded_client(client: AsyncClient) -> AsyncClient:
             monitored=True,
             artwork_url="https://images.example/artist-a.jpg",
         )
-        catalog_artist_a.albums.append(CatalogAlbum(title="Great Album", release_type="Album"))
+        catalog_album_a = CatalogAlbum(title="Great Album", release_type="Album")
+        catalog_artist_a.albums.append(catalog_album_a)
+        tracks[0].catalog_album = catalog_album_a
         catalog_artist_b = CatalogArtist(name="Artist B", monitored=True)
         catalog_artist_b.albums.append(CatalogAlbum(title="Solo Work", release_type="Album"))
         session.add_all([catalog_artist_a, catalog_artist_b])
