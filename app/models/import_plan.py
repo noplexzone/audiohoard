@@ -128,7 +128,10 @@ WHEN NEW.status IN ('ready', 'importing', 'imported')
  AND NEW.file_state != 'removed'
  AND EXISTS (
     SELECT 1 FROM import_plans AS existing
-    WHERE existing.destination_path = NEW.destination_path
+    WHERE (
+        existing.destination_path = NEW.destination_path
+        OR (NEW.track_id IS NOT NULL AND existing.track_id = NEW.track_id)
+      )
       AND existing.status IN ('ready', 'importing', 'imported')
       AND existing.file_state != 'removed'
       AND (
@@ -143,13 +146,18 @@ END
 
 _ADOPTION_CLAIM_UPDATE_TRIGGER = """
 CREATE TRIGGER IF NOT EXISTS trg_import_plans_adoption_claim_update
-BEFORE UPDATE OF source_path, destination_path, status, file_state ON import_plans
+BEFORE UPDATE OF track_id, source_path, destination_path, planned_operations_json,
+    status, file_state
+ON import_plans
 WHEN NEW.status IN ('ready', 'importing', 'imported')
  AND NEW.file_state != 'removed'
  AND EXISTS (
     SELECT 1 FROM import_plans AS existing
     WHERE existing.id != OLD.id
-      AND existing.destination_path = NEW.destination_path
+      AND (
+        existing.destination_path = NEW.destination_path
+        OR (NEW.track_id IS NOT NULL AND existing.track_id = NEW.track_id)
+      )
       AND existing.status IN ('ready', 'importing', 'imported')
       AND existing.file_state != 'removed'
       AND (

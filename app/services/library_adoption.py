@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -654,8 +654,18 @@ async def _track_has_other_file(
         .where(
             or_(*identity),
             ImportPlan.destination_path != path,
-            ImportPlan.status == ImportWorkflowState.imported,
-            ImportPlan.file_state == LibraryFileState.present,
+            or_(
+                and_(
+                    ImportPlan.status.in_(
+                        [ImportWorkflowState.ready, ImportWorkflowState.importing]
+                    ),
+                    ImportPlan.file_state != LibraryFileState.removed,
+                ),
+                and_(
+                    ImportPlan.status == ImportWorkflowState.imported,
+                    ImportPlan.file_state == LibraryFileState.present,
+                ),
+            ),
         )
     )
     return bool(count)

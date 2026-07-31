@@ -726,6 +726,65 @@ async def test_imported_identity_with_present_file_sends_duplicate_to_review(
 
 
 @pytest.mark.asyncio
+async def test_catalog_track_with_active_normal_plan_sends_adoption_to_review(
+    db_session, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    candidate_path = root / "Artist" / "Album (2024)" / "01 - Song.mp3"
+    _tagged_mp3(candidate_path)
+    _artist, album = await _catalog(db_session)
+    job = Job(source="legacy", query="planned import", status=JobStatus.done)
+    release = Release(
+        job=job,
+        source="legacy",
+        title="Album",
+        album_artist="Artist",
+        year="2024",
+    )
+    track = Track(
+        job=job,
+        release=release,
+        catalog_track_id=album.tracks[0].id,
+        source="legacy",
+        artist="Artist",
+        album_artist="Artist",
+        album="Album",
+        title="Song",
+        year="2024",
+        track_no=1,
+        disc=1,
+        import_state=ImportWorkflowState.ready,
+    )
+    existing_plan = ImportPlan(
+        release=release,
+        track=track,
+        source_path="/staging/planned.mp3",
+        destination_path=str(root / "Artist" / "Album (2024)" / "planned.mp3"),
+        status=ImportWorkflowState.ready,
+        file_state=LibraryFileState.unknown,
+    )
+    db_session.add(existing_plan)
+    await db_session.flush()
+    scan_id = await enqueue_library_adoption_scan(
+        db_session,
+        library_root=root,
+        scope=AdoptionScope(AdoptionScopeKind.catalog_album, album.id),
+    )
+    await db_session.commit()
+
+    scan = await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=root)
+
+    assert scan.adopted_count == 0
+    assert scan.review_count == 1
+    assert (
+        await db_session.scalar(
+            select(func.count(ImportPlan.id)).where(ImportPlan.track_id == track.id)
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
 async def test_active_destination_claim_is_database_unique(db_session) -> None:
     job = Job(source="legacy", query="legacy import", status=JobStatus.done)
     release = Release(

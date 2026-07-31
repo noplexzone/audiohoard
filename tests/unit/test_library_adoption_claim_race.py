@@ -19,6 +19,7 @@ def test_begin_immediate_serializes_adoption_against_ordinary_import(tmp_path: P
         """
         CREATE TABLE import_plans (
             id INTEGER PRIMARY KEY,
+            track_id INTEGER,
             status TEXT NOT NULL,
             file_state TEXT NOT NULL,
             destination_path TEXT NOT NULL,
@@ -47,8 +48,8 @@ def test_begin_immediate_serializes_adoption_against_ordinary_import(tmp_path: P
             importer.execute(
                 """
                 INSERT INTO import_plans
-                    (status, file_state, destination_path, planned_operations_json)
-                VALUES ('ready', 'present', '/music/song.flac', '{}')
+                    (track_id, status, file_state, destination_path, planned_operations_json)
+                VALUES (1, 'ready', 'present', '/music/other.flac', '{}')
                 """
             )
             importer.commit()
@@ -66,8 +67,9 @@ def test_begin_immediate_serializes_adoption_against_ordinary_import(tmp_path: P
     scanner.execute(
         """
         INSERT INTO import_plans
-            (status, file_state, destination_path, planned_operations_json)
+            (track_id, status, file_state, destination_path, planned_operations_json)
         VALUES (
+            1,
             'imported',
             'present',
             '/music/song.flac',
