@@ -215,7 +215,8 @@ async def test_library_lists_only_eligible_catalog_artists(client: AsyncClient) 
     assert "Hidden Artist" not in resp.text
     assert f'href="/artists/catalog/{watched_id}"' in resp.text
     assert 'src="/artwork?url=https%3A//images.example/watchlisted.jpg"' in resp.text
-    assert "No partial releases" in resp.text
+    assert "primary-source releases complete" in resp.text
+    assert "partial" not in resp.text.casefold()
     assert "ownership unknown" not in resp.text.casefold()
 
 
@@ -477,8 +478,8 @@ async def test_library_shows_track_artist(seeded_client: AsyncClient) -> None:
 
 async def test_library_shows_release_progress_counts(seeded_client: AsyncClient) -> None:
     resp = await seeded_client.get("/library")
-    assert "releases complete" in resp.text
-    assert "ownership unknown" in resp.text
+    assert "primary-source releases complete" in resp.text
+    assert "ownership unknown" not in resp.text.casefold()
 
 
 async def test_library_uses_watchlisted_catalog_artists(seeded_client: AsyncClient) -> None:
@@ -1245,6 +1246,120 @@ async def test_album_download_retries_transient_sqlite_writer_lock(
             (await session.scalars(select(Job).where(Job.catalog_album_id == album_id))).all()
         )
     assert len(jobs) == 1
+
+
+async def test_library_artist_cards_use_primary_source_counts_and_copy(
+    client: AsyncClient,
+) -> None:
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        artist = CatalogArtist(
+            name="Primary Count Artist",
+            monitored=True,
+            primary_metadata_provider="deezer",
+            watchlist_provider="musicbrainz",
+        )
+        deezer_identity = CatalogArtistIdentity(
+            provider="deezer", provider_artist_id="primary-deezer", name=artist.name
+        )
+        mb_identity = CatalogArtistIdentity(
+            provider="musicbrainz", provider_artist_id="primary-mb", name=artist.name
+        )
+        deezer_album = CatalogAlbum(title="Primary Album", track_count=1, release_type="Album")
+        secondary_album = CatalogAlbum(
+            title="Secondary Album", track_count=1, release_type="Album"
+        )
+        deezer_album.tracks.append(CatalogAlbumTrack(position=1, disc=1, title="Primary Track"))
+        secondary_album.tracks.append(
+            CatalogAlbumTrack(position=1, disc=1, title="Secondary Track")
+        )
+        deezer_identity.releases.append(
+            CatalogAlbumProvider(
+                provider_album_id="primary-album",
+                title=deezer_album.title,
+                release_kind="album",
+                catalog_album=deezer_album,
+            )
+        )
+        mb_identity.releases.append(
+            CatalogAlbumProvider(
+                provider_album_id="secondary-album",
+                title=secondary_album.title,
+                release_kind="album",
+                catalog_album=secondary_album,
+            )
+        )
+        artist.albums.extend([deezer_album, secondary_album])
+        artist.identities.extend([deezer_identity, mb_identity])
+        session.add(artist)
+        await session.commit()
+
+    response = await client.get("/library")
+
+    assert response.status_code == 200
+    assert "0</strong> of 1 primary-source releases complete" in response.text
+    assert "Deezer" in response.text
+    assert "partial" not in response.text.casefold()
+    assert "ownership unknown" not in response.text.casefold()
+
+
+async def test_catalog_artist_primary_source_selection_changes_display_provider(
+    client: AsyncClient,
+) -> None:
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        artist = CatalogArtist(name="Switch Source Artist", monitored=True)
+        deezer_identity = CatalogArtistIdentity(
+            provider="deezer", provider_artist_id="switch-deezer", name=artist.name
+        )
+        mb_identity = CatalogArtistIdentity(
+            provider="musicbrainz", provider_artist_id="switch-mb", name=artist.name
+        )
+        deezer_album = CatalogAlbum(title="Deezer Album", track_count=1, release_type="Album")
+        mb_album = CatalogAlbum(title="MusicBrainz Album", track_count=1, release_type="Album")
+        deezer_identity.releases.append(
+            CatalogAlbumProvider(
+                provider_album_id="deezer-album",
+                title=deezer_album.title,
+                release_kind="album",
+                catalog_album=deezer_album,
+            )
+        )
+        mb_identity.releases.append(
+            CatalogAlbumProvider(
+                provider_album_id="mb-album",
+                title=mb_album.title,
+                release_kind="album",
+                catalog_album=mb_album,
+            )
+        )
+        artist.albums.extend([deezer_album, mb_album])
+        artist.identities.extend([deezer_identity, mb_identity])
+        session.add(artist)
+        await session.commit()
+        artist_id = artist.id
+
+    page = await client.get(f"/artists/catalog/{artist_id}")
+    csrf_token = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+    response = await client.post(
+        f"/artists/catalog/{artist_id}/primary-source",
+        data={"csrf_token": csrf_token, "primary_metadata_provider": "musicbrainz"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert (
+        response.headers["location"]
+        == f"/artists/catalog/{artist_id}?provider=musicbrainz&sort=desc"
+    )
+    async with factory() as session:
+        refreshed = await session.get(CatalogArtist, artist_id)
+        assert refreshed is not None
+        assert refreshed.primary_metadata_provider == "musicbrainz"
+    switched = await client.get(f"/artists/catalog/{artist_id}")
+    assert "Primary: MusicBrainz" in switched.text
+    assert "MusicBrainz Album" in switched.text
+    assert "Deezer Album" not in switched.text
 
 
 async def test_album_download_without_fetch_header_still_redirects(

@@ -36,14 +36,10 @@
           <div class="ownership-bar unknown" aria-hidden="true"></div>
           <p class="ownership-detail">Catalog ownership is unknown</p>
         {% else %}
-          <p class="ownership-copy"><strong>{{ artist.complete_release_count }}</strong> of {{ artist.release_count }} releases complete</p>
+          <p class="ownership-copy"><strong>{{ artist.complete_release_count }}</strong> of {{ artist.release_count }} primary-source releases complete</p>
           <progress value="{{ artist.complete_release_count }}" max="{{ artist.release_count if artist.release_count else 1 }}">{{ artist.complete_release_count }} of {{ artist.release_count }}</progress>
-          <p class="ownership-detail">
-            {% if artist.partial_release_count %}{{ artist.partial_release_count }} partial{% else %}No partial releases{% endif %}
-            {% if artist.unknown_release_count %} · {{ artist.unknown_release_count }} ownership unknown{% endif %}
-            · {{ artist.wanted_release_count }} wanted · {{ artist.downloaded_file_count }} downloaded file{% if artist.downloaded_file_count != 1 %}s{% endif %}
-          </p>
         {% endif %}
+        {% if artist.primary_metadata_provider %}<span class="badge info">{{ display_name(artist.primary_metadata_provider) }}</span>{% endif %}
         <span class="badge {{ 'ok' if artist.watchlisted else 'info' }}">{{ 'Watchlisted' if artist.watchlisted else 'In library' }}</span>
       </div>
     </a>

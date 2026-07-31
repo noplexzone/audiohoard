@@ -39,6 +39,7 @@ class CatalogArtist(Base):
         String(32), nullable=False, default="all", server_default="all"
     )
     watchlist_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    primary_metadata_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     watchlist_release_albums: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="1"
     )

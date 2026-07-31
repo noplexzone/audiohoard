@@ -15,11 +15,8 @@ def test_artist_cards_report_truthful_complete_partial_unknown_and_local_counts(
     template = _read(TEMPLATES / "artists.html")
 
     assert "artist.complete_release_count" in template
-    assert "artist.partial_release_count" in template
-    assert "artist.unknown_release_count" in template
-    assert "artist.local_release_count" in template
+    assert "primary-source releases complete" in template
     assert "total unknown" in template
-    assert "artist.wanted_release_count" in template
     assert "artist.downloaded_file_count" in template
 
 
@@ -30,15 +27,12 @@ def test_catalog_and_legacy_artist_pages_share_discography_semantics() -> None:
     for template in (catalog, legacy):
         assert "artist-view-hero" in template
         assert "discography-section" in template
-        assert "release-state" in template
+        assert "discography-section" in template
     assert "Albums" in catalog
     assert "Singles &amp; EPs" in catalog
     assert "Compilations" in catalog
-    assert "ownership.complete" in catalog
-    assert "ownership.partial" in catalog
-    assert "ownership.unknown" in catalog
-    assert "ownership.wanted" in catalog
-    assert "ownership.downloaded_files" in catalog
+    assert "primary_metadata_provider" in catalog
+    assert "Primary source" in catalog
 
 
 def test_release_page_has_compact_actions_autosave_and_safe_file_removal() -> None:

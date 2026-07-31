@@ -13,6 +13,7 @@
   {% else %}{% set ownership.wanted = ownership.wanted + 1 %}{% endif %}
 {% endfor %}
 <script defer src="/static/js/artist-watchlist.js?v={{ app_version }}" data-page-module="artist-watchlist"></script>
+<script defer src="/static/js/album.js?v={{ app_version }}" data-page-module="album"></script>
 <nav class="breadcrumb"><a href="/library">Library</a> / {{ artist.name }}</nav>
 <section class="artist-view-hero card">
   <div class="artist-view-art" aria-hidden="true">
@@ -25,7 +26,7 @@
     {% endif %}
   </div>
   <div class="artist-view-copy">
-    <p class="eyebrow">Catalog artist</p>
+    <p class="eyebrow">Catalog artist · <span class="source-tag">Primary: {{ display_name(primary_metadata_provider) }}</span></p>
     <div class="artist-title-row">
       <h1>{{ display_identity.name if display_identity else artist.name }}</h1>
       {% if display_identity %}
@@ -40,8 +41,18 @@
       {% if counts_by_type.compilations %}{% if counts_by_type.albums or counts_by_type.singles_eps %} · {% endif %}{{ counts_by_type.compilations }} compilation{{ '' if counts_by_type.compilations == 1 else 's' }}{% endif %}
       {% if not total_releases %}No releases stored yet{% endif %}
     </p>
-    {% if total_releases %}<p class="ownership-detail">{{ ownership.complete }} complete · {{ ownership.partial }} partial · {{ ownership.unknown }} ownership unknown · {{ ownership.wanted }} wanted · {{ ownership.downloaded_files }} downloaded file{% if ownership.downloaded_files != 1 %}s{% endif %}</p>{% endif %}
     <div class="artist-actions">
+      <form method="post" action="/artists/catalog/{{ artist.id }}/primary-source" class="primary-source-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="release_type" value="{{ release_type }}">
+        <input type="hidden" name="sort" value="{{ sort }}">
+        <label class="inline-select">Primary source
+          <select name="primary_metadata_provider" data-primary-source-select>
+            {% for name in available_providers %}<option value="{{ name }}" {% if primary_metadata_provider == name %}selected{% endif %}>{{ display_name(name) }}</option>{% endfor %}
+          </select>
+        </label>
+        <button class="btn secondary compact-save" type="submit">Save</button>
+      </form>
       <form method="post" action="/maintenance/scan/artists/{{ artist.id }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <button class="btn secondary" type="submit">Scan artist</button>
@@ -136,11 +147,7 @@
               </p>
               <p class="release-progress">{% if progress.manifest_known %}{{ progress.downloaded_track_count }} of {{ progress.wanted_track_count }} tracks in library{% else %}{{ progress.downloaded_track_count }} local · total unknown{% endif %}</p>
               <p class="provider-badges">
-                {% if not progress.manifest_known %}<span class="release-state unknown">Ownership unknown</span>
-                {% elif progress.complete %}<span class="release-state complete">Complete</span>
-                {% elif progress.downloaded_track_count %}<span class="release-state partial">Partial</span>
-                {% else %}<span class="release-state missing">Missing</span>{% endif %}
-                <span class="badge info">{{ display_name(selected_provider) }}</span>{% if album.content_rating and album.content_rating != "unknown" %}<span class="badge warn">{{ album.content_rating.replace("_", " ") | title }}</span>{% endif %}
+                <span class="badge info">{{ display_name(primary_metadata_provider) }}</span>{% if album.content_rating and album.content_rating != "unknown" %}<span class="badge warn">{{ album.content_rating.replace("_", " ") | title }}</span>{% endif %}
               </p>
               <div class="album-card-actions">
                 {% if artist.monitored and artist.watchlist_provider == selected_provider %}<label class="check-label compact-check"><input type="checkbox" name="album_monitored" form="monitor-form" value="{{ album.id }}" {% if album.monitored %}checked{% endif %}> <span>Watchlist</span></label>{% endif %}
