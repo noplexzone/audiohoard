@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func, or_, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, or_, select, text, update
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -121,6 +121,12 @@ class CandidateChangedError(RuntimeError):
 
 def _safe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_LENGTH]
+
+
+def _is_sqlite_busy(exc: OperationalError) -> bool:
+    original = exc.orig
+    code = getattr(original, "sqlite_errorcode", None)
+    return code in {5, 517} or "database is locked" in str(original).casefold()
 
 
 def _norm(value: str | None) -> str:
@@ -296,7 +302,7 @@ def _match_album(
     snapshot: FileSnapshot, albums: list[CatalogAlbum], *, strict_scope: bool
 ) -> tuple[CatalogAlbum | None, tuple[str, ...]]:
     metadata = snapshot.metadata
-    observed_mbid = metadata.release_group_mbid or metadata.album_mbid
+    observed_mbid = metadata.release_group_mbid
     if observed_mbid:
         matches = [
             album
@@ -1008,11 +1014,16 @@ async def run_library_adoption_scan(
                 scan.heartbeat_at = datetime.now(UTC)
                 await db.commit()
 
+            # End any read transaction used to reload persisted candidates. Each
+            # candidate starts with a SQLite write reservation so an importer
+            # cannot commit a destination claim between our owner read and insert.
+            await db.commit()
             album_ids: set[int] = set()
             batch_releases: dict[int, Release] = {}
             for candidate in candidates:
                 if candidate.state != AdoptionCandidateState.pending:
                     continue
+                await db.execute(text("BEGIN IMMEDIATE"))
                 lease = await db.execute(
                     select(
                         LibraryAdoptionScan.state,
@@ -1127,6 +1138,27 @@ async def run_library_adoption_scan(
             raise
         except Exception as exc:
             await db.rollback()
+            if isinstance(exc, OperationalError) and _is_sqlite_busy(exc):
+                await db.execute(
+                    update(LibraryAdoptionScan)
+                    .where(
+                        LibraryAdoptionScan.id == scan_id,
+                        LibraryAdoptionScan.lease_token == lease_token,
+                    )
+                    .values(
+                        state=AdoptionScanState.queued,
+                        lease_token=None,
+                        heartbeat_at=datetime.now(UTC),
+                        error_detail=(
+                            "SQLite was busy while claiming a destination; queued for retry"
+                        ),
+                        completed_at=None,
+                    )
+                )
+                await db.commit()
+                current = await db.get(LibraryAdoptionScan, scan_id, populate_existing=True)
+                assert current is not None
+                return current
             scan = await db.get(LibraryAdoptionScan, scan_id, populate_existing=True)
             assert scan is not None
             if scan.lease_token == lease_token:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,7 @@ def _tagged_mp3(
     disc: str = "1",
     recording_mbid: str | None = "recording-1",
     album_mbid: str | None = "album-1",
+    release_mbid: str | None = None,
 ) -> bytes:
     path.parent.mkdir(parents=True, exist_ok=True)
     tags = ID3()
@@ -53,6 +55,8 @@ def _tagged_mp3(
         tags.add(TXXX(encoding=3, desc="MusicBrainz Track Id", text=recording_mbid))
     if album_mbid:
         tags.add(TXXX(encoding=3, desc="MusicBrainz Release Group Id", text=album_mbid))
+    if release_mbid:
+        tags.add(TXXX(encoding=3, desc="MusicBrainz Album Id", text=release_mbid))
     tags.save(path)
     return path.read_bytes()
 
@@ -395,25 +399,33 @@ async def test_full_scan_never_overrides_catalog_mbid_conflict_with_imported_fal
     db_session, tmp_path: Path
 ) -> None:
     root = tmp_path / "music"
-    path = root / "Artist" / "Album" / "01 - Song.mp3"
-    _tagged_mp3(path, album_mbid="contradictory-release", recording_mbid=None)
+    path = root / "Legacy Artist" / "Legacy Album" / "01 - Legacy Song.mp3"
+    _tagged_mp3(
+        path,
+        artist="Legacy Artist",
+        album="Legacy Album",
+        title="Legacy Song",
+        album_mbid=None,
+        release_mbid="contradictory-release",
+        recording_mbid=None,
+    )
     await _catalog(db_session)
     job = Job(source="legacy", query="legacy import", status=JobStatus.done)
     release = Release(
         job=job,
         source="legacy",
-        title="Album",
-        album_artist="Artist",
+        title="Legacy Album",
+        album_artist="Legacy Artist",
         release_mbid="different-release",
     )
     track = Track(
         job=job,
         release=release,
         source="legacy",
-        artist="Artist",
-        album_artist="Artist",
-        album="Album",
-        title="Song",
+        artist="Legacy Artist",
+        album_artist="Legacy Artist",
+        album="Legacy Album",
+        title="Legacy Song",
         track_no=1,
         disc=1,
         import_state=ImportWorkflowState.imported,
@@ -428,6 +440,60 @@ async def test_full_scan_never_overrides_catalog_mbid_conflict_with_imported_fal
     assert scan.adopted_count == 0
     assert scan.review_count == 1
     assert await db_session.scalar(select(func.count(ImportPlan.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_release_mbid_is_imported_evidence_not_catalog_group_contradiction(
+    db_session, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    path = root / "Legacy Artist" / "Legacy Album" / "01 - Legacy Song.mp3"
+    payload = _tagged_mp3(
+        path,
+        artist="Legacy Artist",
+        album="Legacy Album",
+        title="Legacy Song",
+        album_mbid=None,
+        release_mbid="release-legacy",
+        recording_mbid=None,
+    )
+    await _catalog(db_session)
+    job = Job(source="legacy", query="legacy import", status=JobStatus.done)
+    release = Release(
+        job=job,
+        source="legacy",
+        title="Legacy Album",
+        album_artist="Legacy Artist",
+        year="2020",
+        release_mbid="release-legacy",
+        import_state=ImportWorkflowState.imported,
+    )
+    track = Track(
+        job=job,
+        release=release,
+        source="legacy",
+        title="Legacy Song",
+        artist="Legacy Artist",
+        album_artist="Legacy Artist",
+        album="Legacy Album",
+        year="2020",
+        disc=1,
+        track_no=1,
+        content_sha256=hashlib.sha256(payload).hexdigest(),
+        import_state=ImportWorkflowState.imported,
+    )
+    db_session.add_all([job, release, track])
+    await db_session.commit()
+
+    scan_id = await enqueue_library_adoption_scan(db_session, library_root=root)
+    await db_session.commit()
+    scan = await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=root)
+
+    candidate = await db_session.scalar(select(LibraryAdoptionCandidate))
+    assert scan.adopted_count == 1
+    assert candidate is not None
+    assert candidate.state == AdoptionCandidateState.adopted
+    assert candidate.resulting_track_id == track.id
 
 
 @pytest.mark.asyncio
