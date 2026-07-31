@@ -545,7 +545,23 @@ async def _run_job_in_session(
             )
         existing_tracks = list((await db.scalars(track_query)).all())
         catalog_disc_total = _catalog_disc_total(catalog_tracks)
+        selected_catalog_track = next(
+            (track for track in catalog_tracks if track.id == job.catalog_track_id), None
+        )
         for result in results:
+            if (
+                result.source == "slskd"
+                and selected_catalog_track is not None
+                and not _targeted_catalog_result_matches(result, selected_catalog_track)
+            ):
+                failures.append(
+                    {
+                        "code": "candidate_identity_mismatch",
+                        "operation": "search",
+                        "retryable": False,
+                    }
+                )
+                continue
             catalog_track = _catalog_track_for_result(result, catalog_tracks, job.catalog_track_id)
             track_title = catalog_track.title if catalog_track is not None else result.title
             track_album = catalog_album.title if catalog_album is not None else result.album
@@ -943,6 +959,54 @@ def _catalog_track_for_result(
     return None
 
 
+def _targeted_catalog_result_matches(result: SearchResult, target: CatalogAlbumTrack) -> bool:
+    """Require title identity before binding a slskd result to a targeted catalog track."""
+    expected = normalize_for_catalog_match(strip_non_identity_descriptors(target.title))
+    observed_title = result.title or ""
+    observed = normalize_for_catalog_match(strip_non_identity_descriptors(observed_title))
+    filename = result.metadata.get("filename")
+    observed_source = str(filename) if isinstance(filename, str) else observed_title
+    observed_source_norm = normalize_for_catalog_match(
+        strip_non_identity_descriptors(observed_source)
+    )
+    return bool(expected and (observed == expected or expected in observed_source_norm))
+
+
+_PROVIDER_PUNCTUATION = str.maketrans(
+    {"‘": "'", "’": "'", "“": '"', "”": '"', "\u00a0": " ", "–": "-", "—": "-"}
+)
+_EDITION_SUFFIX = re.compile(
+    r"\s*\((?:acoustic|live(?:\s+from\s+[^)]*)?|deluxe|remaster(?:ed)?(?:\s+\d{4})?|radio\s+edit|single\s+version)\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _provider_safe_text(value: str) -> str:
+    return " ".join(value.translate(_PROVIDER_PUNCTUATION).split())
+
+
+def _targeted_query_variants(artist: str, album: str, track: str) -> list[str]:
+    safe_artist = _provider_safe_text(artist)
+    safe_album = _provider_safe_text(album)
+    safe_track = _provider_safe_text(track)
+    title = safe_track or safe_album
+    variants = [" ".join(part for part in (safe_artist, title) if part)]
+    simplified = _EDITION_SUFFIX.sub("", title).strip()
+    if simplified and simplified.casefold() != title.casefold():
+        variants.append(" ".join(part for part in (safe_artist, simplified) if part))
+    return list(dict.fromkeys(variant for variant in variants if variant))
+
+
+def _queries_for_job(job: Job, album: CatalogAlbum | None) -> list[str]:
+    if album is None or job.catalog_track_id is None:
+        return [_provider_safe_text(job.query)]
+    track = next((item for item in album.tracks if item.id == job.catalog_track_id), None)
+    if track is None:
+        return [_provider_safe_text(job.query)]
+    artist = album.artist.name if album.artist is not None else ""
+    return _targeted_query_variants(artist, album.title, track.title)
+
+
 def _existing_track_for_result(
     tracks: list[Track],
     title: str | None,
@@ -1152,7 +1216,11 @@ async def _fetch_results(
     )
 
     for source in priority:
-        req = SearchRequest(query=job.query, sources=[source])
+        queries = (
+            _queries_for_job(job, _scoring_album)
+            if source == "slskd"
+            else [_provider_safe_text(job.query)]
+        )
         try:
             adapter = _source_adapter(source, cfg)
             if priority_job:
@@ -1170,25 +1238,44 @@ async def _fetch_results(
                     continue
 
             # For slskd album downloads: group files by folder and select the best one.
+            results: list[SearchResult] = []
+            served_query: str | None = None
             if (
                 source == "slskd"
                 and _scoring_album is not None
                 and job.catalog_track_id is None
                 and isinstance(adapter, SlskdAdapter)
             ):
+                req = SearchRequest(query=queries[0], sources=[source])
                 results = await _fetch_slskd_album_results(
                     adapter, req, job, _scoring_album, runtime, db
                 )
+                served_query = queries[0]
             else:
-                results = await adapter.search(req)
+                for query in queries:
+                    req = SearchRequest(query=query, sources=[source])
+                    candidate_results = await adapter.search(req)
+                    candidate_results = (
+                        await _without_blocked_slskd_results(candidate_results, db)
+                    )[:limit]
+                    if candidate_results:
+                        results = candidate_results
+                        served_query = query
+                        break
 
-            results = (await _without_blocked_slskd_results(results, db))[:limit]
             if not results:
                 attempted.append({"source": source, "status": "empty", "reason": "zero results"})
                 _set_acquisition_provenance(job, attempted)
                 await _persist_provider_progress(db, checkpoint)
                 continue
-            attempted.append({"source": source, "status": "served", "results": len(results)})
+            attempted_payload: dict[str, object] = {
+                "source": source,
+                "status": "served",
+                "results": len(results),
+            }
+            if served_query is not None:
+                attempted_payload["query"] = served_query
+            attempted.append(attempted_payload)
             job.source = source
             _set_acquisition_provenance(job, attempted, source)
             await _persist_provider_progress(db, checkpoint)

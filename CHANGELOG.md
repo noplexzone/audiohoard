@@ -6,6 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Preserve featured-artist text during slskd targeted matching so plain and featured/remix singles no longer collapse to the same candidate.
+
 ## [0.8.9] - 2026-07-30
 
 ### Fixed

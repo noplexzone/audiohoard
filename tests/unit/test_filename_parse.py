@@ -1,4 +1,8 @@
-from app.metadata.filename_parse import compose_search_query, parse_filename
+from app.metadata.filename_parse import (
+    compose_search_query,
+    parse_filename,
+    strip_non_identity_descriptors,
+)
 
 
 def test_parse_artist_album_title_with_track_and_codec() -> None:
@@ -19,4 +23,15 @@ def test_parse_artist_title_and_keep_remaster_hint_out_of_title() -> None:
 def test_fielded_query_composition() -> None:
     assert (
         compose_search_query("", "Nirvana", "Nevermind", "Lithium") == "Nirvana Nevermind Lithium"
+    )
+
+
+def test_featured_artist_annotation_is_identity_preserving() -> None:
+    assert (
+        strip_non_identity_descriptors("Miami (feat. Lil Wayne & Rick Ross)")
+        == "Miami (feat. Lil Wayne & Rick Ross)"
+    )
+    assert (
+        strip_non_identity_descriptors("Heartless (Feat Julia Michaels)")
+        == "Heartless (Feat Julia Michaels)"
     )
