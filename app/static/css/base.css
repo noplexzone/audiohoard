@@ -201,7 +201,7 @@ svg {
 }
 
 main {
-  width: min(100%, 1440px);
+  width: min(100%, 1760px);
   min-width: 0;
   margin: 0 auto;
   padding: 2.2rem clamp(1.3rem, 3vw, 3.2rem) 8rem;

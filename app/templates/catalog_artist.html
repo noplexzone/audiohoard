@@ -41,39 +41,48 @@
       {% if counts_by_type.compilations %}{% if counts_by_type.albums or counts_by_type.singles_eps %} · {% endif %}{{ counts_by_type.compilations }} compilation{{ '' if counts_by_type.compilations == 1 else 's' }}{% endif %}
       {% if not total_releases %}No releases stored yet{% endif %}
     </p>
+    {% if artist_rollup.tracks_total > 0 or artist_rollup.releases_total > 0 %}
+    <p class="artist-rollup">
+      {% if artist_rollup.tracks_total > 0 %}<strong>{{ artist_rollup.tracks_in_library }}</strong> of {{ artist_rollup.tracks_total }} tracks · {% endif %}<strong>{{ artist_rollup.releases_complete }}</strong> of {{ artist_rollup.releases_total }} releases complete
+    </p>
+    {% endif %}
     <div class="artist-actions">
-      <form method="post" action="/artists/catalog/{{ artist.id }}/primary-source" class="primary-source-form">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <input type="hidden" name="release_type" value="{{ release_type }}">
-        <input type="hidden" name="sort" value="{{ sort }}">
-        <label class="inline-select">Primary source
-          <select name="primary_metadata_provider" data-primary-source-select>
-            {% for name in available_providers %}<option value="{{ name }}" {% if primary_metadata_provider == name %}selected{% endif %}>{{ display_name(name) }}</option>{% endfor %}
-          </select>
-        </label>
-        <button class="btn secondary compact-save" type="submit">Save</button>
-      </form>
-      <form method="post" action="/maintenance/scan/artists/{{ artist.id }}">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button class="btn secondary" type="submit">Scan artist</button>
-      </form>
-      <form method="post" action="/artists/catalog/{{ artist.id }}/monitor">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <input type="hidden" name="provider" value="{{ selected_provider }}">
-        <input type="hidden" name="release_type" value="{{ release_type }}">
-        <input type="hidden" name="sort" value="{{ sort }}">
-        <input type="hidden" name="quick" value="1">
-        <button class="btn" type="submit">{% if artist.monitored %}Watchlisted ✓{% else %}Add to watchlist{% endif %}</button>
-      </form>
-      {% if artist.monitored %}
-      <form method="post" action="/artists/catalog/{{ artist.id }}/download-monitored" data-download-form>
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <input type="hidden" name="provider" value="{{ selected_provider }}">
-        <input type="hidden" name="release_type" value="{{ release_type }}">
-        <input type="hidden" name="sort" value="{{ sort }}">
-        <button class="btn secondary" type="submit">Download watchlisted releases</button>
-      </form>
-      {% endif %}
+      <div class="artist-actions-primary">
+        <form method="post" action="/artists/catalog/{{ artist.id }}/monitor">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="provider" value="{{ selected_provider }}">
+          <input type="hidden" name="release_type" value="{{ release_type }}">
+          <input type="hidden" name="sort" value="{{ sort }}">
+          <input type="hidden" name="quick" value="1">
+          <button class="btn" type="submit">{% if artist.monitored %}Watchlisted ✓{% else %}Add to watchlist{% endif %}</button>
+        </form>
+        {% if artist.monitored %}
+        <form method="post" action="/artists/catalog/{{ artist.id }}/download-monitored" data-download-form>
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="provider" value="{{ selected_provider }}">
+          <input type="hidden" name="release_type" value="{{ release_type }}">
+          <input type="hidden" name="sort" value="{{ sort }}">
+          <button class="btn secondary" type="submit">Download watchlisted releases</button>
+        </form>
+        {% endif %}
+      </div>
+      <div class="artist-actions-secondary">
+        <form method="post" action="/artists/catalog/{{ artist.id }}/primary-source" class="primary-source-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="release_type" value="{{ release_type }}">
+          <input type="hidden" name="sort" value="{{ sort }}">
+          <label class="inline-select">Primary source
+            <select name="primary_metadata_provider" data-primary-source-select>
+              {% for name in available_providers %}<option value="{{ name }}" {% if primary_metadata_provider == name %}selected{% endif %}>{{ display_name(name) }}</option>{% endfor %}
+            </select>
+          </label>
+          <button class="btn secondary compact-save" type="submit">Save</button>
+        </form>
+        <form method="post" action="/maintenance/scan/artists/{{ artist.id }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="btn secondary" type="submit">Scan artist</button>
+        </form>
+      </div>
     </div>
   </div>
 </section>
@@ -143,11 +152,14 @@
             <div class="album-card-body">
               <h3>{% if album.catalog_album_id %}<a href="/albums/{{ album.catalog_album_id }}" title="{{ album.title | e }}">{{ album.title }}</a>{% else %}{{ album.title }}{% endif %}</h3>
               <p class="muted-line">
-                {% if album.year %}{{ album.year }}{% endif %}{% if album.year and album.release_type_raw %} · {% endif %}{% if album.release_type_raw %}{{ album.release_type_raw }}{% else %}{{ album.release_kind | title }}{% endif %}{% if album.content_rating and album.content_rating != "unknown" %}{% if album.year or album.release_type_raw %} · {% endif %}{{ album.content_rating.replace("_", " ") | title }}{% endif %}{% if album.track_count %}{% if album.year or album.release_type_raw or (album.content_rating and album.content_rating != "unknown") %} · {% endif %}{{ album.track_count }} tracks{% endif %}
+                {% if album.year %}{{ album.year }}{% endif %}{% if album.year and album.release_type_raw %} · {% endif %}{% if album.release_type_raw %}{{ album.release_type_raw }}{% else %}{{ album.release_kind | title }}{% endif %}{% if album.track_count %}{% if album.year or album.release_type_raw %} · {% endif %}{{ album.track_count }} tracks{% endif %}
               </p>
+              {% if progress.manifest_known and progress.wanted_track_count > 0 %}
+                <div class="card-progress-bar" aria-hidden="true"><div class="card-progress-fill" data-percent="{{ (progress.downloaded_track_count * 100) // progress.wanted_track_count }}"></div></div>
+              {% endif %}
               <p class="release-progress">{% if progress.manifest_known %}{{ progress.downloaded_track_count }} of {{ progress.wanted_track_count }} tracks in library{% else %}{{ progress.downloaded_track_count }} local · total unknown{% endif %}</p>
               <p class="provider-badges">
-                <span class="badge info">{{ display_name(primary_metadata_provider) }}</span>{% if album.content_rating and album.content_rating != "unknown" %}<span class="badge warn">{{ album.content_rating.replace("_", " ") | title }}</span>{% endif %}
+                {% if album.provider and album.provider != selected_provider %}<span class="badge info">{{ display_name(album.provider) }}</span>{% endif %}{% if album.content_rating and album.content_rating != "unknown" %}<span class="badge warn">{{ album.content_rating.replace("_", " ") | title }}</span>{% endif %}
               </p>
               <div class="album-card-actions">
                 {% if artist.monitored and artist.watchlist_provider == selected_provider %}<label class="check-label compact-check"><input type="checkbox" name="album_monitored" form="monitor-form" value="{{ album.id }}" {% if album.monitored %}checked{% endif %}> <span>Watchlist</span></label>{% endif %}
