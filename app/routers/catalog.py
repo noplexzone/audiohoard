@@ -661,7 +661,10 @@ async def open_catalog_artist_page(
             provider,
         )
     await db.commit()
-    background_tasks.add_task(_enrich_artist_task, artist.id, runtime.enabled_metadata_providers)
+    if await _queue_artist_enrichment(db, artist.id):
+        background_tasks.add_task(
+            _enrich_artist_task, artist.id, runtime.enabled_metadata_providers
+        )
     return RedirectResponse(f"/artists/catalog/{artist.id}", status_code=303)
 
 

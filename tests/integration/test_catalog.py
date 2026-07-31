@@ -968,6 +968,55 @@ async def test_watchlisting_populated_artist_does_not_queue_enrichment(
     assert queued_tasks == []
 
 
+async def test_search_page_watchlisted_artist_redirect_shows_loading_discography(
+    client: AsyncClient, monkeypatch
+) -> None:
+    from app.metadata.base import ArtistDetail
+    from app.services import catalog_metadata
+
+    class FakeDeezerProvider:
+        async def search_artists(self, query):
+            return []
+
+        async def get_artist(self, id):
+            return ArtistDetail(
+                provider="deezer",
+                provider_id=id,
+                name="Search Loading Artist",
+                deezer_id=id,
+            )
+
+        async def get_discography(self, id):
+            return []
+
+    queued_tasks = []
+
+    def capture_task(self, func, *args, **kwargs):
+        queued_tasks.append((func, args, kwargs))
+
+    monkeypatch.setattr(
+        catalog_metadata, "build_metadata_provider", lambda name, settings: FakeDeezerProvider()
+    )
+    monkeypatch.setattr("app.routers.catalog.BackgroundTasks.add_task", capture_task)
+
+    response = await client.post(
+        "/artists/catalog/open",
+        data={
+            "provider": "deezer",
+            "provider_id": "search-loading-dz",
+            "monitor": "true",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert "Loading discography" in response.text
+    assert 'data-artist-refresh="true"' in response.text
+    assert len(queued_tasks) == 1
+    assert queued_tasks[0][0].__name__ == "_enrich_artist_task"
+
+
 async def test_search_page_watchlist_defaults_monitor_all_enriched_release_types(
     client: AsyncClient, monkeypatch
 ) -> None:
