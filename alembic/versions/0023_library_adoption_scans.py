@@ -112,16 +112,20 @@ def upgrade() -> None:
         """
         CREATE TRIGGER trg_import_plans_adoption_claim_insert
         BEFORE INSERT ON import_plans
-        WHEN NEW.status IN ('ready', 'importing', 'imported')
-         AND NEW.file_state != 'removed'
+        WHEN (
+            (NEW.status IN ('ready', 'importing') AND NEW.file_state != 'removed')
+            OR (NEW.status = 'imported' AND NEW.file_state = 'present')
+         )
          AND EXISTS (
             SELECT 1 FROM import_plans AS existing
             WHERE (
         existing.destination_path = NEW.destination_path
         OR (NEW.track_id IS NOT NULL AND existing.track_id = NEW.track_id)
       )
-              AND existing.status IN ('ready', 'importing', 'imported')
-              AND existing.file_state != 'removed'
+              AND (
+                (existing.status IN ('ready', 'importing') AND existing.file_state != 'removed')
+                OR (existing.status = 'imported' AND existing.file_state = 'present')
+              )
               AND (
                 json_extract(NEW.planned_operations_json, '$.operation') = 'adopt_in_place'
                 OR json_extract(existing.planned_operations_json, '$.operation') = 'adopt_in_place'
@@ -138,8 +142,10 @@ def upgrade() -> None:
         BEFORE UPDATE OF track_id, source_path, destination_path, planned_operations_json,
             status, file_state
 ON import_plans
-        WHEN NEW.status IN ('ready', 'importing', 'imported')
-         AND NEW.file_state != 'removed'
+        WHEN (
+            (NEW.status IN ('ready', 'importing') AND NEW.file_state != 'removed')
+            OR (NEW.status = 'imported' AND NEW.file_state = 'present')
+         )
          AND EXISTS (
             SELECT 1 FROM import_plans AS existing
             WHERE existing.id != OLD.id
@@ -147,8 +153,10 @@ ON import_plans
         existing.destination_path = NEW.destination_path
         OR (NEW.track_id IS NOT NULL AND existing.track_id = NEW.track_id)
       )
-              AND existing.status IN ('ready', 'importing', 'imported')
-              AND existing.file_state != 'removed'
+              AND (
+                (existing.status IN ('ready', 'importing') AND existing.file_state != 'removed')
+                OR (existing.status = 'imported' AND existing.file_state = 'present')
+              )
               AND (
                 json_extract(NEW.planned_operations_json, '$.operation') = 'adopt_in_place'
                 OR json_extract(existing.planned_operations_json, '$.operation') = 'adopt_in_place'

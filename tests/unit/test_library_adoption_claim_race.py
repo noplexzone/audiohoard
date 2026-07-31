@@ -8,14 +8,8 @@ from pathlib import Path
 from app.models.import_plan import _ADOPTION_CLAIM_INSERT_TRIGGER
 
 
-def test_begin_immediate_serializes_adoption_against_ordinary_import(tmp_path: Path) -> None:
-    database = tmp_path / "claim-race.db"
-    scanner = sqlite3.connect(database, timeout=5, check_same_thread=False)
-    importer = sqlite3.connect(database, timeout=5, check_same_thread=False)
-    for connection in (scanner, importer):
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA busy_timeout=5000")
-    scanner.execute(
+def _claim_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
         """
         CREATE TABLE import_plans (
             id INTEGER PRIMARY KEY,
@@ -27,7 +21,40 @@ def test_begin_immediate_serializes_adoption_against_ordinary_import(tmp_path: P
         )
         """
     )
-    scanner.execute(_ADOPTION_CLAIM_INSERT_TRIGGER)
+    connection.execute(_ADOPTION_CLAIM_INSERT_TRIGGER)
+
+
+def test_missing_historical_plan_does_not_block_adoption_repair() -> None:
+    connection = sqlite3.connect(":memory:")
+    _claim_table(connection)
+    connection.execute(
+        """
+        INSERT INTO import_plans
+            (track_id, status, file_state, destination_path, planned_operations_json)
+        VALUES (1, 'imported', 'missing', '/music/old.flac', '{}')
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO import_plans
+            (track_id, status, file_state, destination_path, planned_operations_json)
+        VALUES (1, 'imported', 'present', '/music/found.flac',
+                '{"operation": "adopt_in_place"}')
+        """
+    )
+
+    assert connection.execute("SELECT COUNT(*) FROM import_plans").fetchone()[0] == 2
+    connection.close()
+
+
+def test_begin_immediate_serializes_adoption_against_ordinary_import(tmp_path: Path) -> None:
+    database = tmp_path / "claim-race.db"
+    scanner = sqlite3.connect(database, timeout=5, check_same_thread=False)
+    importer = sqlite3.connect(database, timeout=5, check_same_thread=False)
+    for connection in (scanner, importer):
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=5000")
+    _claim_table(scanner)
     scanner.commit()
 
     scanner.execute("BEGIN IMMEDIATE")
