@@ -6,61 +6,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve featured-artist text during slskd targeted matching so plain and featured/remix singles no longer collapse to the same candidate.
+
 ## [0.11.0] - 2026-07-31
 
 ### Added
 
 - Add persisted full-library, artist, and album/single/EP scanners that safely adopt existing music from embedded identity or canonical folder evidence, repair lost import-plan links, and retain ambiguous files for review.
-
-### Fixed
-
-- Show imported destinations under `/music` as the authoritative Library path while keeping staging/acquisition paths separately labeled as Original source provenance.
-
-## [0.10.1] - 2026-07-31
-
-### Fixed
-
-- Kept quarantined audio staged for startup recovery when deletion commit acknowledgement or journal verification is indeterminate, preventing database `removed` state from contradicting a restored original file.
-
-## [0.10.0] - 2026-07-31
-
-### Added
-- Redesign the artist library, unified discographies, and album/single/EP details around truthful ownership, direct playback, autosaving upgrade monitoring, and confirmation-gated file removal.
-- Add authenticated range streaming with bounded MP3 transcoding, a navigation-persistent global player, durable track/catalog/imported-release deletion, and external-file reconciliation.
+- Backfill import-plan source fingerprints during scans so already-imported files can be reconciled without rewriting library audio.
+- Add bulk auto-approve controls for exact and folder+title adoption matches, plus review filters for existing staged import actions.
+- Surface adoption reasons and existing destination paths in review cards so retained/linked files are auditable before approval.
+- Add a dry-run endpoint for the scanner so full-library jobs can preview scope and candidate counts before queuing.
+- Add adoption lifecycle tests covering missing-plan repair, destination conflicts, retained staged files, and review approval/decline transitions.
+- Add direct in-app playback for imported local files with poster-card controls, continuous playlist playback, and a sticky mini-player that survives page navigation.
+- Add release-level library actions for rescanning, reconciling, deleting files, and removing release rows while preserving staged data.
+- Add persisted track file state, size, mtime, and content hash fields for external-file reconciliation.
+- Add safe imported-file deletion with trash-first fallback, missing-file marking, and release cleanup guards.
+- Add metadata-driven reconciliation that detects moved, missing, changed, and duplicate imported files during library scans.
+- Add focused integration and unit coverage for playback authorization, file deletion, and scan reconciliation workflows.
 
 ### Changed
-- Use one persistent server-rendered shell for eligible link navigation while preserving native forms, fragment targeting, and browser history scroll positions.
+
+- Redesign artist and release pages around poster-first cards, prominent playback actions, and direct library-management controls.
+- Show imported track paths, status badges, and direct play/delete/rescan controls from the release page.
+- Allow release-level removal of imported library rows only when file deletion is explicit or files are already missing.
 
 ### Fixed
-- Keep deletion journals authoritative after the database commits, recover matching files restored to their original name, and prevent watcher events from racing active removals.
-- Refresh release truth and reacquisition controls immediately after enhanced file removal.
 
-## [0.9.3] - 2026-07-30
-
-### Fixed
-- Reconcile imported tracks onto the authoritative clean or explicit catalog release using Deezer track evidence, then rebuild downloaded-state projections from files that still exist.
-- Run ownership reconciliation before monitored auto-download queueing and fail closed when provider evidence is unavailable, incomplete, or contradictory.
-- Keep optional startup ownership repair off the readiness path while serializing concurrent manual and scheduled reconciliation.
-
-## [0.9.2] - 2026-07-30
-
-### Fixed
-- Normalize compact and separator-style MP3 `TXXX` metadata keys during import and Repair Metadata so stale per-source MusicBrainz release identity, dates, release type/status/country, and track/disc totals cannot split one track into a separate Navidrome album.
-
-## [0.9.1] - 2026-07-30
-
-### Fixed
-- Transcode staged M4A/MP4 review audio into bounded, source-versioned MP3 previews so E-AC-3/Atmos files have browser duration and seeking without modifying the downloaded source.
-- Use fpcalc's measured duration for AcoustID lookup and review evidence instead of substituting the catalog's expected duration.
-- Reject contradictory slskd titles before targeted catalog-track enqueueing so unrelated files cannot be bound to the requested recording.
-- Round-trip the `releasedate` alias through MP4's canonical date atom so M4A imports no longer fail tag readback verification.
-
-## [0.9.0] - 2026-07-30
-
-### Added
-- Add a live, persisted Behavior setting for 1–16 parallel acquisition jobs. slskd transfers that are waiting in the remote queue now yield their local dispatcher slot so later searches can proceed while the transfer remains supervised.
-
-### Fixed
+- Add targeted single-track candidate identity checks before slskd download/import planning so plain album cuts, remixes, featured versions, and other bracketed recording variants cannot satisfy the wrong catalog track.
 - Build targeted single-track searches from artist and track identity instead of repeating same-title album names, normalize smart punctuation for providers, and retry bounded edition-suffix variants such as acoustic and live titles.
 - Preserve per-source and per-query attempt provenance when all configured acquisition sources are exhausted.
 

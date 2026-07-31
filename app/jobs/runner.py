@@ -985,14 +985,15 @@ def _catalog_track_for_result(
 def _targeted_catalog_result_matches(result: SearchResult, target: CatalogAlbumTrack) -> bool:
     """Require title identity before binding a slskd result to a targeted catalog track."""
     observed = normalize_for_catalog_match(strip_non_identity_descriptors(result.title or ""))
-    expected_core = parse_filename(target.title).title
-    expected = normalize_for_catalog_match(strip_non_identity_descriptors(expected_core))
+    expected_core = normalize_for_catalog_match(
+        strip_non_identity_descriptors(parse_filename(target.title).title)
+    )
+    expected_full = normalize_for_catalog_match(strip_non_identity_descriptors(target.title))
     filename = result.metadata.get("filename")
     observed_source = str(filename) if isinstance(filename, str) else result.title or ""
     return bool(
         observed
-        and expected
-        and observed == expected
+        and observed in (expected_core, expected_full)
         and _identity_qualifiers(observed_source) == _identity_qualifiers(target.title)
     )
 
@@ -1273,6 +1274,8 @@ async def _fetch_results(
                     continue
 
             # For slskd album downloads: group files by folder and select the best one.
+            results: list[SearchResult] = []
+            served_query: str | None = None
             if (
                 source == "slskd"
                 and _scoring_album is not None
@@ -1284,21 +1287,22 @@ async def _fetch_results(
                     adapter, req, job, _scoring_album, runtime, db
                 )
                 results = (await _without_blocked_slskd_results(results, db))[:limit]
+                served_query = query_variants[0]
                 attempted.append(
                     {
                         "source": source,
                         "status": "served" if results else "empty",
                         "results": len(results),
-                        "query": query_variants[0],
+                        "query": served_query,
                     }
                 )
             else:
-                results = []
                 for provider_query in query_variants:
                     req = SearchRequest(query=provider_query, sources=[source])
                     results = (
                         await _without_blocked_slskd_results(await adapter.search(req), db)
                     )[:limit]
+                    served_query = provider_query
                     attempted.append(
                         {
                             "source": source,

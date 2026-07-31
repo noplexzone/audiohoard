@@ -717,6 +717,85 @@ async def test_fetch_hook_internal_typeerror_is_not_retried(
     assert calls == 1
 
 
+async def test_catalog_track_slskd_query_uses_track_title_not_album_title(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.settings_service import save_runtime_settings
+
+    await save_runtime_settings(
+        db_session,
+        [{"name": "slskd", "enabled": True}],
+        10,
+        metadata_providers=[{"name": "musicbrainz", "enabled": True}],
+        primary_metadata_provider="musicbrainz",
+    )
+    artist = CatalogArtist(name="Morgan Wallen")
+    album = CatalogAlbum(artist=artist, title="Miami - Single", year="2025", track_count=1)
+    track = CatalogAlbumTrack(
+        album=album,
+        disc=1,
+        position=1,
+        title="Miami (feat. Lil Wayne & Rick Ross)",
+    )
+    db_session.add_all([artist, album, track])
+    await db_session.flush()
+    job = Job(
+        source="slskd",
+        query="Morgan Wallen Miami - Single",
+        status=JobStatus.pending,
+        catalog_album_id=album.id,
+        catalog_track_id=track.id,
+    )
+    db_session.add(job)
+    await db_session.flush()
+    queries: list[str] = []
+
+    class FakeAdapter:
+        async def search(self, request: object) -> Sequence[SearchResult]:
+            queries.append(request.query)
+            return [
+                SearchResult(
+                    source="slskd",
+                    title="Miami (feat. Lil Wayne & Rick Ross)",
+                    artist="Morgan Wallen",
+                    url="slskd://peer/Miami.mp3",
+                    metadata={
+                        "username": "peer",
+                        "filename": "Miami (feat. Lil Wayne & Rick Ross).mp3",
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(runner, "_source_adapter", lambda source, cfg: FakeAdapter())
+
+    await runner._fetch_results(job, test_settings, db_session)
+
+    assert queries == ["Morgan Wallen Miami (feat. Lil Wayne & Rick Ross)"]
+
+
+def test_targeted_slskd_match_keeps_featured_artists_distinct() -> None:
+    target = CatalogAlbumTrack(
+        id=42, disc=1, position=1, title="Miami (feat. Lil Wayne & Rick Ross)"
+    )
+    plain_result = SearchResult(
+        source="slskd",
+        title="Miami",
+        artist="Morgan Wallen",
+        url="slskd://peer/Miami.mp3",
+        metadata={"filename": "Morgan Wallen - Miami.mp3"},
+    )
+    featured_result = SearchResult(
+        source="slskd",
+        title="Miami (feat. Lil Wayne & Rick Ross)",
+        artist="Morgan Wallen",
+        url="slskd://peer/Miami-featured.mp3",
+        metadata={"filename": "Morgan Wallen - Miami (feat. Lil Wayne & Rick Ross).mp3"},
+    )
+
+    assert not runner._targeted_catalog_result_matches(plain_result, target)
+    assert runner._targeted_catalog_result_matches(featured_result, target)
+
+
 async def test_priority_job_records_clear_failure_when_all_sources_exhausted(
     db_session: AsyncSession, test_settings: Settings, monkeypatch: object
 ) -> None:
