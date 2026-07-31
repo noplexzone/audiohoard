@@ -15,9 +15,9 @@ Audiohoard stores acquisition provenance in `Track.source_path`/`Track.staging_p
 
 ## Architecture
 
-Extend `app/services/library_scan.py` into filesystem discovery plus transactional adoption. Scopes cover the full library, a catalog artist ID, a catalog album ID (including singles/EPs), and an imported-only artist optionally narrowed by release title/year.
+Keep `app/services/library_scan.py` as comparison-only verification and add `app/services/library_adoption.py` for adoption. Scopes cover the full library, a catalog artist ID, a catalog album ID (including singles/EPs), and an imported-only artist optionally narrowed by release title/year.
 
-Filesystem work runs before database writes: enumerate supported files without following symlinks, resolve beneath `library_root`, read tags/duration via Mutagen in a worker thread, and retain folder/filename evidence. A process-local async lock serializes scans. Every insertion rechecks destination ownership for idempotence.
+Filesystem work runs before short database writes: skip already-owned destinations, enumerate supported files without following symlinks, resolve beneath `library_root`, read tags/duration and hash candidates in a worker thread, and retain folder/filename evidence. A process-local async lock serializes scans. Persisted queued/running states recover interrupted work, and every insertion rechecks file snapshots and destination ownership for idempotence.
 
 ## Matching
 
@@ -38,9 +38,9 @@ Conflicting MBID, title, position, artist, album, or year evidence is ambiguous.
 
 ## Persistence
 
-For a high-confidence catalog match, prefer an existing matching Track, especially one whose plan was lost. Otherwise create a hidden completed `Job(source="library")`, imported Release, and Track. Create an imported/present ImportPlan whose source and destination are the safe library path and whose staging path is null. Synchronize catalog IDs, identity, metadata, size/format, and recompute album `in_library` truth. Commit one scan atomically; rollback affects only database rows because files are never modified.
+Persist `LibraryAdoptionScan` and `LibraryAdoptionCandidate` rows so progress and unresolved evidence survive restarts. For a high-confidence catalog match, prefer an existing matching Track, especially one whose plan was lost. Otherwise create one hidden completed `Job(source="library_adoption")` and imported Release per catalog release batch, then create Tracks. Create imported/present ImportPlans whose source and destination are the safe library path and whose staging path is null. Synchronize catalog IDs, identity, metadata, size/format, and recompute album `in_library` truth. Candidate commits are bounded and snapshot-verified; rollback affects only database rows because files are never modified.
 
-Results include matched, adopted, ambiguous, orphan, missing, and scanned counts plus bounded details.
+Results include scanned, adopted, review, unmatched, stale, and error counts with persisted candidate details.
 
 ## HTTP and UI
 
@@ -49,7 +49,7 @@ Authenticated, CSRF-protected background POST actions:
 - `POST /maintenance/scan`
 - `POST /maintenance/scan/artists/{artist_id}`
 - `POST /maintenance/scan/albums/{album_id}`
-- `POST /maintenance/scan/imported-artist`
+- `POST /maintenance/scan/imported`
 
 Redirects return to the originating page with queued status; complete details remain on Maintenance.
 

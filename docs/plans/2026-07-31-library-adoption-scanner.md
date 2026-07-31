@@ -4,7 +4,7 @@
 
 **Goal:** Adopt high-confidence audio already under `/music`, restore missing database links, expose full-library/artist/release actions, and stop showing staging provenance as the current path.
 
-**Architecture:** Extend the existing scanner with Mutagen evidence extraction, fail-closed catalog/imported-record matching, and transactional Track/ImportPlan adoption. Authenticated server-rendered routes dispatch scoped background scans; files are never modified.
+**Architecture:** Preserve comparison-only scanning and add persisted scan/candidate models, a recoverable runner, Mutagen evidence extraction, fail-closed catalog/imported-record matching, and snapshot-verified Track/ImportPlan adoption. Authenticated server-rendered routes enqueue scoped scans; files are never modified.
 
 **Tech Stack:** Python 3.12+, FastAPI, async SQLAlchemy 2.x, SQLite, Mutagen, Jinja, pytest, Ruff, mypy.
 
@@ -22,7 +22,7 @@
 
 ### Task 1: Core adoption scanner
 
-**Files:** modify `app/services/library_scan.py`; test `tests/unit/test_library_scan.py`.
+**Files:** add `app/models/library_adoption.py`, `app/metadata/audio_file.py`, `app/services/library_adoption.py`, `app/services/library_adoption_runner.py`, and migration `0023`; modify `app/services/library_scan.py`; test `tests/unit/test_library_adoption.py` and schema parity.
 
 Add tagged audio fixtures and RED tests for exact adoption, lost-plan repair, idempotence, artist/album scope isolation, complete-album truth, duplicate release ambiguity, contradictory MBID/title/position, unknown release, and symlink/outside-root rejection. Implement safe evidence extraction, deterministic release/track matching, hidden completed library jobs/releases only when needed, present imported plans, and catalog truth recomputation. Run focused tests. Commit `feat(library): adopt matched library files during scans`.
 
