@@ -1119,6 +1119,7 @@ async def enrich_catalog_artist(
                     CatalogArtistIdentity.provider == artist.watchlist_provider,
                 )
                 .options(selectinload(CatalogArtistIdentity.releases))
+                .execution_options(populate_existing=True)
             )
         ).first()
         if selected_identity is not None:

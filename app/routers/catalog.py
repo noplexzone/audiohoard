@@ -904,6 +904,7 @@ async def enrich_catalog_artist_page(
 async def monitor_catalog_artist_page(
     artist_id: int,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
@@ -1019,6 +1020,13 @@ async def monitor_catalog_artist_page(
                 release.catalog_album.monitored = True
     if selected_identity is not None:
         await _sync_artist_upgrade_monitoring(db, artist, list(selected_identity.releases))
+    should_queue_enrichment = artist.monitored and (
+        selected_identity is None or not list(selected_identity.releases)
+    )
+    if should_queue_enrichment and await _queue_artist_enrichment(db, artist.id):
+        background_tasks.add_task(
+            _enrich_artist_task, artist.id, runtime.enabled_metadata_providers
+        )
     await db.commit()
     return RedirectResponse(
         _artist_page_url(artist.id, provider=view_provider, release_type=release_type, sort=sort),

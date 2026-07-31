@@ -7,6 +7,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 import app.database as db_module
 from app.models.catalog_entities import (
@@ -882,6 +883,191 @@ async def test_catalog_artist_enrich_queues_without_running_inline(
     assert len(queued_tasks) == 1
     assert queued_tasks[0][0].__name__ == "_enrich_artist_task"
     assert queued_tasks[0][1][0] == artist_id
+
+
+async def test_watchlisting_unhydrated_artist_queues_enrichment(
+    client: AsyncClient, monkeypatch
+) -> None:
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        artist = CatalogArtist(name="Unhydrated Watchlist Artist", watchlist_provider="deezer")
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="deezer",
+            provider_artist_id="unhydrated-dz",
+            name="Unhydrated Watchlist Artist",
+        )
+        session.add(identity)
+        await session.commit()
+        artist_id = artist.id
+
+    queued_tasks = []
+
+    def capture_task(self, func, *args, **kwargs):
+        queued_tasks.append((func, args, kwargs))
+
+    monkeypatch.setattr("app.routers.catalog.BackgroundTasks.add_task", capture_task)
+
+    response = await client.post(
+        f"/artists/catalog/{artist_id}/monitor",
+        data={"quick": "1", "provider": "deezer", "csrf_token": client.cookies.get("csrf", "")},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    async with factory() as session:
+        refreshed = await session.get(CatalogArtist, artist_id)
+    assert refreshed is not None
+    assert refreshed.enrichment_state == "queued"
+    assert len(queued_tasks) == 1
+    assert queued_tasks[0][0].__name__ == "_enrich_artist_task"
+    assert queued_tasks[0][1][0] == artist_id
+
+
+async def test_watchlisting_populated_artist_does_not_queue_enrichment(
+    client: AsyncClient, monkeypatch
+) -> None:
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        artist = CatalogArtist(name="Populated Watchlist Artist", watchlist_provider="deezer")
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="deezer",
+            provider_artist_id="populated-dz",
+            name="Populated Watchlist Artist",
+        )
+        identity.releases.append(
+            CatalogAlbumProvider(
+                provider_album_id="populated-album",
+                title="Populated Album",
+                release_kind="album",
+            )
+        )
+        session.add(artist)
+        await session.commit()
+        artist_id = artist.id
+
+    queued_tasks = []
+
+    def capture_task(self, func, *args, **kwargs):
+        queued_tasks.append((func, args, kwargs))
+
+    monkeypatch.setattr("app.routers.catalog.BackgroundTasks.add_task", capture_task)
+
+    response = await client.post(
+        f"/artists/catalog/{artist_id}/monitor",
+        data={"quick": "1", "provider": "deezer", "csrf_token": client.cookies.get("csrf", "")},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    async with factory() as session:
+        refreshed = await session.get(CatalogArtist, artist_id)
+    assert refreshed is not None
+    assert refreshed.enrichment_state == "idle"
+    assert queued_tasks == []
+
+
+async def test_search_page_watchlist_defaults_monitor_all_enriched_release_types(
+    client: AsyncClient, monkeypatch
+) -> None:
+    import app.settings_service as settings_service
+    from app.metadata.base import AlbumHit, ArtistDetail
+    from app.services import catalog_metadata
+    from app.settings_service import save_runtime_settings
+
+    class FakeDeezerProvider:
+        async def search_artists(self, query):
+            return []
+
+        async def get_artist(self, id):
+            return ArtistDetail(
+                provider="deezer",
+                provider_id=id,
+                name="Search Default Artist",
+                deezer_id=id,
+            )
+
+        async def get_discography(self, id):
+            return [
+                AlbumHit(
+                    provider="deezer",
+                    provider_id="default-album",
+                    title="Default Album",
+                    release_kind="album",
+                    release_type="Album",
+                ),
+                AlbumHit(
+                    provider="deezer",
+                    provider_id="default-single",
+                    title="Default Single",
+                    release_kind="single",
+                    release_type="Single",
+                ),
+                AlbumHit(
+                    provider="deezer",
+                    provider_id="default-ep",
+                    title="Default EP",
+                    release_kind="ep",
+                    release_type="EP",
+                ),
+            ]
+
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        await save_runtime_settings(
+            session,
+            [{"name": "slskd", "enabled": True}],
+            10,
+            metadata_providers=[{"name": "deezer", "enabled": True}],
+            primary_metadata_provider="deezer",
+            default_watchlist_release_albums=True,
+            default_watchlist_release_singles=True,
+            default_watchlist_release_eps=True,
+            default_watchlist_monitor_upgrades=True,
+        )
+        await session.commit()
+
+    monkeypatch.setattr(
+        catalog_metadata, "build_metadata_provider", lambda name, settings: FakeDeezerProvider()
+    )
+
+    response = await client.post(
+        "/artists/catalog/open",
+        data={
+            "provider": "deezer",
+            "provider_id": "search-default-dz",
+            "monitor": "true",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    settings_service._cache = None
+    async with factory() as session:
+        artist = (
+            await session.execute(
+                select(CatalogArtist)
+                .where(CatalogArtist.name == "Search Default Artist")
+                .options(
+                    selectinload(CatalogArtist.identities).selectinload(
+                        CatalogArtistIdentity.releases
+                    )
+                )
+            )
+        ).scalar_one()
+        release_monitoring = {
+            release.release_kind: release.monitored
+            for identity in artist.identities
+            for release in identity.releases
+        }
+
+    assert artist.watchlist_release_albums is True
+    assert artist.watchlist_release_singles is True
+    assert artist.watchlist_release_eps is True
+    assert artist.watchlist_monitor_upgrades is True
+    assert release_monitoring == {"album": True, "single": True, "ep": True}
 
 
 async def test_release_progress_does_not_treat_untracked_library_folder_as_owned(
