@@ -6,6 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Redesign the artist library, unified discographies, and album/single/EP details around truthful ownership, direct playback, autosaving upgrade monitoring, and confirmation-gated file removal.
+
 ## [0.9.3] - 2026-07-30
 
 ### Fixed

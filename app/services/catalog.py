@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from sqlalchemy import and_, case, exists, func, literal, or_, select
+from sqlalchemy import String, and_, case, cast, exists, func, literal, or_, select
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -197,11 +197,21 @@ class MissingReleaseRow:
 
 
 @dataclass(frozen=True)
+class ReleaseLibraryFile:
+    catalog_track_id: int
+    track_id: int
+    file_format: str
+    file_size_bytes: int | None
+    source: str
+
+
+@dataclass(frozen=True)
 class ReleaseProgress:
     wanted_track_count: int
     downloaded_track_count: int
     downloaded_catalog_track_ids: frozenset[int] = frozenset()
     library_track_ids: tuple[tuple[int, int], ...] = ()
+    library_files: tuple[ReleaseLibraryFile, ...] = ()
     manifest_known: bool = False
 
     @property
@@ -221,6 +231,12 @@ class ReleaseProgress:
 
     def library_track_id(self, catalog_track_id: int) -> int | None:
         return dict(self.library_track_ids).get(catalog_track_id)
+
+    def library_file(self, catalog_track_id: int) -> ReleaseLibraryFile | None:
+        return next(
+            (item for item in self.library_files if item.catalog_track_id == catalog_track_id),
+            None,
+        )
 
 
 @dataclass
@@ -536,9 +552,27 @@ async def get_release_progress(
     for album_id, track_id, disc, position in manifest_rows:
         manifest_tracks.setdefault(int(album_id), {})[(int(disc), int(position))] = int(track_id)
     manifest_counts = {album_id: len(tracks) for album_id, tracks in manifest_tracks.items()}
-    imported_by_album: dict[int, dict[int, int]] = {}
+    local_file_counts = {
+        int(album_id): int(file_count)
+        for album_id, file_count in (
+            await db.execute(
+                select(Track.catalog_album_id, func.count(func.distinct(Track.id)))
+                .where(Track.catalog_album_id.in_(ids), _present_library_artifact_filter())
+                .group_by(Track.catalog_album_id)
+            )
+        ).all()
+        if album_id is not None
+    }
+    imported_by_album: dict[int, dict[int, ReleaseLibraryFile]] = {}
     imported_rows = await db.execute(
-        select(Track.catalog_album_id, Track.catalog_track_id, Track.id)
+        select(
+            Track.catalog_album_id,
+            Track.catalog_track_id,
+            Track.id,
+            Track.file_format,
+            Track.file_size_bytes,
+            Track.source,
+        )
         .join(CatalogAlbumTrack, CatalogAlbumTrack.id == Track.catalog_track_id)
         .where(
             Track.catalog_album_id.in_(ids),
@@ -547,23 +581,48 @@ async def get_release_progress(
         )
         .distinct()
     )
-    for album_id, catalog_track_id, library_track_id in imported_rows:
+    for (
+        album_id,
+        catalog_track_id,
+        library_track_id,
+        file_format,
+        file_size,
+        source,
+    ) in imported_rows:
         if album_id is not None and catalog_track_id is not None:
             album_tracks = imported_by_album.setdefault(int(album_id), {})
             catalog_id = int(catalog_track_id)
-            album_tracks[catalog_id] = max(album_tracks.get(catalog_id, 0), int(library_track_id))
+            candidate = ReleaseLibraryFile(
+                catalog_track_id=catalog_id,
+                track_id=int(library_track_id),
+                file_format=str(file_format or ""),
+                file_size_bytes=int(file_size) if file_size is not None else None,
+                source=str(source),
+            )
+            current = album_tracks.get(catalog_id)
+            if current is None or candidate.track_id > current.track_id:
+                album_tracks[catalog_id] = candidate
 
     progress: dict[int, ReleaseProgress] = {}
     for (album_id,) in album_rows:
         release_id = int(album_id)
         manifest_count = manifest_counts.get(release_id, 0)
-        library_track_ids = tuple(sorted(imported_by_album.get(release_id, {}).items()))
+        library_files = tuple(
+            sorted(
+                imported_by_album.get(release_id, {}).values(),
+                key=lambda item: item.catalog_track_id,
+            )
+        )
+        library_track_ids = tuple((item.catalog_track_id, item.track_id) for item in library_files)
         downloaded_ids = frozenset(catalog_id for catalog_id, _track_id in library_track_ids)
         progress[release_id] = ReleaseProgress(
             wanted_track_count=manifest_count,
-            downloaded_track_count=min(len(downloaded_ids), manifest_count),
+            downloaded_track_count=(
+                len(downloaded_ids) if manifest_count else local_file_counts.get(release_id, 0)
+            ),
             downloaded_catalog_track_ids=downloaded_ids,
             library_track_ids=library_track_ids,
+            library_files=library_files,
             manifest_known=manifest_count > 0,
         )
     return progress
@@ -968,29 +1027,37 @@ async def get_library_artists_page(
     )
     legacy_filters: list[Any] = [
         Track.catalog_album_id.is_(None),
-        _library_artifact_filter(),
+        _present_library_artifact_filter(),
         ~matching_catalog_artist,
     ]
     if q:
         legacy_filters.append(_artist_expr().ilike(f"%{q}%"))
-    legacy_rows = (
+    legacy_release_key = case(
+        (Track.release_id.is_not(None), literal("release:") + cast(Track.release_id, String)),
+        else_=literal("album:") + _album_expr() + literal(":") + _year_expr(),
+    )
+    legacy_projection = (
         select(
-            literal(None).label("catalog_id"),
             _artist_expr().label("name"),
-            literal(None).label("artwork_url"),
-            literal(False).label("monitored"),
-            literal(0).label("release_count"),
-            func.sum(case((_present_import_plan_exists(), 1), else_=0)).label(
-                "downloaded_file_count"
-            ),
-            literal(0).label("wanted_release_count"),
-            literal(0).label("complete_release_count"),
-            literal(0).label("partial_release_count"),
-            literal(0).label("unknown_release_count"),
-            literal(0).label("local_release_count"),
+            func.count(func.distinct(Track.id)).label("downloaded_file_count"),
+            func.count(func.distinct(legacy_release_key)).label("local_release_count"),
         )
         .where(*legacy_filters)
         .group_by(_artist_expr())
+        .subquery()
+    )
+    legacy_rows = select(
+        literal(None).label("catalog_id"),
+        legacy_projection.c.name,
+        literal(None).label("artwork_url"),
+        literal(False).label("monitored"),
+        literal(0).label("release_count"),
+        legacy_projection.c.downloaded_file_count,
+        literal(0).label("wanted_release_count"),
+        literal(0).label("complete_release_count"),
+        literal(0).label("partial_release_count"),
+        legacy_projection.c.local_release_count.label("unknown_release_count"),
+        legacy_projection.c.local_release_count,
     )
     combined = catalog_rows.union_all(legacy_rows).subquery()
     total = int((await db.scalar(select(func.count()).select_from(combined))) or 0)
@@ -1324,7 +1391,7 @@ async def get_artist_detail(
     artist_expr = _artist_expr()
 
     count_stmt = select(func.count(Track.id)).where(
-        artist_expr == artist_name, _library_artifact_filter()
+        artist_expr == artist_name, _present_library_artifact_filter()
     )
     total_tracks = int((await db.scalar(count_stmt)) or 0)
 
@@ -1333,7 +1400,7 @@ async def get_artist_detail(
     stmt = (
         select(Track)
         .options(selectinload(Track.release), selectinload(Track.import_plans))
-        .where(artist_expr == artist_name, _library_artifact_filter())
+        .where(artist_expr == artist_name, _present_library_artifact_filter())
         .order_by(Track.year, Track.album, Track.disc, Track.track_no, Track.title, Track.id)
         .offset(_page_offset(page, per_page))
         .limit(per_page)
@@ -1341,12 +1408,12 @@ async def get_artist_detail(
     tracks = list((await db.execute(stmt)).scalars().all())
 
     total_duration_stmt = select(func.coalesce(func.sum(Track.duration_sec), 0)).where(
-        artist_expr == artist_name, _library_artifact_filter()
+        artist_expr == artist_name, _present_library_artifact_filter()
     )
     total_duration = int((await db.scalar(total_duration_stmt)) or 0)
 
     album_count = await _count_album_groups(
-        db, artist_expr == artist_name, _library_artifact_filter()
+        db, artist_expr == artist_name, _present_library_artifact_filter()
     )
 
     album_map: dict[tuple[int | None, str | None, str | None], AlbumGroup] = {}

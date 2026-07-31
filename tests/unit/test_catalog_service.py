@@ -585,6 +585,9 @@ async def test_release_progress_requires_present_plan_and_hydrated_manifest(
     removed_attempt.catalog_album_id = unknown.id
     removed_attempt.import_plans[0].file_state = LibraryFileState.missing
     db_session.add(removed_attempt)
+    unknown_local = _make_track(job.id, title="Local Unknown", artist=artist.name)
+    unknown_local.catalog_album_id = unknown.id
+    db_session.add(unknown_local)
     await db_session.flush()
 
     progress = await get_release_progress(db_session, [hydrated.id, unknown.id])
@@ -595,6 +598,7 @@ async def test_release_progress_requires_present_plan_and_hydrated_manifest(
     assert progress[hydrated.id].track_state(hydrated.tracks[0].id) == "present"
     assert progress[unknown.id].manifest_known is False
     assert progress[unknown.id].wanted_track_count == 0
+    assert progress[unknown.id].downloaded_track_count == 1
     assert progress[unknown.id].complete is False
 
 

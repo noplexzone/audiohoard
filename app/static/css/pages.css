@@ -921,15 +921,7 @@ a.metric-card:hover {
 }
 
 .album-download {
-  opacity: 0;
-  transform: translateY(4px);
-  transition: opacity .16s ease, transform .16s ease;
-}
-
-.album-card:hover .album-download,
-.album-card:focus-within .album-download {
-  opacity: 1;
-  transform: translateY(0);
+  min-height: 44px;
 }
 
 .library-section {
@@ -1495,4 +1487,212 @@ a.metric-card:hover {
   flex-wrap: wrap;
   gap: .45rem;
   align-items: center;
+}
+
+/* Artist and release library */
+.artist-card-link {
+  display: block;
+  min-height: 100%;
+}
+
+.ownership-copy {
+  margin: .3rem 0 .45rem;
+  color: var(--text);
+  font-size: .78rem;
+}
+
+.ownership-detail {
+  min-height: 2.1em;
+  margin: 0 0 .65rem;
+  color: var(--muted);
+  font-size: .7rem;
+}
+
+.ownership-bar {
+  width: 100%;
+  height: 6px;
+  margin: .55rem 0;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-3);
+}
+
+.ownership-bar.unknown {
+  background: repeating-linear-gradient(135deg, var(--surface-3) 0 8px, var(--border) 8px 12px);
+}
+
+.discography-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: .85rem;
+}
+
+.discography-heading h2,
+.discography-heading p {
+  margin-bottom: 0;
+}
+
+.discography-heading > p {
+  max-width: 560px;
+  color: var(--muted);
+  font-size: .78rem;
+}
+
+.release-state {
+  display: inline-flex;
+  min-height: 24px;
+  align-items: center;
+  padding: .2rem .55rem;
+  border-radius: 999px;
+  font-size: .66rem;
+  font-weight: 850;
+}
+
+.release-state.complete { background: rgba(68,215,122,.13); color: var(--ok); }
+.release-state.partial { background: rgba(231,184,78,.13); color: var(--warn); }
+.release-state.missing { background: var(--surface-3); color: var(--muted); }
+.release-state.unknown { background: rgba(147,170,160,.12); color: var(--muted); }
+
+.legacy-release-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.legacy-release-card,
+.release-track-section {
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.legacy-release-header {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  align-items: center;
+  gap: .9rem;
+  margin-bottom: .75rem;
+}
+
+.legacy-release-header h3 { margin: 0; }
+.album-art.compact { width: 74px; border-radius: 10px; }
+
+.album-hero-copy { min-width: 0; }
+.album-byline { margin: 0; color: var(--text); font-weight: 750; }
+.album-byline a { min-height: 44px; display: inline-flex; align-items: center; }
+
+.release-action-toolbar {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: .65rem;
+  flex-wrap: wrap;
+}
+
+.release-action-toolbar form { margin: 0; }
+.monitor-autosave { display: flex; min-height: 44px; align-items: center; gap: .45rem; }
+.monitor-autosave .check-label { margin: 0; }
+.save-status { min-width: 4.8rem; color: var(--muted); font-size: .72rem; }
+.save-status.saved { color: var(--ok); }
+.save-status.error { color: var(--danger); }
+
+.release-maintenance { position: relative; margin: 0; border: 0; }
+.release-maintenance summary {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  padding: .5rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-size: .82rem;
+}
+
+.maintenance-actions {
+  display: flex;
+  gap: .5rem;
+  padding: .6rem 0;
+  flex-wrap: wrap;
+}
+
+.release-track-section { margin-top: 1.25rem; }
+.release-track-list {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.release-track-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 44px 3rem minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: .65rem;
+  min-height: 68px;
+  padding: .55rem .25rem;
+  border-top: 1px solid var(--border-soft);
+}
+
+.release-track-row:first-child { border-top: 0; }
+.release-track-row.just-removed { opacity: .7; }
+.track-position { color: var(--muted); font-variant-numeric: tabular-nums; text-align: center; }
+.track-copy { min-width: 0; }
+.track-copy strong,
+.track-copy a,
+.track-copy small { display: block; }
+.track-copy strong,
+.track-copy a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.track-copy small { color: var(--muted); font-size: .7rem; overflow-wrap: anywhere; }
+.track-duration { color: var(--muted); font-size: .75rem; font-variant-numeric: tabular-nums; }
+.track-actions { display: flex; align-items: center; gap: .4rem; }
+.track-actions form { display: inline-flex; }
+.track-actions .btn { min-height: 44px; }
+.track-remove { color: var(--danger) !important; }
+
+.danger-zone {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 1.25rem;
+  padding: 1rem;
+  border: 1px solid rgba(241,111,115,.3);
+  border-radius: var(--radius);
+  background: rgba(241,111,115,.05);
+}
+
+.danger-zone h2 { margin-bottom: .25rem; }
+.danger-zone p { max-width: 720px; margin: 0; color: var(--muted); font-size: .78rem; }
+.btn.danger { border-color: rgba(241,111,115,.45); background: transparent; color: var(--danger); }
+.btn.danger:hover { background: rgba(241,111,115,.12); color: var(--danger); }
+
+@media (max-width: 760px) {
+  .discography-heading,
+  .danger-zone { align-items: stretch; flex-direction: column; }
+  .release-action-toolbar { align-items: stretch; flex-direction: column; }
+  .release-action-toolbar > form,
+  .release-action-toolbar > form > .btn,
+  .release-maintenance,
+  .release-maintenance summary { width: 100%; }
+  .monitor-autosave { justify-content: space-between; }
+  .release-track-row { grid-template-columns: 44px 2.5rem minmax(0, 1fr); }
+  .track-duration { grid-column: 2; }
+  .track-actions { grid-column: 3; justify-content: flex-start; flex-wrap: wrap; }
+  .danger-zone .btn { width: 100%; }
+}
+
+@media (max-width: 430px) {
+  .artist-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .55rem; }
+  .artist-card-body { padding: .7rem; }
+  .ownership-detail { min-height: 3em; }
+  .album-detail-hero { grid-template-columns: 1fr; gap: .75rem; }
+  .album-detail-art { width: 140px; max-width: 44vw; }
+  .album-detail-hero .release-action-toolbar { width: 100%; }
+  .release-track-section { padding: .75rem; }
+  .release-track-row { gap: .4rem; }
+  .track-actions .btn { padding-inline: .75rem; }
 }

@@ -611,7 +611,7 @@ async def test_album_page_links_to_catalog_artist(client: AsyncClient) -> None:
     assert f'href="/artists/catalog/{artist_id}"' in response.text
 
 
-async def test_album_page_uses_list_for_three_tracks_or_fewer_and_table_for_more(
+async def test_album_page_uses_one_responsive_track_list_for_all_release_sizes(
     client: AsyncClient,
 ) -> None:
     artist_id = await _seed_catalog()
@@ -646,9 +646,10 @@ async def test_album_page_uses_list_for_three_tracks_or_fewer_and_table_for_more
     short_response = await client.get(f"/albums/{short_album_id}")
     long_response = await client.get(f"/albums/{long_album_id}")
 
-    assert 'class="album-track-list"' in short_response.text
-    assert 'class="table-wrap album-track-table"' not in short_response.text
-    assert 'class="table-wrap album-track-table"' in long_response.text
+    assert 'class="release-track-list"' in short_response.text
+    assert 'class="release-track-list"' in long_response.text
+    assert "album-track-table" not in short_response.text
+    assert "album-track-table" not in long_response.text
 
 
 async def test_artist_page_renders_one_discography_filter_bar(client: AsyncClient) -> None:

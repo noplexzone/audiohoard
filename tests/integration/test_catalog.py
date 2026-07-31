@@ -213,8 +213,8 @@ async def test_library_lists_only_eligible_catalog_artists(client: AsyncClient) 
     assert "Hidden Artist" not in resp.text
     assert f'href="/artists/catalog/{watched_id}"' in resp.text
     assert 'src="/artwork?url=https%3A//images.example/watchlisted.jpg"' in resp.text
-    assert "0 releases" in resp.text
-    assert "0 not in library" in resp.text
+    assert "No partial releases" in resp.text
+    assert "ownership unknown" not in resp.text.casefold()
 
 
 async def test_legacy_artist_routes_redirect_to_library(client: AsyncClient) -> None:
@@ -475,7 +475,8 @@ async def test_library_shows_track_artist(seeded_client: AsyncClient) -> None:
 
 async def test_library_shows_release_progress_counts(seeded_client: AsyncClient) -> None:
     resp = await seeded_client.get("/library")
-    assert "not in library" in resp.text
+    assert "releases complete" in resp.text
+    assert "ownership unknown" in resp.text
 
 
 async def test_library_uses_watchlisted_catalog_artists(seeded_client: AsyncClient) -> None:
@@ -832,8 +833,8 @@ async def test_catalog_artist_unifies_release_progress_on_existing_cards(
     assert "Wanted releases</h2>" not in response.text
     assert "Albums" in response.text
     assert "Singles &amp; EPs" in response.text
-    assert "1 / 3 downloaded" in response.text
-    assert "1 / 1 downloaded" in response.text
+    assert "1 of 3 tracks in library" in response.text
+    assert "1 of 1 tracks in library" in response.text
     assert "Unknown Empty Album" in response.text
     assert "0 / 2 downloaded" not in response.text
     assert "0 / 0 downloaded" not in response.text
@@ -1007,7 +1008,7 @@ async def test_catalog_album_shows_total_and_per_track_downloaded_wanted_states(
 
     assert response.status_code == 200
     assert provider_fetches == 0
-    assert "1 of 3 in library" in response.text
+    assert "1 of 3 tracks in library" in response.text
     imported_id = catalog_track_ids["partial imported"]
     missing_id = catalog_track_ids["partial missing"]
     imported_row = response.text.split(f'data-track-id="{imported_id}"', 1)[1].split("</li>", 1)[0]

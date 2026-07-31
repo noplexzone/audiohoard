@@ -4,6 +4,14 @@
 {% set csrf_token = request.cookies.get('csrf', '') | e %}
 {% set total_releases = counts_by_type.albums + counts_by_type.singles_eps + counts_by_type.compilations %}
 {% set provenance = artist.provenance_json | from_json if artist.provenance_json else {} %}
+{% set ownership = namespace(complete=0, partial=0, unknown=0, wanted=0, downloaded_files=0) %}
+{% for item in release_progress.values() %}
+  {% set ownership.downloaded_files = ownership.downloaded_files + item.downloaded_track_count %}
+  {% if item.complete %}{% set ownership.complete = ownership.complete + 1 %}
+  {% elif not item.manifest_known %}{% set ownership.unknown = ownership.unknown + 1 %}{% set ownership.wanted = ownership.wanted + 1 %}
+  {% elif item.downloaded_track_count %}{% set ownership.partial = ownership.partial + 1 %}{% set ownership.wanted = ownership.wanted + 1 %}
+  {% else %}{% set ownership.wanted = ownership.wanted + 1 %}{% endif %}
+{% endfor %}
 <script defer src="/static/js/artist-watchlist.js?v={{ app_version }}" data-page-module="artist-watchlist"></script>
 <nav class="breadcrumb"><a href="/library">Library</a> / {{ artist.name }}</nav>
 <section class="artist-view-hero card">
@@ -32,6 +40,7 @@
       {% if counts_by_type.compilations %}{% if counts_by_type.albums or counts_by_type.singles_eps %} · {% endif %}{{ counts_by_type.compilations }} compilation{{ '' if counts_by_type.compilations == 1 else 's' }}{% endif %}
       {% if not total_releases %}No releases stored yet{% endif %}
     </p>
+    {% if total_releases %}<p class="ownership-detail">{{ ownership.complete }} complete · {{ ownership.partial }} partial · {{ ownership.unknown }} ownership unknown · {{ ownership.wanted }} wanted · {{ ownership.downloaded_files }} downloaded file{% if ownership.downloaded_files != 1 %}s{% endif %}</p>{% endif %}
     <div class="artist-actions">
       <form method="post" action="/artists/catalog/{{ artist.id }}/monitor">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -103,6 +112,7 @@
 </details>
 
 <section id="discography-region" data-artist-id="{{ artist.id }}" data-artist-refresh="{{ 'true' if discography_loading else 'false' }}">
+<p class="sr-only">Discography grouped into Albums, Singles &amp; EPs, and Compilations.</p>
 {% if albums %}
   {% for heading, section_albums in grouped_albums %}
     {% if section_albums %}
@@ -120,8 +130,14 @@
               <p class="muted-line">
                 {% if album.year %}{{ album.year }}{% endif %}{% if album.year and album.release_type_raw %} · {% endif %}{% if album.release_type_raw %}{{ album.release_type_raw }}{% else %}{{ album.release_kind | title }}{% endif %}{% if album.content_rating and album.content_rating != "unknown" %}{% if album.year or album.release_type_raw %} · {% endif %}{{ album.content_rating.replace("_", " ") | title }}{% endif %}{% if album.track_count %}{% if album.year or album.release_type_raw or (album.content_rating and album.content_rating != "unknown") %} · {% endif %}{{ album.track_count }} tracks{% endif %}
               </p>
-              <p class="release-progress">{% if progress.wanted_track_count %}{{ progress.downloaded_track_count }} / {{ progress.wanted_track_count }} downloaded{% else %}Track count unavailable{% endif %}</p>
-              <p class="provider-badges"><span class="badge info">{{ display_name(selected_provider) }}</span>{% if album.content_rating and album.content_rating != "unknown" %}<span class="badge warn">{{ album.content_rating.replace("_", " ") | title }}</span>{% endif %}</p>
+              <p class="release-progress">{% if progress.manifest_known %}{{ progress.downloaded_track_count }} of {{ progress.wanted_track_count }} tracks in library{% else %}{{ progress.downloaded_track_count }} local · total unknown{% endif %}</p>
+              <p class="provider-badges">
+                {% if not progress.manifest_known %}<span class="release-state unknown">Ownership unknown</span>
+                {% elif progress.complete %}<span class="release-state complete">Complete</span>
+                {% elif progress.downloaded_track_count %}<span class="release-state partial">Partial</span>
+                {% else %}<span class="release-state missing">Missing</span>{% endif %}
+                <span class="badge info">{{ display_name(selected_provider) }}</span>{% if album.content_rating and album.content_rating != "unknown" %}<span class="badge warn">{{ album.content_rating.replace("_", " ") | title }}</span>{% endif %}
+              </p>
               <div class="album-card-actions">
                 {% if artist.monitored and artist.watchlist_provider == selected_provider %}<label class="check-label compact-check"><input type="checkbox" name="album_monitored" form="monitor-form" value="{{ album.id }}" {% if album.monitored %}checked{% endif %}> <span>Watchlist</span></label>{% endif %}
                 {% if album.catalog_album_id %}<form method="post" action="/albums/{{ album.catalog_album_id }}/download" data-download-form>
