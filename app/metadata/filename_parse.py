@@ -117,7 +117,8 @@ _DESCRIPTOR_RE = re.compile(
     r"(?:\s+[^\)\]]{0,40})?\s*[\)\]]",
     re.I,
 )
-# "feat." annotations embedded in titles (common in rap/hip-hop catalogs)
+# Featured-artist annotations change recording identity for singles/remixes;
+# keep them by default so plain and featured versions do not collapse.
 _FEAT_RE = re.compile(r"\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring)[^\)\]]*[\)\]]", re.I)
 # Producer tag e.g. "(prod. by Metro Boomin)"
 _PROD_RE = re.compile(r"\s*[\(\[]\s*prod\.?[^\)\]]*[\)\]]", re.I)
@@ -148,15 +149,18 @@ def normalize_for_catalog_match(title: str) -> str:
     return t
 
 
-def strip_non_identity_descriptors(title: str) -> str:
+def strip_non_identity_descriptors(title: str, *, preserve_featured_artists: bool = True) -> str:
     """Remove parenthetical descriptors that do not change recording identity.
 
     Safe to use only for *fuzzy* catalog matching — do not use for display.
     Does NOT remove (live), (acoustic), (demo), (instrumental) etc. which DO
-    indicate a different recording.
+    indicate a different recording.  Featured artists are preserved by default
+    because they distinguish singles/remixes from plain album tracks; callers
+    that compare external fingerprint titles may opt into stripping them.
     """
     t = _DESCRIPTOR_RE.sub("", title)
-    t = _FEAT_RE.sub("", t)
+    if not preserve_featured_artists:
+        t = _FEAT_RE.sub("", t)
     t = _PROD_RE.sub("", t)
     return t.strip()
 

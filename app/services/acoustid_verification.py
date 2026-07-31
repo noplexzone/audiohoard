@@ -59,7 +59,9 @@ def _recording_title_matches_track(
     track_title: str | None,
     acceptance_threshold: float,
 ) -> bool:
-    expected_title = normalize_for_catalog_match(strip_non_identity_descriptors(track_title or ""))
+    expected_title = normalize_for_catalog_match(
+        strip_non_identity_descriptors(track_title or "", preserve_featured_artists=False)
+    )
     if not expected_title:
         return False
     for result in acoustid_results:
@@ -80,7 +82,9 @@ def _recording_title_matches_track(
                 continue
             observed_title = recording.get("title")
             if isinstance(observed_title, str) and (
-                normalize_for_catalog_match(strip_non_identity_descriptors(observed_title))
+                normalize_for_catalog_match(
+                    strip_non_identity_descriptors(observed_title, preserve_featured_artists=False)
+                )
                 == expected_title
             ):
                 return True
