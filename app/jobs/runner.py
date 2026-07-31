@@ -6,7 +6,7 @@ import inspect
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import ParseResult, urlparse
@@ -70,6 +70,14 @@ _SINGLE_TRACK_PREFIX_RE = re.compile(
     r"^(?:cd\s*\d+\s*[-_.]?\s*)?(\d{1,2})\s*[-_. ]",
 )
 _BRACKET_CONTENT_RE = re.compile(r"[\(\[\{]([^\)\]\}]+)[\)\]\}]")
+_COLLABORATOR_SPLIT_RE = re.compile(
+    r"\s*(?:,|&|/|;|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|\band\b)\s*",
+    re.IGNORECASE,
+)
+_FEATURE_TEXT_RE = re.compile(
+    r"(?:\(|\[)?\s*(?:feat\.?|ft\.?|featuring)\s+([^\)\]\-]+)",
+    re.IGNORECASE,
+)
 _TECHNICAL_QUALIFIER_RE = re.compile(
     r"^(?:flac|mp3|aac|m4a|alac|lossless|hi-?res|web(?:rip)?|cd(?:rip)?|"
     r"(?:19|20)\d{2}|\d+(?:\.\d+)?\s*(?:khz|kbps|bit))$",
@@ -569,11 +577,20 @@ async def _run_job_in_session(
         selected_catalog_track = next(
             (track for track in catalog_tracks if track.id == job.catalog_track_id), None
         )
+        selected_required_terms = (
+            await _targeted_required_identity_terms(selected_catalog_track, catalog_album, cfg)
+            if selected_catalog_track is not None
+            else []
+        )
         for result in results:
             if (
                 result.source == "slskd"
                 and selected_catalog_track is not None
-                and not _targeted_catalog_result_matches(result, selected_catalog_track)
+                and not _targeted_catalog_result_matches(
+                    result,
+                    selected_catalog_track,
+                    required_terms=selected_required_terms,
+                )
             ):
                 failures.append(
                     {
@@ -982,8 +999,13 @@ def _catalog_track_for_result(
     return None
 
 
-def _targeted_catalog_result_matches(result: SearchResult, target: CatalogAlbumTrack) -> bool:
-    """Require title identity before binding a slskd result to a targeted catalog track."""
+def _targeted_catalog_result_matches(
+    result: SearchResult,
+    target: CatalogAlbumTrack,
+    *,
+    required_terms: Sequence[str] = (),
+) -> bool:
+    """Require title and structured collaborator/version identity for a target."""
     observed = normalize_for_catalog_match(strip_non_identity_descriptors(result.title or ""))
     expected_core = normalize_for_catalog_match(
         strip_non_identity_descriptors(parse_filename(target.title).title)
@@ -991,11 +1013,24 @@ def _targeted_catalog_result_matches(result: SearchResult, target: CatalogAlbumT
     expected_full = normalize_for_catalog_match(strip_non_identity_descriptors(target.title))
     filename = result.metadata.get("filename")
     observed_source = str(filename) if isinstance(filename, str) else result.title or ""
-    return bool(
-        observed
-        and observed in (expected_core, expected_full)
-        and _identity_qualifiers(observed_source) == _identity_qualifiers(target.title)
-    )
+    if not (observed and observed in (expected_core, expected_full)):
+        return False
+    if required_terms and not _observed_contains_required_terms(observed_source, required_terms):
+        return False
+    target_qualifiers = _identity_qualifiers(target.title)
+    observed_qualifiers = _identity_qualifiers(observed_source)
+    if required_terms:
+        # A MusicBrainz recording credit may carry the collaborator identity while
+        # the catalog title is bare (e.g. Miami). In that case required artist
+        # terms are the authoritative guard; do not reject a useful promo filename
+        # merely because it adds harmless bracket tags like clean/dirty/year.
+        return target_qualifiers <= observed_qualifiers
+    return observed_qualifiers == target_qualifiers
+
+
+def _observed_contains_required_terms(value: str, required_terms: Sequence[str]) -> bool:
+    haystack = normalize_for_catalog_match(value)
+    return all(normalize_for_catalog_match(term) in haystack for term in required_terms)
 
 
 def _identity_qualifiers(value: str) -> set[str]:
@@ -1187,26 +1222,113 @@ def _provider_safe_text(value: str) -> str:
     return " ".join(value.translate(_PROVIDER_PUNCTUATION).split())
 
 
-def _targeted_query_variants(artist: str, album: str, track: str) -> list[str]:
+def _targeted_query_variants(
+    artist: str,
+    album: str,
+    track: str,
+    *,
+    required_terms: Sequence[str] = (),
+) -> list[str]:
     safe_artist = _provider_safe_text(artist)
     safe_album = _provider_safe_text(album)
     safe_track = _provider_safe_text(track)
     title = safe_track or safe_album
-    variants = [" ".join(part for part in (safe_artist, title) if part)]
+    required_for_query = [
+        term
+        for term in required_terms
+        if normalize_for_catalog_match(term) not in normalize_for_catalog_match(title)
+    ]
+    safe_required = _provider_safe_text(" ".join(required_for_query))
+    variants = [" ".join(part for part in (safe_artist, title, safe_required) if part)]
+    if safe_required:
+        variants.append(" ".join(part for part in (safe_artist, title) if part))
     simplified = _EDITION_SUFFIX.sub("", title).strip()
     if simplified and simplified.casefold() != title.casefold():
-        variants.append(" ".join(part for part in (safe_artist, simplified) if part))
+        variants.append(
+            " ".join(part for part in (safe_artist, simplified, safe_required) if part)
+        )
+        if safe_required:
+            variants.append(" ".join(part for part in (safe_artist, simplified) if part))
     return list(dict.fromkeys(variant for variant in variants if variant))
 
 
-def _queries_for_job(job: Job, album: CatalogAlbum | None) -> list[str]:
+async def _queries_for_job(job: Job, album: CatalogAlbum | None, cfg: Settings) -> list[str]:
     if album is None or job.catalog_track_id is None:
         return [_provider_safe_text(job.query)]
     track = next((item for item in album.tracks if item.id == job.catalog_track_id), None)
     if track is None:
         return [_provider_safe_text(job.query)]
     artist = album.artist.name if album.artist is not None else ""
-    return _targeted_query_variants(artist, album.title, track.title)
+    required_terms = await _targeted_required_identity_terms(track, album, cfg)
+    return _targeted_query_variants(
+        artist, album.title, track.title, required_terms=required_terms
+    )
+
+
+async def _targeted_required_identity_terms(
+    track: CatalogAlbumTrack,
+    album: CatalogAlbum | None,
+    cfg: Settings,
+) -> list[str]:
+    """Return collaborator/version terms required by the target recording identity."""
+    primary_artist = album.artist.name if album is not None and album.artist is not None else ""
+    terms = _required_identity_terms_from_text(track.title, primary_artist)
+    if track.recording_mbid and cfg.musicbrainz_user_agent:
+        try:
+            meta = await MusicBrainzClient(cfg.musicbrainz_user_agent).lookup_recording(
+                track.recording_mbid
+            )
+        except Exception as exc:
+            logger.warning(
+                "MusicBrainz target recording lookup failed for %s: %s",
+                track.recording_mbid,
+                exc,
+            )
+        else:
+            if meta is not None:
+                terms.extend(_required_identity_terms_from_text(meta.title, primary_artist))
+                if meta.artist:
+                    terms.extend(_collaborator_terms(meta.artist, primary_artist))
+    return list(dict.fromkeys(term for term in terms if term))
+
+
+def _required_identity_terms_from_text(value: str, primary_artist: str) -> list[str]:
+    terms: list[str] = []
+    for match in _FEATURE_TEXT_RE.finditer(value):
+        terms.extend(_collaborator_terms(match.group(1), primary_artist))
+    return terms
+
+
+def _collaborator_terms(artist_credit: str, primary_artist: str) -> list[str]:
+    primary = normalize_for_catalog_match(primary_artist)
+    featured_match = re.search(
+        r"\b(?:feat\.?|ft\.?|featuring)\b\s*(.+)", artist_credit, re.IGNORECASE
+    )
+    if featured_match:
+        featured_source = featured_match.group(1)
+        lead_source = artist_credit[: featured_match.start()]
+        lead_pieces = [
+            piece.strip(" .-_()[]")
+            for piece in _COLLABORATOR_SPLIT_RE.split(lead_source)
+            if piece.strip(" .-_()[]")
+        ]
+        # Preserve co-leads like "Thomas Wesley & Julia Michaels feat. Morgan Wallen"
+        # without requiring the first lead alias when the watched artist is featured.
+        pieces = lead_pieces[1:] + [
+            piece.strip(" .-_()[]") for piece in _COLLABORATOR_SPLIT_RE.split(featured_source)
+        ]
+    else:
+        pieces = [piece.strip(" .-_()[]") for piece in _COLLABORATOR_SPLIT_RE.split(artist_credit)]
+    terms: list[str] = []
+    for piece in pieces:
+        normalized = normalize_for_catalog_match(piece)
+        if not normalized or normalized == primary or normalized in primary:
+            continue
+        # Keep phrase-level terms; single generic words introduce too much noise.
+        if len(normalized) < 3:
+            continue
+        terms.append(piece)
+    return terms
 
 
 def _set_acquisition_provenance(
@@ -1254,7 +1376,7 @@ async def _fetch_results(
     _scoring_album = (
         await _load_catalog_album(db, job.catalog_album_id) if job.catalog_album_id else None
     )
-    query_variants = _queries_for_job(job, _scoring_album)
+    query_variants = await _queries_for_job(job, _scoring_album, cfg)
 
     for source in priority:
         try:
