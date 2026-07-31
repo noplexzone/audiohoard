@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, Text, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Index, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -123,6 +123,11 @@ class DeletionOperation(Base):
     )
     original_path: Mapped[str] = mapped_column(Text, nullable=False)
     temporary_path: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_device: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    expected_inode: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    file_was_missing: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
     state: Mapped[DeletionOperationState] = mapped_column(
         Enum(DeletionOperationState, native_enum=False, create_constraint=True),
         nullable=False,

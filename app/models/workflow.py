@@ -20,6 +20,7 @@ class ImportWorkflowState(StrEnum):
     ready = "ready"
     importing = "importing"
     imported = "imported"
+    removed = "removed"
     failed = "failed"
     rolled_back = "rolled_back"
 

@@ -3,17 +3,18 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.auth import get_current_user
+from app.auth import get_current_user, require_mutation
 from app.config import Settings
 from app.database import get_db
 from app.models.track import Track
 from app.schemas.track import TrackRead
+from app.services.library_removal import LibraryRemovalError, remove_imported_track
 from app.services.media_streaming import (
     MediaAssetError,
     TranscodeError,
@@ -28,6 +29,57 @@ router = APIRouter(dependencies=[Depends(get_current_user)])
 
 def _get_templates(request: Request) -> Jinja2Templates:
     return request.app.state.templates  # type: ignore[no-any-return]
+
+
+async def _confirmed_delete(request: Request) -> bool:
+    if request.headers.get("content-type", "").casefold().startswith("application/json"):
+        try:
+            payload = await request.json()
+        except ValueError:
+            return False
+        return isinstance(payload, dict) and payload.get("confirmation") == "delete"
+    form = await request.form()
+    return form.get("confirmation") == "delete"
+
+
+def _wants_json(request: Request) -> bool:
+    return (
+        "application/json" in request.headers.get("accept", "").casefold()
+        or request.headers.get("x-requested-with", "").casefold() == "fetch"
+        or request.headers.get("content-type", "").casefold().startswith("application/json")
+    )
+
+
+@router.post("/library/tracks/{track_id}/delete", include_in_schema=False)
+async def delete_imported_track(
+    track_id: int,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> Response:
+    if not await _confirmed_delete(request):
+        raise HTTPException(status_code=422, detail="Explicit deletion confirmation is required")
+    try:
+        result = await remove_imported_track(
+            db,
+            track_id,
+            library_root=settings.library_root,
+            cache_root=settings.artwork_cache_root.parent / "library-audio",
+        )
+    except LibraryRemovalError as exc:
+        status = 404 if "not found" in str(exc).casefold() else 409
+        raise HTTPException(status_code=status, detail=str(exc)) from None
+    if _wants_json(request):
+        return JSONResponse(
+            {
+                "deleted_files": result.deleted_files,
+                "track_ids": list(result.affected_track_ids),
+                "already_removed": result.already_removed,
+                "cleanup_pending": result.cleanup_pending,
+            }
+        )
+    return RedirectResponse("/library?view=tracks&removed=1", status_code=303)
 
 
 @router.api_route("/tracks/{track_id}/audio", methods=["GET", "HEAD"], include_in_schema=False)

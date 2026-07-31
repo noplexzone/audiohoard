@@ -72,6 +72,7 @@ def downgrade() -> None:
     op.drop_table("deletion_operations")
     with op.batch_alter_table("import_plans") as batch_op:
         batch_op.drop_index("ix_import_plans_file_state")
+        batch_op.drop_constraint("libraryfilestate", type_="check")
         batch_op.drop_column("file_removal_reason")
         batch_op.drop_column("file_removed_at")
         batch_op.drop_column("file_checked_at")

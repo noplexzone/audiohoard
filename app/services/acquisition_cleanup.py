@@ -18,7 +18,7 @@ from sqlalchemy.orm import selectinload
 from app.config import get_settings
 from app.database import get_session_factory
 from app.models.catalog_entities import CatalogAlbumTrack
-from app.models.import_plan import ImportPlan
+from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import Track
@@ -339,7 +339,11 @@ async def prune_orphaned_terminal_records(
             *(asyncio.to_thread(_track_has_file, track) for track in tracks)
         )
         for track, has_file in zip(tracks, has_files, strict=True):
-            if not has_file:
+            has_library_removal_evidence = any(
+                plan.file_state in {LibraryFileState.missing, LibraryFileState.removed}
+                for plan in track.import_plans
+            )
+            if not has_file and not has_library_removal_evidence:
                 await db.delete(track)
                 removed_tracks += 1
         await db.flush()
