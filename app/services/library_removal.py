@@ -400,14 +400,14 @@ async def _recompute_database_truth(
     return track_ids
 
 
-async def _operations_committed(db: AsyncSession, operation_ids: tuple[int, ...]) -> bool:
+async def _operations_prepared(db: AsyncSession, operation_ids: tuple[int, ...]) -> bool:
     states = list(
         await db.scalars(
             select(DeletionOperation.state).where(DeletionOperation.id.in_(operation_ids))
         )
     )
     return len(states) == len(operation_ids) and all(
-        state == DeletionOperationState.committed for state in states
+        state == DeletionOperationState.prepared for state in states
     )
 
 
@@ -475,9 +475,14 @@ async def _remove_plans(
                 await db.commit()
                 database_committed = True
             except BaseException:
+                # Once commit acknowledgement is lost, restoration is safe only when
+                # the durable journal can be positively verified as entirely prepared.
+                # Any unreadable, mixed, committed, or finalized state is recovery work.
+                database_committed = True
                 await db.rollback()
-                database_committed = await _operations_committed(db, operation_ids)
-                if not database_committed:
+                restore_is_safe = await _operations_prepared(db, operation_ids)
+                if restore_is_safe:
+                    database_committed = False
                     for target in reversed(targets):
                         await asyncio.to_thread(_restore_target, target)
                     with suppress(Exception):

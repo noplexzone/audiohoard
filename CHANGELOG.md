@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-07-31
+
+### Fixed
+
+- Kept quarantined audio staged for startup recovery when deletion commit acknowledgement or journal verification is indeterminate, preventing database `removed` state from contradicting a restored original file.
+
 ## [0.10.0] - 2026-07-31
 
 ### Added
