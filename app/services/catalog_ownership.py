@@ -192,9 +192,17 @@ async def _resolve_evidence(
             logger.warning("Could not resolve Deezer ownership for track %s: %s", deezer_id, exc)
             return None
         if track is None:
+            if fail_fast:
+                raise CatalogOwnershipEvidenceError(
+                    f"Deezer returned no ownership record for track {deezer_id}"
+                )
             return None
         rating = normalize_content_rating(track.content_rating)
         if rating == CONTENT_RATING_UNKNOWN:
+            if fail_fast:
+                raise CatalogOwnershipEvidenceError(
+                    f"Deezer returned no authoritative content rating for track {deezer_id}"
+                )
             return None
         return DeezerReleaseEvidence(track.deezer_id, track.album_id, rating)
 

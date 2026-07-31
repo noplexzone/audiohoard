@@ -296,6 +296,62 @@ async def test_strict_evidence_resolution_propagates_provider_failure(
             fail_fast=True,
         )
 
+    class MissingDeezerClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        async def get_track(self, _track_id: str):
+            return None
+
+    monkeypatch.setattr(catalog_ownership, "DeezerClient", MissingDeezerClient)
+    with pytest.raises(catalog_ownership.CatalogOwnershipEvidenceError):
+        await catalog_ownership._resolve_evidence(
+            test_settings,
+            [candidate],
+            fail_fast=True,
+        )
+
+    class UnknownRatingTrack:
+        deezer_id = "123"
+        album_id = None
+        content_rating = "unknown"
+
+    class UnknownRatingDeezerClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        async def get_track(self, _track_id: str):
+            return UnknownRatingTrack()
+
+    monkeypatch.setattr(catalog_ownership, "DeezerClient", UnknownRatingDeezerClient)
+    with pytest.raises(catalog_ownership.CatalogOwnershipEvidenceError):
+        await catalog_ownership._resolve_evidence(
+            test_settings,
+            [candidate],
+            fail_fast=True,
+        )
+
+    class RatedTrack:
+        deezer_id = "123"
+        album_id = "album-1"
+        content_rating = "explicit"
+
+    class PartialDeezerClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        async def get_track(self, track_id: str):
+            return RatedTrack() if track_id == "123" else None
+
+    monkeypatch.setattr(catalog_ownership, "DeezerClient", PartialDeezerClient)
+    second = catalog_ownership._OwnershipCandidate(2, "456", ("/tmp/second.flac",))
+    with pytest.raises(catalog_ownership.CatalogOwnershipEvidenceError):
+        await catalog_ownership._resolve_evidence(
+            test_settings,
+            [candidate, second],
+            fail_fast=True,
+        )
+
 
 async def test_reconcile_ignores_unknown_rating_and_non_imported_track(
     db_session: AsyncSession,
