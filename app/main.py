@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from importlib.resources import files
 from pathlib import Path
 from typing import Annotated
@@ -50,6 +50,7 @@ from app.services.acquisition_cleanup import (
 from app.services.acquisition_recovery import recover_approved_downloads
 from app.services.artist_monitoring import DiscographyRefreshScheduler
 from app.services.catalog_metadata import reconcile_duplicate_catalog_artists
+from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
 from app.services.dashboard import get_dashboard_data
 from app.services.health_status import get_health_status_service
 from app.services.maintenance_scheduler import MaintenanceScheduler
@@ -66,6 +67,23 @@ _TEMPLATES_DIR = files("app") / "templates"
 _STATIC_DIR = files("app") / "static"
 
 logger = logging.getLogger(__name__)
+
+
+async def _reconcile_catalog_ownership_at_startup(settings: Settings) -> None:
+    try:
+        ownership_repairs = await reconcile_deezer_catalog_ownership(
+            get_session_factory(), settings
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Catalog ownership reconciliation failed at startup")
+    else:
+        if ownership_repairs:
+            logger.info(
+                "Reconciled %d imported track catalog ownership record(s) at startup",
+                ownership_repairs,
+            )
 
 
 @asynccontextmanager
@@ -99,12 +117,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await db.commit()
         if n:
             logger.info("Reconciled %d duplicate catalog artist(s) at startup", n)
-        repaired = await recover_approved_downloads(
-            db, await build_effective_settings(db, get_settings())
-        )
+        effective_settings = await build_effective_settings(db, get_settings())
+        repaired = await recover_approved_downloads(db, effective_settings)
         await db.commit()
         if repaired:
             logger.info("Recovered and imported %d approved release(s) at startup", repaired)
+    ownership_task = asyncio.create_task(
+        _reconcile_catalog_ownership_at_startup(effective_settings),
+        name="catalog-ownership-startup-reconciliation",
+    )
+    app.state.catalog_ownership_reconciliation_task = ownership_task
     await cleanup_imported_sources(pending_cleanups)
     await job_dispatcher.recover()
     settings = get_settings()
@@ -122,6 +144,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        if not ownership_task.done():
+            ownership_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await ownership_task
         await health_status.stop()
         await quality_upgrade_scheduler.stop()
         await maintenance_scheduler.stop()

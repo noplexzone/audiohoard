@@ -90,6 +90,7 @@ async def test_scheduler_isolates_artist_failures_and_dispatches_after_commit(
     failing_id = await _create_artist(monitoring_factory, "Failing", album=False)
     successful_id = await _create_artist(monitoring_factory, "Successful", album=False)
     processed: list[int] = []
+    events: list[str] = []
     visible_when_dispatched: list[bool] = []
 
     monkeypatch.setattr(artist_monitoring, "get_session_factory", lambda: monitoring_factory)
@@ -116,26 +117,83 @@ async def test_scheduler_isolates_artist_failures_and_dispatches_after_commit(
         *,
         auto_download: bool = False,
     ) -> tuple[list[CatalogAlbum], list[int]]:
+        assert auto_download is False
         if artist.id == failing_id:
             raise RuntimeError("provider failure")
         processed.append(artist.id)
+        events.append("refresh")
+        return [], []
+
+    async def fake_reconcile(*args: object, **kwargs: object) -> int:
+        assert kwargs["fail_on_provider_error"] is True
+        events.append("reconcile")
+        return 0
+
+    async def fake_queue(db: AsyncSession, artist: CatalogArtist) -> list[int]:
+        events.append("queue")
         job = Job(source="priority", query=artist.name, status=JobStatus.pending)
         db.add(job)
         await db.flush()
-        return [], [job.id]
+        return [job.id]
 
     async def probe_dispatch(job_id: int) -> None:
+        events.append("dispatch")
         async with monitoring_factory() as db:
             visible_when_dispatched.append(await db.get(Job, job_id) is not None)
 
     monkeypatch.setattr(artist_monitoring, "refresh_monitored_artist", fake_refresh)
+    monkeypatch.setattr(artist_monitoring, "reconcile_deezer_catalog_ownership", fake_reconcile)
+    monkeypatch.setattr(artist_monitoring, "queue_wanted_artist_releases", fake_queue)
     monkeypatch.setattr(artist_monitoring.job_dispatcher, "dispatch", probe_dispatch)
 
     delay = await DiscographyRefreshScheduler()._refresh_cycle()
 
     assert processed == [successful_id]
+    assert events == ["refresh", "reconcile", "queue", "dispatch"]
     assert visible_when_dispatched == [True]
     assert delay == 3600
+
+
+async def test_scheduler_does_not_queue_when_reconciliation_fails(
+    monitoring_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _create_artist(monitoring_factory, "Unsafe", album=False)
+    queue = AsyncMock(return_value=[])
+    dispatch = AsyncMock()
+
+    monkeypatch.setattr(artist_monitoring, "get_session_factory", lambda: monitoring_factory)
+    monkeypatch.setattr(
+        artist_monitoring,
+        "build_effective_settings",
+        AsyncMock(return_value=Settings(secret_key="test-secret")),
+    )
+    monkeypatch.setattr(
+        artist_monitoring,
+        "get_runtime_settings",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                auto_download_wanted=True,
+                discography_refresh_hours=1,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        artist_monitoring,
+        "refresh_monitored_artist",
+        AsyncMock(return_value=([], [])),
+    )
+    monkeypatch.setattr(
+        artist_monitoring,
+        "reconcile_deezer_catalog_ownership",
+        AsyncMock(side_effect=RuntimeError("provider unavailable")),
+    )
+    monkeypatch.setattr(artist_monitoring, "queue_wanted_artist_releases", queue)
+    monkeypatch.setattr(artist_monitoring.job_dispatcher, "dispatch", dispatch)
+
+    assert await DiscographyRefreshScheduler()._refresh_cycle() == 3600
+    queue.assert_not_awaited()
+    dispatch.assert_not_awaited()
 
 
 async def test_scheduler_can_restart_after_stop(monkeypatch: pytest.MonkeyPatch) -> None:

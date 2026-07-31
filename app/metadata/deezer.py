@@ -27,6 +27,8 @@ class DeezerTrack:
     title: str
     artist: str | None = None
     album: str | None = None
+    album_id: str | None = None
+    content_rating: str = "unknown"
     bpm: float | None = None
     gain: float | None = None
     preview_url: str | None = None
@@ -301,6 +303,7 @@ def _parse_track(data: dict[str, object]) -> DeezerTrack:
     title = str(data.get("title") or data.get("title_short") or "")
     artist = None
     album = None
+    album_id = None
 
     artist_data = data.get("artist")
     if isinstance(artist_data, dict):
@@ -309,6 +312,7 @@ def _parse_track(data: dict[str, object]) -> DeezerTrack:
     album_data = data.get("album")
     if isinstance(album_data, dict):
         album = str(album_data.get("title") or "") or None
+        album_id = str(album_data.get("id") or "") or None
 
     bpm = data.get("bpm")
     gain = data.get("gain")
@@ -322,6 +326,8 @@ def _parse_track(data: dict[str, object]) -> DeezerTrack:
         title=title,
         artist=artist,
         album=album,
+        album_id=album_id,
+        content_rating=deezer_content_rating(data),
         bpm=_to_float(bpm),
         gain=_to_float(gain),
         preview_url=str(preview) if preview else None,

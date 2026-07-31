@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app import main
+from app.config import Settings
+
+
+class _Service:
+    def __init__(self, *_args, **_kwargs) -> None:
+        pass
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+
+async def test_startup_ownership_reconciliation_does_not_delay_readiness(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    started = asyncio.Event()
+
+    async def blocked_reconciliation(*_args, **_kwargs) -> int:
+        started.set()
+        await asyncio.Event().wait()
+        return 0
+
+    monkeypatch.setattr(main, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(
+        main,
+        "get_runtime_settings",
+        AsyncMock(return_value=SimpleNamespace(max_parallel_acquisitions=1)),
+    )
+    monkeypatch.setattr(main, "pending_imported_source_cleanups", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        main,
+        "prune_orphaned_terminal_records",
+        AsyncMock(return_value=SimpleNamespace(tracks=0, releases=0, jobs=0)),
+    )
+    monkeypatch.setattr(main, "reconcile_duplicate_catalog_artists", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        main,
+        "build_effective_settings",
+        AsyncMock(return_value=Settings(secret_key="test-secret")),
+    )
+    monkeypatch.setattr(main, "recover_approved_downloads", AsyncMock(return_value=0))
+    monkeypatch.setattr(main, "cleanup_imported_sources", AsyncMock())
+    monkeypatch.setattr(main, "reconcile_deezer_catalog_ownership", blocked_reconciliation)
+    monkeypatch.setattr(main, "DiscographyRefreshScheduler", _Service)
+    monkeypatch.setattr(main, "MaintenanceScheduler", _Service)
+    monkeypatch.setattr(main, "MonitoringScheduler", _Service)
+    monkeypatch.setattr(main, "QualityUpgradeCycleScheduler", _Service)
+    monkeypatch.setattr(main, "get_health_status_service", lambda: _Service())
+    monkeypatch.setattr(main.job_dispatcher, "set_max_concurrent_jobs", AsyncMock())
+    monkeypatch.setattr(main.job_dispatcher, "recover", AsyncMock())
+    monkeypatch.setattr(main.job_dispatcher, "start_watchdog", AsyncMock())
+    monkeypatch.setattr(main.job_dispatcher, "start_cleanup_reconciler", AsyncMock())
+    monkeypatch.setattr(main.job_dispatcher, "shutdown", AsyncMock())
+
+    app = FastAPI()
+    async with asyncio.timeout(1):
+        async with main.lifespan(app):
+            await started.wait()
+            task = app.state.catalog_ownership_reconciliation_task
+            assert task.done() is False
+
+    assert task.cancelled()

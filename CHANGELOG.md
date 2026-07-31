@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-07-30
+
+### Fixed
+- Reconcile imported tracks onto the authoritative clean or explicit catalog release using Deezer track evidence, then rebuild downloaded-state projections from files that still exist.
+- Run ownership reconciliation before monitored auto-download queueing and fail closed when provider evidence is unavailable, incomplete, or contradictory.
+- Keep optional startup ownership repair off the readiness path while serializing concurrent manual and scheduled reconciliation.
+
 ## [0.9.2] - 2026-07-30
 
 ### Fixed
