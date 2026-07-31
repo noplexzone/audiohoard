@@ -5,20 +5,13 @@
 <header class="page-header"><div><p class="eyebrow">Operations</p><h1>Maintenance</h1><p>Cached library verification and duplicate cleanup controls.</p></div></header>
 {% if deleted %}<div class="alert ok" role="status">Cleaned {{ deleted }} duplicate file{{ '' if deleted == '1' else 's' }}.</div>{% endif %}
 {% if upgrade_status == 'ok' %}<div class="alert ok" role="status">Quality upgrade imported.</div>{% elif upgrade_status == 'error' %}<div class="alert error" role="alert">Quality upgrade failed: {{ upgrade_detail }}</div>{% endif %}
+{% if adoption_status == 'queued' %}<div class="alert ok" role="status">Library scan queued.</div>{% endif %}
 <div class="maintenance-grid">
   <section class="panel maintenance-bucket" aria-labelledby="scan-heading">
-    <div class="section-heading"><div><p class="eyebrow">Library scan</p><h2 id="scan-heading">Filesystem verification</h2></div><form method="post" action="/maintenance/scan">{{ csrf() }}<button class="btn" type="submit">Scan now</button></form></div>
-    {% set scan = maintenance.library_scan %}
-    <div class="status-strip">
-      <span><strong>{{ scan.matched if scan else 0 }}</strong><small>Matched</small></span>
-      <span><strong>{{ scan.orphans | length if scan else 0 }}</strong><small>Orphans shown</small></span>
-      <span><strong>{{ scan.missing | length if scan else 0 }}</strong><small>Missing shown</small></span>
-      <span><strong>{{ scan.scanned_files if scan else 0 }}</strong><small>Scanned files</small></span>
-    </div>
-    <h3>Orphans</h3>
-    {% if scan and scan.orphans %}<ul class="maintenance-list">{% for path in scan.orphans if path not in maintenance.ignored_orphans %}<li><code>{{ path }}</code><span class="inline-actions"><form method="post" action="/maintenance/orphans/import">{{ csrf() }}<input type="hidden" name="path" value="{{ path }}"><button class="btn secondary" type="submit">Import</button></form><form method="post" action="/maintenance/orphans/ignore">{{ csrf() }}<input type="hidden" name="path" value="{{ path }}"><button class="btn secondary" type="submit">Ignore</button></form></span></li>{% endfor %}</ul>{% else %}<div class="empty-state mini"><h3>No orphaned files shown</h3><p>Run a scan to compare library files against imported plans.</p></div>{% endif %}
-    <h3>Missing imports</h3>
-    {% if scan and scan.missing %}<ul class="maintenance-list">{% for path in scan.missing %}<li><code>{{ path }}</code><a class="btn secondary" href="/search">Re-acquire</a></li>{% endfor %}</ul>{% else %}<div class="empty-state mini"><h3>No missing imports shown</h3><p>Imported plan destinations are present or no scan has run.</p></div>{% endif %}
+    <div class="section-heading"><div><p class="eyebrow">Library scan</p><h2 id="scan-heading">Filesystem scanner</h2></div><form method="post" action="/maintenance/scan">{{ csrf() }}<button class="btn" type="submit">Scan full library</button></form></div>
+    {% if adoption_scans %}<ul class="maintenance-list">{% for scan in adoption_scans %}<li><span><strong>{{ scan.scope_kind.value | replace('_', ' ') | title }}</strong><br><small>{{ scan.scanned_count }} scanned · {{ scan.adopted_count }} adopted · {{ scan.review_count }} review · {{ scan.unmatched_count }} unmatched</small></span><span class="badge {{ 'ok' if scan.state.value == 'completed' else ('error' if scan.state.value == 'failed' else 'info') }}">{{ scan.state.value }}</span></li>{% endfor %}</ul>{% else %}<div class="empty-state mini"><h3>No adoption scans yet</h3><p>Scan existing music to reconnect or import files that match the catalog.</p></div>{% endif %}
+    <h3>Needs review</h3>
+    {% if adoption_candidates %}<ul class="maintenance-list">{% for candidate in adoption_candidates %}<li><span><code>{{ candidate.path }}</code><br><small>{{ (candidate.reason_codes_json | from_json) | join(', ') }}</small></span><form method="post" action="/maintenance/adoption/candidates/{{ candidate.id }}/ignore">{{ csrf() }}<button class="btn secondary" type="submit">Ignore</button></form></li>{% endfor %}</ul>{% else %}<div class="empty-state mini"><h3>No ambiguous files</h3><p>Files that cannot be attached safely will appear here.</p></div>{% endif %}
   </section>
   <section class="panel maintenance-bucket" aria-labelledby="duplicates-heading">
     <div class="section-heading"><div><p class="eyebrow">Duplicates</p><h2 id="duplicates-heading">Quality cleanup</h2></div></div>

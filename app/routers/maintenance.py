@@ -12,9 +12,15 @@ from starlette.responses import Response
 from app.auth import get_current_user, require_mutation
 from app.config import Settings
 from app.database import get_db, get_session_factory
+from app.models.library_adoption import (
+    AdoptionCandidateState,
+    AdoptionScopeKind,
+    LibraryAdoptionCandidate,
+    LibraryAdoptionScan,
+)
 from app.models.monitoring import MonitoringRecord, MonitoringStatus
+from app.services.library_adoption import AdoptionScope, enqueue_library_adoption_scan
 from app.services.library_import import ImportExecutionError
-from app.services.library_scan import scan_library_filesystem
 from app.services.maintenance_state import MaintenanceState, empty_maintenance_state
 from app.services.maintenance_workflows import (
     clean_safe_library_duplicates,
@@ -36,14 +42,6 @@ def _state(request: Request) -> MaintenanceState:
         state = empty_maintenance_state()
         request.app.state.maintenance_state = state
     return state
-
-
-async def _run_scan(app_state: Any, settings: Settings, artist_id: int | None) -> None:
-    async with get_session_factory()() as db:
-        result = await scan_library_filesystem(
-            db, library_root=settings.library_root, artist_id=artist_id
-        )
-    app_state.maintenance_state.store_library_scan(result)
 
 
 async def _run_duplicate_scan(app_state: Any, settings: Settings) -> None:
@@ -79,6 +77,19 @@ async def maintenance_page(
             .order_by(MonitoringRecord.updated_at.desc())
         )
     ).all()
+    adoption_scans = (
+        await db.scalars(
+            select(LibraryAdoptionScan).order_by(LibraryAdoptionScan.id.desc()).limit(10)
+        )
+    ).all()
+    adoption_candidates = (
+        await db.scalars(
+            select(LibraryAdoptionCandidate)
+            .where(LibraryAdoptionCandidate.state == AdoptionCandidateState.review)
+            .order_by(LibraryAdoptionCandidate.id.desc())
+            .limit(50)
+        )
+    ).all()
     response: Response = templates.TemplateResponse(
         request,
         "maintenance.html",
@@ -88,6 +99,9 @@ async def maintenance_page(
             "upgrade_records": upgrade_records,
             "upgrade_status": request.query_params.get("upgrade", ""),
             "upgrade_detail": request.query_params.get("detail", ""),
+            "adoption_status": request.query_params.get("adoption", ""),
+            "adoption_scans": adoption_scans,
+            "adoption_candidates": adoption_candidates,
         },
     )
     return response
@@ -96,14 +110,97 @@ async def maintenance_page(
 @router.post("/scan", include_in_schema=False)
 async def maintenance_scan(
     request: Request,
-    background_tasks: BackgroundTasks,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    scan_id = await enqueue_library_adoption_scan(
+        db, library_root=settings.library_root, scope=AdoptionScope()
+    )
+    await db.commit()
+    request.app.state.library_adoption_runner.wake()
+    return RedirectResponse(f"/maintenance?adoption=queued&scan_id={scan_id}", status_code=303)
+
+
+@router.post("/scan/artists/{artist_id}", include_in_schema=False)
+async def maintenance_scan_artist(
+    artist_id: int,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    try:
+        await enqueue_library_adoption_scan(
+            db,
+            library_root=settings.library_root,
+            scope=AdoptionScope(AdoptionScopeKind.catalog_artist, artist_id),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    await db.commit()
+    request.app.state.library_adoption_runner.wake()
+    return RedirectResponse(f"/artists/catalog/{artist_id}?scan=queued", status_code=303)
+
+
+@router.post("/scan/albums/{album_id}", include_in_schema=False)
+async def maintenance_scan_album(
+    album_id: int,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    try:
+        await enqueue_library_adoption_scan(
+            db,
+            library_root=settings.library_root,
+            scope=AdoptionScope(AdoptionScopeKind.catalog_album, album_id),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    await db.commit()
+    request.app.state.library_adoption_runner.wake()
+    return RedirectResponse(f"/albums/{album_id}?scan=queued", status_code=303)
+
+
+@router.post("/scan/imported", include_in_schema=False)
+async def maintenance_scan_imported(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> RedirectResponse:
     form = await request.form()
-    artist_raw = str(form.get("artist_id", "")).strip()
-    artist_id = int(artist_raw) if artist_raw else None
-    background_tasks.add_task(_run_scan, request.app.state, settings, artist_id)
+    artist_name = str(form.get("artist_name", "")).strip()
+    album_title = str(form.get("album_title", "")).strip() or None
+    year = str(form.get("year", "")).strip() or None
+    scope = AdoptionScope(
+        AdoptionScopeKind.imported_release if album_title else AdoptionScopeKind.imported_artist,
+        artist_name=artist_name,
+        album_title=album_title,
+        year=year,
+    )
+    try:
+        await enqueue_library_adoption_scan(db, library_root=settings.library_root, scope=scope)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    await db.commit()
+    request.app.state.library_adoption_runner.wake()
+    return RedirectResponse("/maintenance?adoption=queued", status_code=303)
+
+
+@router.post("/adoption/candidates/{candidate_id}/ignore", include_in_schema=False)
+async def ignore_adoption_candidate(
+    candidate_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    candidate = await db.get(LibraryAdoptionCandidate, candidate_id)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Adoption candidate not found")
+    if candidate.state == AdoptionCandidateState.review:
+        candidate.state = AdoptionCandidateState.ignored
     return RedirectResponse("/maintenance", status_code=303)
 
 

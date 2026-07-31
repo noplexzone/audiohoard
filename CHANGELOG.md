@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-31
+
+### Added
+
+- Add persisted full-library, artist, and album/single/EP scanners that safely adopt existing music from embedded identity or canonical folder evidence, repair lost import-plan links, and retain ambiguous files for review.
+
+### Fixed
+
+- Show imported destinations under `/music` as the authoritative Library path while keeping staging/acquisition paths separately labeled as Original source provenance.
+
 ## [0.10.1] - 2026-07-31
 
 ### Fixed

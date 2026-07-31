@@ -622,8 +622,8 @@ class MutagenTagWriter:
         return all(readback.get(key) == value for key, value in tags.items())
 
     @no_type_check
-    def read_tags(self, path: Path) -> dict[str, str]:
-        suffix = path.suffix.casefold()
+    def read_tags(self, path: Path, *, suffix_hint: str | None = None) -> dict[str, str]:
+        suffix = (suffix_hint or path.suffix).casefold()
         comment_keys = (
             "title",
             "artist",

@@ -4,7 +4,19 @@ from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Index, String, Text, func
+from sqlalchemy import (
+    DDL,
+    BigInteger,
+    Boolean,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    event,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -107,6 +119,75 @@ class ImportPlan(Base):
     deletion_operations: Mapped[list[DeletionOperation]] = relationship(
         "DeletionOperation", back_populates="import_plan", cascade="all, delete-orphan"
     )
+
+
+_ADOPTION_CLAIM_INSERT_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_import_plans_adoption_claim_insert
+BEFORE INSERT ON import_plans
+WHEN (
+    (NEW.status IN ('ready', 'importing') AND NEW.file_state != 'removed')
+    OR (NEW.status = 'imported' AND NEW.file_state = 'present')
+ )
+ AND EXISTS (
+    SELECT 1 FROM import_plans AS existing
+    WHERE (
+        existing.destination_path = NEW.destination_path
+        OR (NEW.track_id IS NOT NULL AND existing.track_id = NEW.track_id)
+      )
+      AND (
+        (existing.status IN ('ready', 'importing') AND existing.file_state != 'removed')
+        OR (existing.status = 'imported' AND existing.file_state = 'present')
+      )
+      AND (
+        json_extract(NEW.planned_operations_json, '$.operation') = 'adopt_in_place'
+        OR json_extract(existing.planned_operations_json, '$.operation') = 'adopt_in_place'
+      )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'adopted library destination already claimed');
+END
+"""
+
+_ADOPTION_CLAIM_UPDATE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_import_plans_adoption_claim_update
+BEFORE UPDATE OF track_id, source_path, destination_path, planned_operations_json,
+    status, file_state
+ON import_plans
+WHEN (
+    (NEW.status IN ('ready', 'importing') AND NEW.file_state != 'removed')
+    OR (NEW.status = 'imported' AND NEW.file_state = 'present')
+ )
+ AND EXISTS (
+    SELECT 1 FROM import_plans AS existing
+    WHERE existing.id != OLD.id
+      AND (
+        existing.destination_path = NEW.destination_path
+        OR (NEW.track_id IS NOT NULL AND existing.track_id = NEW.track_id)
+      )
+      AND (
+        (existing.status IN ('ready', 'importing') AND existing.file_state != 'removed')
+        OR (existing.status = 'imported' AND existing.file_state = 'present')
+      )
+      AND (
+        json_extract(NEW.planned_operations_json, '$.operation') = 'adopt_in_place'
+        OR json_extract(existing.planned_operations_json, '$.operation') = 'adopt_in_place'
+      )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'adopted library destination already claimed');
+END
+"""
+
+event.listen(
+    ImportPlan.__table__,
+    "after_create",
+    DDL(_ADOPTION_CLAIM_INSERT_TRIGGER).execute_if(dialect="sqlite"),  # type: ignore[no-untyped-call]
+)
+event.listen(
+    ImportPlan.__table__,
+    "after_create",
+    DDL(_ADOPTION_CLAIM_UPDATE_TRIGGER).execute_if(dialect="sqlite"),  # type: ignore[no-untyped-call]
+)
 
 
 class DeletionOperation(Base):
