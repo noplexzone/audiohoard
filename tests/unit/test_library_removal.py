@@ -173,6 +173,38 @@ async def test_db_failure_restores_all_files_and_imported_truth(
     assert all(track.import_state == ImportWorkflowState.imported for track in tracks)
 
 
+async def test_indeterminate_commit_never_restores_staged_file(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "library"
+    _, tracks, plans, paths = await _seed_album(db_session, root, names=("indeterminate.mp3",))
+    original_commit = AsyncSession.commit
+    calls = 0
+
+    async def commit_then_lose_acknowledgement(self: AsyncSession) -> None:
+        nonlocal calls
+        calls += 1
+        await original_commit(self)
+        if calls == 2:
+            raise RuntimeError("injected lost commit acknowledgement")
+
+    async def fail_verification(*_args, **_kwargs) -> bool:
+        raise RuntimeError("injected journal verification failure")
+
+    monkeypatch.setattr(AsyncSession, "commit", commit_then_lose_acknowledgement)
+    monkeypatch.setattr(library_removal, "_operations_prepared", fail_verification)
+
+    with pytest.raises(LibraryRemovalError, match="recovery is required"):
+        await remove_imported_track(
+            db_session, tracks[0].id, library_root=root, cache_root=tmp_path / "c"
+        )
+
+    await db_session.refresh(plans[0])
+    assert plans[0].file_state == LibraryFileState.removed
+    assert not paths[0].exists()
+    assert len(list(paths[0].parent.glob("*.audiohoard-delete-*"))) == 1
+
+
 async def test_post_commit_failure_never_restores_removed_file(
     db_session: AsyncSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
