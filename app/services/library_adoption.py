@@ -310,7 +310,15 @@ def _match_album(
             if album.mbid and album.mbid.casefold() == observed_mbid.casefold()
         ]
         if len(matches) == 1:
-            return matches[0], ("album_mbid",)
+            album = matches[0]
+            supplied_artist = metadata.album_artist or metadata.artist
+            if (
+                (metadata.album and _norm(metadata.album) != _norm(album.title))
+                or (supplied_artist and _norm(supplied_artist) != _norm(album.artist.name))
+                or (metadata.year and album.year and metadata.year != album.year)
+            ):
+                return None, ("album_mbid_metadata_contradiction",)
+            return album, ("album_mbid",)
         if len(matches) > 1:
             return None, ("duplicate_album_mbid",)
         return None, ("album_mbid_contradiction",)
@@ -330,7 +338,15 @@ def _match_album(
             and not (folder_year and album.year and folder_year != album.year)
         ]
         if len(matches) == 1:
-            return matches[0], ("canonical_library_folders",)
+            album = matches[0]
+            supplied_artist = metadata.album_artist or metadata.artist
+            if metadata.album and _norm(metadata.album) != _norm(album.title):
+                return None, ("album_tag_folder_contradiction",)
+            if supplied_artist and _norm(supplied_artist) != _norm(album.artist.name):
+                return None, ("artist_tag_folder_contradiction",)
+            if metadata.year and album.year and metadata.year != album.year:
+                return None, ("year_tag_folder_contradiction",)
+            return album, ("canonical_library_folders",)
         if len(matches) > 1:
             return None, ("ambiguous_album_folder",)
         return None, ("insufficient_album_tags",)
@@ -372,11 +388,16 @@ def _match_catalog(
         ]
         if len(recording) == 1:
             track = recording[0]
-            if metadata.title and _norm(metadata.title) != _norm(track.title):
+            if (
+                (metadata.title and _norm(metadata.title) != _norm(track.title))
+                or (metadata.disc is not None and metadata.disc != track.disc)
+                or (metadata.track is not None and metadata.track != track.position)
+                or _duration_conflicts(metadata.duration_sec, track.duration_sec)
+            ):
                 return MatchDecision(
                     AdoptionCandidateState.review,
                     "contradictory",
-                    ("recording_title_contradiction",),
+                    ("recording_metadata_contradiction",),
                     album.artist_id,
                     album.id,
                 )

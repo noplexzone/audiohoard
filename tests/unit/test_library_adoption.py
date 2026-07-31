@@ -5,7 +5,7 @@ import hashlib
 from pathlib import Path
 
 import pytest
-from mutagen.id3 import ID3, TALB, TIT2, TPE1, TPE2, TPOS, TRCK, TXXX
+from mutagen.id3 import ID3, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK, TXXX
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
@@ -42,6 +42,7 @@ def _tagged_mp3(
     recording_mbid: str | None = "recording-1",
     album_mbid: str | None = "album-1",
     release_mbid: str | None = None,
+    year: str | None = None,
 ) -> bytes:
     path.parent.mkdir(parents=True, exist_ok=True)
     tags = ID3()
@@ -51,6 +52,8 @@ def _tagged_mp3(
     tags.add(TALB(encoding=3, text=album))
     tags.add(TRCK(encoding=3, text=track))
     tags.add(TPOS(encoding=3, text=disc))
+    if year:
+        tags.add(TDRC(encoding=3, text=year))
     if recording_mbid:
         tags.add(TXXX(encoding=3, desc="MusicBrainz Track Id", text=recording_mbid))
     if album_mbid:
@@ -119,6 +122,47 @@ async def test_exact_mbids_adopt_in_place_without_mutating_file(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("artist", "album", "year", "disc", "track_no"),
+    [
+        ("Wrong Artist", "Wrong Album", "1999", "1", "1"),
+        ("Artist", "Album", "2024", "9", "9"),
+    ],
+)
+async def test_exact_mbids_with_contradictory_metadata_require_review(
+    db_session,
+    tmp_path: Path,
+    artist: str,
+    album: str,
+    year: str,
+    disc: str,
+    track_no: str,
+) -> None:
+    library = tmp_path / "library"
+    _tagged_mp3(
+        library / "Artist" / "Album (2024)" / "01 - Song.mp3",
+        artist=artist,
+        album=album,
+        year=year,
+        disc=disc,
+        track=track_no,
+    )
+    _artist, catalog_album = await _catalog(db_session)
+    scan_id = await enqueue_library_adoption_scan(
+        db_session,
+        library_root=library,
+        scope=AdoptionScope(AdoptionScopeKind.catalog_album, catalog_album.id),
+    )
+    await db_session.commit()
+
+    scan = await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=library)
+
+    assert scan.adopted_count == 0
+    assert scan.review_count == 1
+    assert await db_session.scalar(select(func.count(ImportPlan.id))) == 0
+
+
+@pytest.mark.asyncio
 async def test_duplicate_files_for_one_track_persist_for_review_and_do_not_attach(
     db_session, tmp_path: Path
 ) -> None:
@@ -168,6 +212,37 @@ async def test_contradictory_album_mbid_persists_without_ownership(
         scan.unmatched_count,
         scan.error_count,
     )
+    assert await db_session.scalar(select(func.count(ImportPlan.id))) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("artist", "album"),
+    [("Wrong Artist", ""), ("", "Wrong Album")],
+)
+async def test_incomplete_contradictory_tags_do_not_override_canonical_folders(
+    db_session, tmp_path: Path, artist: str, album: str
+) -> None:
+    library = tmp_path / "library"
+    _tagged_mp3(
+        library / "Artist" / "Album (2024)" / "01 - Song.mp3",
+        artist=artist,
+        album=album,
+        album_mbid=None,
+        recording_mbid=None,
+    )
+    _artist, catalog_album = await _catalog(db_session)
+    scan_id = await enqueue_library_adoption_scan(
+        db_session,
+        library_root=library,
+        scope=AdoptionScope(AdoptionScopeKind.catalog_album, catalog_album.id),
+    )
+    await db_session.commit()
+
+    scan = await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=library)
+
+    assert scan.adopted_count == 0
+    assert scan.review_count == 1
     assert await db_session.scalar(select(func.count(ImportPlan.id))) == 0
 
 
