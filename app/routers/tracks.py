@@ -12,7 +12,9 @@ from sqlalchemy.orm import selectinload
 from app.auth import get_current_user, require_mutation
 from app.config import Settings
 from app.database import get_db
+from app.models.import_plan import LibraryFileState
 from app.models.track import Track
+from app.models.workflow import ImportWorkflowState
 from app.schemas.track import TrackRead
 from app.services.library_removal import LibraryRemovalError, remove_imported_track
 from app.services.media_streaming import (
@@ -137,7 +139,9 @@ async def get_track(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> Track:
     result = await db.execute(
-        select(Track).options(selectinload(Track.path_previews)).where(Track.id == track_id)
+        select(Track)
+        .options(selectinload(Track.path_previews), selectinload(Track.import_plans))
+        .where(Track.id == track_id)
     )
     track = result.scalar_one_or_none()
     if track is None:
@@ -153,9 +157,19 @@ async def track_detail_page(
 ) -> HTMLResponse:
     templates = _get_templates(request)
     result = await db.execute(
-        select(Track).options(selectinload(Track.path_previews)).where(Track.id == track_id)
+        select(Track)
+        .options(selectinload(Track.path_previews), selectinload(Track.import_plans))
+        .where(Track.id == track_id)
     )
     track = result.scalar_one_or_none()
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found")
-    return templates.TemplateResponse(request, "track.html", {"track": track})
+    playable = any(
+        plan.status == ImportWorkflowState.imported
+        and plan.file_state == LibraryFileState.present
+        and bool(plan.destination_path.strip())
+        for plan in track.import_plans
+    )
+    return templates.TemplateResponse(
+        request, "track.html", {"track": track, "playable": playable}
+    )

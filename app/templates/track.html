@@ -5,7 +5,8 @@
 <div class="page-header track-hero">
   <div class="cover-tile hero-cover" aria-hidden="true">{{ (track.album_artist or track.artist or 'T')[:1] | upper }}</div>
   <div><p class="eyebrow">Track details</p><h1>{{ track.title or "Unknown Track" }}</h1>
-  <p>Track #{{ track.id }} from job #{{ track.job_id }} via <strong>{{ track.source }}</strong></p></div>
+  <p>Track #{{ track.id }} from job #{{ track.job_id }} via <strong>{{ track.source }}</strong></p>
+  {% if playable %}<button type="button" class="btn" aria-label="Play {{ (track.title or 'Unknown Track') | e }}" data-play-url="/library/tracks/{{ track.id }}/audio" data-track-id="{{ track.id }}" data-track-title="{{ track.title or 'Unknown Track' | e }}" data-track-artist="{{ (track.album_artist or track.artist or 'Unknown artist') | e }}" data-track-artwork="">Play</button>{% else %}<button type="button" class="btn secondary" disabled aria-disabled="true">Audio unavailable</button>{% endif %}</div>
 </div>
 
 <div class="card-grid">

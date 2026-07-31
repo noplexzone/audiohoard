@@ -119,6 +119,7 @@
   <table aria-label="Track list">
     <thead>
       <tr>
+        <th scope="col"><span class="sr-only">Play</span></th>
         <th scope="col">File</th>
         <th scope="col">Title</th>
         <th scope="col">Artist</th>
@@ -132,9 +133,10 @@
         <th scope="col">Import</th>
       </tr>
     </thead>
-    <tbody>
+    <tbody data-play-queue>
       {% for track in tracks.items %}
       <tr>
+        <td><button type="button" class="player-row-play" aria-label="Play {{ track.title | e }}" data-play-url="/library/tracks/{{ track.id }}/audio" data-track-id="{{ track.id }}" data-track-title="{{ track.title | e }}" data-track-artist="{{ track.artist | e }}" data-track-artwork="{% if track.artwork_url %}/artwork?url={{ track.artwork_url | urlencode }}{% endif %}">▶</button></td>
         <td><code title="{{ track.file_path | e }}">{{ track.file_path.rsplit('/', 1)[-1] }}</code><div class="hint"><code>{{ track.file_path }}</code></div></td>
         <td><a href="/tracks/{{ track.id }}/ui">{{ track.title }}</a></td>
         <td>

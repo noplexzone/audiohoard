@@ -1,92 +1,55 @@
-(function () {
-  'use strict';
+'use strict';
 
-  var POLL_INTERVAL_MS = 10000;
+window.AudiohoardNavigation.registerPage('downloads', function (region) {
+  var controller = new AbortController();
+  var signal = controller.signal;
   var pollTimer = null;
+  var pollInterval = 10000; // POLL_INTERVAL_MS = 10000
 
-  function queueContainer() {
-    return document.getElementById('downloads-queue');
-  }
-
+  function queueContainer() { return region.querySelector('#downloads-queue'); }
   function hasActiveGroup(container) {
-    if (!container) return false;
-    return Array.from(container.querySelectorAll('.badge')).some(function (el) {
-      var text = el.textContent.trim();
-      return text === 'pending' || text === 'running';
+    return container && Array.from(container.querySelectorAll('.badge')).some(function (element) {
+      return ['pending', 'running'].includes(element.textContent.trim());
     });
   }
-
-  function captureDetailsState(container) {
+  function detailsState(container) {
     var state = Object.create(null);
     container.querySelectorAll('[data-download-group]').forEach(function (row) {
-      var key = row.getAttribute('data-download-group');
       var details = row.querySelector('details');
-      if (details) {
-        state[key] = details.open;
-      }
+      if (details) state[row.dataset.downloadGroup] = details.open;
     });
     return state;
   }
-
-  function restoreDetailsState(container, state) {
+  function restoreDetails(container, state) {
     container.querySelectorAll('[data-download-group]').forEach(function (row) {
-      var key = row.getAttribute('data-download-group');
-      if (Object.prototype.hasOwnProperty.call(state, key)) {
-        var details = row.querySelector('details');
-        if (details) {
-          details.open = state[key];
-        }
+      var details = row.querySelector('details');
+      if (details && Object.prototype.hasOwnProperty.call(state, row.dataset.downloadGroup)) {
+        details.open = state[row.dataset.downloadGroup];
       }
     });
   }
-
-  function buildQueueUrl() {
+  function poll() {
+    var container = queueContainer();
+    if (document.hidden || !container) return;
     var params = new URLSearchParams(window.location.search);
     var statusParam = params.get('status');
-    return '/downloads/queue' + (statusParam ? '?status=' + encodeURIComponent(statusParam) : '');
+    var url = '/downloads/queue' + (statusParam ? '?status=' + encodeURIComponent(statusParam) : '');
+    window.fetch(url, { credentials: 'same-origin', signal: signal }).then(function (response) {
+      return response.ok ? response.text() : null;
+    }).then(function (html) {
+      var current = queueContainer();
+      if (html === null || !current) return;
+      var saved = detailsState(current);
+      current.innerHTML = html;
+      restoreDetails(current, saved);
+      if (!hasActiveGroup(current) && pollTimer) { window.clearInterval(pollTimer); pollTimer = null; }
+    }).catch(function (error) { if (error.name !== 'AbortError') return; });
   }
 
-  function poll() {
-    if (document.hidden) return;
-    var container = queueContainer();
-    if (!container) return;
-
-    fetch(buildQueueUrl(), { credentials: 'same-origin' })
-      .then(function (resp) {
-        if (!resp.ok) return null;
-        return resp.text();
-      })
-      .then(function (html) {
-        if (html === null) return;
-        var container = queueContainer();
-        if (!container) return;
-        var saved = captureDetailsState(container);
-        var scrollY = window.scrollY;
-        container.innerHTML = html;
-        restoreDetailsState(container, saved);
-        window.scrollTo(0, scrollY);
-        if (!hasActiveGroup(container)) {
-          clearInterval(pollTimer);
-          pollTimer = null;
-        }
-      })
-      .catch(function () {
-        // network error — keep polling
-      });
-  }
-
-
-  document.addEventListener('submit', function (event) {
+  region.addEventListener('submit', function (event) {
     var form = event.target.closest('form[data-confirm]');
-    if (form && !window.confirm(form.getAttribute('data-confirm'))) {
-      event.preventDefault();
-    }
-  });
-
-  document.addEventListener('DOMContentLoaded', function () {
-    var container = queueContainer();
-    if (hasActiveGroup(container)) {
-      pollTimer = setInterval(poll, POLL_INTERVAL_MS);
-    }
-  });
-})();
+    if (form && !window.confirm(form.dataset.confirm)) event.preventDefault();
+  }, { signal: signal });
+  if (hasActiveGroup(queueContainer())) pollTimer = window.setInterval(poll, pollInterval);
+  return function () { controller.abort(); if (pollTimer) window.clearInterval(pollTimer); };
+});

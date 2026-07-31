@@ -407,9 +407,9 @@ async def test_wanted_queue_all_enqueues_every_listed_release(
     ids = await _seed_wanted_view_releases()
     page = await client.get("/wanted")
     assert page.status_code == 200
-    assert f'value="{ids["partial"]}"' in page.text
-    assert f'value="{ids["second_partial"]}"' in page.text
-    assert f'value="{ids["complete"]}"' not in page.text
+    assert f'name="catalog_album_ids" value="{ids["partial"]}"' in page.text
+    assert f'name="catalog_album_ids" value="{ids["second_partial"]}"' in page.text
+    assert f'name="catalog_album_ids" value="{ids["complete"]}"' not in page.text
     dispatched: list[int] = []
 
     async def fake_dispatch(job_id: int) -> None:

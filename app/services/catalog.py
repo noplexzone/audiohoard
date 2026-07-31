@@ -201,6 +201,7 @@ class ReleaseProgress:
     wanted_track_count: int
     downloaded_track_count: int
     downloaded_catalog_track_ids: frozenset[int] = frozenset()
+    library_track_ids: tuple[tuple[int, int], ...] = ()
     manifest_known: bool = False
 
     @property
@@ -217,6 +218,9 @@ class ReleaseProgress:
             if catalog_track_id in self.downloaded_catalog_track_ids
             else LibraryFileState.missing
         )
+
+    def library_track_id(self, catalog_track_id: int) -> int | None:
+        return dict(self.library_track_ids).get(catalog_track_id)
 
 
 @dataclass
@@ -532,9 +536,9 @@ async def get_release_progress(
     for album_id, track_id, disc, position in manifest_rows:
         manifest_tracks.setdefault(int(album_id), {})[(int(disc), int(position))] = int(track_id)
     manifest_counts = {album_id: len(tracks) for album_id, tracks in manifest_tracks.items()}
-    imported_by_album: dict[int, set[int]] = {}
+    imported_by_album: dict[int, dict[int, int]] = {}
     imported_rows = await db.execute(
-        select(Track.catalog_album_id, Track.catalog_track_id)
+        select(Track.catalog_album_id, Track.catalog_track_id, Track.id)
         .join(CatalogAlbumTrack, CatalogAlbumTrack.id == Track.catalog_track_id)
         .where(
             Track.catalog_album_id.in_(ids),
@@ -543,19 +547,23 @@ async def get_release_progress(
         )
         .distinct()
     )
-    for album_id, catalog_track_id in imported_rows:
+    for album_id, catalog_track_id, library_track_id in imported_rows:
         if album_id is not None and catalog_track_id is not None:
-            imported_by_album.setdefault(int(album_id), set()).add(int(catalog_track_id))
+            album_tracks = imported_by_album.setdefault(int(album_id), {})
+            catalog_id = int(catalog_track_id)
+            album_tracks[catalog_id] = max(album_tracks.get(catalog_id, 0), int(library_track_id))
 
     progress: dict[int, ReleaseProgress] = {}
     for (album_id,) in album_rows:
         release_id = int(album_id)
         manifest_count = manifest_counts.get(release_id, 0)
-        downloaded_ids = frozenset(imported_by_album.get(release_id, set()))
+        library_track_ids = tuple(sorted(imported_by_album.get(release_id, {}).items()))
+        downloaded_ids = frozenset(catalog_id for catalog_id, _track_id in library_track_ids)
         progress[release_id] = ReleaseProgress(
             wanted_track_count=manifest_count,
             downloaded_track_count=min(len(downloaded_ids), manifest_count),
             downloaded_catalog_track_ids=downloaded_ids,
+            library_track_ids=library_track_ids,
             manifest_known=manifest_count > 0,
         )
     return progress

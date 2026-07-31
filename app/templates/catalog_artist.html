@@ -4,7 +4,7 @@
 {% set csrf_token = request.cookies.get('csrf', '') | e %}
 {% set total_releases = counts_by_type.albums + counts_by_type.singles_eps + counts_by_type.compilations %}
 {% set provenance = artist.provenance_json | from_json if artist.provenance_json else {} %}
-<script defer src="/static/js/artist-watchlist.js?v={{ app_version }}"></script>
+<script defer src="/static/js/artist-watchlist.js?v={{ app_version }}" data-page-module="artist-watchlist"></script>
 <nav class="breadcrumb"><a href="/library">Library</a> / {{ artist.name }}</nav>
 <section class="artist-view-hero card">
   <div class="artist-view-art" aria-hidden="true">

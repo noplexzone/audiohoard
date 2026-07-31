@@ -14,6 +14,8 @@
   <link rel="icon" type="image/png" sizes="16x16" href="/static/branding/favicon-16.png">
   <link rel="apple-touch-icon" href="/static/branding/apple-touch-icon.png">
   <link rel="manifest" href="/static/branding/site.webmanifest">
+  <script src="/static/js/player.js?v={{ app_version }}" defer></script>
+  <script src="/static/js/navigation.js?v={{ app_version }}" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to main content</a>
@@ -29,15 +31,14 @@
 </svg>
 {% set path = request.url.path %}
 {% set auth_view = path in ['/login', '/setup'] %}
-<div class="app-shell{% if auth_view %} auth-shell{% endif %}">
+<div class="app-shell{% if auth_view %} auth-shell{% endif %}"{% if not auth_view %} data-progressive-shell{% endif %}>
   {% if not auth_view %}
   <aside class="sidebar">
     <a class="brand" href="/" aria-label="Audiohoard home"><span class="brand-mark"><img src="/static/branding/icon-32.png" alt="" width="32" height="32"></span><span>Audiohoard</span></a>
     <nav class="primary-nav" aria-label="Primary navigation">
-      {% set path = request.url.path %}
       <a href="/" {% if path == "/" %}class="active" aria-current="page"{% endif %}><svg><use href="#i-home"/></svg><span>Dashboard</span></a>
       <a href="/search" {% if path.startswith("/search") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-search"/></svg><span>Search</span></a>
-      <a href="/library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
+      <a href="/library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") or path.startswith("/albums") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
       <a href="/wanted" {% if path.startswith("/wanted") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Wanted</span></a>
       <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span>{% if request.state.pending_review_count | default(0) > 0 %}<span class="nav-badge">{{ request.state.pending_review_count }}</span>{% endif %}</a>
     </nav>
@@ -62,15 +63,40 @@
     </div>
   </header>
   {% endif %}
-  <main id="main-content" tabindex="-1">
+  <main id="main-content" tabindex="-1" data-page-region>
     {% if flash_message %}<div class="alert {{ flash_type | default('info') }}" role="status">{{ flash_message }}</div>{% endif %}
     {% block content %}{% endblock %}
   </main>
   {% if not auth_view %}
+  <section class="global-player" id="global-player" aria-label="Audio player" data-player-state="idle">
+    <div class="player-art" data-player-art aria-hidden="true"><span>♪</span></div>
+    <div class="player-track-copy">
+      <strong data-player-title>Nothing playing</strong>
+      <span data-player-artist>Choose a track from your library</span>
+    </div>
+    <div class="player-transport">
+      <button type="button" class="player-icon" data-player-previous aria-label="Previous track" disabled>⏮</button>
+      <button type="button" class="player-icon player-toggle" data-player-toggle aria-label="Play" disabled>▶</button>
+      <button type="button" class="player-icon" data-player-next aria-label="Next track" disabled>⏭</button>
+    </div>
+    <div class="player-timeline">
+      <span data-player-current-time>0:00</span>
+      <label class="sr-only" for="player-seek">Playback position</label>
+      <input id="player-seek" data-player-seek type="range" min="0" max="1000" value="0" disabled>
+      <span data-player-duration>0:00</span>
+    </div>
+    <div class="player-volume">
+      <button type="button" class="player-icon" data-player-mute aria-label="Mute">🔊</button>
+      <label class="sr-only" for="player-volume">Volume</label>
+      <input id="player-volume" data-player-volume type="range" min="0" max="1" step="0.05" value="1">
+    </div>
+    <p class="sr-only" data-player-status aria-live="polite">Player ready</p>
+  </section>
+  <audio id="global-audio" preload="metadata"></audio>
   <nav class="mobile-nav" aria-label="Mobile navigation">
     <a href="/" {% if path == "/" %}class="active" aria-current="page"{% endif %}><svg><use href="#i-home"/></svg><span>Home</span></a>
     <a href="/search" {% if path.startswith("/search") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-search"/></svg><span>Search</span></a>
-    <a href="/library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
+    <a href="/library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") or path.startswith("/albums") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
     <a href="/wanted" {% if path.startswith("/wanted") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Wanted</span></a>
     <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span>{% if request.state.pending_review_count | default(0) > 0 %}<span class="nav-badge">{{ request.state.pending_review_count }}</span>{% endif %}</a>
   </nav>

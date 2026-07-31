@@ -36,6 +36,7 @@
   <table aria-label="{{ album.album }} track list">
     <thead>
       <tr>
+        <th scope="col"><span class="sr-only">Play</span></th>
         <th scope="col">#</th>
         <th scope="col">Title</th>
         <th scope="col">Format</th>
@@ -44,9 +45,10 @@
         <th scope="col">Status</th>
       </tr>
     </thead>
-    <tbody>
+    <tbody data-play-queue>
       {% for track in album.tracks %}
       <tr>
+        <td><button type="button" class="player-row-play" aria-label="Play {{ track.title | e }}" data-play-url="/library/tracks/{{ track.id }}/audio" data-track-id="{{ track.id }}" data-track-title="{{ track.title | e }}" data-track-artist="{{ track.artist | e }}" data-track-artwork="{% if track.artwork_url %}/artwork?url={{ track.artwork_url | urlencode }}{% endif %}">▶</button></td>
         <td class="track-no">
           {% if track.disc %}D{{ track.disc }}-{% endif %}{{ track.track_no or "?" }}
         </td>
