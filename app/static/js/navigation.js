@@ -225,6 +225,44 @@
     return url;
   }
 
+
+  function setSubmitButton(button, text, disabled) {
+    if (!button) return;
+    button.disabled = disabled;
+    button.textContent = text;
+  }
+
+  function primarySubmitButton(form, event) {
+    if (event && event.submitter && event.submitter.matches('button[type="submit"], input[type="submit"]')) {
+      return event.submitter;
+    }
+    return form.querySelector('button[type="submit"], input[type="submit"]');
+  }
+
+  document.addEventListener('submit', async function (event) {
+    if (event.defaultPrevented) return;
+    var form = event.target.closest('form[data-download-form]');
+    if (!form) return;
+    event.preventDefault();
+    var button = primarySubmitButton(form, event);
+    var original = button ? button.textContent : '';
+    setSubmitButton(button, 'Queueing…', true);
+    try {
+      var response = await window.fetch(form.action, {
+        method: 'POST', body: new FormData(form), credentials: 'same-origin',
+        headers: { 'Accept': 'application/json', 'X-Requested-With': 'fetch' },
+      });
+      if (!response.ok) throw new Error('Download request failed');
+      var data = await response.json();
+      setSubmitButton(button, data.queued > 0 ? 'Queued' : 'Nothing to queue', true);
+      window.setTimeout(function () {
+        if (button && button.isConnected) setSubmitButton(button, original, false);
+      }, 1600);
+    } catch (error) {
+      setSubmitButton(button, 'Try again', false);
+    }
+  });
+
   document.addEventListener('click', function (event) {
     if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey ||
         event.shiftKey || event.altKey) return;
