@@ -53,6 +53,8 @@ from app.services.catalog_metadata import reconcile_duplicate_catalog_artists
 from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
 from app.services.dashboard import get_dashboard_data
 from app.services.health_status import get_health_status_service
+from app.services.library_reconciliation import LibraryReconciliationService
+from app.services.library_removal import recover_deletion_operations
 from app.services.maintenance_scheduler import MaintenanceScheduler
 from app.services.maintenance_state import empty_maintenance_state
 from app.services.monitoring import MonitoringScheduler, QualityUpgradeCycleScheduler
@@ -103,6 +105,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     async with get_session_factory()() as db:
         runtime = await get_runtime_settings(db)
         await job_dispatcher.set_max_concurrent_jobs(runtime.max_parallel_acquisitions)
+        effective_settings = await build_effective_settings(db, get_settings())
+    await recover_deletion_operations(
+        get_session_factory(),
+        library_root=effective_settings.library_root,
+        cache_root=effective_settings.artwork_cache_root.parent / "library-audio",
+    )
+    library_reconciliation = LibraryReconciliationService(
+        get_session_factory(), effective_settings.library_root
+    )
+    app.state.library_reconciliation_service = library_reconciliation
+    await library_reconciliation.startup_reconcile()
+    async with get_session_factory()() as db:
         pending_cleanups = await pending_imported_source_cleanups(db)
         pruned = await prune_orphaned_terminal_records(db)
         if pruned.tracks or pruned.releases or pruned.jobs:
@@ -117,7 +131,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await db.commit()
         if n:
             logger.info("Reconciled %d duplicate catalog artist(s) at startup", n)
-        effective_settings = await build_effective_settings(db, get_settings())
         repaired = await recover_approved_downloads(db, effective_settings)
         await db.commit()
         if repaired:
@@ -141,9 +154,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await maintenance_scheduler.start()
     await quality_upgrade_scheduler.start()
     await health_status.start()
+    await library_reconciliation.start()
     try:
         yield
     finally:
+        await library_reconciliation.stop()
         if not ownership_task.done():
             ownership_task.cancel()
         with suppress(asyncio.CancelledError):

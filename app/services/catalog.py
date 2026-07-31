@@ -8,14 +8,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from sqlalchemy import and_, case, exists, func, literal, or_, select
+from sqlalchemy import String, and_, case, cast, exists, func, literal, or_, select
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import run_with_sqlite_lock_retry
 from app.media_formats import IMPORTABLE_AUDIO_SUFFIXES
-from app.metadata.content_rating import CONTENT_RATING_UNKNOWN, normalize_content_rating
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -23,7 +22,7 @@ from app.models.catalog_entities import (
     CatalogArtist,
     CatalogArtistIdentity,
 )
-from app.models.import_plan import ImportPlan
+from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
 from app.models.track import Track
 from app.models.workflow import AcquisitionState, ImportWorkflowState
@@ -144,6 +143,7 @@ class TrackRow:
     acoustid: str | None
     release_id: int | None
     artwork_url: str | None = None
+    library_file_state: str = LibraryFileState.unknown
 
 
 @dataclass
@@ -178,6 +178,10 @@ class LibraryArtistRow:
     downloaded_file_count: int
     wanted_release_count: int
     watchlisted: bool
+    complete_release_count: int = 0
+    partial_release_count: int = 0
+    unknown_release_count: int = 0
+    local_release_count: int = 0
 
 
 @dataclass
@@ -189,6 +193,16 @@ class MissingReleaseRow:
     artwork_url: str | None
     wanted_track_count: int
     downloaded_track_count: int
+    manifest_known: bool = False
+
+
+@dataclass(frozen=True)
+class ReleaseLibraryFile:
+    catalog_track_id: int
+    track_id: int
+    file_format: str
+    file_size_bytes: int | None
+    source: str
 
 
 @dataclass(frozen=True)
@@ -196,11 +210,32 @@ class ReleaseProgress:
     wanted_track_count: int
     downloaded_track_count: int
     downloaded_catalog_track_ids: frozenset[int] = frozenset()
+    library_track_ids: tuple[tuple[int, int], ...] = ()
+    library_files: tuple[ReleaseLibraryFile, ...] = ()
+    manifest_known: bool = False
 
     @property
     def complete(self) -> bool:
-        return self.wanted_track_count > 0 and (
-            self.downloaded_track_count >= self.wanted_track_count
+        return (
+            self.manifest_known
+            and self.wanted_track_count > 0
+            and (self.downloaded_track_count >= self.wanted_track_count)
+        )
+
+    def track_state(self, catalog_track_id: int) -> str:
+        return (
+            LibraryFileState.present
+            if catalog_track_id in self.downloaded_catalog_track_ids
+            else LibraryFileState.missing
+        )
+
+    def library_track_id(self, catalog_track_id: int) -> int | None:
+        return dict(self.library_track_ids).get(catalog_track_id)
+
+    def library_file(self, catalog_track_id: int) -> ReleaseLibraryFile | None:
+        return next(
+            (item for item in self.library_files if item.catalog_track_id == catalog_track_id),
+            None,
         )
 
 
@@ -270,7 +305,9 @@ def _track_file_path(t: Track) -> str:
         imported_destinations = [
             plan.destination_path.strip()
             for plan in t.import_plans
-            if plan.status == ImportWorkflowState.imported and plan.destination_path.strip()
+            if plan.status == ImportWorkflowState.imported
+            and plan.file_state == LibraryFileState.present
+            and plan.destination_path.strip()
         ]
         if imported_destinations:
             return imported_destinations[-1]
@@ -278,6 +315,13 @@ def _track_file_path(t: Track) -> str:
 
 
 def to_track_row(t: Track) -> TrackRow:
+    file_state = LibraryFileState.unknown
+    if "import_plans" not in sa_inspect(t).unloaded:
+        imported_plans = [
+            plan for plan in t.import_plans if plan.status == ImportWorkflowState.imported
+        ]
+        if imported_plans:
+            file_state = imported_plans[-1].file_state
     return TrackRow(
         id=t.id,
         title=_normalize_title(t),
@@ -301,6 +345,7 @@ def to_track_row(t: Track) -> TrackRow:
         acoustid=t.acoustid,
         release_id=t.release_id,
         artwork_url=t.catalog_album.artwork_url if t.catalog_album else None,
+        library_file_state=file_state,
     )
 
 
@@ -338,6 +383,21 @@ def _library_artifact_filter() -> Any:
         Track.file_size_bytes > 0,
         imported_destination,
     )
+
+
+def _present_import_plan_exists() -> Any:
+    return exists(
+        select(ImportPlan.id).where(
+            ImportPlan.track_id == Track.id,
+            ImportPlan.status == ImportWorkflowState.imported,
+            ImportPlan.file_state == LibraryFileState.present,
+            _non_empty(ImportPlan.destination_path),
+        )
+    )
+
+
+def _present_library_artifact_filter() -> Any:
+    return and_(_library_artifact_filter(), _present_import_plan_exists())
 
 
 @dataclass(frozen=True, slots=True)
@@ -466,53 +526,20 @@ async def get_release_progress(
     *,
     library_root: Path | None = None,
 ) -> dict[int, ReleaseProgress]:
-    """Project catalog release ownership from wanted tracks and committed imports.
+    """Project ownership from hydrated manifests and confirmed-present imports.
 
-    ``CatalogAlbum.track_count`` remains the truthful denominator when a provider has
-    reported a count but the track manifest has not been hydrated yet. Imported counts
-    are distinct catalog tracks so repeated acquisition attempts cannot inflate progress.
+    Provider track-count metadata is not a manifest: a release without persisted
+    ``CatalogAlbumTrack`` rows has an unknown denominator and can never be reported
+    complete. Repeated acquisition attempts collapse to distinct catalog tracks.
+    ``library_root`` remains accepted for caller compatibility, but page-time filesystem
+    discovery is intentionally not used as ownership evidence.
     """
     ids = sorted(set(album_ids))
     if not ids:
         return {}
 
-    album_rows = (
-        await db.execute(
-            select(
-                CatalogAlbum.id,
-                CatalogAlbum.track_count,
-                CatalogAlbum.title,
-                CatalogAlbum.year,
-                CatalogArtist.name,
-                CatalogAlbum.artist_id,
-                CatalogAlbum.release_type,
-                CatalogAlbum.content_rating,
-            )
-            .join(CatalogArtist, CatalogArtist.id == CatalogAlbum.artist_id)
-            .where(CatalogAlbum.id.in_(ids))
-        )
-    ).all()
-    album_data = [(int(row[0]), row[1], row[2], row[3], row[4]) for row in album_rows]
-    album_identity = {
-        int(row[0]): (
-            int(row[5]),
-            _catalog_progress_title_key(str(row[2])),
-            row[3],
-            row[6],
-            normalize_content_rating(row[7]),
-        )
-        for row in album_rows
-    }
-    sibling_keys: dict[tuple[int, str, str | None, str | None], set[str]] = {}
-    for artist_id, title_key, year, release_type, rating in album_identity.values():
-        if rating == CONTENT_RATING_UNKNOWN:
-            continue
-        sibling_keys.setdefault((artist_id, title_key, year, release_type), set()).add(rating)
-    filesystem_ambiguous_album_ids = {
-        album_id
-        for album_id, (artist_id, title_key, year, release_type, _rating) in album_identity.items()
-        if len(sibling_keys.get((artist_id, title_key, year, release_type), set())) > 1
-    }
+    del library_root
+    album_rows = (await db.execute(select(CatalogAlbum.id).where(CatalogAlbum.id.in_(ids)))).all()
     manifest_tracks: dict[int, dict[tuple[int, int], int]] = {}
     manifest_rows = await db.execute(
         select(
@@ -525,57 +552,78 @@ async def get_release_progress(
     for album_id, track_id, disc, position in manifest_rows:
         manifest_tracks.setdefault(int(album_id), {})[(int(disc), int(position))] = int(track_id)
     manifest_counts = {album_id: len(tracks) for album_id, tracks in manifest_tracks.items()}
-    filesystem_evidence = (
-        await asyncio.to_thread(_filesystem_release_evidence, library_root, album_data)
-        if library_root is not None
-        else {}
-    )
-    imported_by_album: dict[int, set[int]] = {}
+    local_file_counts = {
+        int(album_id): int(file_count)
+        for album_id, file_count in (
+            await db.execute(
+                select(Track.catalog_album_id, func.count(func.distinct(Track.id)))
+                .where(Track.catalog_album_id.in_(ids), _present_library_artifact_filter())
+                .group_by(Track.catalog_album_id)
+            )
+        ).all()
+        if album_id is not None
+    }
+    imported_by_album: dict[int, dict[int, ReleaseLibraryFile]] = {}
     imported_rows = await db.execute(
-        select(Track.catalog_album_id, Track.catalog_track_id)
+        select(
+            Track.catalog_album_id,
+            Track.catalog_track_id,
+            Track.id,
+            Track.file_format,
+            Track.file_size_bytes,
+            Track.source,
+        )
         .join(CatalogAlbumTrack, CatalogAlbumTrack.id == Track.catalog_track_id)
         .where(
             Track.catalog_album_id.in_(ids),
             CatalogAlbumTrack.album_id == Track.catalog_album_id,
-            _library_artifact_filter(),
+            _present_library_artifact_filter(),
         )
         .distinct()
     )
-    for album_id, catalog_track_id in imported_rows:
+    for (
+        album_id,
+        catalog_track_id,
+        library_track_id,
+        file_format,
+        file_size,
+        source,
+    ) in imported_rows:
         if album_id is not None and catalog_track_id is not None:
-            imported_by_album.setdefault(int(album_id), set()).add(int(catalog_track_id))
+            album_tracks = imported_by_album.setdefault(int(album_id), {})
+            catalog_id = int(catalog_track_id)
+            candidate = ReleaseLibraryFile(
+                catalog_track_id=catalog_id,
+                track_id=int(library_track_id),
+                file_format=str(file_format or ""),
+                file_size_bytes=int(file_size) if file_size is not None else None,
+                source=str(source),
+            )
+            current = album_tracks.get(catalog_id)
+            if current is None or candidate.track_id > current.track_id:
+                album_tracks[catalog_id] = candidate
 
     progress: dict[int, ReleaseProgress] = {}
-    for album_id, known_track_count, _title, _year, _artist_name in album_data:
+    for (album_id,) in album_rows:
         release_id = int(album_id)
         manifest_count = manifest_counts.get(release_id, 0)
-        wanted = manifest_count if manifest_count > 0 else int(known_track_count or 0)
-        downloaded_id_set = set(imported_by_album.get(release_id, set()))
-        release_evidence = (
-            None
-            if release_id in filesystem_ambiguous_album_ids
-            else filesystem_evidence.get(release_id)
-        )
-        release_manifest = manifest_tracks.get(release_id, {})
-        if release_evidence is not None:
-            downloaded_id_set.update(
-                release_manifest[track_key]
-                for track_key in release_evidence.track_keys
-                if track_key in release_manifest
-            )
-        downloaded_ids = frozenset(downloaded_id_set)
-        downloaded = (
-            len(downloaded_ids)
-            if release_manifest
-            else max(
-                len(downloaded_ids),
-                release_evidence.file_count if release_evidence is not None else 0,
+        library_files = tuple(
+            sorted(
+                imported_by_album.get(release_id, {}).values(),
+                key=lambda item: item.catalog_track_id,
             )
         )
+        library_track_ids = tuple((item.catalog_track_id, item.track_id) for item in library_files)
+        downloaded_ids = frozenset(catalog_id for catalog_id, _track_id in library_track_ids)
         progress[release_id] = ReleaseProgress(
-            wanted_track_count=wanted,
-            downloaded_track_count=min(downloaded, wanted),
+            wanted_track_count=manifest_count,
+            downloaded_track_count=(
+                len(downloaded_ids) if manifest_count else local_file_counts.get(release_id, 0)
+            ),
             downloaded_catalog_track_ids=downloaded_ids,
+            library_track_ids=library_track_ids,
+            library_files=library_files,
+            manifest_known=manifest_count > 0,
         )
     return progress
 
@@ -848,9 +896,9 @@ async def get_library_artists_page(
         and_(Track.catalog_album_id.is_(None), track_artist == catalog_artist),
     )
     downloaded_count = (
-        select(func.count(Track.id))
+        select(func.count(func.distinct(Track.id)))
         .outerjoin(CatalogAlbum, CatalogAlbum.id == Track.catalog_album_id)
-        .where(belongs_to_catalog_artist, _library_artifact_filter())
+        .where(belongs_to_catalog_artist, _present_library_artifact_filter())
         .correlate(CatalogArtist)
         .scalar_subquery()
     )
@@ -872,25 +920,82 @@ async def get_library_artists_page(
         .scalar_subquery()
     )
     canonical_identity_id = func.coalesce(watchlist_identity_id, primary_identity_id)
-    wanted_count = (
+    provider_only_count = (
         select(func.count(CatalogAlbumProvider.id))
-        .outerjoin(CatalogAlbum, CatalogAlbum.id == CatalogAlbumProvider.catalog_album_id)
         .where(
             CatalogAlbumProvider.artist_identity_id == canonical_identity_id,
-            or_(
-                CatalogAlbumProvider.catalog_album_id.is_(None),
-                CatalogAlbum.in_library.is_(False),
-            ),
+            CatalogAlbumProvider.catalog_album_id.is_(None),
         )
         .correlate(CatalogArtist)
         .scalar_subquery()
     )
-    release_count = (
-        select(func.count(CatalogAlbumProvider.id))
-        .where(CatalogAlbumProvider.artist_identity_id == canonical_identity_id)
-        .correlate(CatalogArtist)
-        .scalar_subquery()
+    manifest_counts = (
+        select(
+            CatalogAlbumTrack.album_id.label("album_id"),
+            func.count(CatalogAlbumTrack.id).label("manifest_count"),
+        )
+        .group_by(CatalogAlbumTrack.album_id)
+        .subquery()
     )
+    present_catalog_tracks = (
+        select(
+            Track.catalog_album_id.label("album_id"),
+            func.count(func.distinct(Track.catalog_track_id)).label("present_count"),
+        )
+        .join(
+            CatalogAlbumTrack,
+            and_(
+                CatalogAlbumTrack.id == Track.catalog_track_id,
+                CatalogAlbumTrack.album_id == Track.catalog_album_id,
+            ),
+        )
+        .where(Track.catalog_album_id.is_not(None), _present_library_artifact_filter())
+        .group_by(Track.catalog_album_id)
+        .subquery()
+    )
+    manifest_count = func.coalesce(manifest_counts.c.manifest_count, 0)
+    present_count = func.coalesce(present_catalog_tracks.c.present_count, 0)
+    album_projection = (
+        select(
+            CatalogAlbum.artist_id.label("artist_id"),
+            func.count(CatalogAlbum.id).label("total_count"),
+            func.sum(
+                case(
+                    (
+                        and_(manifest_count > 0, present_count >= manifest_count),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("complete_count"),
+            func.sum(
+                case(
+                    (
+                        and_(
+                            manifest_count > 0,
+                            present_count > 0,
+                            present_count < manifest_count,
+                        ),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("partial_count"),
+            func.sum(case((manifest_count == 0, 1), else_=0)).label("unknown_count"),
+            func.sum(case((present_count > 0, 1), else_=0)).label("local_count"),
+        )
+        .outerjoin(manifest_counts, manifest_counts.c.album_id == CatalogAlbum.id)
+        .outerjoin(present_catalog_tracks, present_catalog_tracks.c.album_id == CatalogAlbum.id)
+        .group_by(CatalogAlbum.artist_id)
+        .subquery()
+    )
+    canonical_total = func.coalesce(album_projection.c.total_count, 0)
+    complete_count = func.coalesce(album_projection.c.complete_count, 0)
+    partial_count = func.coalesce(album_projection.c.partial_count, 0)
+    unknown_count = func.coalesce(album_projection.c.unknown_count, 0) + provider_only_count
+    local_count = func.coalesce(album_projection.c.local_count, 0)
+    release_count = canonical_total + provider_only_count
+    wanted_count = release_count - complete_count
     has_imported_file = exists(
         select(Track.id)
         .outerjoin(CatalogAlbum, CatalogAlbum.id == Track.catalog_album_id)
@@ -899,38 +1004,60 @@ async def get_library_artists_page(
     catalog_filters: list[Any] = [or_(CatalogArtist.monitored.is_(True), has_imported_file)]
     if q:
         catalog_filters.append(CatalogArtist.name.ilike(f"%{q}%"))
-    catalog_rows = select(
-        CatalogArtist.id.label("catalog_id"),
-        CatalogArtist.name.label("name"),
-        CatalogArtist.artwork_url.label("artwork_url"),
-        CatalogArtist.monitored.label("monitored"),
-        release_count.label("release_count"),
-        downloaded_count.label("downloaded_file_count"),
-        wanted_count.label("wanted_release_count"),
-    ).where(*catalog_filters)
+    catalog_rows = (
+        select(
+            CatalogArtist.id.label("catalog_id"),
+            CatalogArtist.name.label("name"),
+            CatalogArtist.artwork_url.label("artwork_url"),
+            CatalogArtist.monitored.label("monitored"),
+            release_count.label("release_count"),
+            downloaded_count.label("downloaded_file_count"),
+            wanted_count.label("wanted_release_count"),
+            complete_count.label("complete_release_count"),
+            partial_count.label("partial_release_count"),
+            unknown_count.label("unknown_release_count"),
+            local_count.label("local_release_count"),
+        )
+        .outerjoin(album_projection, album_projection.c.artist_id == CatalogArtist.id)
+        .where(*catalog_filters)
+    )
 
     matching_catalog_artist = exists(
         select(CatalogArtist.id).where(catalog_artist == track_artist).correlate(Track)
     )
     legacy_filters: list[Any] = [
         Track.catalog_album_id.is_(None),
-        _library_artifact_filter(),
+        _present_library_artifact_filter(),
         ~matching_catalog_artist,
     ]
     if q:
         legacy_filters.append(_artist_expr().ilike(f"%{q}%"))
-    legacy_rows = (
+    legacy_release_key = case(
+        (Track.release_id.is_not(None), literal("release:") + cast(Track.release_id, String)),
+        else_=literal("album:") + _album_expr() + literal(":") + _year_expr(),
+    )
+    legacy_projection = (
         select(
-            literal(None).label("catalog_id"),
             _artist_expr().label("name"),
-            literal(None).label("artwork_url"),
-            literal(False).label("monitored"),
-            literal(0).label("release_count"),
-            func.count(Track.id).label("downloaded_file_count"),
-            literal(0).label("wanted_release_count"),
+            func.count(func.distinct(Track.id)).label("downloaded_file_count"),
+            func.count(func.distinct(legacy_release_key)).label("local_release_count"),
         )
         .where(*legacy_filters)
         .group_by(_artist_expr())
+        .subquery()
+    )
+    legacy_rows = select(
+        literal(None).label("catalog_id"),
+        legacy_projection.c.name,
+        literal(None).label("artwork_url"),
+        literal(False).label("monitored"),
+        literal(0).label("release_count"),
+        legacy_projection.c.downloaded_file_count,
+        literal(0).label("wanted_release_count"),
+        literal(0).label("complete_release_count"),
+        literal(0).label("partial_release_count"),
+        legacy_projection.c.local_release_count.label("unknown_release_count"),
+        legacy_projection.c.local_release_count,
     )
     combined = catalog_rows.union_all(legacy_rows).subquery()
     total = int((await db.scalar(select(func.count()).select_from(combined))) or 0)
@@ -971,6 +1098,10 @@ async def get_library_artists_page(
                 downloaded_file_count=int(row["downloaded_file_count"] or 0),
                 wanted_release_count=int(row["wanted_release_count"] or 0),
                 watchlisted=bool(row["monitored"]),
+                complete_release_count=int(row["complete_release_count"] or 0),
+                partial_release_count=int(row["partial_release_count"] or 0),
+                unknown_release_count=int(row["unknown_release_count"] or 0),
+                local_release_count=int(row["local_release_count"] or 0),
             )
         )
     return Page(items=items, total=total, page=page, per_page=per_page)
@@ -992,15 +1123,13 @@ async def get_missing_releases_page(
         .correlate(CatalogAlbum)
         .scalar_subquery()
     )
-    wanted_count = case(
-        (manifest_count > 0, manifest_count), else_=func.coalesce(CatalogAlbum.track_count, 0)
-    )
+    wanted_count = manifest_count
     downloaded_count = (
         select(func.count(func.distinct(Track.catalog_track_id)))
         .where(
             Track.catalog_album_id == CatalogAlbum.id,
             Track.catalog_track_id.is_not(None),
-            _library_artifact_filter(),
+            _present_library_artifact_filter(),
         )
         .correlate(CatalogAlbum)
         .scalar_subquery()
@@ -1008,7 +1137,7 @@ async def get_missing_releases_page(
     filters: list[Any] = [
         CatalogArtist.monitored.is_(True),
         CatalogAlbum.monitored.is_(True),
-        downloaded_count < wanted_count,
+        or_(manifest_count == 0, downloaded_count < wanted_count),
     ]
     if q:
         pattern = f"%{q}%"
@@ -1049,6 +1178,7 @@ async def get_missing_releases_page(
             artwork_url=str(row["artwork_url"]) if row["artwork_url"] else None,
             wanted_track_count=int(row["wanted_track_count"] or 0),
             downloaded_track_count=int(row["downloaded_track_count"] or 0),
+            manifest_known=int(row["wanted_track_count"] or 0) > 0,
         )
         for row in rows
     ]
@@ -1261,7 +1391,7 @@ async def get_artist_detail(
     artist_expr = _artist_expr()
 
     count_stmt = select(func.count(Track.id)).where(
-        artist_expr == artist_name, _library_artifact_filter()
+        artist_expr == artist_name, _present_library_artifact_filter()
     )
     total_tracks = int((await db.scalar(count_stmt)) or 0)
 
@@ -1269,8 +1399,12 @@ async def get_artist_detail(
 
     stmt = (
         select(Track)
-        .options(selectinload(Track.release), selectinload(Track.import_plans))
-        .where(artist_expr == artist_name, _library_artifact_filter())
+        .options(
+            selectinload(Track.release),
+            selectinload(Track.import_plans),
+            selectinload(Track.catalog_album),
+        )
+        .where(artist_expr == artist_name, _present_library_artifact_filter())
         .order_by(Track.year, Track.album, Track.disc, Track.track_no, Track.title, Track.id)
         .offset(_page_offset(page, per_page))
         .limit(per_page)
@@ -1278,12 +1412,12 @@ async def get_artist_detail(
     tracks = list((await db.execute(stmt)).scalars().all())
 
     total_duration_stmt = select(func.coalesce(func.sum(Track.duration_sec), 0)).where(
-        artist_expr == artist_name, _library_artifact_filter()
+        artist_expr == artist_name, _present_library_artifact_filter()
     )
     total_duration = int((await db.scalar(total_duration_stmt)) or 0)
 
     album_count = await _count_album_groups(
-        db, artist_expr == artist_name, _library_artifact_filter()
+        db, artist_expr == artist_name, _present_library_artifact_filter()
     )
 
     album_map: dict[tuple[int | None, str | None, str | None], AlbumGroup] = {}

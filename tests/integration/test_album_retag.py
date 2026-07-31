@@ -29,7 +29,7 @@ async def test_album_page_offers_confirmed_manual_metadata_repair(
     assert response.status_code == 200
     assert f'action="/albums/{album_id}/retag"' in response.text
     assert "Repair metadata" in response.text
-    assert 'data-confirm="Retag every audio file in this album folder' in response.text
+    assert 'data-confirm="Repair metadata for every downloaded file' in response.text
     assert f'action="/albums/{album_id}/quality-deduplicate"' in response.text
     assert "Clean quality duplicates" in response.text
     assert "/static/js/album.js" in response.text

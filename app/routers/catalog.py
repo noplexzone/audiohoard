@@ -58,6 +58,11 @@ from app.services.catalog_metadata import (
 )
 from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
 from app.services.library_import import ImportExecutionError, retag_catalog_album
+from app.services.library_removal import (
+    LibraryRemovalError,
+    remove_catalog_album,
+    remove_imported_release_group,
+)
 from app.services.monitoring import (
     _monitoring_profile_from_runtime,
     current_release_quality,
@@ -449,6 +454,25 @@ def _templates(request: Request) -> Jinja2Templates:
     return request.app.state.templates  # type: ignore[no-any-return]
 
 
+async def _confirmed_delete(request: Request) -> bool:
+    if request.headers.get("content-type", "").casefold().startswith("application/json"):
+        try:
+            payload = await request.json()
+        except ValueError:
+            return False
+        return isinstance(payload, dict) and payload.get("confirmation") == "delete"
+    form = await request.form()
+    return form.get("confirmation") == "delete"
+
+
+def _wants_json(request: Request) -> bool:
+    return (
+        "application/json" in request.headers.get("accept", "").casefold()
+        or request.headers.get("x-requested-with", "").casefold() == "fetch"
+        or request.headers.get("content-type", "").casefold().startswith("application/json")
+    )
+
+
 @router.get("/library", response_class=HTMLResponse)
 async def library_page(
     request: Request,
@@ -555,6 +579,55 @@ async def artist_detail_page(
     )
 
 
+@router.post("/library/releases/delete", include_in_schema=False)
+async def delete_imported_release_files(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> Response:
+    if not await _confirmed_delete(request):
+        raise HTTPException(status_code=422, detail="Explicit deletion confirmation is required")
+    form = await request.form()
+    artist_name = str(form.get("artist_name", "")).strip()
+    album_title = str(form.get("album_title", "")).strip()
+    if not artist_name or not album_title:
+        raise HTTPException(status_code=422, detail="Imported release identity is invalid")
+    year = str(form.get("year", "")).strip()
+    release_value = str(form.get("release_id", "")).strip()
+    try:
+        release_id = int(release_value) if release_value else None
+    except ValueError:
+        raise HTTPException(
+            status_code=422, detail="Imported release identity is invalid"
+        ) from None
+    try:
+        result = await remove_imported_release_group(
+            db,
+            release_id=release_id,
+            artist_name=artist_name,
+            album_title=album_title,
+            year=year,
+            library_root=settings.library_root,
+            cache_root=settings.artwork_cache_root.parent / "library-audio",
+        )
+    except LibraryRemovalError as exc:
+        status = 404 if "not found" in str(exc).casefold() else 409
+        raise HTTPException(status_code=status, detail=str(exc)) from None
+    if _wants_json(request):
+        return JSONResponse(
+            {
+                "release_id": release_id,
+                "deleted_files": result.deleted_files,
+                "track_ids": list(result.affected_track_ids),
+                "already_removed": result.already_removed,
+                "cleanup_pending": result.cleanup_pending,
+            }
+        )
+    location = "/artists/detail?" + urlencode({"name": artist_name, "removed": "1"})
+    return RedirectResponse(location, status_code=303)
+
+
 @router.get("/artists/catalog/open", response_class=HTMLResponse)
 async def open_catalog_artist_page(
     provider: str,
@@ -657,12 +730,7 @@ async def catalog_artist_page(
             release.catalog_album_id or 0,
             ReleaseProgress(wanted_track_count=0, downloaded_track_count=0),
         )
-        wanted = max(projected.wanted_track_count, release.track_count or 0)
-        release_progress[release.id] = ReleaseProgress(
-            wanted_track_count=wanted,
-            downloaded_track_count=min(projected.downloaded_track_count, wanted),
-            downloaded_catalog_track_ids=projected.downloaded_catalog_track_ids,
-        )
+        release_progress[release.id] = projected
     albums = sorted(
         provider_albums,
         key=lambda release: (release.year or "0000", release.title.casefold()),
@@ -1090,6 +1158,39 @@ async def catalog_album_page(
             "watching_for_upgrades": bool(watched_release_ids),
         },
     )
+
+
+@router.post("/library/albums/{catalog_album_id}/delete", include_in_schema=False)
+async def delete_catalog_album_files(
+    catalog_album_id: int,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> Response:
+    if not await _confirmed_delete(request):
+        raise HTTPException(status_code=422, detail="Explicit deletion confirmation is required")
+    try:
+        result = await remove_catalog_album(
+            db,
+            catalog_album_id,
+            library_root=settings.library_root,
+            cache_root=settings.artwork_cache_root.parent / "library-audio",
+        )
+    except LibraryRemovalError as exc:
+        status = 404 if "not found" in str(exc).casefold() else 409
+        raise HTTPException(status_code=status, detail=str(exc)) from None
+    if _wants_json(request):
+        return JSONResponse(
+            {
+                "catalog_album_id": catalog_album_id,
+                "deleted_files": result.deleted_files,
+                "track_ids": list(result.affected_track_ids),
+                "already_removed": result.already_removed,
+                "cleanup_pending": result.cleanup_pending,
+            }
+        )
+    return RedirectResponse(f"/albums/{catalog_album_id}?removed=1", status_code=303)
 
 
 @router.post("/albums/{album_id}/watch-upgrade", include_in_schema=False)

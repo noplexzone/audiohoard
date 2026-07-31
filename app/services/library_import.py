@@ -11,6 +11,7 @@ import shutil
 import stat
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO, no_type_check
 from urllib.parse import urljoin, urlparse
@@ -45,7 +46,12 @@ from app.database import register_transaction_callbacks
 from app.http import stream_with_retry
 from app.media_formats import is_importable_audio, supported_audio_formats_display
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
-from app.models.import_plan import CollisionState, ImportPlan, TagVerificationState
+from app.models.import_plan import (
+    CollisionState,
+    ImportPlan,
+    LibraryFileState,
+    TagVerificationState,
+)
 from app.models.release import Release
 from app.models.track import Track
 from app.models.workflow import ImportWorkflowState
@@ -1488,6 +1494,10 @@ async def execute_release_import(
             if ext and len(ext) <= 16 and ext.isalnum():
                 track.file_format = ext
             plan.status = ImportWorkflowState.imported
+            plan.file_state = LibraryFileState.present
+            plan.file_checked_at = datetime.now(UTC)
+            plan.file_removed_at = None
+            plan.file_removal_reason = None
             plan.collision_state = CollisionState.clear
         imported_tracks = list(
             (

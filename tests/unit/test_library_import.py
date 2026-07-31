@@ -13,7 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS, is_importable_audio
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
-from app.models.import_plan import CollisionState, ImportPlan, TagVerificationState
+from app.models.import_plan import (
+    CollisionState,
+    ImportPlan,
+    LibraryFileState,
+    TagVerificationState,
+)
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import Track
@@ -199,6 +204,8 @@ async def test_execute_import_copies_to_destination_temp_writes_verified_tags_an
     assert str(destination.parent) in imported[0].destination_temp_path
     assert imported[0].tag_verification_state == TagVerificationState.verified
     assert imported[0].status == ImportWorkflowState.imported
+    assert imported[0].file_state == LibraryFileState.present
+    assert imported[0].file_checked_at is not None
     assert release.import_state == ImportWorkflowState.imported
     readback = MutagenTagWriter().read_tags(destination)
     assert readback["title"] == "Song 1"

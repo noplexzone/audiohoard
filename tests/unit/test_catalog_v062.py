@@ -9,7 +9,7 @@ from app.models.catalog_entities import (
     CatalogArtist,
     CatalogArtistIdentity,
 )
-from app.models.import_plan import ImportPlan
+from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import FingerprintState, IdentityResolutionState, Track
@@ -55,6 +55,7 @@ async def test_library_artists_include_watchlisted_and_imported_but_not_staging_
             source_path="/staging/imported.flac",
             destination_path="/music/Imported Only/Imported.flac",
             status=ImportWorkflowState.imported,
+            file_state=LibraryFileState.present,
         )
     )
     staging_track = _track(
@@ -69,7 +70,8 @@ async def test_library_artists_include_watchlisted_and_imported_but_not_staging_
     assert [item.name for item in page.items] == ["Imported Only", "Watchlisted Only"]
     by_name = {item.name: item for item in page.items}
     assert by_name["Imported Only"].downloaded_file_count == 1
-    assert by_name["Imported Only"].wanted_release_count == 0
+    assert by_name["Imported Only"].wanted_release_count == 1
+    assert by_name["Imported Only"].unknown_release_count == 1
     assert by_name["Watchlisted Only"].downloaded_file_count == 0
     assert by_name["Watchlisted Only"].wanted_release_count == 1
     assert by_name["Watchlisted Only"].watchlisted is True
@@ -139,6 +141,7 @@ async def test_library_artists_keep_unlinked_imports_visible(db_session: AsyncSe
                 source_path=f"/staging/{name}.flac",
                 destination_path=f"/music/{name}/Legacy Album (2000)/01 Track.flac",
                 status=ImportWorkflowState.imported,
+                file_state=LibraryFileState.present,
             )
         )
         tracks.append(track)
@@ -196,6 +199,7 @@ async def test_library_only_counts_downloaded_tracks_with_a_file_path(
             source_path="/staging/downloaded.flac",
             destination_path="/music/downloaded.flac",
             status=ImportWorkflowState.imported,
+            file_state=LibraryFileState.present,
         )
     )
     await db_session.flush()
@@ -232,6 +236,7 @@ async def test_library_prefers_imported_destination_path(db_session: AsyncSessio
         source_path="/staging/source.flac",
         destination_path="/music/Artist/Album/00 Old Import.flac",
         status=ImportWorkflowState.imported,
+        file_state=LibraryFileState.present,
     )
     plan = ImportPlan(
         release=release,
@@ -239,6 +244,7 @@ async def test_library_prefers_imported_destination_path(db_session: AsyncSessio
         source_path="/staging/source.flac",
         destination_path="/music/Artist/Album/01 Imported.flac",
         status=ImportWorkflowState.imported,
+        file_state=LibraryFileState.present,
     )
     db_session.add_all([old_plan, plan])
     await db_session.flush()

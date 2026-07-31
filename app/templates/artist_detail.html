@@ -1,103 +1,37 @@
 {% extends "base.html" %}
 {% block title %}{{ detail.display_name }} — Library — Audiohoard{% endblock %}
 {% block content %}
-<nav class="breadcrumb" aria-label="Breadcrumb">
-  <a href="/library">Library</a> / <span aria-current="page">{{ detail.display_name }}</span>
-</nav>
-
-<div class="page-header artist-hero">
-  <div class="artist-avatar hero-avatar" aria-hidden="true">{{ detail.display_name[:1] | upper }}</div>
-  <div><p class="eyebrow">Artist</p><h1>{{ detail.display_name }}</h1>
-  <p>
-    {{ detail.track_count }} track{% if detail.track_count != 1 %}s{% endif %}
-    across {{ detail.album_count }} album{% if detail.album_count != 1 %}s{% endif %}
-    {% if detail.total_duration_sec %}
-    &mdash;
-    {% set h = (detail.total_duration_sec // 3600) %}
-    {% set m = ((detail.total_duration_sec % 3600) // 60) %}
-    {% if h > 0 %}{{ h }}h {{ m }}m{% else %}{{ m }}m{% endif %}
-    {% endif %}
-  </p></div>
-</div>
-
-{% if detail.albums %}
-{% for album in detail.albums %}
-<section class="album-section" aria-labelledby="album-{{ loop.index }}">
-  <div class="album-header">
-    <h2 id="album-{{ loop.index }}">{{ album.album }}</h2>
-    {% if album.year %}<span class="album-year">{{ album.year }}</span>{% endif %}
-    {% if album.label %}<span class="album-label">{{ album.label }}</span>{% endif %}
-    {% if album.country %}<span class="album-country">{{ album.country }}</span>{% endif %}
-    {% if album.catalog_number %}<span class="album-catalog">{{ album.catalog_number }}</span>{% endif %}
-    {% if album.release_mbid %}
-    <span class="album-mbid"><abbr title="MusicBrainz Release ID">MBID</abbr>: {{ album.release_mbid }}</span>
-    {% endif %}
+{% set csrf_token = request.cookies.get('csrf', '') | e %}
+<script defer src="/static/js/album.js?v={{ app_version }}" data-page-module="album"></script>
+<nav class="breadcrumb" aria-label="Breadcrumb"><a href="/library">Library</a> / <span aria-current="page">{{ detail.display_name }}</span></nav>
+<section class="artist-view-hero card">
+  <div class="artist-view-art" aria-hidden="true"><span>{{ detail.display_name[:2] | upper }}</span></div>
+  <div class="artist-view-copy"><p class="eyebrow">Local artist</p><h1>{{ detail.display_name }}</h1>
+    <p class="artist-release-summary">{{ detail.album_count }} local release{% if detail.album_count != 1 %}s{% endif %} · total unknown · {{ detail.track_count }} track{% if detail.track_count != 1 %}s{% endif %}</p>
+    <span class="badge info">In library</span>
   </div>
-  <table aria-label="{{ album.album }} track list">
-    <thead>
-      <tr>
-        <th scope="col">#</th>
-        <th scope="col">Title</th>
-        <th scope="col">Format</th>
-        <th scope="col">Duration</th>
-        <th scope="col">Source</th>
-        <th scope="col">Status</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for track in album.tracks %}
-      <tr>
-        <td class="track-no">
-          {% if track.disc %}D{{ track.disc }}-{% endif %}{{ track.track_no or "?" }}
-        </td>
-        <td><a href="/tracks/{{ track.id }}/ui">{{ track.title }}</a></td>
-        <td>
-          {% if track.fmt %}<span class="badge info">{{ track.fmt }}</span>{% else %}—{% endif %}
-        </td>
-        <td>
-          {% if track.duration_sec %}
-          {% set dm = (track.duration_sec // 60) %}
-          {% set ds = (track.duration_sec % 60) %}
-          {{ dm }}:{{ "%02d" | format(ds) }}
-          {% else %}—{% endif %}
-        </td>
-        <td><span class="badge info">{{ track.source }}</span></td>
-        <td>
-          {% if track.import_state == "imported" %}
-            <span class="badge ok">{{ track.import_state }}</span>
-          {% elif track.import_state == "failed" %}
-            <span class="badge error">{{ track.import_state }}</span>
-          {% else %}
-            <span class="badge warn">{{ track.import_state }}</span>
-          {% endif %}
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
 </section>
-{% endfor %}
-
-{% if detail.total_track_pages > 1 %}
-<nav class="pagination" aria-label="Track pagination">
-  {% if detail.has_prev %}
-  <a href="/artists/detail?name={{ detail.display_name | urlencode }}&page={{ detail.page - 1 }}&per_page={{ detail.per_page }}" class="btn secondary" aria-label="Previous page">← Prev</a>
-  {% else %}
-  <span class="btn secondary disabled" aria-disabled="true">← Prev</span>
-  {% endif %}
-  <span class="pagination-info">Page {{ detail.page }} of {{ detail.total_track_pages }}</span>
-  {% if detail.has_next %}
-  <a href="/artists/detail?name={{ detail.display_name | urlencode }}&page={{ detail.page + 1 }}&per_page={{ detail.per_page }}" class="btn secondary" aria-label="Next page">Next →</a>
-  {% else %}
-  <span class="btn secondary disabled" aria-disabled="true">Next →</span>
-  {% endif %}
-</nav>
-{% endif %}
-
-{% else %}
-<div class="empty-state" role="status">
-  <p>No tracks found for <strong>{{ detail.display_name }}</strong>.</p>
-  <a href="/library" class="btn secondary">Back to Library</a>
-</div>
-{% endif %}
+{% if detail.albums %}
+<section class="discography-section" aria-labelledby="local-releases"><div class="discography-heading"><div><p class="eyebrow">Discography</p><h2 id="local-releases">Local releases</h2></div><p>Catalog totals and release types are unavailable for imported-only music.</p></div>
+  <div class="legacy-release-grid">
+  {% for album in detail.albums %}
+    <article class="legacy-release-card">
+      <header class="legacy-release-header"><div class="album-art compact" aria-hidden="true"><span>{{ album.album[:2] | upper }}</span></div><div><h3>{{ album.album }}</h3><p class="muted-line">{{ album.year or 'Unknown year' }} · Local release{% if album.label %} · {{ album.label }}{% endif %}{% if album.catalog_number %} · {{ album.catalog_number }}{% endif %}</p>{% if album.release_mbid %}<p class="release-identity"><span class="sr-only">MusicBrainz release ID </span><code>{{ album.release_mbid }}</code></p>{% endif %}<span class="release-state complete">Local files present</span></div></header>
+      <ol class="release-track-list" data-play-queue aria-label="{{ album.album | e }} tracks">
+      {% for track in album.tracks %}
+        <li class="release-track-row" data-library-track-id="{{ track.id }}">
+          <button type="button" class="player-row-play" aria-label="Play {{ track.title | e }}" data-play-url="/library/tracks/{{ track.id }}/audio" data-track-id="{{ track.id }}" data-track-title="{{ track.title | e }}" data-track-artist="{{ track.artist | e }}" data-track-artwork="{% if track.artwork_url %}/artwork?url={{ track.artwork_url | urlencode }}{% endif %}">▶</button>
+          <span class="track-position">{% if track.disc %}{{ track.disc }}-{% endif %}{{ "%02d" | format(track.track_no) if track.track_no else '?' }}</span>
+          <div class="track-copy"><a href="/tracks/{{ track.id }}/ui">{{ track.title }}</a><small>{{ track.fmt | upper if track.fmt else 'Audio' }}{% if track.file_size_bytes %} · {{ "%.1f" | format(track.file_size_bytes / 1048576) }} MB{% endif %} · {{ track.source }}</small></div>
+          <form method="post" action="/library/tracks/{{ track.id }}/delete" data-remove-form data-confirm="Permanently remove ‘{{ track.title | e }}’ from your library? Catalog metadata will be kept when available."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="confirmation" value="delete"><button class="btn secondary track-remove" type="submit">Remove<span class="sr-only"> {{ track.title }}</span></button></form>
+        </li>
+      {% endfor %}
+      </ol>
+      <footer class="legacy-release-danger"><form method="post" action="/library/releases/delete" data-remove-form data-remove-release data-confirm="Permanently remove every downloaded file for ‘{{ album.album | e }}’? Imported metadata rows will be kept."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="confirmation" value="delete"><input type="hidden" name="artist_name" value="{{ detail.display_name | e }}"><input type="hidden" name="album_title" value="{{ album.album | e }}"><input type="hidden" name="year" value="{{ album.year or '' | e }}"><input type="hidden" name="release_id" value="{{ album.release_id or '' }}"><button class="btn danger" type="submit">Remove whole release</button></form></footer>
+    </article>
+  {% endfor %}
+  </div>
+</section>
+{% if detail.total_track_pages > 1 %}<nav class="pagination" aria-label="Track pagination">{% if detail.has_prev %}<a href="/artists/detail?name={{ detail.display_name | urlencode }}&page={{ detail.page - 1 }}&per_page={{ detail.per_page }}" class="btn secondary">← Prev</a>{% endif %}<span class="pagination-info">Page {{ detail.page }} of {{ detail.total_track_pages }}</span>{% if detail.has_next %}<a href="/artists/detail?name={{ detail.display_name | urlencode }}&page={{ detail.page + 1 }}&per_page={{ detail.per_page }}" class="btn secondary">Next →</a>{% endif %}</nav>{% endif %}
+{% else %}<div class="empty-state" role="status"><h2>No playable files</h2><p>No present tracks remain for this artist.</p><a href="/library" class="btn secondary">Back to Library</a></div>{% endif %}
 {% endblock %}

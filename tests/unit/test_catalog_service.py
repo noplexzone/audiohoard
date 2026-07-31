@@ -12,7 +12,7 @@ from app.models.catalog_entities import (
     CatalogArtist,
     CatalogArtistIdentity,
 )
-from app.models.import_plan import ImportPlan
+from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import FingerprintState, IdentityResolutionState, Track
@@ -75,6 +75,7 @@ def _make_track(
         source_path=source_path or "/staging/source.flac",
         destination_path=source_path or "/music/track.flac",
         status=ImportWorkflowState.imported,
+        file_state=LibraryFileState.present,
     )
     track.import_plans.append(plan)
     return track
@@ -462,8 +463,143 @@ async def test_library_artist_card_counts_watchlist_provider_releases_only(
     row = next(item for item in page.items if item.name == artist.name)
 
     assert row.release_count == 2
-    assert row.wanted_release_count == 2
+    assert row.complete_release_count == 2
+    assert row.partial_release_count == 0
+    assert row.unknown_release_count == 0
+    assert row.local_release_count == 2
+    assert row.wanted_release_count == 0
     assert row.downloaded_file_count == 2
+
+
+async def test_library_artist_projection_distinguishes_complete_partial_unknown_and_missing(
+    db_session: AsyncSession, job: Job
+) -> None:
+    artist = CatalogArtist(name="Truthful Artist", monitored=True, watchlist_provider="deezer")
+    identity = CatalogArtistIdentity(
+        provider="deezer", provider_artist_id="truthful", name=artist.name
+    )
+    complete = CatalogAlbum(artist=artist, title="Complete", track_count=99)
+    partial = CatalogAlbum(artist=artist, title="Partial", track_count=2)
+    empty = CatalogAlbum(artist=artist, title="Empty", track_count=1)
+    unknown = CatalogAlbum(artist=artist, title="Unknown", track_count=7)
+    complete.tracks.extend(
+        CatalogAlbumTrack(position=position, disc=1, title=f"Complete {position}")
+        for position in (1, 2)
+    )
+    partial.tracks.extend(
+        CatalogAlbumTrack(position=position, disc=1, title=f"Partial {position}")
+        for position in (1, 2)
+    )
+    empty.tracks.append(CatalogAlbumTrack(position=1, disc=1, title="Empty 1"))
+    for index, album in enumerate((complete, partial, empty, unknown), start=1):
+        identity.releases.append(
+            CatalogAlbumProvider(
+                provider_album_id=f"release-{index}",
+                title=album.title,
+                catalog_album=album,
+                release_kind="album",
+            )
+        )
+    artist.identities.append(identity)
+    db_session.add(artist)
+    await db_session.flush()
+
+    for album, catalog_track in (
+        (complete, complete.tracks[0]),
+        (complete, complete.tracks[1]),
+        (partial, partial.tracks[0]),
+    ):
+        imported = _make_track(job.id, title=catalog_track.title, artist=artist.name)
+        imported.catalog_album_id = album.id
+        imported.catalog_track_id = catalog_track.id
+        db_session.add(imported)
+    missing = _make_track(job.id, title="Removed attempt", artist=artist.name)
+    missing.catalog_album_id = empty.id
+    missing.catalog_track_id = empty.tracks[0].id
+    missing.import_plans[0].file_state = LibraryFileState.removed
+    missing.import_plans[0].status = ImportWorkflowState.removed
+    db_session.add(missing)
+    await db_session.flush()
+
+    row = (await get_library_artists_page(db_session)).items[0]
+
+    assert row.release_count == 4
+    assert row.complete_release_count == 1
+    assert row.partial_release_count == 1
+    assert row.unknown_release_count == 1
+    assert row.local_release_count == 2
+    assert row.wanted_release_count == 3
+    assert row.downloaded_file_count == 3
+
+
+async def test_library_artist_projection_deduplicates_provider_aliases_but_not_canonical_ids(
+    db_session: AsyncSession,
+) -> None:
+    artist = CatalogArtist(name="Alias Artist", monitored=True, watchlist_provider="deezer")
+    first = CatalogAlbum(artist=artist, title="Same Title", year="2020")
+    second = CatalogAlbum(artist=artist, title="Same Title", year="2020")
+    for provider in ("deezer", "musicbrainz"):
+        identity = CatalogArtistIdentity(
+            provider=provider, provider_artist_id=f"alias-{provider}", name=artist.name
+        )
+        identity.releases.extend(
+            [
+                CatalogAlbumProvider(
+                    provider_album_id=f"{provider}-first",
+                    title=first.title,
+                    catalog_album=first,
+                    release_kind="album",
+                ),
+                CatalogAlbumProvider(
+                    provider_album_id=f"{provider}-second",
+                    title=second.title,
+                    catalog_album=second,
+                    release_kind="album",
+                ),
+            ]
+        )
+        artist.identities.append(identity)
+    db_session.add(artist)
+    await db_session.flush()
+
+    row = (await get_library_artists_page(db_session)).items[0]
+
+    assert row.release_count == 2
+    assert row.unknown_release_count == 2
+
+
+async def test_release_progress_requires_present_plan_and_hydrated_manifest(
+    db_session: AsyncSession, job: Job
+) -> None:
+    artist = CatalogArtist(name="Manifest Artist")
+    hydrated = CatalogAlbum(artist=artist, title="Hydrated", track_count=99)
+    hydrated.tracks.append(CatalogAlbumTrack(position=1, disc=1, title="One"))
+    unknown = CatalogAlbum(artist=artist, title="Provider Count Only", track_count=1)
+    db_session.add(artist)
+    await db_session.flush()
+    imported = _make_track(job.id, title="One", artist=artist.name)
+    imported.catalog_album_id = hydrated.id
+    imported.catalog_track_id = hydrated.tracks[0].id
+    db_session.add(imported)
+    removed_attempt = _make_track(job.id, title="Provider Count Only", artist=artist.name)
+    removed_attempt.catalog_album_id = unknown.id
+    removed_attempt.import_plans[0].file_state = LibraryFileState.missing
+    db_session.add(removed_attempt)
+    unknown_local = _make_track(job.id, title="Local Unknown", artist=artist.name)
+    unknown_local.catalog_album_id = unknown.id
+    db_session.add(unknown_local)
+    await db_session.flush()
+
+    progress = await get_release_progress(db_session, [hydrated.id, unknown.id])
+
+    assert progress[hydrated.id].manifest_known is True
+    assert progress[hydrated.id].wanted_track_count == 1
+    assert progress[hydrated.id].complete is True
+    assert progress[hydrated.id].track_state(hydrated.tracks[0].id) == "present"
+    assert progress[unknown.id].manifest_known is False
+    assert progress[unknown.id].wanted_track_count == 0
+    assert progress[unknown.id].downloaded_track_count == 1
+    assert progress[unknown.id].complete is False
 
 
 async def test_library_stats_counts(db_session: AsyncSession, job: Job) -> None:

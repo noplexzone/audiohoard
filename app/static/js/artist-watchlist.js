@@ -1,94 +1,92 @@
-(() => {
-  const inputs = Array.from(document.querySelectorAll('input[form="monitor-form"]'));
-  const initialState = new Map(inputs.map((input) => [input, input.checked]));
-  const bar = document.createElement("div");
-  const count = document.createElement("span");
-  const save = document.createElement("button");
-  bar.className = "unsaved-bar";
+'use strict';
+
+window.AudiohoardNavigation.registerPage('artist-watchlist', function (region) {
+  var controller = new AbortController();
+  var signal = controller.signal;
+  var inputs = Array.from(region.querySelectorAll('input[form="monitor-form"]'));
+  var initialState = new Map(inputs.map(function (input) { return [input, input.checked]; }));
+  var bar = document.createElement('div');
+  var count = document.createElement('span');
+  var save = document.createElement('button');
+  var discographyTimer = null;
+  bar.className = 'unsaved-bar';
   bar.hidden = true;
-  bar.setAttribute("role", "status");
-  save.type = "submit";
-  save.className = "btn";
-  save.setAttribute("form", "monitor-form");
-  save.textContent = "Save";
+  bar.setAttribute('role', 'status');
+  save.type = 'submit';
+  save.className = 'btn';
+  save.setAttribute('form', 'monitor-form');
+  save.textContent = 'Save';
   bar.append(count, save);
-  document.body.append(bar);
+  region.append(bar);
 
-  const updateBar = () => {
-    const unsaved = inputs.filter((input) => input.checked !== initialState.get(input)).length;
-    count.textContent = `${unsaved} unsaved selection${unsaved === 1 ? "" : "s"}`;
+  function updateBar() {
+    var unsaved = inputs.filter(function (input) { return input.checked !== initialState.get(input); }).length;
+    count.textContent = unsaved + ' unsaved selection' + (unsaved === 1 ? '' : 's');
     bar.hidden = unsaved === 0;
-  };
-
-  inputs.forEach((input) => input.addEventListener("change", updateBar));
-  document.querySelectorAll(".dismiss-btn").forEach((button) => {
-    button.addEventListener("click", () => button.closest('[role="alert"]')?.remove());
+  }
+  inputs.forEach(function (input) {
+    input.addEventListener('change', updateBar, { signal: signal });
+  });
+  region.querySelectorAll('.dismiss-btn').forEach(function (button) {
+    button.addEventListener('click', function () { button.closest('[role="alert"]')?.remove(); }, { signal: signal });
   });
 
-
-
-  const region = document.getElementById('discography-region');
-  if (region && region.dataset.artistRefresh === 'true') {
-    const artistId = region.dataset.artistId;
-    const pollDiscography = async () => {
+  var discography = region.querySelector('#discography-region');
+  if (discography && discography.dataset.artistRefresh === 'true') {
+    var artistId = discography.dataset.artistId;
+    var pollDiscography = async function () {
       if (document.hidden) return;
       try {
-        const stateResponse = await window.fetch(`/artists/catalog/${artistId}/state`, { credentials: 'same-origin' });
+        var stateResponse = await window.fetch('/artists/catalog/' + artistId + '/state', {
+          credentials: 'same-origin', signal: signal,
+        });
         if (!stateResponse.ok) return;
-        const state = await stateResponse.json();
+        var state = await stateResponse.json();
         if (state.enrichment_state === 'queued' || state.enrichment_state === 'running') return;
-        const pageResponse = await window.fetch(window.location.href, { credentials: 'same-origin' });
+        var pageResponse = await window.fetch(window.location.href, { credentials: 'same-origin', signal: signal });
         if (!pageResponse.ok) return;
-        const html = await pageResponse.text();
-        const doc = new DOMParser().parseFromString(html, 'text/html');
-        const fresh = doc.getElementById('discography-region');
-        if (fresh) {
-          region.innerHTML = fresh.innerHTML;
-          region.dataset.artistRefresh = fresh.dataset.artistRefresh || 'false';
+        var html = await pageResponse.text();
+        var fresh = new DOMParser().parseFromString(html, 'text/html').getElementById('discography-region');
+        if (fresh && discography.isConnected) {
+          discography.innerHTML = fresh.innerHTML;
+          discography.dataset.artistRefresh = fresh.dataset.artistRefresh || 'false';
         }
-        window.clearInterval(discographyTimer);
-      } catch (_error) {
-        // Provider/background timing can race the first page. Keep polling.
+        if (discographyTimer) { window.clearInterval(discographyTimer); discographyTimer = null; }
+      } catch (error) {
+        if (error.name === 'AbortError') return;
       }
     };
-    const discographyTimer = window.setInterval(pollDiscography, 5000);
+    discographyTimer = window.setInterval(pollDiscography, 5000);
   }
 
-  document.querySelectorAll('form[data-download-form]').forEach((form) => {
-    form.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const button = form.querySelector('button[type="submit"]');
-      const original = button?.textContent ?? '';
-      if (button) {
-        button.disabled = true;
-        button.textContent = 'Queueing…';
-      }
-      try {
-        const response = await window.fetch(form.action, {
-          method: 'POST',
-          body: new FormData(form),
-          credentials: 'same-origin',
-          headers: { 'X-Requested-With': 'fetch' },
-        });
-        if (!response.ok) {
-          throw new Error('Download request failed');
-        }
-        const data = await response.json();
-        if (button) {
-          button.textContent = data.queued > 0 ? 'Queued' : 'Nothing to queue';
-        }
-        window.setTimeout(() => {
-          if (button) {
-            button.disabled = false;
-            button.textContent = original;
-          }
-        }, 1600);
-      } catch (_error) {
-        if (button) {
-          button.disabled = false;
-          button.textContent = 'Try again';
-        }
-      }
-    });
-  });
-})();
+  region.addEventListener('submit', async function (event) {
+    var form = event.target.closest('form[data-download-form]');
+    if (!form) return;
+    event.preventDefault();
+    var button = form.querySelector('button[type="submit"]');
+    var original = button ? button.textContent : '';
+    if (button) { button.disabled = true; button.textContent = 'Queueing…'; }
+    try {
+      var response = await window.fetch(form.action, {
+        method: 'POST', body: new FormData(form), credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'fetch' }, signal: signal,
+      });
+      if (!response.ok) throw new Error('Download request failed');
+      var data = await response.json();
+      if (button) button.textContent = data.queued > 0 ? 'Queued' : 'Nothing to queue';
+      window.setTimeout(function () {
+        if (button && button.isConnected) { button.disabled = false; button.textContent = original; }
+      }, 1600);
+    } catch (error) {
+      if (error.name === 'AbortError') return;
+      if (button) { button.disabled = false; button.textContent = 'Try again'; }
+    }
+  }, { signal: signal });
+
+  updateBar();
+  return function () {
+    controller.abort();
+    if (discographyTimer) window.clearInterval(discographyTimer);
+    bar.remove();
+  };
+});

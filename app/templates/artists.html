@@ -1,52 +1,54 @@
 {% extends "base.html" %}
 {% block title %}Library — Audiohoard{% endblock %}
 {% block content %}
-<div class="page-header">
-  <h1>Library</h1>
-  <p>{{ artists.total }} artist{% if artists.total != 1 %}s{% endif %} watchlisted or in your downloaded library</p>
-</div>
+<header class="page-header library-heading">
+  <div><p class="eyebrow">Your music</p><h1>Library</h1><p>{{ artists.total }} artist{% if artists.total != 1 %}s{% endif %} watchlisted or represented by local files</p></div>
+</header>
 <nav class="discography-filters" aria-label="Library views">
-  <a class="filter-chip active" href="/library">Artists</a>
+  <a class="filter-chip active" href="/library" aria-current="page">Artists</a>
   <a class="filter-chip" href="/library?view=tracks">Tracks</a>
 </nav>
 <form method="get" action="/library" class="filter-bar" role="search" aria-label="Filter library artists">
-  <label class="sr-only" for="art-q">Search</label>
-  <input id="art-q" type="search" name="q" value="{{ q }}" placeholder="Search library artists…" aria-label="Search library artists">
-  <label class="sr-only" for="art-sort">Sort</label>
-  <select id="art-sort" name="sort" aria-label="Sort order">
+  <label class="sr-only" for="art-q">Search artists</label>
+  <input id="art-q" type="search" name="q" value="{{ q }}" placeholder="Search artists…">
+  <label class="sr-only" for="art-sort">Sort artists</label>
+  <select id="art-sort" name="sort" aria-label="Sort artists">
     <option value="name" {% if sort == "name" %}selected{% endif %}>Name</option>
     <option value="downloaded" {% if sort == "downloaded" %}selected{% endif %}>Most downloaded files</option>
-    <option value="wanted" {% if sort == "wanted" %}selected{% endif %}>Most not in library</option>
+    <option value="wanted" {% if sort == "wanted" %}selected{% endif %}>Most releases incomplete</option>
   </select>
-  <button type="submit" class="btn">Filter</button>
+  <button type="submit" class="btn">Apply</button>
   {% if q %}<a href="/library" class="btn secondary">Clear</a>{% endif %}
 </form>
 {% if artists.items %}
 <div class="artist-grid" role="list" aria-label="Library artists">
-  {% for artist in artists.items %}
+{% for artist in artists.items %}
   <article class="artist-card" role="listitem">
-    <a href="{{ artist.detail_url }}" aria-label="Open {{ artist.name }}">
+    <a class="artist-card-link" href="{{ artist.detail_url }}" aria-label="Open {{ artist.name | e }}">
       <div class="artist-avatar avatar-{{ loop.index % 4 }}">
-        {% if artist.artwork_url %}
-          <img loading="lazy" width="320" height="320" decoding="async" src="/artwork?url={{ artist.artwork_url | urlencode }}" alt="{{ artist.name | e }} artwork">
+      {% if artist.artwork_url %}<img loading="lazy" width="360" height="360" decoding="async" src="/artwork?url={{ artist.artwork_url | urlencode }}" alt="">
+      {% else %}<span aria-hidden="true">{{ artist.name[:2] | upper }}</span>{% endif %}
+      </div>
+      <div class="artist-card-body">
+        <h2>{{ artist.name }}</h2>
+        {% if artist.id is none %}
+          <p class="ownership-copy">{{ artist.local_release_count }} local release{% if artist.local_release_count != 1 %}s{% endif %} · {{ artist.downloaded_file_count }} downloaded file{% if artist.downloaded_file_count != 1 %}s{% endif %} · catalog total unknown</p>
+          <div class="ownership-bar unknown" aria-hidden="true"></div>
+          <p class="ownership-detail">Catalog ownership is unknown</p>
         {% else %}
-          <span role="img" aria-label="No artwork available for {{ artist.name | e }}">{{ artist.name[:2] | upper }}</span>
+          <p class="ownership-copy"><strong>{{ artist.complete_release_count }}</strong> of {{ artist.release_count }} releases complete</p>
+          <progress value="{{ artist.complete_release_count }}" max="{{ artist.release_count if artist.release_count else 1 }}">{{ artist.complete_release_count }} of {{ artist.release_count }}</progress>
+          <p class="ownership-detail">
+            {% if artist.partial_release_count %}{{ artist.partial_release_count }} partial{% else %}No partial releases{% endif %}
+            {% if artist.unknown_release_count %} · {{ artist.unknown_release_count }} ownership unknown{% endif %}
+            · {{ artist.wanted_release_count }} wanted · {{ artist.downloaded_file_count }} downloaded file{% if artist.downloaded_file_count != 1 %}s{% endif %}
+          </p>
         {% endif %}
+        <span class="badge {{ 'ok' if artist.watchlisted else 'info' }}">{{ 'Watchlisted' if artist.watchlisted else 'In library' }}</span>
       </div>
     </a>
-    <div class="artist-card-body">
-      <h2><a href="{{ artist.detail_url }}">{{ artist.name }}</a></h2>
-      <p class="muted-line">{{ artist.release_count }} release{% if artist.release_count != 1 %}s{% endif %}</p>
-      {% if artist.release_count %}
-        <progress value="{{ artist.release_count - artist.wanted_release_count }}" max="{{ artist.release_count }}">{{ artist.release_count - artist.wanted_release_count }} of {{ artist.release_count }}</progress>
-      {% else %}
-        <progress value="0" max="1">0 of 0</progress>
-      {% endif %}
-      <p>{% if artist.watchlisted %}<span class="badge ok">Watchlisted ✓</span>{% else %}<span class="badge info">In library</span>{% endif %}</p>
-      <p class="sr-only">{{ artist.release_count - artist.wanted_release_count }} of {{ artist.release_count }} releases in library, {{ artist.wanted_release_count }} not in library</p>
-    </div>
   </article>
-  {% endfor %}
+{% endfor %}
 </div>
 <nav class="pagination" aria-label="Artist list pagination">
   {% if artists.has_prev %}<a href="/library?{{ filter_qs }}&page={{ artists.page - 1 }}" class="btn secondary">← Prev</a>{% else %}<span class="btn secondary disabled" aria-disabled="true">← Prev</span>{% endif %}
@@ -55,8 +57,8 @@
 </nav>
 {% else %}
 <div class="empty-state" role="status">
-  {% if q %}<p>No library artists match <strong>{{ q }}</strong>.</p><a href="/library" class="btn secondary">Clear search</a>
-  {% else %}<p>Your library and artist watchlist are empty.</p><p>Use <a href="/search">Search</a> to watch an artist or download music.</p>{% endif %}
+  {% if q %}<h2>No matching artists</h2><p>No library artists match <strong>{{ q }}</strong>.</p><a href="/library" class="btn secondary">Clear search</a>
+  {% else %}<h2>Your library is ready for music</h2><p>Watch an artist or download a release to begin.</p><a href="/search" class="btn">Search artists</a>{% endif %}
 </div>
 {% endif %}
 {% endblock %}

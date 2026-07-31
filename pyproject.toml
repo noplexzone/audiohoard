@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audiohoard"
-version = "0.9.3"
+version = "0.10.0"
 description = "Self-hosted music acquisition, metadata enrichment, and library naming"
 requires-python = ">=3.12"
 dependencies = [
@@ -24,6 +24,7 @@ dependencies = [
     "mutagen>=1.47",
     "argon2-cffi>=23.1",
     "cryptography>=49.0.0",
+    "watchfiles>=1.0",
 ]
 
 [project.scripts]

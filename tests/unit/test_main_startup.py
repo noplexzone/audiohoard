@@ -28,6 +28,12 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
 ) -> None:
     factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
     started = asyncio.Event()
+    startup_order: list[str] = []
+
+    class _Reconciliation(_Service):
+        async def startup_reconcile(self) -> int:
+            startup_order.append("reconcile")
+            return 0
 
     async def blocked_reconciliation(*_args, **_kwargs) -> int:
         started.set()
@@ -41,11 +47,16 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
         AsyncMock(return_value=SimpleNamespace(max_parallel_acquisitions=1)),
     )
     monkeypatch.setattr(main, "pending_imported_source_cleanups", AsyncMock(return_value=[]))
-    monkeypatch.setattr(
-        main,
-        "prune_orphaned_terminal_records",
-        AsyncMock(return_value=SimpleNamespace(tracks=0, releases=0, jobs=0)),
-    )
+
+    async def recover_deletions(*_args, **_kwargs) -> None:
+        startup_order.append("recover")
+
+    async def prune(_db):
+        startup_order.append("prune")
+        return SimpleNamespace(tracks=0, releases=0, jobs=0)
+
+    monkeypatch.setattr(main, "recover_deletion_operations", recover_deletions)
+    monkeypatch.setattr(main, "prune_orphaned_terminal_records", prune)
     monkeypatch.setattr(main, "reconcile_duplicate_catalog_artists", AsyncMock(return_value=0))
     monkeypatch.setattr(
         main,
@@ -59,6 +70,7 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
     monkeypatch.setattr(main, "MaintenanceScheduler", _Service)
     monkeypatch.setattr(main, "MonitoringScheduler", _Service)
     monkeypatch.setattr(main, "QualityUpgradeCycleScheduler", _Service)
+    monkeypatch.setattr(main, "LibraryReconciliationService", _Reconciliation)
     monkeypatch.setattr(main, "get_health_status_service", lambda: _Service())
     monkeypatch.setattr(main.job_dispatcher, "set_max_concurrent_jobs", AsyncMock())
     monkeypatch.setattr(main.job_dispatcher, "recover", AsyncMock())
@@ -74,3 +86,4 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
             assert task.done() is False
 
     assert task.cancelled()
+    assert startup_order == ["recover", "reconcile", "prune"]
