@@ -16,7 +16,7 @@ from app.models.workflow import AcquisitionState, ImportWorkflowState
 
 async def _seed_imported_album(
     settings: Settings, *, names: tuple[str, ...]
-) -> tuple[int, list[int], list[Path]]:
+) -> tuple[int, int, list[int], list[Path]]:
     root = settings.library_root
     artist = CatalogArtist(name="Removal Artist")
     album = CatalogAlbum(
@@ -73,14 +73,14 @@ async def _seed_imported_album(
     async with get_session_factory()() as db:
         db.add_all([artist, album, job, release, *tracks, *plans])
         await db.commit()
-        return album.id, [track.id for track in tracks], paths
+        return album.id, release.id, [track.id for track in tracks], paths
 
 
 async def test_track_delete_requires_auth(
     unauthenticated_client: AsyncClient,
     test_settings: Settings,
 ) -> None:
-    _, track_ids, _ = await _seed_imported_album(test_settings, names=("auth.mp3",))
+    _, _, track_ids, _ = await _seed_imported_album(test_settings, names=("auth.mp3",))
     response = await unauthenticated_client.post(
         f"/library/tracks/{track_ids[0]}/delete",
         json={"confirmation": "delete"},
@@ -92,7 +92,7 @@ async def test_track_delete_requires_csrf_and_confirmation(
     client: AsyncClient,
     test_settings: Settings,
 ) -> None:
-    _, track_ids, paths = await _seed_imported_album(test_settings, names=("one.mp3",))
+    _, _, track_ids, paths = await _seed_imported_album(test_settings, names=("one.mp3",))
     endpoint = f"/library/tracks/{track_ids[0]}/delete"
 
     csrf = client.headers.pop("X-CSRF-Token")
@@ -110,7 +110,7 @@ async def test_track_delete_requires_csrf_and_confirmation(
 async def test_track_delete_returns_json_and_is_idempotent(
     client: AsyncClient, test_settings: Settings
 ) -> None:
-    _, track_ids, paths = await _seed_imported_album(test_settings, names=("single.mp3",))
+    _, _, track_ids, paths = await _seed_imported_album(test_settings, names=("single.mp3",))
     endpoint = f"/library/tracks/{track_ids[0]}/delete"
     first = await client.post(
         endpoint,
@@ -132,10 +132,57 @@ async def test_track_delete_returns_json_and_is_idempotent(
     assert second.json()["already_removed"] is True
 
 
+async def test_imported_release_delete_removes_every_file_and_returns_json(
+    client: AsyncClient, test_settings: Settings
+) -> None:
+    _, release_id, track_ids, paths = await _seed_imported_album(
+        test_settings,
+        names=("legacy-one.mp3", "legacy-two.mp3"),
+    )
+
+    response = await client.post(
+        "/library/releases/delete",
+        data={
+            "confirmation": "delete",
+            "release_id": str(release_id),
+            "artist_name": "Removal Artist",
+            "album_title": "Removal Album",
+            "year": "",
+        },
+        headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["deleted_files"] == 2
+    assert response.json()["track_ids"] == track_ids
+    assert not any(path.exists() for path in paths)
+
+
+async def test_imported_release_delete_requires_confirmation(
+    client: AsyncClient, test_settings: Settings
+) -> None:
+    _, release_id, _, paths = await _seed_imported_album(
+        test_settings, names=("unconfirmed-release.mp3",)
+    )
+
+    response = await client.post(
+        "/library/releases/delete",
+        data={
+            "confirmation": "no",
+            "release_id": str(release_id),
+            "artist_name": "Removal Artist",
+            "album_title": "Removal Album",
+        },
+    )
+
+    assert response.status_code == 422
+    assert paths[0].exists()
+
+
 async def test_album_delete_removes_every_file_and_redirects(
     client: AsyncClient, test_settings: Settings
 ) -> None:
-    album_id, _, paths = await _seed_imported_album(
+    album_id, _, _, paths = await _seed_imported_album(
         test_settings,
         names=("one.mp3", "two.mp3"),
     )

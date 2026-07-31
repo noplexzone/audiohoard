@@ -1579,6 +1579,13 @@ a.metric-card:hover {
 
 .legacy-release-header h3 { margin: 0; }
 .album-art.compact { width: 74px; border-radius: 10px; }
+.legacy-release-danger {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: .75rem;
+  padding-top: .75rem;
+  border-top: 1px solid var(--border);
+}
 
 .album-hero-copy { min-width: 0; }
 .album-byline { margin: 0; color: var(--text); font-weight: 750; }

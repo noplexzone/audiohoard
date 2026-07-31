@@ -56,27 +56,12 @@ window.AudiohoardNavigation.registerPage('album', function (region) {
           headers: { 'Accept': 'application/json', 'X-Requested-With': 'fetch' }, signal: signal,
         });
         if (!removal.ok) throw new Error('Removal failed');
-        var result = await removal.json();
-        var removedIds = new Set((result.track_ids || []).map(String));
-        region.querySelectorAll('[data-library-track-id]').forEach(function (row) {
-          if (!removeForm.hasAttribute('data-remove-album') && !removedIds.has(row.dataset.libraryTrackId)) return;
-          row.classList.remove('is-present');
-          row.classList.add('is-missing', 'just-removed');
-          row.removeAttribute('data-library-track-id');
-          var play = row.querySelector('.player-row-play');
-          if (play) {
-            play.disabled = true;
-            play.setAttribute('aria-disabled', 'true');
-            play.removeAttribute('data-play-url');
-          }
-          var copy = row.querySelector('.track-copy small');
-          if (copy) copy.textContent = 'Audio unavailable · ready to reacquire';
-          var actions = row.querySelector('.track-actions');
-          if (actions) actions.innerHTML = '<span class="badge info">Removed · reacquirable</span>';
-          var legacyRemove = row.querySelector('form[data-remove-form]');
-          if (legacyRemove) legacyRemove.remove();
-        });
-        if (removeForm.hasAttribute('data-remove-album')) removeForm.closest('.danger-zone')?.remove();
+        await removal.json();
+        if (window.AudiohoardNavigation && window.AudiohoardNavigation.refresh) {
+          await window.AudiohoardNavigation.refresh();
+        } else {
+          window.location.reload();
+        }
       } catch (error) {
         if (error.name === 'AbortError') return;
         setButton(removeButton, 'Try again', false);

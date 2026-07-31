@@ -83,6 +83,11 @@ def test_navigation_source_preserves_native_fallback_and_page_lifecycle() -> Non
     assert "event.ctrlKey" in source
     assert "anchor.download" in source
     assert "url.origin !== window.location.origin" in source
+    assert "scrollRestoration" in source
+    assert "scrollY" in source and "scrollX" in source
+    assert "decodeURIComponent" in source and "url.hash" in source
+    assert "AudiohoardNavigation" in source and "refresh" in source
+    assert "document.addEventListener('submit'" not in source
 
 
 def test_player_source_handles_queue_transcode_media_and_keyboard_safely() -> None:

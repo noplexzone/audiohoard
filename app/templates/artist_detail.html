@@ -27,6 +27,7 @@
         </li>
       {% endfor %}
       </ol>
+      <footer class="legacy-release-danger"><form method="post" action="/library/releases/delete" data-remove-form data-remove-release data-confirm="Permanently remove every downloaded file for ‘{{ album.album | e }}’? Imported metadata rows will be kept."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="confirmation" value="delete"><input type="hidden" name="artist_name" value="{{ detail.display_name | e }}"><input type="hidden" name="album_title" value="{{ album.album | e }}"><input type="hidden" name="year" value="{{ album.year or '' | e }}"><input type="hidden" name="release_id" value="{{ album.release_id or '' }}"><button class="btn danger" type="submit">Remove whole release</button></form></footer>
     </article>
   {% endfor %}
   </div>

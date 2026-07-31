@@ -22,6 +22,7 @@ from app.services.library_removal import (
     LibraryRemovalError,
     recover_deletion_operations,
     remove_catalog_album,
+    remove_imported_release_group,
     remove_imported_track,
 )
 
@@ -170,6 +171,106 @@ async def test_db_failure_restores_all_files_and_imported_truth(
     assert album.in_library is True
     assert all(plan.status == ImportWorkflowState.imported for plan in plans)
     assert all(track.import_state == ImportWorkflowState.imported for track in tracks)
+
+
+async def test_post_commit_failure_never_restores_removed_file(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "library"
+    _, tracks, plans, paths = await _seed_album(db_session, root, names=("committed.mp3",))
+
+    def fail_cleanup(_target):
+        raise RuntimeError("injected post-commit cleanup failure")
+
+    monkeypatch.setattr(library_removal, "_unlink_target", fail_cleanup)
+    with pytest.raises(LibraryRemovalError, match="recovery is required"):
+        await remove_imported_track(
+            db_session, tracks[0].id, library_root=root, cache_root=tmp_path / "c"
+        )
+
+    await db_session.refresh(plans[0])
+    assert plans[0].file_state == LibraryFileState.removed
+    assert not paths[0].exists()
+    temporary = list(paths[0].parent.glob("*.audiohoard-delete-*"))
+    assert len(temporary) == 1
+
+
+async def test_committed_recovery_deletes_matching_file_restored_to_original_name(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    root = tmp_path / "library"
+    _, tracks, plans, paths = await _seed_album(db_session, root, names=("restored.mp3",))
+    original = paths[0]
+    metadata = original.stat()
+    plans[0].file_state = LibraryFileState.removed
+    plans[0].status = ImportWorkflowState.removed
+    tracks[0].import_state = ImportWorkflowState.removed
+    operation = DeletionOperation(
+        group_id="committed-original-group",
+        import_plan_id=plans[0].id,
+        original_path=str(original),
+        temporary_path=str(original.with_name(".restored.mp3.audiohoard-delete-recovery")),
+        expected_device=metadata.st_dev,
+        expected_inode=metadata.st_ino,
+        state=DeletionOperationState.committed,
+    )
+    db_session.add(operation)
+    await db_session.commit()
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+
+    await recover_deletion_operations(factory, library_root=root, cache_root=tmp_path / "c")
+
+    assert not original.exists()
+    async with factory() as check:
+        recovered = await check.get(DeletionOperation, operation.id)
+        assert recovered is not None and recovered.state == DeletionOperationState.finalized
+
+
+async def test_imported_release_group_removes_all_present_files(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    root = tmp_path / "library"
+    _, tracks, plans, paths = await _seed_album(db_session, root)
+
+    result = await remove_imported_release_group(
+        db_session,
+        release_id=plans[0].release_id,
+        artist_name="ignored",
+        album_title="ignored",
+        year="",
+        library_root=root,
+        cache_root=tmp_path / "c",
+    )
+
+    assert result.deleted_files == 2
+    assert result.affected_track_ids == tuple(sorted(track.id for track in tracks))
+    assert all(not path.exists() for path in paths)
+
+
+async def test_imported_fallback_group_uses_exact_artist_album_and_year(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    root = tmp_path / "library"
+    _, tracks, _, paths = await _seed_album(db_session, root)
+    for track in tracks:
+        track.release = None
+        track.album_artist = "Fallback Artist"
+        track.album = "Fallback Album"
+        track.year = "2024"
+    await db_session.commit()
+
+    result = await remove_imported_release_group(
+        db_session,
+        release_id=None,
+        artist_name="Fallback Artist",
+        album_title="Fallback Album",
+        year="2024",
+        library_root=root,
+        cache_root=tmp_path / "c",
+    )
+
+    assert result.deleted_files == 2
+    assert all(not path.exists() for path in paths)
 
 
 async def test_album_rejects_unsafe_member_before_mutating_any_file(

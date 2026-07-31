@@ -63,6 +63,20 @@ def test_release_page_has_compact_actions_autosave_and_safe_file_removal() -> No
     assert "Saving…" in source
     assert "Saved" in source
     assert "Could not save" in source
+    assert "AudiohoardNavigation.refresh" in source
+    assert "innerHTML" not in source
+
+
+def test_imported_only_release_exposes_confirmation_gated_bulk_removal() -> None:
+    template = _read(TEMPLATES / "artist_detail.html")
+
+    assert 'action="/library/releases/delete"' in template
+    assert "data-remove-release" in template
+    assert 'name="confirmation" value="delete"' in template
+    assert 'name="release_id"' in template
+    assert 'name="artist_name"' in template
+    assert 'name="album_title"' in template
+    assert "Remove whole release" in template
 
 
 def test_release_track_rows_expose_playback_details_and_unavailable_states() -> None:

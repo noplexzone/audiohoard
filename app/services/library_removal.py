@@ -191,6 +191,16 @@ def _matches_expected(target: _Target, name: str) -> bool:
     )
 
 
+def _entry_exists(target: _Target, name: str) -> bool:
+    if target.parent_fd is None:
+        return False
+    try:
+        os.stat(name, dir_fd=target.parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def _stage_target(target: _Target) -> None:
     if target.missing:
         return
@@ -390,6 +400,17 @@ async def _recompute_database_truth(
     return track_ids
 
 
+async def _operations_committed(db: AsyncSession, operation_ids: tuple[int, ...]) -> bool:
+    states = list(
+        await db.scalars(
+            select(DeletionOperation.state).where(DeletionOperation.id.in_(operation_ids))
+        )
+    )
+    return len(states) == len(operation_ids) and all(
+        state == DeletionOperationState.committed for state in states
+    )
+
+
 async def _mark_finalized(
     db: AsyncSession, operation_ids: tuple[int, ...], *, error: str | None = None
 ) -> None:
@@ -418,6 +439,7 @@ async def _remove_plans(
         for key in lock_keys:
             await stack.enter_async_context(_TARGET_LOCKS.setdefault(key, asyncio.Lock()))
         targets: list[_Target] = []
+        database_committed = False
         try:
             seen_paths: set[Path] = set()
             for plan in plans:
@@ -447,19 +469,23 @@ async def _remove_plans(
             await db.commit()
             for target in targets:
                 await asyncio.to_thread(_stage_target, target)
+            operation_ids = tuple(operation.id for operation in operations)
             try:
                 track_ids = await _recompute_database_truth(db, plans, operations)
                 await db.commit()
+                database_committed = True
             except BaseException:
                 await db.rollback()
-                for target in reversed(targets):
-                    await asyncio.to_thread(_restore_target, target)
-                with suppress(Exception):
-                    await _mark_finalized(
-                        db,
-                        tuple(operation.id for operation in operations),
-                        error="rolled back before database commit",
-                    )
+                database_committed = await _operations_committed(db, operation_ids)
+                if not database_committed:
+                    for target in reversed(targets):
+                        await asyncio.to_thread(_restore_target, target)
+                    with suppress(Exception):
+                        await _mark_finalized(
+                            db,
+                            operation_ids,
+                            error="rolled back before database commit",
+                        )
                 raise
 
             cleanup_pending = False
@@ -483,23 +509,25 @@ async def _remove_plans(
             )
         except LibraryRemovalError:
             await db.rollback()
-            for target in reversed(targets):
-                with suppress(Exception):
-                    await asyncio.to_thread(_restore_target, target)
+            if not database_committed:
+                for target in reversed(targets):
+                    with suppress(Exception):
+                        await asyncio.to_thread(_restore_target, target)
             raise
         except BaseException as exc:
             await db.rollback()
             restore_failed = False
-            for target in reversed(targets):
-                try:
-                    await asyncio.to_thread(_restore_target, target)
-                except Exception:
-                    restore_failed = True
+            if not database_committed:
+                for target in reversed(targets):
+                    try:
+                        await asyncio.to_thread(_restore_target, target)
+                    except Exception:
+                        restore_failed = True
             if isinstance(exc, asyncio.CancelledError):
                 raise
             detail = (
                 "Library removal recovery is required"
-                if restore_failed
+                if database_committed or restore_failed
                 else "Library removal could not be completed"
             )
             raise LibraryRemovalError(detail) from exc
@@ -557,6 +585,60 @@ async def remove_catalog_album(
             .order_by(ImportPlan.id)
         )
     )
+    return await _remove_plans(db, plans, library_root=library_root, cache_root=cache_root)
+
+
+async def remove_imported_release_group(
+    db: AsyncSession,
+    *,
+    release_id: int | None,
+    artist_name: str,
+    album_title: str,
+    year: str,
+    library_root: Path,
+    cache_root: Path,
+) -> RemovalResult:
+    if release_id is not None:
+        if await db.get(Release, release_id) is None:
+            raise LibraryRemovalError("Imported release was not found")
+        track_filter = Track.release_id == release_id
+    else:
+        artist_name = artist_name.strip()
+        album_title = album_title.strip()
+        if not artist_name or not album_title:
+            raise LibraryRemovalError("Imported release identity is invalid")
+        track_filter = (
+            (Track.release_id.is_(None))
+            & (
+                func.coalesce(
+                    func.nullif(Track.album_artist, ""),
+                    func.nullif(Track.artist, ""),
+                    "Unknown",
+                )
+                == artist_name
+            )
+            & (func.coalesce(func.nullif(Track.album, ""), "Unknown") == album_title)
+            & (func.coalesce(func.nullif(Track.year, ""), "") == year.strip())
+        )
+    track_ids = tuple(
+        sorted(int(value) for value in await db.scalars(select(Track.id).where(track_filter)))
+    )
+    if not track_ids:
+        raise LibraryRemovalError("Imported release was not found")
+    plans = list(
+        await db.scalars(
+            select(ImportPlan)
+            .join(Track, ImportPlan.track_id == Track.id)
+            .where(
+                track_filter,
+                ImportPlan.status == ImportWorkflowState.imported,
+                ImportPlan.file_state == LibraryFileState.present,
+            )
+            .order_by(ImportPlan.id)
+        )
+    )
+    if not plans:
+        return RemovalResult(0, track_ids, already_removed=True)
     return await _remove_plans(db, plans, library_root=library_root, cache_root=cache_root)
 
 
@@ -625,12 +707,26 @@ async def recover_deletion_operations(
                         plan = await db.get(ImportPlan, row.import_plan_id)
                         if plan is not None and plan.track_id is not None:
                             track_ids.add(plan.track_id)
-                        if target.parent_fd is not None and _matches_expected(
-                            target, target.temporary_name
-                        ):
+                        if target.parent_fd is None:
+                            if not row.file_was_missing:
+                                cleanup_pending = True
+                        elif _matches_expected(target, target.original_name):
+                            target.missing = False
+                            try:
+                                await asyncio.to_thread(_stage_target, target)
+                            except (LibraryRemovalError, OSError):
+                                cleanup_pending = True
+                            else:
+                                if not await asyncio.to_thread(_unlink_target, target):
+                                    cleanup_pending = True
+                        elif _matches_expected(target, target.temporary_name):
                             target.staged = True
                             if not await asyncio.to_thread(_unlink_target, target):
                                 cleanup_pending = True
+                        elif _entry_exists(target, target.original_name) or _entry_exists(
+                            target, target.temporary_name
+                        ):
+                            cleanup_pending = True
                     if not cleanup_pending:
                         await asyncio.to_thread(
                             invalidate_track_previews, cache_root, tuple(sorted(track_ids))

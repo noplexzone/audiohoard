@@ -8,6 +8,7 @@
   var loadedScripts = new Set();
   var pageModules = new Map();
   var pageCleanups = [];
+  var scrollFrame = null;
   var navigationStatus = document.createElement('p');
   navigationStatus.className = 'sr-only';
   navigationStatus.setAttribute('aria-live', 'polite');
@@ -17,6 +18,9 @@
   window.AudiohoardNavigation = {
     registerPage: function (name, initializer) {
       pageModules.set(name, initializer);
+    },
+    refresh: function () {
+      return navigate(new URL(window.location.href), { replace: true, preserveScroll: true });
     },
   };
 
@@ -107,8 +111,57 @@
     window.location.assign(url.href || String(url));
   }
 
+  function captureScrollState() {
+    var state = Object.assign({}, history.state || {}, {
+      audiohoard: true,
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+    });
+    history.replaceState(state, '', window.location.href);
+  }
+
+  function focusTarget(target) {
+    var hadTabindex = target.hasAttribute('tabindex');
+    if (!hadTabindex) target.setAttribute('tabindex', '-1');
+    target.focus({ preventScroll: true });
+    if (!hadTabindex) {
+      target.addEventListener('blur', function () { target.removeAttribute('tabindex'); }, { once: true });
+    }
+  }
+
+  function restoreDestination(url, options, region) {
+    var opts = options || {};
+    if (opts.preserveScroll) {
+      window.scrollTo({ left: opts.scrollX, top: opts.scrollY, behavior: 'auto' });
+      return;
+    }
+    if (opts.popstate && opts.state && Number.isFinite(opts.state.scrollY)) {
+      window.scrollTo({
+        left: Number.isFinite(opts.state.scrollX) ? opts.state.scrollX : 0,
+        top: opts.state.scrollY,
+        behavior: 'auto',
+      });
+      return;
+    }
+    if (url.hash) {
+      var fragment;
+      try { fragment = decodeURIComponent(url.hash.slice(1)); } catch (_error) { fragment = url.hash.slice(1); }
+      var target = document.getElementById(fragment) || document.getElementsByName(fragment)[0];
+      if (target) {
+        target.scrollIntoView({ block: 'start', behavior: 'auto' });
+        focusTarget(target);
+        return;
+      }
+    }
+    window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+    region.focus({ preventScroll: true });
+  }
+
   async function navigate(url, options) {
     var opts = options || {};
+    var preservedX = window.scrollX;
+    var preservedY = window.scrollY;
+    if (!opts.popstate && !opts.replace) captureScrollState();
     if (controller) controller.abort();
     controller = new AbortController();
     var activeController = controller;
@@ -139,10 +192,18 @@
       region.replaceChildren.apply(region, Array.from(freshRegion.childNodes));
       document.title = freshDocument.title;
       synchronizeNavigation(freshDocument);
-      if (!opts.popstate) history.pushState({ audiohoard: true }, '', response.url || url.href);
+      var finalUrl = new URL(response.url || url.href);
+      finalUrl.hash = url.hash;
+      if (opts.replace) {
+        history.replaceState(history.state || { audiohoard: true }, '', finalUrl.href);
+      } else if (!opts.popstate) {
+        history.pushState({ audiohoard: true, scrollX: 0, scrollY: 0 }, '', finalUrl.href);
+      }
       await initializePage(region, freshDocument);
-      window.scrollTo({ top: 0, behavior: 'auto' });
-      region.focus({ preventScroll: true });
+      restoreDestination(finalUrl, Object.assign({}, opts, {
+        scrollX: preservedX,
+        scrollY: preservedY,
+      }), region);
       navigationStatus.textContent = document.title + ' loaded';
     } catch (error) {
       if (error && error.name === 'AbortError') return;
@@ -177,30 +238,29 @@
     navigate(url);
   });
 
-  document.addEventListener('submit', function (event) {
-    if (event.defaultPrevented) return;
-    var form = event.target;
-    if (!(form instanceof HTMLFormElement) || (form.method || 'get').toLowerCase() !== 'get' ||
-        (form.target && form.target !== '_self') || form.hasAttribute('data-native-navigation')) return;
-    var url = eligibleUrl(form.action || window.location.href);
-    if (!url) return;
-    event.preventDefault();
-    var params = new URLSearchParams(new FormData(form));
-    if (event.submitter && event.submitter.name) params.append(event.submitter.name, event.submitter.value);
-    url.search = params.toString();
-    navigate(url);
+  window.addEventListener('popstate', function (event) {
+    var url = eligibleUrl(window.location.href);
+    if (url) navigate(url, { popstate: true, state: event.state || {} });
   });
 
-  window.addEventListener('popstate', function () {
-    var url = eligibleUrl(window.location.href);
-    if (url) navigate(url, { popstate: true });
-  });
+  window.addEventListener('scroll', function () {
+    if (scrollFrame !== null) return;
+    scrollFrame = window.requestAnimationFrame(function () {
+      scrollFrame = null;
+      if (!controller) captureScrollState();
+    });
+  }, { passive: true });
 
   document.addEventListener('DOMContentLoaded', function () {
     document.querySelectorAll('script[src]').forEach(function (script) {
       loadedScripts.add(canonicalScript(script.src));
     });
-    history.replaceState({ audiohoard: true }, '', window.location.href);
+    if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+    history.replaceState(Object.assign({}, history.state || {}, {
+      audiohoard: true,
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+    }), '', window.location.href);
     initializePage(currentRegion(), document);
   }, { once: true });
 }());

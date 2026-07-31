@@ -8,7 +8,12 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
-from app.models.import_plan import ImportPlan, LibraryFileState
+from app.models.import_plan import (
+    DeletionOperation,
+    DeletionOperationState,
+    ImportPlan,
+    LibraryFileState,
+)
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.settings import AppSetting
@@ -116,6 +121,38 @@ async def test_sweep_backfills_unknown_then_external_unlink_and_exact_restore_up
         assert checked_track.file_size_bytes == len(b"restored")
         assert (await check.get(Release, release.id)).import_state == ImportWorkflowState.imported
         assert (await check.get(CatalogAlbum, album.id)).in_library is True
+
+
+async def test_active_deletion_journal_suppresses_watcher_missing_state(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    root = tmp_path / "library"
+    path = root / "Artist" / "Album" / "deleting.mp3"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"audio")
+    plan, *_ = await _seed_plan(db_session, root, "deleting.mp3", state=LibraryFileState.present)
+    metadata = path.stat()
+    db_session.add(
+        DeletionOperation(
+            group_id="active-delete",
+            import_plan_id=plan.id,
+            original_path=str(path),
+            temporary_path=str(path.with_name(".deleting.mp3.audiohoard-delete-active")),
+            expected_device=metadata.st_dev,
+            expected_inode=metadata.st_ino,
+            state=DeletionOperationState.prepared,
+        )
+    )
+    await db_session.commit()
+    path.unlink()
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    service = LibraryReconciliationService(factory, root)
+
+    assert await service.reconcile_paths({path}) == 0
+
+    async with factory() as check:
+        checked = await check.get(ImportPlan, plan.id)
+        assert checked is not None and checked.file_state == LibraryFileState.present
 
 
 async def test_missing_plan_keeps_track_imported_when_an_exact_present_plan_survives(

@@ -58,7 +58,11 @@ from app.services.catalog_metadata import (
 )
 from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
 from app.services.library_import import ImportExecutionError, retag_catalog_album
-from app.services.library_removal import LibraryRemovalError, remove_catalog_album
+from app.services.library_removal import (
+    LibraryRemovalError,
+    remove_catalog_album,
+    remove_imported_release_group,
+)
 from app.services.monitoring import (
     _monitoring_profile_from_runtime,
     current_release_quality,
@@ -573,6 +577,55 @@ async def artist_detail_page(
         "artist_detail.html",
         {"detail": detail},
     )
+
+
+@router.post("/library/releases/delete", include_in_schema=False)
+async def delete_imported_release_files(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> Response:
+    if not await _confirmed_delete(request):
+        raise HTTPException(status_code=422, detail="Explicit deletion confirmation is required")
+    form = await request.form()
+    artist_name = str(form.get("artist_name", "")).strip()
+    album_title = str(form.get("album_title", "")).strip()
+    if not artist_name or not album_title:
+        raise HTTPException(status_code=422, detail="Imported release identity is invalid")
+    year = str(form.get("year", "")).strip()
+    release_value = str(form.get("release_id", "")).strip()
+    try:
+        release_id = int(release_value) if release_value else None
+    except ValueError:
+        raise HTTPException(
+            status_code=422, detail="Imported release identity is invalid"
+        ) from None
+    try:
+        result = await remove_imported_release_group(
+            db,
+            release_id=release_id,
+            artist_name=artist_name,
+            album_title=album_title,
+            year=year,
+            library_root=settings.library_root,
+            cache_root=settings.artwork_cache_root.parent / "library-audio",
+        )
+    except LibraryRemovalError as exc:
+        status = 404 if "not found" in str(exc).casefold() else 409
+        raise HTTPException(status_code=status, detail=str(exc)) from None
+    if _wants_json(request):
+        return JSONResponse(
+            {
+                "release_id": release_id,
+                "deleted_files": result.deleted_files,
+                "track_ids": list(result.affected_track_ids),
+                "already_removed": result.already_removed,
+                "cleanup_pending": result.cleanup_pending,
+            }
+        )
+    location = "/artists/detail?" + urlencode({"name": artist_name, "removed": "1"})
+    return RedirectResponse(location, status_code=303)
 
 
 @router.get("/artists/catalog/open", response_class=HTMLResponse)

@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - Redesign the artist library, unified discographies, and album/single/EP details around truthful ownership, direct playback, autosaving upgrade monitoring, and confirmation-gated file removal.
+- Add authenticated range streaming with bounded MP3 transcoding, a navigation-persistent global player, durable track/catalog/imported-release deletion, and external-file reconciliation.
+
+### Changed
+- Use one persistent server-rendered shell for eligible link navigation while preserving native forms, fragment targeting, and browser history scroll positions.
+
+### Fixed
+- Keep deletion journals authoritative after the database commits, recover matching files restored to their original name, and prevent watcher events from racing active removals.
+- Refresh release truth and reacquisition controls immediately after enhanced file removal.
 
 ## [0.9.3] - 2026-07-30
 

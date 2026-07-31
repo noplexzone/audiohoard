@@ -11,12 +11,18 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 from watchfiles import awatch
 
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
-from app.models.import_plan import ImportPlan, LibraryFileState
+from app.models.import_plan import (
+    DeletionOperation,
+    DeletionOperationState,
+    ImportPlan,
+    LibraryFileState,
+)
 from app.models.release import Release
 from app.models.settings import AppSetting
 from app.models.track import Track
@@ -32,6 +38,15 @@ _ELIGIBLE_STATES = (
 )
 type WatchBatch = set[tuple[object, str]]
 type WatchChanges = Callable[[Path], AsyncIterator[WatchBatch]]
+
+
+def _not_in_active_deletion() -> ColumnElement[bool]:
+    return ~exists(
+        select(DeletionOperation.id).where(
+            DeletionOperation.import_plan_id == ImportPlan.id,
+            DeletionOperation.state != DeletionOperationState.finalized,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -242,7 +257,9 @@ class LibraryReconciliationService:
                 if inspection is None:
                     continue
                 presence = inspection.present
-                plan = await db.get(ImportPlan, plan_id)
+                plan = await db.scalar(
+                    select(ImportPlan).where(ImportPlan.id == plan_id, _not_in_active_deletion())
+                )
                 if (
                     plan is None
                     or plan.status != ImportWorkflowState.imported
@@ -299,6 +316,7 @@ class LibraryReconciliationService:
                                     ),
                                     ImportPlan.status == ImportWorkflowState.imported,
                                     ImportPlan.file_state.in_(_ELIGIBLE_STATES),
+                                    _not_in_active_deletion(),
                                 )
                                 .order_by(ImportPlan.id)
                                 .limit(self._batch_size)
@@ -338,6 +356,7 @@ class LibraryReconciliationService:
                                 ImportPlan.id > cursor,
                                 ImportPlan.status == ImportWorkflowState.imported,
                                 ImportPlan.file_state.in_(_ELIGIBLE_STATES),
+                                _not_in_active_deletion(),
                             )
                             .order_by(ImportPlan.id)
                             .limit(self._batch_size)
