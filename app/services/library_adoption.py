@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hashlib
 import json
 import os
@@ -11,9 +10,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.media_formats import IMPORTABLE_AUDIO_SUFFIXES
@@ -48,7 +48,7 @@ from app.models.workflow import (
 from app.services.catalog import _has_symlink_component
 
 _SCAN_LOCK = asyncio.Lock()
-_STALE_AFTER = timedelta(minutes=15)
+_STALE_AFTER = timedelta(hours=2)
 _MAX_ERROR_LENGTH = 500
 
 
@@ -114,6 +114,10 @@ class MatchDecision:
     track_id: int | None = None
 
 
+class CandidateChangedError(RuntimeError):
+    pass
+
+
 def _safe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_LENGTH]
 
@@ -127,50 +131,60 @@ def _duration_conflicts(actual: int | None, expected: int | None) -> bool:
 
 
 def _snapshot_file(root: Path, path: Path) -> FileSnapshot | None:
-    root = root.resolve()
-    if _has_symlink_component(root, path):
-        return None
+    root = root.absolute()
+    path = path.absolute()
     try:
-        resolved = path.resolve(strict=True)
-        resolved.relative_to(root)
-        before = os.stat(resolved, follow_symlinks=False)
-        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+        relative = path.relative_to(root)
+        if not relative.parts:
             return None
-        digest = hashlib.sha256()
-        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(root, directory_flags)
         try:
-            with os.fdopen(fd, "rb") as handle:
+            for component in relative.parts[:-1]:
+                next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+                os.close(directory_fd)
+                directory_fd = next_fd
+            file_fd = os.open(relative.parts[-1], flags, dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+        try:
+            before = os.fstat(file_fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+                return None
+            digest = hashlib.sha256()
+            with os.fdopen(os.dup(file_fd), "rb") as handle:
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                     digest.update(chunk)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.close(fd)
-            raise
-        metadata = read_audio_file_metadata(resolved)
-        after = os.stat(resolved, follow_symlinks=False)
+            metadata = read_audio_file_metadata(
+                Path(f"/proc/self/fd/{file_fd}"), suffix_hint=path.suffix
+            )
+            after = os.fstat(file_fd)
+            bound = os.stat(path, follow_symlinks=False)
+        finally:
+            os.close(file_fd)
     except (OSError, ValueError, Exception) as exc:
-        # Mutagen errors are intentionally treated as unsupported/corrupt evidence.
+        # Mutagen and path errors are intentionally treated as unsupported/corrupt evidence.
         if isinstance(exc, asyncio.CancelledError):
             raise
         return None
     identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
     identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    if identity_before != identity_after:
+    identity_bound = (bound.st_dev, bound.st_ino, bound.st_size, bound.st_mtime_ns)
+    if identity_before != identity_after or identity_after != identity_bound:
         return None
-    relative = resolved.relative_to(root)
-    parts = relative.parts
-    parsed = parse_filename(resolved.name)
-    position = parsed_position_evidence(resolved.name)
+    parsed = parse_filename(path.name)
+    position = parsed_position_evidence(path.name)
     return FileSnapshot(
-        path=resolved,
+        path=path,
         device=before.st_dev,
         inode=before.st_ino,
         size=before.st_size,
         mtime_ns=before.st_mtime_ns,
         sha256=digest.hexdigest(),
         metadata=metadata,
-        folder_artist=parts[0] if len(parts) >= 2 else None,
-        folder_album=parts[-2] if len(parts) >= 2 else None,
+        folder_artist=relative.parts[0] if len(relative.parts) >= 2 else None,
+        folder_album=relative.parts[-2] if len(relative.parts) >= 2 else None,
         filename_title=parsed.title,
         filename_disc=position.get("disc"),
         filename_track=position.get("track_no"),
@@ -178,35 +192,47 @@ def _snapshot_file(root: Path, path: Path) -> FileSnapshot | None:
 
 
 def discover_audio_files(
-    root: Path, *, excluded_paths: set[str] | None = None
+    root: Path,
+    *,
+    excluded_paths: set[str] | None = None,
+    search_roots: list[Path] | None = None,
 ) -> list[FileSnapshot]:
     root = root.resolve()
     if not root.is_dir() or root.is_symlink():
         return []
     snapshots: list[FileSnapshot] = []
-    for directory, dirs, files in os.walk(root, topdown=True, followlinks=False):
-        base = Path(directory)
-        dirs[:] = sorted(
-            name
-            for name in dirs
-            if not (base / name).is_symlink() and not _has_symlink_component(root, base / name)
-        )
-        for name in sorted(files):
-            path = base / name
-            if path.suffix.casefold() not in IMPORTABLE_AUDIO_SUFFIXES or path.is_symlink():
-                continue
-            if excluded_paths and str(path.resolve(strict=False)) in excluded_paths:
-                continue
-            snapshot = _snapshot_file(root, path)
-            if snapshot is not None:
-                snapshots.append(snapshot)
+    roots = search_roots or [root]
+    for search_root in roots:
+        search_root = search_root.resolve()
+        try:
+            search_root.relative_to(root)
+        except ValueError:
+            continue
+        if not search_root.is_dir() or search_root.is_symlink():
+            continue
+        for directory, dirs, files in os.walk(search_root, topdown=True, followlinks=False):
+            base = Path(directory)
+            dirs[:] = sorted(
+                name
+                for name in dirs
+                if not (base / name).is_symlink() and not _has_symlink_component(root, base / name)
+            )
+            for name in sorted(files):
+                path = base / name
+                if path.suffix.casefold() not in IMPORTABLE_AUDIO_SUFFIXES:
+                    continue
+                if excluded_paths and str(path.resolve(strict=False)) in excluded_paths:
+                    continue
+                snapshot = _snapshot_file(root, path)
+                if snapshot is not None:
+                    snapshots.append(snapshot)
     return snapshots
 
 
 async def enqueue_library_adoption_scan(
     db: AsyncSession, *, library_root: Path, scope: AdoptionScope | None = None
 ) -> int:
-    del library_root  # The configured root is supplied again by the persisted runner.
+    normalized_root = str(await asyncio.to_thread(library_root.resolve))
     scope = scope or AdoptionScope()
     if scope.kind == AdoptionScopeKind.full:
         if scope.scope_id is not None or scope.payload():
@@ -231,6 +257,7 @@ async def enqueue_library_adoption_scan(
         .where(
             LibraryAdoptionScan.state.in_([AdoptionScanState.queued, AdoptionScanState.running]),
             LibraryAdoptionScan.scope_kind == scope.kind,
+            LibraryAdoptionScan.library_root == normalized_root,
             LibraryAdoptionScan.scope_id.is_(scope.scope_id)
             if scope.scope_id is None
             else LibraryAdoptionScan.scope_id == scope.scope_id,
@@ -242,7 +269,12 @@ async def enqueue_library_adoption_scan(
     )
     if active is not None:
         return int(active)
-    scan = LibraryAdoptionScan(scope_kind=scope.kind, scope_id=scope.scope_id, scope_json=payload)
+    scan = LibraryAdoptionScan(
+        scope_kind=scope.kind,
+        scope_id=scope.scope_id,
+        scope_json=payload,
+        library_root=normalized_root,
+    )
     db.add(scan)
     await db.flush()
     return scan.id
@@ -433,29 +465,50 @@ def _match_catalog(snapshot: FileSnapshot, albums: list[CatalogAlbum]) -> MatchD
     )
 
 
-async def _match_imported(
-    db: AsyncSession, snapshot: FileSnapshot, scan: LibraryAdoptionScan
-) -> MatchDecision:
+async def _imported_tracks(
+    db: AsyncSession, scan: LibraryAdoptionScan, *, all_artists: bool = False
+) -> list[Track]:
     payload = json.loads(scan.scope_json or "{}")
     artist_name = str(payload.get("artist_name", ""))
     album_title = payload.get("album_title")
     year = payload.get("year")
-    query = select(Track).where(
-        func.lower(func.coalesce(Track.album_artist, Track.artist, "")) == artist_name.casefold(),
-        Track.import_state == ImportWorkflowState.imported,
+    query = (
+        select(Track)
+        .where(Track.import_state == ImportWorkflowState.imported)
+        .options(
+            selectinload(Track.catalog_album).selectinload(CatalogAlbum.artist),
+            selectinload(Track.release),
+            selectinload(Track.import_plans),
+        )
     )
+    if not all_artists:
+        query = query.where(
+            func.lower(func.coalesce(Track.album_artist, Track.artist, ""))
+            == artist_name.casefold()
+        )
     if album_title:
         query = query.where(
             func.lower(func.coalesce(Track.album, "")) == str(album_title).casefold()
         )
     if year:
         query = query.where(Track.year == str(year))
-    tracks = list((await db.scalars(query.order_by(Track.id))).all())
+    return list((await db.scalars(query.order_by(Track.id))).all())
+
+
+def _match_imported(snapshot: FileSnapshot, tracks: list[Track]) -> MatchDecision:
     metadata = snapshot.metadata
+    observed_artist = metadata.album_artist or metadata.artist or snapshot.folder_artist
+    observed_album = metadata.album or snapshot.folder_album
+    if observed_album:
+        observed_album = re.sub(r"\s+\((?:19|20)\d{2}\)$", "", observed_album)
     candidates = [
         track
         for track in tracks
-        if (not metadata.album or _norm(track.album) == _norm(metadata.album))
+        if (
+            not observed_artist
+            or _norm(track.album_artist or track.artist) == _norm(observed_artist)
+        )
+        and (not observed_album or _norm(track.album) == _norm(observed_album))
         and (not metadata.title or _norm(track.title) == _norm(metadata.title))
         and (not metadata.track or track.track_no == metadata.track)
         and (not metadata.disc or (track.disc or 1) == metadata.disc)
@@ -465,7 +518,7 @@ async def _match_imported(
         )
         and not _duration_conflicts(metadata.duration_sec, track.duration_sec)
     ]
-    if len(candidates) == 1 and metadata.title and (metadata.album or album_title):
+    if len(candidates) == 1 and metadata.title and observed_album:
         track = candidates[0]
         return MatchDecision(
             AdoptionCandidateState.pending,
@@ -512,21 +565,26 @@ def _candidate(
     )
 
 
-async def _path_is_claimed(db: AsyncSession, path: str) -> bool:
-    count = await db.scalar(
-        select(func.count(ImportPlan.id)).where(
-            ImportPlan.destination_path == path,
-            ImportPlan.status.in_(
-                [
-                    ImportWorkflowState.ready,
-                    ImportWorkflowState.importing,
-                    ImportWorkflowState.imported,
-                ]
-            ),
-            ImportPlan.file_state != LibraryFileState.removed,
+async def _claiming_plan(db: AsyncSession, path: str) -> ImportPlan | None:
+    return (
+        await db.scalars(
+            select(ImportPlan)
+            .where(
+                ImportPlan.destination_path == path,
+                ImportPlan.status.in_(
+                    [
+                        ImportWorkflowState.ready,
+                        ImportWorkflowState.importing,
+                        ImportWorkflowState.imported,
+                    ]
+                ),
+                ImportPlan.file_state != LibraryFileState.removed,
+            )
+            .options(selectinload(ImportPlan.track))
+            .order_by(ImportPlan.id.desc())
+            .limit(1)
         )
-    )
-    return bool(count)
+    ).first()
 
 
 async def _track_has_other_file(db: AsyncSession, catalog_track_id: int, path: str) -> bool:
@@ -560,9 +618,32 @@ async def _adopt_candidate(
     if snapshot is None:
         candidate.state = AdoptionCandidateState.stale
         return
-    if await _path_is_claimed(db, candidate.path):
-        candidate.state = AdoptionCandidateState.adopted
-        candidate.reason_codes_json = json.dumps(["destination_already_owned"])
+    owner = await _claiming_plan(db, candidate.path)
+    if owner is not None:
+        owner_track = owner.track
+        identity_matches = bool(
+            owner_track
+            and (
+                (candidate.proposed_track_id and owner.track_id == candidate.proposed_track_id)
+                or (
+                    candidate.proposed_catalog_track_id
+                    and owner_track.catalog_track_id == candidate.proposed_catalog_track_id
+                )
+            )
+        )
+        hash_matches = bool(
+            owner_track
+            and owner_track.content_sha256
+            and owner_track.content_sha256 == candidate.content_sha256
+        )
+        if identity_matches and hash_matches:
+            candidate.state = AdoptionCandidateState.adopted
+            candidate.resulting_track_id = owner.track_id
+            candidate.resulting_import_plan_id = owner.id
+            candidate.reason_codes_json = json.dumps(["destination_already_owned_by_match"])
+        else:
+            candidate.state = AdoptionCandidateState.review
+            candidate.reason_codes_json = json.dumps(["destination_owned_by_other_identity"])
         return
     if candidate.proposed_catalog_track_id and await _track_has_other_file(
         db, candidate.proposed_catalog_track_id, candidate.path
@@ -616,6 +697,7 @@ async def _adopt_candidate(
             CatalogAlbum,
             candidate.proposed_album_id,
             options=(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks)),
+            populate_existing=True,
         )
     if candidate.proposed_catalog_track_id:
         catalog_track = await db.get(CatalogAlbumTrack, candidate.proposed_catalog_track_id)
@@ -719,6 +801,8 @@ async def _adopt_candidate(
     )
     db.add(plan)
     await db.flush()
+    if await asyncio.to_thread(_snapshot_matches, candidate, root) is None:
+        raise CandidateChangedError("candidate changed before ownership commit")
     candidate.state = AdoptionCandidateState.adopted
     candidate.resulting_track_id = track.id
     candidate.resulting_import_plan_id = plan.id
@@ -757,75 +841,173 @@ async def run_library_adoption_scan(
             raise ValueError("adoption scan not found")
         if scan.state in {AdoptionScanState.completed, AdoptionScanState.cancelled}:
             return scan
-        scan.state = AdoptionScanState.running
-        scan.started_at = scan.started_at or datetime.now(UTC)
-        scan.heartbeat_at = datetime.now(UTC)
-        scan.error_detail = None
+        normalized_root = await asyncio.to_thread(library_root.resolve)
+        if str(normalized_root) != scan.library_root:
+            scan.state = AdoptionScanState.failed
+            scan.error_detail = "Configured library root changed after this scan was queued"
+            scan.completed_at = datetime.now(UTC)
+            await db.commit()
+            return scan
+
+        lease_token = str(uuid4())
+        claim = await db.execute(
+            update(LibraryAdoptionScan)
+            .where(
+                LibraryAdoptionScan.id == scan_id,
+                LibraryAdoptionScan.state == AdoptionScanState.queued,
+            )
+            .values(
+                state=AdoptionScanState.running,
+                lease_token=lease_token,
+                started_at=scan.started_at or datetime.now(UTC),
+                heartbeat_at=datetime.now(UTC),
+                error_detail=None,
+                completed_at=None,
+            )
+        )
+        if getattr(claim, "rowcount", 0) != 1:
+            await db.rollback()
+            current = await db.get(LibraryAdoptionScan, scan_id, populate_existing=True)
+            assert current is not None
+            return current
         await db.commit()
+        scan = await db.get(LibraryAdoptionScan, scan_id, populate_existing=True)
+        assert scan is not None
+
         try:
-            claimed = set(
+            candidates = list(
                 (
                     await db.scalars(
-                        select(ImportPlan.destination_path).where(
-                            ImportPlan.status.in_(
-                                [
-                                    ImportWorkflowState.ready,
-                                    ImportWorkflowState.importing,
-                                    ImportWorkflowState.imported,
-                                ]
-                            ),
-                            ImportPlan.file_state != LibraryFileState.removed,
-                        )
+                        select(LibraryAdoptionCandidate)
+                        .where(LibraryAdoptionCandidate.scan_id == scan.id)
+                        .order_by(LibraryAdoptionCandidate.id)
                     )
                 ).all()
             )
-            snapshots = await asyncio.to_thread(
-                discover_audio_files, library_root, excluded_paths=claimed
-            )
-            albums = (
-                await _catalog_albums(db, scan)
-                if scan.scope_kind
-                in {
-                    AdoptionScopeKind.full,
-                    AdoptionScopeKind.catalog_artist,
-                    AdoptionScopeKind.catalog_album,
-                }
-                else []
-            )
-            candidates: list[LibraryAdoptionCandidate] = []
-            for snapshot in snapshots:
-                decision = (
-                    _match_catalog(snapshot, albums)
-                    if albums
-                    else await _match_imported(db, snapshot, scan)
+            if not candidates:
+                claimed = set(
+                    (
+                        await db.scalars(
+                            select(ImportPlan.destination_path).where(
+                                ImportPlan.status.in_(
+                                    [
+                                        ImportWorkflowState.ready,
+                                        ImportWorkflowState.importing,
+                                        ImportWorkflowState.imported,
+                                    ]
+                                ),
+                                ImportPlan.file_state != LibraryFileState.removed,
+                            )
+                        )
+                    ).all()
                 )
-                candidates.append(_candidate(scan.id, snapshot, decision))
-            by_target: dict[tuple[int | None, int | None], list[LibraryAdoptionCandidate]] = {}
-            for candidate in candidates:
-                if candidate.state == AdoptionCandidateState.pending:
-                    by_target.setdefault(
-                        (candidate.proposed_catalog_track_id, candidate.proposed_track_id), []
-                    ).append(candidate)
-            for group in by_target.values():
-                if len(group) > 1:
-                    for candidate in group:
-                        candidate.state = AdoptionCandidateState.review
-                        candidate.confidence = "ambiguous"
-                        candidate.reason_codes_json = json.dumps(["multiple_files_for_one_track"])
-            db.add_all(candidates)
-            scan.scanned_count = len(snapshots)
-            scan.heartbeat_at = datetime.now(UTC)
-            await db.commit()
+                albums = (
+                    await _catalog_albums(db, scan)
+                    if scan.scope_kind
+                    in {
+                        AdoptionScopeKind.full,
+                        AdoptionScopeKind.catalog_artist,
+                        AdoptionScopeKind.catalog_album,
+                    }
+                    else []
+                )
+                imported_tracks = (
+                    await _imported_tracks(
+                        db,
+                        scan,
+                        all_artists=scan.scope_kind == AdoptionScopeKind.full,
+                    )
+                    if scan.scope_kind
+                    in {
+                        AdoptionScopeKind.full,
+                        AdoptionScopeKind.imported_artist,
+                        AdoptionScopeKind.imported_release,
+                    }
+                    else []
+                )
+                snapshots = await asyncio.to_thread(
+                    discover_audio_files,
+                    normalized_root,
+                    excluded_paths=claimed,
+                )
+                for snapshot in snapshots:
+                    decision = (
+                        _match_catalog(snapshot, albums)
+                        if albums
+                        else MatchDecision(
+                            AdoptionCandidateState.unmatched,
+                            "none",
+                            ("no_catalog_identity",),
+                        )
+                    )
+                    if imported_tracks:
+                        imported_decision = _match_imported(snapshot, imported_tracks)
+                        if (
+                            imported_decision.state == AdoptionCandidateState.pending
+                            or decision.state == AdoptionCandidateState.unmatched
+                        ):
+                            decision = imported_decision
+                    candidates.append(_candidate(scan.id, snapshot, decision))
+
+                by_target: dict[tuple[int | None, int | None], list[LibraryAdoptionCandidate]] = {}
+                for candidate in candidates:
+                    if candidate.state == AdoptionCandidateState.pending:
+                        by_target.setdefault(
+                            (
+                                candidate.proposed_catalog_track_id,
+                                candidate.proposed_track_id,
+                            ),
+                            [],
+                        ).append(candidate)
+                for group in by_target.values():
+                    if len(group) > 1:
+                        for candidate in group:
+                            candidate.state = AdoptionCandidateState.review
+                            candidate.confidence = "ambiguous"
+                            candidate.reason_codes_json = json.dumps(
+                                ["multiple_files_for_one_track"]
+                            )
+                db.add_all(candidates)
+                scan.scanned_count = len(snapshots)
+                scan.heartbeat_at = datetime.now(UTC)
+                await db.commit()
+
             album_ids: set[int] = set()
             batch_releases: dict[int, Release] = {}
             for candidate in candidates:
                 if candidate.state != AdoptionCandidateState.pending:
                     continue
-                await _adopt_candidate(db, candidate, library_root, batch_releases)
+                lease = await db.execute(
+                    select(
+                        LibraryAdoptionScan.state,
+                        LibraryAdoptionScan.lease_token,
+                    ).where(LibraryAdoptionScan.id == scan.id)
+                )
+                state, current_token = lease.one()
+                if state != AdoptionScanState.running or current_token != lease_token:
+                    await db.rollback()
+                    current = await db.get(LibraryAdoptionScan, scan_id, populate_existing=True)
+                    assert current is not None
+                    return current
+                try:
+                    async with db.begin_nested():
+                        await _adopt_candidate(db, candidate, normalized_root, batch_releases)
+                except CandidateChangedError:
+                    batch_releases.clear()
+                    refreshed_candidate = await db.get(
+                        LibraryAdoptionCandidate,
+                        candidate.id,
+                        populate_existing=True,
+                    )
+                    assert refreshed_candidate is not None
+                    candidate = refreshed_candidate
+                    candidate.state = AdoptionCandidateState.stale
+                    candidate.reason_codes_json = json.dumps(["file_changed_before_commit"])
                 if candidate.proposed_album_id:
                     album_ids.add(candidate.proposed_album_id)
                 scan.heartbeat_at = datetime.now(UTC)
                 await db.commit()
+
             await _refresh_album_truth(db, album_ids)
             states = list(
                 (
@@ -844,25 +1026,38 @@ async def run_library_adoption_scan(
             scan.state = AdoptionScanState.completed
             scan.completed_at = datetime.now(UTC)
             scan.heartbeat_at = datetime.now(UTC)
+            scan.lease_token = None
             await db.commit()
             return scan
         except asyncio.CancelledError:
             await db.rollback()
-            scan = await db.get(LibraryAdoptionScan, scan_id)
-            assert scan is not None
-            scan.state = AdoptionScanState.cancelled
-            scan.completed_at = datetime.now(UTC)
+            await db.execute(
+                update(LibraryAdoptionScan)
+                .where(
+                    LibraryAdoptionScan.id == scan_id,
+                    LibraryAdoptionScan.lease_token == lease_token,
+                )
+                .values(
+                    state=AdoptionScanState.queued,
+                    lease_token=None,
+                    heartbeat_at=datetime.now(UTC),
+                    error_detail="Interrupted during shutdown; queued for resume",
+                    completed_at=None,
+                )
+            )
             await db.commit()
             raise
         except Exception as exc:
             await db.rollback()
-            scan = await db.get(LibraryAdoptionScan, scan_id)
+            scan = await db.get(LibraryAdoptionScan, scan_id, populate_existing=True)
             assert scan is not None
-            scan.state = AdoptionScanState.failed
-            scan.error_detail = _safe_error(exc)
-            scan.error_count += 1
-            scan.completed_at = datetime.now(UTC)
-            await db.commit()
+            if scan.lease_token == lease_token:
+                scan.state = AdoptionScanState.failed
+                scan.lease_token = None
+                scan.error_detail = _safe_error(exc)
+                scan.error_count += 1
+                scan.completed_at = datetime.now(UTC)
+                await db.commit()
             return scan
 
 
@@ -880,6 +1075,7 @@ async def recover_library_adoption_scans(db: AsyncSession) -> list[int]:
     )
     for scan in stale:
         scan.state = AdoptionScanState.queued
+        scan.lease_token = None
         scan.error_detail = "Recovered after interrupted scan"
     queued = list(
         (
@@ -892,13 +1088,3 @@ async def recover_library_adoption_scans(db: AsyncSession) -> list[int]:
     )
     await db.commit()
     return [int(scan_id) for scan_id in queued]
-
-
-async def run_queued_library_adoption_scans(
-    session_factory: async_sessionmaker[AsyncSession], *, library_root: Path
-) -> None:
-    async with session_factory() as db:
-        scan_ids = await recover_library_adoption_scans(db)
-    for scan_id in scan_ids:
-        async with session_factory() as db:
-            await run_library_adoption_scan(db, scan_id=scan_id, library_root=library_root)

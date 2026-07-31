@@ -107,9 +107,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         runtime = await get_runtime_settings(db)
         await job_dispatcher.set_max_concurrent_jobs(runtime.max_parallel_acquisitions)
         effective_settings = await build_effective_settings(db, get_settings())
-    library_adoption_runner = LibraryAdoptionRunner(
-        get_session_factory(), effective_settings.library_root
-    )
+    library_adoption_runner = LibraryAdoptionRunner(get_session_factory())
     app.state.library_adoption_runner = library_adoption_runner
     await recover_deletion_operations(
         get_session_factory(),

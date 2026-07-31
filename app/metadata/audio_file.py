@@ -48,8 +48,8 @@ def _total(value: str | None, explicit: str | None) -> int | None:
     return None
 
 
-def read_audio_file_metadata(path: Path) -> AudioFileMetadata:
-    tags = MutagenTagWriter().read_tags(path)
+def read_audio_file_metadata(path: Path, *, suffix_hint: str | None = None) -> AudioFileMetadata:
+    tags = MutagenTagWriter().read_tags(path, suffix_hint=suffix_hint)
     try:
         audio = MutagenFile(path)
     except Exception:
@@ -73,5 +73,5 @@ def read_audio_file_metadata(path: Path) -> AudioFileMetadata:
         album_mbid=tags.get("musicbrainz_albumid"),
         release_group_mbid=tags.get("musicbrainz_releasegroupid"),
         duration_sec=duration,
-        file_format=path.suffix.casefold().lstrip("."),
+        file_format=(suffix_hint or path.suffix).casefold().lstrip("."),
     )

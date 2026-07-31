@@ -24,6 +24,8 @@ def upgrade() -> None:
         sa.Column("scope_kind", sa.String(length=16), nullable=False),
         sa.Column("scope_id", sa.Integer(), nullable=True),
         sa.Column("scope_json", sa.Text(), nullable=True),
+        sa.Column("library_root", sa.Text(), nullable=False),
+        sa.Column("lease_token", sa.String(length=36), nullable=True),
         sa.Column("state", sa.String(length=16), server_default="queued", nullable=False),
         sa.Column("scanned_count", sa.Integer(), server_default="0", nullable=False),
         sa.Column("adopted_count", sa.Integer(), server_default="0", nullable=False),

@@ -54,6 +54,8 @@ class LibraryAdoptionScan(Base):
     )
     scope_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     scope_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    library_root: Mapped[str] = mapped_column(Text, nullable=False)
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     state: Mapped[AdoptionScanState] = mapped_column(
         Enum(AdoptionScanState, native_enum=False, create_constraint=True),
         nullable=False,

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 from mutagen.id3 import ID3, TALB, TIT2, TPE1, TPE2, TPOS, TRCK, TXXX
 from sqlalchemy import func, select
 
+import app.services.library_adoption as adoption_service
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
@@ -14,6 +16,7 @@ from app.models.library_adoption import (
     AdoptionScanState,
     AdoptionScopeKind,
     LibraryAdoptionCandidate,
+    LibraryAdoptionScan,
 )
 from app.models.release import Release
 from app.models.track import Track
@@ -124,7 +127,12 @@ async def test_duplicate_files_for_one_track_persist_for_review_and_do_not_attac
 
     scan = await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=library)
 
-    assert scan.review_count == 2
+    assert scan.state == AdoptionScanState.completed, scan.error_detail
+    assert scan.review_count == 2, (
+        scan.scanned_count,
+        scan.unmatched_count,
+        scan.error_count,
+    )
     assert await db_session.scalar(select(func.count(ImportPlan.id))) == 0
     states = list((await db_session.scalars(select(LibraryAdoptionCandidate.state))).all())
     assert states == [AdoptionCandidateState.review, AdoptionCandidateState.review]
@@ -146,7 +154,12 @@ async def test_contradictory_album_mbid_persists_without_ownership(
 
     scan = await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=library)
 
-    assert scan.review_count == 1
+    assert scan.state == AdoptionScanState.completed, scan.error_detail
+    assert scan.review_count == 1, (
+        scan.scanned_count,
+        scan.unmatched_count,
+        scan.error_count,
+    )
     assert await db_session.scalar(select(func.count(ImportPlan.id))) == 0
 
 
@@ -283,6 +296,112 @@ async def test_album_batch_reuses_release_and_sets_complete_truth(
     assert await db_session.scalar(select(func.count(Job.id))) == 1
     await db_session.refresh(album)
     assert album.in_library is True
+
+
+@pytest.mark.asyncio
+async def test_interrupted_scan_resumes_persisted_candidates(
+    db_session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "music"
+    path = root / "Example Artist" / "Example Album (2024)" / "01 - Song 1.mp3"
+    _tagged_mp3(path)
+    _, album = await _catalog(db_session)
+    scan_id = await enqueue_library_adoption_scan(
+        db_session,
+        library_root=root,
+        scope=AdoptionScope(AdoptionScopeKind.catalog_album, scope_id=album.id),
+    )
+    await db_session.commit()
+
+    original = adoption_service._adopt_candidate
+
+    async def interrupt(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(adoption_service, "_adopt_candidate", interrupt)
+    with pytest.raises(asyncio.CancelledError):
+        await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=root)
+    scan = await db_session.get(LibraryAdoptionScan, scan_id)
+    assert scan is not None and scan.state == AdoptionScanState.queued
+    candidate_count = await db_session.scalar(
+        select(func.count(LibraryAdoptionCandidate.id)).where(
+            LibraryAdoptionCandidate.scan_id == scan_id
+        )
+    )
+    assert candidate_count == 1
+
+    monkeypatch.setattr(adoption_service, "_adopt_candidate", original)
+    scan = await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=root)
+    assert scan.state == AdoptionScanState.completed, scan.error_detail
+    assert scan.adopted_count == 1
+    candidate_count = await db_session.scalar(
+        select(func.count(LibraryAdoptionCandidate.id)).where(
+            LibraryAdoptionCandidate.scan_id == scan_id
+        )
+    )
+    assert candidate_count == 1
+
+
+@pytest.mark.asyncio
+async def test_full_scan_falls_back_to_imported_only_identity(db_session, tmp_path: Path) -> None:
+    root = tmp_path / "music"
+    path = root / "Legacy Artist" / "Legacy Album (2020)" / "01 - Legacy Song.mp3"
+    _tagged_mp3(
+        path,
+        artist="Legacy Artist",
+        album="Legacy Album",
+        title="Legacy Song",
+        album_mbid=None,
+        recording_mbid=None,
+    )
+    await _catalog(db_session)  # Keep an unrelated catalog identity present.
+    job = Job(source="legacy", query="legacy import", status=JobStatus.done)
+    release = Release(
+        job=job,
+        source="legacy",
+        title="Legacy Album",
+        album_artist="Legacy Artist",
+        year="2020",
+    )
+    track = Track(
+        job=job,
+        release=release,
+        source="legacy",
+        artist="Legacy Artist",
+        album_artist="Legacy Artist",
+        album="Legacy Album",
+        title="Legacy Song",
+        year="2020",
+        track_no=1,
+        disc=1,
+        import_state=ImportWorkflowState.imported,
+    )
+    db_session.add(track)
+    await db_session.flush()
+    track_id = track.id
+    scan_id = await enqueue_library_adoption_scan(db_session, library_root=root)
+    await db_session.commit()
+
+    scan = await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=root)
+    assert scan.state == AdoptionScanState.completed, scan.error_detail
+    assert scan.adopted_count == 1
+    plan = await db_session.scalar(select(ImportPlan).where(ImportPlan.track_id == track_id))
+    assert plan is not None and plan.destination_path == str(path)
+
+
+@pytest.mark.asyncio
+async def test_queued_scan_fails_closed_when_library_root_changes(
+    db_session, tmp_path: Path
+) -> None:
+    original_root = tmp_path / "music-a"
+    changed_root = tmp_path / "music-b"
+    original_root.mkdir()
+    changed_root.mkdir()
+    scan_id = await enqueue_library_adoption_scan(db_session, library_root=original_root)
+    await db_session.commit()
+    scan = await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=changed_root)
+    assert scan.state == AdoptionScanState.failed
+    assert "root changed" in (scan.error_detail or "")
 
 
 @pytest.mark.asyncio
