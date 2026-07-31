@@ -173,7 +173,7 @@ async def test_db_failure_restores_all_files_and_imported_truth(
     assert all(track.import_state == ImportWorkflowState.imported for track in tracks)
 
 
-async def test_indeterminate_commit_never_restores_staged_file(
+async def test_unreadable_journal_after_indeterminate_commit_never_restores_staged_file(
     db_session: AsyncSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "library"
@@ -203,6 +203,50 @@ async def test_indeterminate_commit_never_restores_staged_file(
     assert plans[0].file_state == LibraryFileState.removed
     assert not paths[0].exists()
     assert len(list(paths[0].parent.glob("*.audiohoard-delete-*"))) == 1
+
+
+async def test_restore_is_safe_only_when_every_journal_row_is_prepared(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    root = tmp_path / "library"
+    _, _, plans, paths = await _seed_album(db_session, root)
+    operations = []
+    for index, (plan, path) in enumerate(zip(plans, paths, strict=True)):
+        metadata = path.stat()
+        operations.append(
+            DeletionOperation(
+                group_id="restore-predicate-group",
+                import_plan_id=plan.id,
+                original_path=str(path),
+                temporary_path=str(path.with_name(f".predicate-{index}")),
+                expected_device=metadata.st_dev,
+                expected_inode=metadata.st_ino,
+                state=DeletionOperationState.prepared,
+            )
+        )
+    db_session.add_all(operations)
+    await db_session.commit()
+    operation_ids = tuple(operation.id for operation in operations)
+
+    assert await library_removal._operations_prepared(db_session, operation_ids) is True
+
+    operations[0].state = DeletionOperationState.committed
+    await db_session.commit()
+    assert await library_removal._operations_prepared(db_session, operation_ids) is False
+
+    operations[0].state = DeletionOperationState.prepared
+    operations[1].state = DeletionOperationState.finalized
+    await db_session.commit()
+    assert await library_removal._operations_prepared(db_session, operation_ids) is False
+
+    operations[1].state = DeletionOperationState.prepared
+    await db_session.commit()
+    assert (
+        await library_removal._operations_prepared(
+            db_session, (operations[0].id, operations[1].id + 1_000_000)
+        )
+        is False
+    )
 
 
 async def test_post_commit_failure_never_restores_removed_file(
