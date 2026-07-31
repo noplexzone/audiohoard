@@ -19,10 +19,11 @@ from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
 from app.models.import_plan import ImportPlan
 from app.models.track import Track
 from app.models.workflow import ImportWorkflowState
-from app.services.catalog_metadata import _norm_title, release_bucket
+from app.services.catalog_metadata import _norm_title
 
 logger = logging.getLogger(__name__)
 _PROVENANCE_KEY = "catalog_ownership_rating_v1"
+_RECONCILE_LOCK = asyncio.Lock()
 
 
 @dataclass(frozen=True)
@@ -104,14 +105,14 @@ async def _collect_candidates(
             sibling.id != CatalogAlbum.id,
             func.lower(func.trim(sibling.title)) == func.lower(func.trim(CatalogAlbum.title)),
             (sibling.year == CatalogAlbum.year)
-            | sibling.year.is_(None)
-            | CatalogAlbum.year.is_(None),
-            (sibling.release_type == CatalogAlbum.release_type)
-            | sibling.release_type.is_(None)
-            | CatalogAlbum.release_type.is_(None),
+            | (sibling.year.is_(None) & CatalogAlbum.year.is_(None)),
+            (
+                func.lower(func.trim(sibling.release_type))
+                == func.lower(func.trim(CatalogAlbum.release_type))
+            )
+            | (sibling.release_type.is_(None) & CatalogAlbum.release_type.is_(None)),
             (sibling.track_count == CatalogAlbum.track_count)
-            | sibling.track_count.is_(None)
-            | CatalogAlbum.track_count.is_(None),
+            | (sibling.track_count.is_(None) & CatalogAlbum.track_count.is_(None)),
             sibling.content_rating != CONTENT_RATING_UNKNOWN,
             CatalogAlbum.content_rating != CONTENT_RATING_UNKNOWN,
             sibling.content_rating != CatalogAlbum.content_rating,
@@ -197,6 +198,17 @@ async def _resolve_evidence(
                     f"Deezer returned no ownership record for track {deezer_id}"
                 )
             return None
+        if str(track.deezer_id) != deezer_id:
+            if fail_fast:
+                raise CatalogOwnershipEvidenceError(
+                    f"Deezer returned track {track.deezer_id} for requested track {deezer_id}"
+                )
+            logger.warning(
+                "Deezer returned track %s for requested ownership track %s",
+                track.deezer_id,
+                deezer_id,
+            )
+            return None
         rating = normalize_content_rating(track.content_rating)
         if rating == CONTENT_RATING_UNKNOWN:
             if fail_fast:
@@ -215,19 +227,13 @@ def _albums_compatible(current: CatalogAlbum, candidate: CatalogAlbum) -> bool:
         return False
     if _norm_title(current.title) != _norm_title(candidate.title):
         return False
-    if current.year and candidate.year and current.year != candidate.year:
+    if current.year != candidate.year:
         return False
-    if (
-        current.release_type
-        and candidate.release_type
-        and release_bucket(current.release_type) != release_bucket(candidate.release_type)
-    ):
+    current_type = current.release_type.strip().casefold() if current.release_type else None
+    candidate_type = candidate.release_type.strip().casefold() if candidate.release_type else None
+    if current_type != candidate_type:
         return False
-    return not (
-        current.track_count
-        and candidate.track_count
-        and current.track_count != candidate.track_count
-    )
+    return current.track_count == candidate.track_count
 
 
 def _matching_track(track: Track, album: CatalogAlbum) -> CatalogAlbumTrack | None:
@@ -237,13 +243,9 @@ def _matching_track(track: Track, album: CatalogAlbum) -> CatalogAlbumTrack | No
         if track.title and _norm_title(candidate.title) == _norm_title(track.title)
     ]
     if track.track_no is not None:
-        positioned = [candidate for candidate in matches if candidate.position == track.track_no]
-        if positioned:
-            matches = positioned
+        matches = [candidate for candidate in matches if candidate.position == track.track_no]
     if track.disc is not None:
-        on_disc = [candidate for candidate in matches if candidate.disc == track.disc]
-        if on_disc:
-            matches = on_disc
+        matches = [candidate for candidate in matches if candidate.disc == track.disc]
     if track.duration_sec is not None:
         matches = [
             candidate
@@ -436,6 +438,22 @@ async def recompute_catalog_library_flags(
 
 
 async def reconcile_deezer_catalog_ownership(
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    *,
+    artist_id: int | None = None,
+    fail_on_provider_error: bool = False,
+) -> int:
+    async with _RECONCILE_LOCK:
+        return await _reconcile_deezer_catalog_ownership_unlocked(
+            session_factory,
+            settings,
+            artist_id=artist_id,
+            fail_on_provider_error=fail_on_provider_error,
+        )
+
+
+async def _reconcile_deezer_catalog_ownership_unlocked(
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
     *,

@@ -257,6 +257,63 @@ async def test_reconcile_rejects_different_release_version(
     assert track.catalog_album_id == clean.id
 
 
+@pytest.mark.parametrize(
+    ("field", "clean_value", "explicit_value"),
+    [
+        ("year", None, 2026),
+        ("release_type", "single", "ep"),
+        ("track_count", None, 1),
+    ],
+)
+async def test_reconcile_requires_identical_release_metadata(
+    db_session: AsyncSession,
+    test_settings: Settings,
+    tmp_path: Path,
+    monkeypatch,
+    field: str,
+    clean_value: object,
+    explicit_value: object,
+) -> None:
+    destination = tmp_path / "track.flac"
+    destination.write_bytes(b"audio")
+    clean, explicit, _track = await _add_imported_single(db_session, destination)
+    setattr(clean, field, clean_value)
+    setattr(explicit, field, explicit_value)
+    await db_session.commit()
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+
+    async def evidence(_settings, _candidates):
+        raise AssertionError("incompatible releases must not query provider ownership")
+
+    monkeypatch.setattr(catalog_ownership, "_resolve_evidence", evidence)
+    assert await catalog_ownership.reconcile_deezer_catalog_ownership(factory, test_settings) == 0
+
+
+@pytest.mark.parametrize(("field", "value"), [("position", 2), ("disc", 2)])
+async def test_reconcile_rejects_conflicting_track_position(
+    db_session: AsyncSession,
+    tmp_path: Path,
+    field: str,
+    value: int,
+) -> None:
+    destination = tmp_path / "track.flac"
+    destination.write_bytes(b"audio")
+    clean, explicit, track = await _add_imported_single(db_session, destination)
+    setattr(explicit.tracks[0], field, value)
+    await db_session.commit()
+
+    changed, affected, verified = await catalog_ownership.apply_catalog_ownership_evidence(
+        db_session,
+        {
+            str(track.deezer_id): DeezerReleaseEvidence(
+                str(track.deezer_id), "explicit-album", "explicit"
+            )
+        },
+    )
+    assert changed == 0 and affected == set() and verified == {}
+    assert track.catalog_album_id == clean.id
+
+
 async def test_reconcile_does_not_query_provider_when_imported_file_is_missing(
     db_session: AsyncSession,
     test_settings: Settings,
@@ -349,6 +406,26 @@ async def test_strict_evidence_resolution_propagates_provider_failure(
         await catalog_ownership._resolve_evidence(
             test_settings,
             [candidate, second],
+            fail_fast=True,
+        )
+
+    class MismatchedTrack:
+        deezer_id = "999"
+        album_id = "album-1"
+        content_rating = "explicit"
+
+    class MismatchedDeezerClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        async def get_track(self, _track_id: str):
+            return MismatchedTrack()
+
+    monkeypatch.setattr(catalog_ownership, "DeezerClient", MismatchedDeezerClient)
+    with pytest.raises(catalog_ownership.CatalogOwnershipEvidenceError):
+        await catalog_ownership._resolve_evidence(
+            test_settings,
+            [candidate],
             fail_fast=True,
         )
 
