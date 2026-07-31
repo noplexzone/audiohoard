@@ -677,12 +677,7 @@ async def catalog_artist_page(
             release.catalog_album_id or 0,
             ReleaseProgress(wanted_track_count=0, downloaded_track_count=0),
         )
-        wanted = max(projected.wanted_track_count, release.track_count or 0)
-        release_progress[release.id] = ReleaseProgress(
-            wanted_track_count=wanted,
-            downloaded_track_count=min(projected.downloaded_track_count, wanted),
-            downloaded_catalog_track_ids=projected.downloaded_catalog_track_ids,
-        )
+        release_progress[release.id] = projected
     albums = sorted(
         provider_albums,
         key=lambda release: (release.year or "0000", release.title.casefold()),

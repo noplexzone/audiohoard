@@ -16,7 +16,7 @@ from app.models.catalog_entities import (
     CatalogArtist,
     CatalogArtistIdentity,
 )
-from app.models.import_plan import ImportPlan
+from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import FingerprintState, IdentityResolutionState, Track
@@ -62,6 +62,7 @@ def _make_track(
             source_path=f"/staging/{title}.flac",
             destination_path=source_path or f"/music/{title}.flac",
             status=ImportWorkflowState.imported,
+            file_state=LibraryFileState.present,
         )
     )
     return track
@@ -879,7 +880,7 @@ async def test_catalog_artist_enrich_queues_without_running_inline(
     assert queued_tasks[0][1][0] == artist_id
 
 
-async def test_release_progress_recognizes_current_library_folder_naming(
+async def test_release_progress_does_not_treat_untracked_library_folder_as_owned(
     test_settings, db_session
 ) -> None:
     from app.services.catalog import get_release_progress
@@ -905,13 +906,11 @@ async def test_release_progress_recognizes_current_library_folder_naming(
     )[album.id]
 
     assert progress.wanted_track_count == 15
-    assert progress.downloaded_track_count == 6
-    assert progress.downloaded_catalog_track_ids == frozenset(
-        track.id for track in album.tracks[:6]
-    )
+    assert progress.downloaded_track_count == 0
+    assert progress.downloaded_catalog_track_ids == frozenset()
 
 
-async def test_release_progress_recognizes_unknown_year_default_folder(
+async def test_release_progress_ignores_untracked_unknown_year_folder(
     test_settings, db_session
 ) -> None:
     from app.services.catalog import get_release_progress
@@ -930,11 +929,13 @@ async def test_release_progress_recognizes_unknown_year_default_folder(
         await get_release_progress(db_session, [album.id], library_root=test_settings.library_root)
     )[album.id]
 
-    assert progress.downloaded_track_count == 1
-    assert progress.downloaded_catalog_track_ids == frozenset({album.tracks[0].id})
+    assert progress.downloaded_track_count == 0
+    assert progress.downloaded_catalog_track_ids == frozenset()
 
 
-async def test_release_progress_maps_multi_disc_track_numbers(test_settings, db_session) -> None:
+async def test_release_progress_ignores_untracked_multi_disc_files(
+    test_settings, db_session
+) -> None:
     from app.services.catalog import get_release_progress
 
     artist = CatalogArtist(name="Various Artist")
@@ -957,8 +958,8 @@ async def test_release_progress_maps_multi_disc_track_numbers(test_settings, db_
         await get_release_progress(db_session, [album.id], library_root=test_settings.library_root)
     )[album.id]
 
-    assert progress.downloaded_track_count == 2
-    assert progress.downloaded_catalog_track_ids == frozenset(track.id for track in album.tracks)
+    assert progress.downloaded_track_count == 0
+    assert progress.downloaded_catalog_track_ids == frozenset()
 
 
 async def test_release_progress_rejects_intermediate_library_symlink(
@@ -1019,7 +1020,7 @@ async def test_catalog_album_shows_total_and_per_track_downloaded_wanted_states(
     assert f'action="/albums/{partial_id}/tracks/{missing_id}/download"' in missing_row
 
 
-async def test_album_download_skips_legacy_files_counted_by_release_progress(
+async def test_album_download_does_not_trust_untracked_legacy_files(
     client: AsyncClient, test_settings, monkeypatch
 ) -> None:
     import app.routers.catalog as catalog_router
@@ -1064,11 +1065,12 @@ async def test_album_download_skips_legacy_files_counted_by_release_progress(
             ).all()
         )
     assert [job.query for job in jobs] == [
+        "Juice WRLD Already Owned",
         "Juice WRLD Actually Missing",
         "Juice WRLD Also Missing",
     ]
     assert all(job.catalog_track_id is not None for job in jobs)
-    assert len(dispatched) == 2
+    assert len(dispatched) == 3
 
 
 async def test_album_download_queues_only_missing_catalog_tracks(
@@ -1113,6 +1115,7 @@ async def test_album_download_queues_only_missing_catalog_tracks(
             catalog_track_id=album.tracks[0].id,
             acquisition_state=AcquisitionState.downloaded,
             import_state=ImportWorkflowState.imported,
+            file_size_bytes=existing_path.stat().st_size,
         )
         owned.import_plans.append(
             ImportPlan(
@@ -1120,6 +1123,7 @@ async def test_album_download_queues_only_missing_catalog_tracks(
                 source_path=str(existing_path),
                 destination_path=str(existing_path),
                 status=ImportWorkflowState.imported,
+                file_state=LibraryFileState.present,
             )
         )
         session.add(owned)
@@ -1338,6 +1342,7 @@ async def test_artist_download_monitored_queues_only_missing_partial_album_track
                 catalog_track_id=catalog_track.id,
                 acquisition_state=AcquisitionState.downloaded,
                 import_state=ImportWorkflowState.imported,
+                file_size_bytes=existing_path.stat().st_size,
             )
             track.import_plans.append(
                 ImportPlan(
@@ -1345,6 +1350,7 @@ async def test_artist_download_monitored_queues_only_missing_partial_album_track
                     source_path=str(existing_path),
                     destination_path=str(existing_path),
                     status=ImportWorkflowState.imported,
+                    file_state=LibraryFileState.present,
                 )
             )
             session.add(track)
