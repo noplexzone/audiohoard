@@ -332,7 +332,15 @@ async def test_lost_plan_is_repaired_without_erasing_provenance(
         acquisition_state=AcquisitionState.downloaded,
         import_state=ImportWorkflowState.imported,
     )
-    db_session.add(job)
+    missing_plan = ImportPlan(
+        release=release,
+        track=track,
+        source_path="/staging/original.mp3",
+        destination_path=str(path.resolve()),
+        status=ImportWorkflowState.imported,
+        file_state=LibraryFileState.missing,
+    )
+    db_session.add_all([job, missing_plan])
     await db_session.commit()
     scan_id = await enqueue_library_adoption_scan(
         db_session,
@@ -347,9 +355,12 @@ async def test_lost_plan_is_repaired_without_erasing_provenance(
     await db_session.refresh(track)
     assert track.source_path == "/staging/original.mp3"
     assert track.staging_path == "/staging/original.mp3"
-    plan = (await db_session.scalars(select(ImportPlan))).one()
-    assert plan.track_id == track.id
-    assert plan.destination_path == str(path.resolve())
+    plans = list((await db_session.scalars(select(ImportPlan).order_by(ImportPlan.id))).all())
+    assert len(plans) == 2
+    assert plans[0].file_state == LibraryFileState.missing
+    assert plans[1].track_id == track.id
+    assert plans[1].destination_path == str(path.resolve())
+    assert plans[1].file_state == LibraryFileState.present
 
 
 @pytest.mark.asyncio

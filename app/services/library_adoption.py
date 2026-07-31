@@ -618,14 +618,18 @@ async def _claiming_plan(db: AsyncSession, path: str) -> ImportPlan | None:
             select(ImportPlan)
             .where(
                 ImportPlan.destination_path == path,
-                ImportPlan.status.in_(
-                    [
-                        ImportWorkflowState.ready,
-                        ImportWorkflowState.importing,
-                        ImportWorkflowState.imported,
-                    ]
+                or_(
+                    and_(
+                        ImportPlan.status.in_(
+                            [ImportWorkflowState.ready, ImportWorkflowState.importing]
+                        ),
+                        ImportPlan.file_state != LibraryFileState.removed,
+                    ),
+                    and_(
+                        ImportPlan.status == ImportWorkflowState.imported,
+                        ImportPlan.file_state == LibraryFileState.present,
+                    ),
                 ),
-                ImportPlan.file_state != LibraryFileState.removed,
             )
             .options(selectinload(ImportPlan.track))
             .order_by(ImportPlan.id.desc())
@@ -961,14 +965,21 @@ async def run_library_adoption_scan(
                     (
                         await db.scalars(
                             select(ImportPlan.destination_path).where(
-                                ImportPlan.status.in_(
-                                    [
-                                        ImportWorkflowState.ready,
-                                        ImportWorkflowState.importing,
-                                        ImportWorkflowState.imported,
-                                    ]
+                                or_(
+                                    and_(
+                                        ImportPlan.status.in_(
+                                            [
+                                                ImportWorkflowState.ready,
+                                                ImportWorkflowState.importing,
+                                            ]
+                                        ),
+                                        ImportPlan.file_state != LibraryFileState.removed,
+                                    ),
+                                    and_(
+                                        ImportPlan.status == ImportWorkflowState.imported,
+                                        ImportPlan.file_state == LibraryFileState.present,
+                                    ),
                                 ),
-                                ImportPlan.file_state != LibraryFileState.removed,
                             )
                         )
                     ).all()
