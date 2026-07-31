@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Text, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -28,6 +28,19 @@ class TagVerificationState(StrEnum):
     verified = "verified"
     failed = "failed"
     skipped = "skipped"
+
+
+class LibraryFileState(StrEnum):
+    unknown = "unknown"
+    present = "present"
+    missing = "missing"
+    removed = "removed"
+
+
+class DeletionOperationState(StrEnum):
+    prepared = "prepared"
+    committed = "committed"
+    finalized = "finalized"
 
 
 class ImportPlan(Base):
@@ -63,6 +76,20 @@ class ImportPlan(Base):
         default=ImportWorkflowState.discovered,
         server_default=ImportWorkflowState.discovered.value,
     )
+    file_state: Mapped[LibraryFileState] = mapped_column(
+        Enum(LibraryFileState, native_enum=False, create_constraint=True),
+        nullable=False,
+        default=LibraryFileState.unknown,
+        server_default=LibraryFileState.unknown.value,
+        index=True,
+    )
+    file_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    file_removed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    file_removal_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     cleanup_attempted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -77,3 +104,40 @@ class ImportPlan(Base):
 
     release: Mapped[Release] = relationship("Release", back_populates="import_plans")
     track: Mapped[Track | None] = relationship("Track", back_populates="import_plans")
+    deletion_operations: Mapped[list[DeletionOperation]] = relationship(
+        "DeletionOperation", back_populates="import_plan", cascade="all, delete-orphan"
+    )
+
+
+class DeletionOperation(Base):
+    __tablename__ = "deletion_operations"
+    __table_args__ = (
+        Index("ix_deletion_operations_group_id", "group_id"),
+        Index("ix_deletion_operations_state", "state"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    group_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    import_plan_id: Mapped[int] = mapped_column(
+        ForeignKey("import_plans.id", ondelete="CASCADE"), nullable=False
+    )
+    original_path: Mapped[str] = mapped_column(Text, nullable=False)
+    temporary_path: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[DeletionOperationState] = mapped_column(
+        Enum(DeletionOperationState, native_enum=False, create_constraint=True),
+        nullable=False,
+        default=DeletionOperationState.prepared,
+        server_default=DeletionOperationState.prepared.value,
+    )
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    import_plan: Mapped[ImportPlan] = relationship(
+        "ImportPlan", back_populates="deletion_operations"
+    )
