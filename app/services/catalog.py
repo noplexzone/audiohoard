@@ -174,6 +174,7 @@ class LibraryArtistRow:
     name: str
     detail_url: str
     artwork_url: str | None
+    primary_metadata_provider: str | None
     release_count: int
     downloaded_file_count: int
     wanted_release_count: int
@@ -902,6 +903,17 @@ async def get_library_artists_page(
         .correlate(CatalogArtist)
         .scalar_subquery()
     )
+    artist_primary_identity_id = (
+        select(CatalogArtistIdentity.id)
+        .where(
+            CatalogArtistIdentity.artist_id == CatalogArtist.id,
+            CatalogArtistIdentity.provider == CatalogArtist.primary_metadata_provider,
+        )
+        .order_by(CatalogArtistIdentity.id)
+        .limit(1)
+        .correlate(CatalogArtist)
+        .scalar_subquery()
+    )
     watchlist_identity_id = (
         select(CatalogArtistIdentity.id)
         .where(
@@ -919,7 +931,15 @@ async def get_library_artists_page(
         .correlate(CatalogArtist)
         .scalar_subquery()
     )
-    canonical_identity_id = func.coalesce(watchlist_identity_id, primary_identity_id)
+    canonical_identity_id = func.coalesce(
+        artist_primary_identity_id, watchlist_identity_id, primary_identity_id
+    )
+    canonical_identity_provider = (
+        select(CatalogArtistIdentity.provider)
+        .where(CatalogArtistIdentity.id == canonical_identity_id)
+        .correlate(CatalogArtist)
+        .scalar_subquery()
+    )
     provider_only_count = (
         select(func.count(CatalogAlbumProvider.id))
         .where(
@@ -955,46 +975,61 @@ async def get_library_artists_page(
     )
     manifest_count = func.coalesce(manifest_counts.c.manifest_count, 0)
     present_count = func.coalesce(present_catalog_tracks.c.present_count, 0)
-    album_projection = (
-        select(
-            CatalogAlbum.artist_id.label("artist_id"),
-            func.count(CatalogAlbum.id).label("total_count"),
-            func.sum(
-                case(
-                    (
-                        and_(manifest_count > 0, present_count >= manifest_count),
-                        1,
-                    ),
-                    else_=0,
-                )
-            ).label("complete_count"),
-            func.sum(
-                case(
-                    (
-                        and_(
-                            manifest_count > 0,
-                            present_count > 0,
-                            present_count < manifest_count,
-                        ),
-                        1,
-                    ),
-                    else_=0,
-                )
-            ).label("partial_count"),
-            func.sum(case((manifest_count == 0, 1), else_=0)).label("unknown_count"),
-            func.sum(case((present_count > 0, 1), else_=0)).label("local_count"),
+
+    def _primary_release_count(*conditions: Any) -> Any:
+        return (
+            select(func.count(func.distinct(CatalogAlbumProvider.catalog_album_id)))
+            .select_from(CatalogAlbumProvider)
+            .join(CatalogAlbum, CatalogAlbum.id == CatalogAlbumProvider.catalog_album_id)
+            .outerjoin(manifest_counts, manifest_counts.c.album_id == CatalogAlbum.id)
+            .outerjoin(
+                present_catalog_tracks, present_catalog_tracks.c.album_id == CatalogAlbum.id
+            )
+            .where(
+                CatalogAlbumProvider.artist_identity_id == canonical_identity_id,
+                CatalogAlbumProvider.catalog_album_id.is_not(None),
+                *conditions,
+            )
+            .correlate(CatalogArtist)
+            .scalar_subquery()
         )
-        .outerjoin(manifest_counts, manifest_counts.c.album_id == CatalogAlbum.id)
-        .outerjoin(present_catalog_tracks, present_catalog_tracks.c.album_id == CatalogAlbum.id)
-        .group_by(CatalogAlbum.artist_id)
-        .subquery()
+
+    def _artist_release_count(*conditions: Any) -> Any:
+        return (
+            select(func.count(func.distinct(CatalogAlbum.id)))
+            .select_from(CatalogAlbum)
+            .outerjoin(manifest_counts, manifest_counts.c.album_id == CatalogAlbum.id)
+            .outerjoin(
+                present_catalog_tracks, present_catalog_tracks.c.album_id == CatalogAlbum.id
+            )
+            .where(CatalogAlbum.artist_id == CatalogArtist.id, *conditions)
+            .correlate(CatalogArtist)
+            .scalar_subquery()
+        )
+
+    primary_total = _primary_release_count()
+    primary_complete = _primary_release_count(manifest_count > 0, present_count >= manifest_count)
+    primary_partial = _primary_release_count(
+        manifest_count > 0, present_count > 0, present_count < manifest_count
     )
-    canonical_total = func.coalesce(album_projection.c.total_count, 0)
-    complete_count = func.coalesce(album_projection.c.complete_count, 0)
-    partial_count = func.coalesce(album_projection.c.partial_count, 0)
-    unknown_count = func.coalesce(album_projection.c.unknown_count, 0) + provider_only_count
-    local_count = func.coalesce(album_projection.c.local_count, 0)
-    release_count = canonical_total + provider_only_count
+    primary_unknown = _primary_release_count(manifest_count == 0) + provider_only_count
+    primary_local = _primary_release_count(present_count > 0)
+
+    all_total = _artist_release_count()
+    all_complete = _artist_release_count(manifest_count > 0, present_count >= manifest_count)
+    all_partial = _artist_release_count(
+        manifest_count > 0, present_count > 0, present_count < manifest_count
+    )
+    all_unknown = _artist_release_count(manifest_count == 0)
+    all_local = _artist_release_count(present_count > 0)
+
+    no_primary_identity = canonical_identity_id.is_(None)
+    canonical_total = case((no_primary_identity, all_total), else_=primary_total)
+    complete_count = case((no_primary_identity, all_complete), else_=primary_complete)
+    partial_count = case((no_primary_identity, all_partial), else_=primary_partial)
+    unknown_count = case((no_primary_identity, all_unknown), else_=primary_unknown)
+    local_count = case((no_primary_identity, all_local), else_=primary_local)
+    release_count = canonical_total + case((no_primary_identity, 0), else_=provider_only_count)
     wanted_count = release_count - complete_count
     has_imported_file = exists(
         select(Track.id)
@@ -1004,23 +1039,20 @@ async def get_library_artists_page(
     catalog_filters: list[Any] = [or_(CatalogArtist.monitored.is_(True), has_imported_file)]
     if q:
         catalog_filters.append(CatalogArtist.name.ilike(f"%{q}%"))
-    catalog_rows = (
-        select(
-            CatalogArtist.id.label("catalog_id"),
-            CatalogArtist.name.label("name"),
-            CatalogArtist.artwork_url.label("artwork_url"),
-            CatalogArtist.monitored.label("monitored"),
-            release_count.label("release_count"),
-            downloaded_count.label("downloaded_file_count"),
-            wanted_count.label("wanted_release_count"),
-            complete_count.label("complete_release_count"),
-            partial_count.label("partial_release_count"),
-            unknown_count.label("unknown_release_count"),
-            local_count.label("local_release_count"),
-        )
-        .outerjoin(album_projection, album_projection.c.artist_id == CatalogArtist.id)
-        .where(*catalog_filters)
-    )
+    catalog_rows = select(
+        CatalogArtist.id.label("catalog_id"),
+        CatalogArtist.name.label("name"),
+        CatalogArtist.artwork_url.label("artwork_url"),
+        CatalogArtist.monitored.label("monitored"),
+        canonical_identity_provider.label("primary_metadata_provider"),
+        release_count.label("release_count"),
+        downloaded_count.label("downloaded_file_count"),
+        wanted_count.label("wanted_release_count"),
+        complete_count.label("complete_release_count"),
+        partial_count.label("partial_release_count"),
+        unknown_count.label("unknown_release_count"),
+        local_count.label("local_release_count"),
+    ).where(*catalog_filters)
 
     matching_catalog_artist = exists(
         select(CatalogArtist.id).where(catalog_artist == track_artist).correlate(Track)
@@ -1051,6 +1083,7 @@ async def get_library_artists_page(
         legacy_projection.c.name,
         literal(None).label("artwork_url"),
         literal(False).label("monitored"),
+        literal(None).label("primary_metadata_provider"),
         literal(0).label("release_count"),
         legacy_projection.c.downloaded_file_count,
         literal(0).label("wanted_release_count"),
@@ -1094,6 +1127,9 @@ async def get_library_artists_page(
                 name=name,
                 detail_url=detail_url,
                 artwork_url=str(row["artwork_url"]) if row["artwork_url"] else None,
+                primary_metadata_provider=str(row["primary_metadata_provider"])
+                if row["primary_metadata_provider"]
+                else None,
                 release_count=int(row["release_count"] or 0),
                 downloaded_file_count=int(row["downloaded_file_count"] or 0),
                 wanted_release_count=int(row["wanted_release_count"] or 0),

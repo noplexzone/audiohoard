@@ -27,6 +27,11 @@ window.AudiohoardNavigation.registerPage('artist-watchlist', function (region) {
   inputs.forEach(function (input) {
     input.addEventListener('change', updateBar, { signal: signal });
   });
+  region.querySelectorAll('[data-primary-source-select]').forEach(function (select) {
+    select.addEventListener('change', function () {
+      if (select.form && select.form.requestSubmit) select.form.requestSubmit();
+    }, { signal: signal });
+  });
   region.querySelectorAll('.dismiss-btn').forEach(function (button) {
     button.addEventListener('click', function () { button.closest('[role="alert"]')?.remove(); }, { signal: signal });
   });

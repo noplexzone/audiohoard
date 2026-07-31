@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Limit artist-card release counts to the selected primary metadata source, simplify card wording, and expose per-artist primary source selection.
+
+### Fixed
+
+- Keep wanted and catalog release download actions on the current page while queueing work via fetch.
+
 ## [0.11.1] - 2026-07-31
 
 ### Fixed

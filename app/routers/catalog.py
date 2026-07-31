@@ -176,6 +176,17 @@ def _selected_provider(
     return available[0] if available else primary
 
 
+def _artist_primary_provider(
+    artist: CatalogArtist, runtime: RuntimeSettings, available: list[str]
+) -> str:
+    return _selected_provider(
+        artist.primary_metadata_provider or runtime.primary_metadata_provider,
+        available,
+        runtime.primary_metadata_provider,
+        artist.watchlist_provider,
+    )
+
+
 def _legacy_provider_album_rows(artist: CatalogArtist, provider_name: str) -> list[Any]:
     rows: list[Any] = []
     for album in artist.albums:
@@ -699,8 +710,9 @@ async def catalog_artist_page(
         raise HTTPException(status_code=404, detail="Catalog artist not found")
     runtime = await get_runtime_settings(db)
     available_providers = available_artist_providers(artist)
+    effective_primary_provider = _artist_primary_provider(artist, runtime, available_providers)
     selected_provider = _selected_provider(
-        provider, available_providers, runtime.primary_metadata_provider, artist.watchlist_provider
+        provider, available_providers, effective_primary_provider, artist.watchlist_provider
     )
     selected_identity = next(
         (identity for identity in artist.identities if identity.provider == selected_provider),
@@ -819,11 +831,47 @@ async def catalog_artist_page(
             "provider_links": provider_links,
             "available_providers": available_providers,
             "selected_provider": selected_provider,
+            "primary_metadata_provider": effective_primary_provider,
             "sort_url": sort_url,
             "enrichment": enrichment,
             "release_progress": release_progress,
             "discography_loading": discography_loading,
         },
+    )
+
+
+@router.post("/artists/catalog/{artist_id}/primary-source", include_in_schema=False)
+async def set_catalog_artist_primary_source(
+    artist_id: int,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    load = selectinload(CatalogArtist.identities)
+    artist = (
+        await db.execute(
+            select(CatalogArtist)
+            .where(CatalogArtist.id == artist_id)
+            .options(load)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if artist is None:
+        raise HTTPException(status_code=404, detail="Catalog artist not found")
+    form = await request.form()
+    runtime = await get_runtime_settings(db)
+    available = available_artist_providers(artist)
+    requested = str(form.get("primary_metadata_provider", ""))
+    selected = _selected_provider(
+        requested, available, runtime.primary_metadata_provider, artist.watchlist_provider
+    )
+    artist.primary_metadata_provider = selected if selected in available else None
+    await db.commit()
+    release_type = str(form.get("release_type", ""))
+    sort = str(form.get("sort", "desc"))
+    return RedirectResponse(
+        _artist_page_url(artist.id, provider=selected, release_type=release_type, sort=sort),
+        status_code=303,
     )
 
 
@@ -921,7 +969,7 @@ async def monitor_catalog_artist_page(
         artist.watchlist_provider = _selected_provider(
             requested_watchlist,
             available,
-            runtime.primary_metadata_provider,
+            _artist_primary_provider(artist, runtime, available),
             artist.watchlist_provider,
         )
 

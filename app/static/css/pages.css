@@ -814,6 +814,28 @@ a.metric-card:hover {
   display: inline-flex;
 }
 
+.inline-select {
+  display: inline-flex;
+  align-items: center;
+  gap: .45rem;
+  color: var(--muted);
+  font-size: .78rem;
+}
+
+.inline-select select {
+  width: auto;
+  min-width: 9rem;
+  padding: .45rem .65rem;
+}
+
+.source-tag {
+  color: var(--text);
+}
+
+.compact-save {
+  padding-inline: .75rem;
+}
+
 .monitoring-options {
   margin-bottom: 1rem;
 }
