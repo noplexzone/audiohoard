@@ -75,7 +75,9 @@ async def scan_library_filesystem(
     artist_name: str | None = None
     if artist_id is not None:
         artist = await db.get(CatalogArtist, artist_id)
-        artist_name = artist.name if artist is not None else None
+        if artist is None:
+            raise ValueError("catalog artist not found")
+        artist_name = artist.name
     root, scan_root, artist_filter = await asyncio.to_thread(
         _resolve_scan_roots, library_root, artist_name
     )

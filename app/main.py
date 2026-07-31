@@ -53,6 +53,7 @@ from app.services.catalog_metadata import reconcile_duplicate_catalog_artists
 from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
 from app.services.dashboard import get_dashboard_data
 from app.services.health_status import get_health_status_service
+from app.services.library_adoption_runner import LibraryAdoptionRunner
 from app.services.library_reconciliation import LibraryReconciliationService
 from app.services.library_removal import recover_deletion_operations
 from app.services.maintenance_scheduler import MaintenanceScheduler
@@ -106,6 +107,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         runtime = await get_runtime_settings(db)
         await job_dispatcher.set_max_concurrent_jobs(runtime.max_parallel_acquisitions)
         effective_settings = await build_effective_settings(db, get_settings())
+    library_adoption_runner = LibraryAdoptionRunner(
+        get_session_factory(), effective_settings.library_root
+    )
+    app.state.library_adoption_runner = library_adoption_runner
     await recover_deletion_operations(
         get_session_factory(),
         library_root=effective_settings.library_root,
@@ -151,6 +156,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         interval_seconds=settings.terminal_cleanup_interval_seconds
     )
     await scheduler.start()
+    await library_adoption_runner.start()
     await maintenance_scheduler.start()
     await quality_upgrade_scheduler.start()
     await health_status.start()
@@ -158,6 +164,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        await library_adoption_runner.stop()
         await library_reconciliation.stop()
         if not ownership_task.done():
             ownership_task.cancel()

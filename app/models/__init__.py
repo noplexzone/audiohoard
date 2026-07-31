@@ -10,6 +10,13 @@ from app.models.catalog_entities import (
 )
 from app.models.import_plan import ImportPlan
 from app.models.job import Job
+from app.models.library_adoption import (
+    AdoptionCandidateState,
+    AdoptionScanState,
+    AdoptionScopeKind,
+    LibraryAdoptionCandidate,
+    LibraryAdoptionScan,
+)
 from app.models.monitoring import MonitoringRecord
 from app.models.path_preview import PathPreview
 from app.models.release import Release
@@ -28,8 +35,13 @@ __all__ = [
     "CatalogAlbumTrack",
     "CatalogArtist",
     "CatalogArtistIdentity",
+    "AdoptionCandidateState",
+    "AdoptionScanState",
+    "AdoptionScopeKind",
     "ImportPlan",
     "Job",
+    "LibraryAdoptionCandidate",
+    "LibraryAdoptionScan",
     "MonitoringRecord",
     "PathPreview",
     "ProviderSetting",
