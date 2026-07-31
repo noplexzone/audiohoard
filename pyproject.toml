@@ -24,6 +24,7 @@ dependencies = [
     "mutagen>=1.47",
     "argon2-cffi>=23.1",
     "cryptography>=49.0.0",
+    "watchfiles>=1.0",
 ]
 
 [project.scripts]

@@ -193,6 +193,7 @@ dependencies = [
     { name = "tenacity" },
     { name = "tidal-dl" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "watchfiles" },
     { name = "yt-dlp" },
 ]
 
@@ -233,6 +234,7 @@ requires-dist = [
     { name = "tenacity", specifier = ">=8.3" },
     { name = "tidal-dl", specifier = "==2022.10.31.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.29" },
+    { name = "watchfiles", specifier = ">=1.0" },
     { name = "yt-dlp", specifier = ">=2024.5" },
 ]
 provides-extras = ["dev"]
