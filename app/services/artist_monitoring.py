@@ -116,6 +116,74 @@ def wanted_releases(releases: list[CatalogAlbumProvider]) -> list[CatalogAlbumPr
     ]
 
 
+async def queue_wanted_artist_releases(db: AsyncSession, artist: CatalogArtist) -> list[int]:
+    """Queue missing monitored albums from the current, reconciled library projection."""
+    identity = None
+    if artist.watchlist_provider:
+        identity = (
+            await db.scalars(
+                select(CatalogArtistIdentity)
+                .where(
+                    CatalogArtistIdentity.artist_id == artist.id,
+                    CatalogArtistIdentity.provider == artist.watchlist_provider,
+                )
+                .options(
+                    selectinload(CatalogArtistIdentity.releases).selectinload(
+                        CatalogAlbumProvider.catalog_album
+                    )
+                )
+            )
+        ).first()
+    if identity is None:
+        albums = list(
+            (
+                await db.scalars(
+                    select(CatalogAlbum).where(
+                        CatalogAlbum.artist_id == artist.id,
+                        CatalogAlbum.monitored.is_(True),
+                        CatalogAlbum.in_library.is_(False),
+                    )
+                )
+            ).all()
+        )
+    else:
+        albums = [
+            release.catalog_album
+            for release in wanted_releases(list(identity.releases))
+            if release.catalog_album is not None
+        ]
+    album_ids = [album.id for album in albums]
+    active_album_ids: set[int] = set()
+    if album_ids:
+        active_album_ids = {
+            album_id
+            for album_id in (
+                await db.scalars(
+                    select(Job.catalog_album_id).where(
+                        Job.catalog_album_id.in_(album_ids),
+                        Job.status.in_(_ACTIVE_JOB_STATES),
+                    )
+                )
+            ).all()
+            if album_id is not None
+        }
+    job_ids: list[int] = []
+    for album in albums:
+        if album.id in active_album_ids:
+            continue
+        job = Job(
+            source="priority",
+            query=f"{artist.name} {album.title}",
+            status=JobStatus.pending,
+            catalog_album_id=album.id,
+        )
+        db.add(job)
+        await db.flush()
+        job_ids.append(job.id)
+        active_album_ids.add(album.id)
+    return job_ids
+
+
 async def refresh_monitored_artist(
     db: AsyncSession,
     settings: Settings,
@@ -160,36 +228,7 @@ async def refresh_monitored_artist(
         new_albums = [album for album in artist.albums if album.id not in before]
         if provider:
             apply_monitor_policy(artist, new_albums)
-        legacy_wanted = [
-            album for album in artist.albums if album.monitored and not album.in_library
-        ]
-        job_ids: list[int] = []
-        if auto_download:
-            active_ids = {
-                album_id
-                for album_id in (
-                    await db.scalars(
-                        select(Job.catalog_album_id).where(
-                            Job.catalog_album_id.in_([album.id for album in legacy_wanted]),
-                            Job.status.in_(_ACTIVE_JOB_STATES),
-                        )
-                    )
-                ).all()
-                if album_id is not None
-            }
-            for album in legacy_wanted:
-                if album.id in active_ids:
-                    continue
-                job = Job(
-                    source="priority",
-                    query=f"{artist.name} {album.title}",
-                    status=JobStatus.pending,
-                    catalog_album_id=album.id,
-                )
-                db.add(job)
-                await db.flush()
-                job_ids.append(job.id)
-                active_ids.add(album.id)
+        job_ids = await queue_wanted_artist_releases(db, artist) if auto_download else []
         artist.last_refreshed_at = datetime.now(tz=UTC)
         await db.flush()
         return [], job_ids
@@ -198,33 +237,7 @@ async def refresh_monitored_artist(
     _sync_canonical_monitoring(artist, releases)
     artist.last_refreshed_at = datetime.now(tz=UTC)
 
-    normalized_job_ids: list[int] = []
-    if auto_download:
-        wanted = wanted_releases(releases)
-        wanted_ids = [release.catalog_album_id for release in wanted if release.catalog_album_id]
-        active_album_ids: set[int] = set()
-        if wanted_ids:
-            result = await db.execute(
-                select(Job.catalog_album_id).where(
-                    Job.catalog_album_id.in_(wanted_ids),
-                    Job.status.in_(_ACTIVE_JOB_STATES),
-                )
-            )
-            active_album_ids = {album_id for album_id in result.scalars() if album_id is not None}
-        for release in wanted:
-            canonical_album = release.catalog_album
-            if canonical_album is None or canonical_album.id in active_album_ids:
-                continue
-            job = Job(
-                source="priority",
-                query=f"{artist.name} {canonical_album.title}",
-                status=JobStatus.pending,
-                catalog_album_id=canonical_album.id,
-            )
-            db.add(job)
-            await db.flush()
-            normalized_job_ids.append(job.id)
-            active_album_ids.add(canonical_album.id)
+    normalized_job_ids = await queue_wanted_artist_releases(db, artist) if auto_download else []
     await db.flush()
     return new, normalized_job_ids
 
@@ -274,11 +287,11 @@ class DiscographyRefreshScheduler:
                     artist = artist_result.scalar_one_or_none()
                     if artist is None or not artist.monitored:
                         continue
-                    _, job_ids = await refresh_monitored_artist(
+                    await refresh_monitored_artist(
                         db,
                         cfg,
                         artist,
-                        auto_download=runtime.auto_download_wanted,
+                        auto_download=False,
                     )
                     await db.commit()
                 try:
@@ -287,6 +300,13 @@ class DiscographyRefreshScheduler:
                     logger.exception(
                         "Catalog ownership reconciliation failed for artist %s", artist_id
                     )
+                else:
+                    if runtime.auto_download_wanted:
+                        async with factory() as db:
+                            artist = await db.get(CatalogArtist, artist_id)
+                            if artist is not None and artist.monitored:
+                                job_ids = await queue_wanted_artist_releases(db, artist)
+                                await db.commit()
             except asyncio.CancelledError:
                 raise
             except Exception:
