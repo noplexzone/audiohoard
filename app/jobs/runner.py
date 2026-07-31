@@ -1006,26 +1006,62 @@ def _targeted_catalog_result_matches(
     required_terms: Sequence[str] = (),
 ) -> bool:
     """Require title and structured collaborator/version identity for a target."""
-    observed = normalize_for_catalog_match(strip_non_identity_descriptors(result.title or ""))
-    expected_core = normalize_for_catalog_match(
-        strip_non_identity_descriptors(parse_filename(target.title).title)
-    )
-    expected_full = normalize_for_catalog_match(strip_non_identity_descriptors(target.title))
     filename = result.metadata.get("filename")
     observed_source = str(filename) if isinstance(filename, str) else result.title or ""
-    if not (observed and observed in (expected_core, expected_full)):
+    if not _targeted_title_matches(result.title or "", observed_source, target.title):
         return False
     if required_terms and not _observed_contains_required_terms(observed_source, required_terms):
         return False
     target_qualifiers = _identity_qualifiers(target.title)
-    observed_qualifiers = _identity_qualifiers(observed_source)
+    observed_qualifiers = _identity_qualifiers(observed_source, basename=True)
     if required_terms:
         # A MusicBrainz recording credit may carry the collaborator identity while
         # the catalog title is bare (e.g. Miami). In that case required artist
         # terms are the authoritative guard; do not reject a useful promo filename
         # merely because it adds harmless bracket tags like clean/dirty/year.
         return target_qualifiers <= observed_qualifiers
-    return observed_qualifiers == target_qualifiers
+    if observed_qualifiers == target_qualifiers:
+        return True
+    if target_qualifiers:
+        source_identity = _identity_text(observed_source, basename=True)
+        return all(
+            qualifier in observed_qualifiers
+            or _contains_identity_phrase(source_identity, qualifier)
+            for qualifier in target_qualifiers
+        ) and not (observed_qualifiers - target_qualifiers)
+    return False
+
+
+def _targeted_title_matches(observed_title: str, observed_source: str, target_title: str) -> bool:
+    observed = normalize_for_catalog_match(strip_non_identity_descriptors(observed_title))
+    expected_core = normalize_for_catalog_match(
+        strip_non_identity_descriptors(parse_filename(target_title).title)
+    )
+    expected_full = normalize_for_catalog_match(strip_non_identity_descriptors(target_title))
+    if observed and observed in (expected_core, expected_full):
+        return True
+    expected_identity = _identity_text(target_title)
+    if not expected_identity:
+        return False
+    source_identity = _identity_text(observed_source, basename=True)
+    return _contains_identity_phrase(source_identity, expected_identity)
+
+
+def _identity_text(value: str, *, basename: bool = False) -> str:
+    text = value.replace("\\", "/")
+    if basename:
+        text = text.rsplit("/", 1)[-1]
+    text = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", text)
+    text = _provider_safe_text(text)
+    text = re.sub(r"[\(\)\[\]{}_/.-]+", " ", text)
+    text = normalize_for_catalog_match(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _contains_identity_phrase(haystack: str, needle: str) -> bool:
+    if not haystack or not needle:
+        return False
+    return re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", haystack) is not None
 
 
 def _observed_contains_required_terms(value: str, required_terms: Sequence[str]) -> bool:
@@ -1033,17 +1069,21 @@ def _observed_contains_required_terms(value: str, required_terms: Sequence[str])
     return all(normalize_for_catalog_match(term) in haystack for term in required_terms)
 
 
-def _identity_qualifiers(value: str) -> set[str]:
+def _identity_qualifiers(value: str, *, basename: bool = False) -> set[str]:
     """Keep bracketed recording-version qualifiers while ignoring technical/non-identity tags."""
     qualifiers: set[str] = set()
-    tail = value.replace("\\", "/").rsplit("/", 1)[-1]
+    tail = value.replace("\\", "/")
+    if basename:
+        tail = tail.rsplit("/", 1)[-1]
     for match in _BRACKET_CONTENT_RE.finditer(tail):
         raw = match.group(1).strip()
         if not raw or _TECHNICAL_QUALIFIER_RE.fullmatch(raw):
             continue
         if strip_non_identity_descriptors(f"x ({raw})") == "x":
             continue
-        qualifiers.add(normalize_for_catalog_match(raw))
+        normalized = _identity_text(raw)
+        if normalized:
+            qualifiers.add(normalized)
     return qualifiers
 
 
