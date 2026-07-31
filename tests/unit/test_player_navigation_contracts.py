@@ -87,7 +87,24 @@ def test_navigation_source_preserves_native_fallback_and_page_lifecycle() -> Non
     assert "scrollY" in source and "scrollX" in source
     assert "decodeURIComponent" in source and "url.hash" in source
     assert "AudiohoardNavigation" in source and "refresh" in source
-    assert "document.addEventListener('submit'" not in source
+
+
+def test_navigation_source_intercepts_download_forms_globally() -> None:
+    source = _read(STATIC / "js" / "navigation.js")
+
+    for contract in (
+        "document.addEventListener('submit'",
+        "form[data-download-form]",
+        "event.preventDefault()",
+        "X-Requested-With': 'fetch'",
+        "new FormData(form)",
+        "Queueing…",
+        "Nothing to queue",
+        "Download request failed",
+    ):
+        assert contract in source
+
+    assert "event.defaultPrevented" in source
 
 
 def test_player_source_handles_queue_transcode_media_and_keyboard_safely() -> None:
