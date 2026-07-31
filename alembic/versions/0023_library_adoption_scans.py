@@ -108,8 +108,53 @@ def upgrade() -> None:
         "ix_library_adoption_candidates_state", "library_adoption_candidates", ["state"]
     )
     op.create_index("ix_library_adoption_candidates_path", "library_adoption_candidates", ["path"])
+    op.execute(
+        """
+        CREATE TRIGGER trg_import_plans_adoption_claim_insert
+        BEFORE INSERT ON import_plans
+        WHEN NEW.status IN ('ready', 'importing', 'imported')
+         AND NEW.file_state != 'removed'
+         AND EXISTS (
+            SELECT 1 FROM import_plans AS existing
+            WHERE existing.destination_path = NEW.destination_path
+              AND existing.status IN ('ready', 'importing', 'imported')
+              AND existing.file_state != 'removed'
+              AND (
+                json_extract(NEW.planned_operations_json, '$.operation') = 'adopt_in_place'
+                OR json_extract(existing.planned_operations_json, '$.operation') = 'adopt_in_place'
+              )
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'adopted library destination already claimed');
+        END
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER trg_import_plans_adoption_claim_update
+        BEFORE UPDATE OF source_path, destination_path, status, file_state ON import_plans
+        WHEN NEW.status IN ('ready', 'importing', 'imported')
+         AND NEW.file_state != 'removed'
+         AND EXISTS (
+            SELECT 1 FROM import_plans AS existing
+            WHERE existing.id != OLD.id
+              AND existing.destination_path = NEW.destination_path
+              AND existing.status IN ('ready', 'importing', 'imported')
+              AND existing.file_state != 'removed'
+              AND (
+                json_extract(NEW.planned_operations_json, '$.operation') = 'adopt_in_place'
+                OR json_extract(existing.planned_operations_json, '$.operation') = 'adopt_in_place'
+              )
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'adopted library destination already claimed');
+        END
+        """
+    )
 
 
 def downgrade() -> None:
+    op.execute("DROP TRIGGER IF EXISTS trg_import_plans_adoption_claim_update")
+    op.execute("DROP TRIGGER IF EXISTS trg_import_plans_adoption_claim_insert")
     op.drop_table("library_adoption_candidates")
     op.drop_table("library_adoption_scans")

@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -292,7 +293,7 @@ async def _catalog_albums(db: AsyncSession, scan: LibraryAdoptionScan) -> list[C
 
 
 def _match_album(
-    snapshot: FileSnapshot, albums: list[CatalogAlbum]
+    snapshot: FileSnapshot, albums: list[CatalogAlbum], *, strict_scope: bool
 ) -> tuple[CatalogAlbum | None, tuple[str, ...]]:
     metadata = snapshot.metadata
     observed_mbid = metadata.release_group_mbid or metadata.album_mbid
@@ -339,11 +340,13 @@ def _match_album(
         return matches[0], ("artist_album_tags",)
     if len(matches) > 1:
         return None, ("ambiguous_album",)
-    return None, ("album_identity_contradiction",)
+    return None, ("album_identity_contradiction" if strict_scope else "no_catalog_album_match",)
 
 
-def _match_catalog(snapshot: FileSnapshot, albums: list[CatalogAlbum]) -> MatchDecision:
-    album, album_reasons = _match_album(snapshot, albums)
+def _match_catalog(
+    snapshot: FileSnapshot, albums: list[CatalogAlbum], *, strict_scope: bool
+) -> MatchDecision:
+    album, album_reasons = _match_album(snapshot, albums, strict_scope=strict_scope)
     if album is None:
         state = (
             AdoptionCandidateState.review
@@ -516,6 +519,23 @@ def _match_imported(snapshot: FileSnapshot, tracks: list[Track]) -> MatchDecisio
             not metadata.recording_mbid
             or (track.mbid or "").casefold() == metadata.recording_mbid.casefold()
         )
+        and (not metadata.year or track.year == metadata.year)
+        and (
+            not metadata.album_mbid
+            or bool(
+                track.release
+                and track.release.release_mbid
+                and track.release.release_mbid.casefold() == metadata.album_mbid.casefold()
+            )
+        )
+        and (
+            not metadata.release_group_mbid
+            or bool(
+                track.catalog_album
+                and track.catalog_album.mbid
+                and track.catalog_album.mbid.casefold() == metadata.release_group_mbid.casefold()
+            )
+        )
         and not _duration_conflicts(metadata.duration_sec, track.duration_sec)
     ]
     if len(candidates) == 1 and metadata.title and observed_album:
@@ -587,12 +607,25 @@ async def _claiming_plan(db: AsyncSession, path: str) -> ImportPlan | None:
     ).first()
 
 
-async def _track_has_other_file(db: AsyncSession, catalog_track_id: int, path: str) -> bool:
+async def _track_has_other_file(
+    db: AsyncSession,
+    path: str,
+    *,
+    track_id: int | None = None,
+    catalog_track_id: int | None = None,
+) -> bool:
+    identity = []
+    if track_id is not None:
+        identity.append(Track.id == track_id)
+    if catalog_track_id is not None:
+        identity.append(Track.catalog_track_id == catalog_track_id)
+    if not identity:
+        return False
     count = await db.scalar(
         select(func.count(ImportPlan.id))
         .join(Track, ImportPlan.track_id == Track.id)
         .where(
-            Track.catalog_track_id == catalog_track_id,
+            or_(*identity),
             ImportPlan.destination_path != path,
             ImportPlan.status == ImportWorkflowState.imported,
             ImportPlan.file_state == LibraryFileState.present,
@@ -645,8 +678,11 @@ async def _adopt_candidate(
             candidate.state = AdoptionCandidateState.review
             candidate.reason_codes_json = json.dumps(["destination_owned_by_other_identity"])
         return
-    if candidate.proposed_catalog_track_id and await _track_has_other_file(
-        db, candidate.proposed_catalog_track_id, candidate.path
+    if await _track_has_other_file(
+        db,
+        candidate.path,
+        track_id=candidate.proposed_track_id,
+        catalog_track_id=candidate.proposed_catalog_track_id,
     ):
         candidate.state = AdoptionCandidateState.review
         candidate.reason_codes_json = json.dumps(["catalog_track_already_owned"])
@@ -932,7 +968,11 @@ async def run_library_adoption_scan(
                 )
                 for snapshot in snapshots:
                     decision = (
-                        _match_catalog(snapshot, albums)
+                        _match_catalog(
+                            snapshot,
+                            albums,
+                            strict_scope=scan.scope_kind != AdoptionScopeKind.full,
+                        )
                         if albums
                         else MatchDecision(
                             AdoptionCandidateState.unmatched,
@@ -940,13 +980,9 @@ async def run_library_adoption_scan(
                             ("no_catalog_identity",),
                         )
                     )
-                    if imported_tracks:
+                    if imported_tracks and decision.state == AdoptionCandidateState.unmatched:
                         imported_decision = _match_imported(snapshot, imported_tracks)
-                        if (
-                            imported_decision.state == AdoptionCandidateState.pending
-                            or decision.state == AdoptionCandidateState.unmatched
-                        ):
-                            decision = imported_decision
+                        decision = imported_decision
                     candidates.append(_candidate(scan.id, snapshot, decision))
 
                 by_target: dict[tuple[int | None, int | None], list[LibraryAdoptionCandidate]] = {}
@@ -1003,6 +1039,48 @@ async def run_library_adoption_scan(
                     candidate = refreshed_candidate
                     candidate.state = AdoptionCandidateState.stale
                     candidate.reason_codes_json = json.dumps(["file_changed_before_commit"])
+                except IntegrityError:
+                    batch_releases.clear()
+                    refreshed_candidate = await db.get(
+                        LibraryAdoptionCandidate,
+                        candidate.id,
+                        populate_existing=True,
+                    )
+                    assert refreshed_candidate is not None
+                    candidate = refreshed_candidate
+                    owner = await _claiming_plan(db, candidate.path)
+                    if owner is None:
+                        raise
+                    owner_track = owner.track
+                    identity_matches = bool(
+                        owner_track
+                        and (
+                            (
+                                candidate.proposed_track_id
+                                and owner.track_id == candidate.proposed_track_id
+                            )
+                            or (
+                                candidate.proposed_catalog_track_id
+                                and owner_track.catalog_track_id
+                                == candidate.proposed_catalog_track_id
+                            )
+                        )
+                    )
+                    hash_matches = bool(
+                        owner_track and owner_track.content_sha256 == candidate.content_sha256
+                    )
+                    if identity_matches and hash_matches:
+                        candidate.state = AdoptionCandidateState.adopted
+                        candidate.resulting_track_id = owner.track_id
+                        candidate.resulting_import_plan_id = owner.id
+                        candidate.reason_codes_json = json.dumps(
+                            ["destination_already_owned_by_match"]
+                        )
+                    else:
+                        candidate.state = AdoptionCandidateState.review
+                        candidate.reason_codes_json = json.dumps(
+                            ["destination_owned_by_other_identity"]
+                        )
                 if candidate.proposed_album_id:
                     album_ids.add(candidate.proposed_album_id)
                 scan.heartbeat_at = datetime.now(UTC)

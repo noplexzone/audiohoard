@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from mutagen.id3 import ID3, TALB, TIT2, TPE1, TPE2, TPOS, TRCK, TXXX
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 import app.services.library_adoption as adoption_service
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
@@ -390,6 +391,46 @@ async def test_full_scan_falls_back_to_imported_only_identity(db_session, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_full_scan_never_overrides_catalog_mbid_conflict_with_imported_fallback(
+    db_session, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    path = root / "Artist" / "Album" / "01 - Song.mp3"
+    _tagged_mp3(path, album_mbid="contradictory-release", recording_mbid=None)
+    await _catalog(db_session)
+    job = Job(source="legacy", query="legacy import", status=JobStatus.done)
+    release = Release(
+        job=job,
+        source="legacy",
+        title="Album",
+        album_artist="Artist",
+        release_mbid="different-release",
+    )
+    track = Track(
+        job=job,
+        release=release,
+        source="legacy",
+        artist="Artist",
+        album_artist="Artist",
+        album="Album",
+        title="Song",
+        track_no=1,
+        disc=1,
+        import_state=ImportWorkflowState.imported,
+    )
+    db_session.add(track)
+    await db_session.flush()
+    scan_id = await enqueue_library_adoption_scan(db_session, library_root=root)
+    await db_session.commit()
+
+    scan = await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=root)
+
+    assert scan.adopted_count == 0
+    assert scan.review_count == 1
+    assert await db_session.scalar(select(func.count(ImportPlan.id))) == 0
+
+
+@pytest.mark.asyncio
 async def test_queued_scan_fails_closed_when_library_root_changes(
     db_session, tmp_path: Path
 ) -> None:
@@ -427,3 +468,104 @@ async def test_symlink_and_zero_byte_files_never_create_candidates(
 
     assert scan.scanned_count == 0
     assert await db_session.scalar(select(func.count(LibraryAdoptionCandidate.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_imported_identity_with_present_file_sends_duplicate_to_review(
+    db_session, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    owned = root / "Legacy Artist" / "Legacy Album (2020)" / "01 - Legacy Song.mp3"
+    duplicate = root / "Loose" / "copy.mp3"
+    _tagged_mp3(
+        owned,
+        artist="Legacy Artist",
+        album="Legacy Album",
+        title="Legacy Song",
+        album_mbid=None,
+        recording_mbid=None,
+    )
+    _tagged_mp3(
+        duplicate,
+        artist="Legacy Artist",
+        album="Legacy Album",
+        title="Legacy Song",
+        album_mbid=None,
+        recording_mbid=None,
+    )
+    job = Job(source="legacy", query="legacy import", status=JobStatus.done)
+    release = Release(
+        job=job,
+        source="legacy",
+        title="Legacy Album",
+        album_artist="Legacy Artist",
+        year="2020",
+    )
+    track = Track(
+        job=job,
+        release=release,
+        source="legacy",
+        artist="Legacy Artist",
+        album_artist="Legacy Artist",
+        album="Legacy Album",
+        title="Legacy Song",
+        year="2020",
+        track_no=1,
+        disc=1,
+        import_state=ImportWorkflowState.imported,
+    )
+    plan = ImportPlan(
+        release=release,
+        track=track,
+        source_path=str(owned),
+        destination_path=str(owned),
+        status=ImportWorkflowState.imported,
+        file_state=LibraryFileState.present,
+    )
+    db_session.add(plan)
+    await db_session.flush()
+    scan_id = await enqueue_library_adoption_scan(db_session, library_root=root)
+    await db_session.commit()
+
+    scan = await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=root)
+
+    assert scan.adopted_count == 0
+    assert scan.review_count == 1
+    assert (
+        await db_session.scalar(
+            select(func.count(ImportPlan.id)).where(ImportPlan.track_id == track.id)
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_destination_claim_is_database_unique(db_session) -> None:
+    job = Job(source="legacy", query="legacy import", status=JobStatus.done)
+    release = Release(
+        job=job,
+        source="legacy",
+        title="Album",
+        album_artist="Artist",
+    )
+    db_session.add_all(
+        [
+            ImportPlan(
+                release=release,
+                source_path="/music/a.mp3",
+                destination_path="/music/a.mp3",
+                planned_operations_json='{"operation": "adopt_in_place"}',
+                status=ImportWorkflowState.ready,
+                file_state=LibraryFileState.unknown,
+            ),
+            ImportPlan(
+                release=release,
+                source_path="/staging/b.mp3",
+                destination_path="/music/a.mp3",
+                status=ImportWorkflowState.imported,
+                file_state=LibraryFileState.present,
+            ),
+        ]
+    )
+    with pytest.raises(IntegrityError):
+        await db_session.flush()
