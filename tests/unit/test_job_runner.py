@@ -53,6 +53,104 @@ def test_targeted_query_variants_normalize_and_simplify_titles() -> None:
     ]
 
 
+def test_targeted_query_variants_include_required_collaborators_first() -> None:
+    assert runner._targeted_query_variants(
+        "Morgan Wallen",
+        "Miami",
+        "Miami",
+        required_terms=("Lil Wayne", "Rick Ross"),
+    ) == [
+        "Morgan Wallen Miami Lil Wayne Rick Ross",
+        "Morgan Wallen Miami",
+    ]
+
+
+def test_targeted_catalog_result_requires_musicbrainz_collaborators() -> None:
+    target = CatalogAlbumTrack(id=12, position=1, disc=1, title="Miami")
+    plain_album = SearchResult(
+        source="slskd",
+        title="Miami",
+        artist="Morgan Wallen",
+        metadata={"filename": r"Morgan Wallen\I’m The Problem\2-16 - Miami.mp3"},
+    )
+    remix = SearchResult(
+        source="slskd",
+        title="Miami",
+        artist="Morgan Wallen",
+        metadata={
+            "filename": ("Morgan Wallen ft Lil Wayne & Rick Ross - Miami (Clean) (2025).mp3")
+        },
+    )
+
+    assert (
+        runner._targeted_catalog_result_matches(
+            plain_album, target, required_terms=("Lil Wayne", "Rick Ross")
+        )
+        is False
+    )
+    assert (
+        runner._targeted_catalog_result_matches(
+            remix, target, required_terms=("Lil Wayne", "Rick Ross")
+        )
+        is True
+    )
+
+
+def test_required_identity_terms_parse_featured_artists_without_primary_artist() -> None:
+    assert runner._required_identity_terms_from_text(
+        "Miami (feat. Lil Wayne & Rick Ross) - Remix", "Morgan Wallen"
+    ) == ["Lil Wayne", "Rick Ross"]
+    assert (
+        runner._required_identity_terms_from_text(
+            "Heartless (feat. Morgan Wallen) (Wallen Album Mix)", "Morgan Wallen"
+        )
+        == []
+    )
+
+
+def test_collaborator_terms_require_featured_artist_not_other_lead() -> None:
+    assert runner._collaborator_terms(
+        "Thomas Wesley & Julia Michaels feat. Morgan Wallen", "Morgan Wallen"
+    ) == ["Julia Michaels"]
+
+
+async def test_queries_for_job_uses_recording_artist_credit_collaborators(
+    test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artist = CatalogArtist(name="Morgan Wallen")
+    album = CatalogAlbum(id=22, title="Miami", track_count=1)
+    track = CatalogAlbumTrack(
+        id=33, position=1, disc=1, title="Miami", recording_mbid="recording-miami"
+    )
+    artist.albums.append(album)
+    album.tracks.append(track)
+    job = Job(
+        source="slskd",
+        query="Morgan Wallen Miami",
+        catalog_album_id=album.id,
+        catalog_track_id=track.id,
+    )
+
+    class FakeMeta:
+        title = "Miami"
+        artist = "Morgan Wallen feat. Lil Wayne & Rick Ross"
+
+    class FakeMusicBrainzClient:
+        def __init__(self, user_agent: str) -> None:
+            assert user_agent
+
+        async def lookup_recording(self, mbid: str) -> FakeMeta:
+            assert mbid == "recording-miami"
+            return FakeMeta()
+
+    monkeypatch.setattr(runner, "MusicBrainzClient", FakeMusicBrainzClient)
+
+    assert await runner._queries_for_job(job, album, test_settings) == [
+        "Morgan Wallen Miami Lil Wayne Rick Ross",
+        "Morgan Wallen Miami",
+    ]
+
+
 def test_targeted_catalog_result_rejects_contradictory_titles() -> None:
     target = CatalogAlbumTrack(id=7, position=11, disc=1, title="Me to Me")
     wrong = SearchResult(
