@@ -6,12 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-07-31
+
 ### Changed
 
 - Limit artist-card release counts to the selected primary metadata source, simplify card wording, and expose per-artist primary source selection.
 
 ### Fixed
 
+- Queue background enrichment when watchlisting an artist before its selected-provider discography has hydrated.
+- Preserve search-page watchlist defaults through enrichment so newly added artists monitor albums, singles, EPs, and upgrade checks according to Behavior settings.
 - Keep artist and release-page download buttons on the current page by giving download forms a global fetch-submit fallback.
 - Add MusicBrainz recording-credit collaborators to targeted slskd searches and candidate guards so bare catalog titles like `Miami` and `Heartless` can still require their remix/featured artists.
 - Match slskd targeted filenames by full basename identity so promo-library suffixes and `1/24` separator variants do not hide otherwise valid single-track files.
