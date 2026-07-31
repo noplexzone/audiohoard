@@ -105,12 +105,15 @@ async def test_exact_mbids_adopt_in_place_without_mutating_file(
     assert (scan.adopted_count, scan.review_count, scan.unmatched_count) == (1, 0, 0)
     plan = (await db_session.scalars(select(ImportPlan))).one()
     track = (await db_session.scalars(select(Track))).one()
+    release = (await db_session.scalars(select(Release))).one()
     assert plan.destination_path == str(path.resolve())
     assert plan.source_path == str(path.resolve())
     assert plan.staging_path is None
     assert plan.status == ImportWorkflowState.imported
     assert plan.file_state == LibraryFileState.present
     assert track.catalog_track_id == album.tracks[0].id
+    assert release.release_mbid is None
+    assert track.catalog_album is not None and track.catalog_album.mbid == album.mbid
     assert track.source_path is None and track.staging_path is None
     assert path.read_bytes() == before
 
@@ -345,6 +348,48 @@ async def test_interrupted_scan_resumes_persisted_candidates(
         )
     )
     assert candidate_count == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_refreshes_catalog_truth_for_previously_committed_adoption(
+    db_session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "music"
+    _tagged_mp3(root / "Artist" / "Album (2024)" / "01 - Song.mp3")
+    _, album = await _catalog(db_session)
+    scan_id = await enqueue_library_adoption_scan(
+        db_session,
+        library_root=root,
+        scope=AdoptionScope(AdoptionScopeKind.catalog_album, scope_id=album.id),
+    )
+    await db_session.commit()
+
+    original_refresh = adoption_service._refresh_album_truth
+
+    async def interrupt_after_candidate_commit(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        adoption_service,
+        "_refresh_album_truth",
+        interrupt_after_candidate_commit,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=root)
+
+    candidate = await db_session.scalar(
+        select(LibraryAdoptionCandidate).where(LibraryAdoptionCandidate.scan_id == scan_id)
+    )
+    assert candidate is not None and candidate.state == AdoptionCandidateState.adopted
+    await db_session.refresh(album)
+    assert album.in_library is False
+
+    monkeypatch.setattr(adoption_service, "_refresh_album_truth", original_refresh)
+    scan = await run_library_adoption_scan(db_session, scan_id=scan_id, library_root=root)
+
+    assert scan.state == AdoptionScanState.completed
+    await db_session.refresh(album)
+    assert album.in_library is True
 
 
 @pytest.mark.asyncio

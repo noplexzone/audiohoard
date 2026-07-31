@@ -766,7 +766,6 @@ async def _adopt_candidate(
                 title=album.title,
                 album_artist=album.artist.name,
                 year=album.year,
-                release_mbid=album.mbid,
                 track_count=len(album.tracks),
                 import_state=ImportWorkflowState.imported,
             )
@@ -1097,6 +1096,18 @@ async def run_library_adoption_scan(
                 scan.heartbeat_at = datetime.now(UTC)
                 await db.commit()
 
+            persisted_album_ids = set(
+                (
+                    await db.scalars(
+                        select(LibraryAdoptionCandidate.proposed_album_id).where(
+                            LibraryAdoptionCandidate.scan_id == scan.id,
+                            LibraryAdoptionCandidate.state == AdoptionCandidateState.adopted,
+                            LibraryAdoptionCandidate.proposed_album_id.is_not(None),
+                        )
+                    )
+                ).all()
+            )
+            album_ids.update(int(album_id) for album_id in persisted_album_ids if album_id)
             await _refresh_album_truth(db, album_ids)
             states = list(
                 (
