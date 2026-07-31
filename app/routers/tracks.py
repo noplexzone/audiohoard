@@ -170,6 +170,24 @@ async def track_detail_page(
         and bool(plan.destination_path.strip())
         for plan in track.import_plans
     )
+    imported_plans = sorted(
+        (
+            plan
+            for plan in track.import_plans
+            if plan.status == ImportWorkflowState.imported
+            and plan.file_state == LibraryFileState.present
+            and bool(plan.destination_path.strip())
+        ),
+        key=lambda plan: plan.id,
+    )
+    library_path = imported_plans[-1].destination_path if imported_plans else None
     return templates.TemplateResponse(
-        request, "track.html", {"track": track, "playable": playable}
+        request,
+        "track.html",
+        {
+            "track": track,
+            "playable": playable,
+            "library_path": library_path,
+            "original_source_path": track.source_path or track.staging_path,
+        },
     )

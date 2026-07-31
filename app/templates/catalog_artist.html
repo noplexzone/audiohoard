@@ -42,6 +42,10 @@
     </p>
     {% if total_releases %}<p class="ownership-detail">{{ ownership.complete }} complete · {{ ownership.partial }} partial · {{ ownership.unknown }} ownership unknown · {{ ownership.wanted }} wanted · {{ ownership.downloaded_files }} downloaded file{% if ownership.downloaded_files != 1 %}s{% endif %}</p>{% endif %}
     <div class="artist-actions">
+      <form method="post" action="/maintenance/scan/artists/{{ artist.id }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="btn secondary" type="submit">Scan artist</button>
+      </form>
       <form method="post" action="/artists/catalog/{{ artist.id }}/monitor">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="provider" value="{{ selected_provider }}">

@@ -79,6 +79,12 @@
 <section class="workflows-panel" aria-labelledby="workflows-heading">
   <div class="section-heading"><div><p class="eyebrow">Tasks</p><h2 id="workflows-heading">Workflows</h2></div><a href="/maintenance">Maintenance log</a></div>
   <div class="workflow-grid">
+    <form method="post" action="/maintenance/scan" class="workflow-card">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <svg><use href="#i-library"/></svg>
+      <span><strong>Scan full library</strong><small>Adopt high-confidence files already stored under the music library.</small></span>
+      <button type="submit" class="btn secondary">Scan</button>
+    </form>
     <form method="post" action="/maintenance/upgrades/scan" class="workflow-card">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <svg><use href="#i-library"/></svg>

@@ -311,7 +311,7 @@ def _track_file_path(t: Track) -> str:
         ]
         if imported_destinations:
             return imported_destinations[-1]
-    return (t.source_path or "").strip()
+    return ""
 
 
 def to_track_row(t: Track) -> TrackRow:

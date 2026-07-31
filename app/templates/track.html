@@ -43,7 +43,8 @@
     <h2>Source</h2>
     <table>
       <tr><th>Source</th><td><span class="badge info">{{ track.source }}</span></td></tr>
-      <tr><th>Source path</th><td class="source-path-cell">{{ track.source_path or "–" }}</td></tr>
+      <tr><th>Library path</th><td class="source-path-cell">{{ library_path or "Unlinked" }}</td></tr>
+      <tr><th>Original source</th><td class="source-path-cell">{{ original_source_path or "–" }}</td></tr>
     </table>
   </div>
 </div>
