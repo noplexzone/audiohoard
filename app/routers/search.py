@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 _VALID_SOURCES = {"slskd", "prowlarr", "youtube", "tidal"}
 _DEFAULT_SOURCES = {"slskd", "prowlarr", "youtube"}
+_INTERACTIVE_SLSKD_SEARCH_TIMEOUT_SEC = 60
+_INTERACTIVE_YOUTUBE_SEARCH_TIMEOUT_SEC = 30
 
 
 def _get_templates(request: Request) -> Jinja2Templates:
@@ -39,12 +41,27 @@ def _build_adapter(
 ) -> SourceAdapter | None:
     if name == "slskd":
         return SlskdAdapter(
-            settings.slskd_url, settings.slskd_api_key, float(budget_seconds or 60)
+            settings.slskd_url,
+            settings.slskd_api_key,
+            float(
+                min(
+                    budget_seconds or _INTERACTIVE_SLSKD_SEARCH_TIMEOUT_SEC,
+                    _INTERACTIVE_SLSKD_SEARCH_TIMEOUT_SEC,
+                )
+            ),
         )
     if name == "prowlarr":
         return ProwlarrAdapter(settings.prowlarr_url, settings.prowlarr_api_key)
     if name == "youtube":
-        return YouTubeAdapter(settings.ytdlp_cookies_file, float(budget_seconds or 30))
+        return YouTubeAdapter(
+            settings.ytdlp_cookies_file,
+            float(
+                min(
+                    budget_seconds or _INTERACTIVE_YOUTUBE_SEARCH_TIMEOUT_SEC,
+                    _INTERACTIVE_YOUTUBE_SEARCH_TIMEOUT_SEC,
+                )
+            ),
+        )
     if name == "tidal":
         return TidalAdapter(
             settings.tidal_config_path,

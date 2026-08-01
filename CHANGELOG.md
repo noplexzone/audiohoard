@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-07-31
+
+### Fixed
+
+- Cap interactive source searches to short provider-specific timeouts so the longer slskd bulk-acquisition budget does not hold web/API search requests open for minutes.
+
 ## [0.13.0] - 2026-07-31
 
 ### Fixed
