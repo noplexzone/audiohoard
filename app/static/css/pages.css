@@ -1952,11 +1952,64 @@ a.metric-card:hover {
   }
 
   .downloads-layout {
+    grid-template-columns: 1fr;
     gap: .85rem;
   }
 
   .review-rail {
     order: -1;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .review-card {
+    padding: .85rem;
+  }
+
+  .review-heading {
+    grid-template-columns: 54px minmax(0, 1fr);
+    gap: .65rem;
+  }
+
+  .review-thumb {
+    width: 54px;
+    height: 54px;
+    flex-basis: 54px;
+  }
+
+  .review-heading h3,
+  .review-item h4,
+  .review-details summary {
+    overflow-wrap: anywhere;
+  }
+
+  .review-audio {
+    display: block;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .review-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .review-actions form,
+  .review-actions .btn {
+    width: 100%;
+  }
+
+  .review-details-grid {
+    grid-template-columns: 1fr;
+    gap: .15rem;
+  }
+
+  .review-details-grid dt {
+    color: var(--muted);
+    font-size: .72rem;
+    font-weight: 800;
+    letter-spacing: .04em;
+    text-transform: uppercase;
   }
 
   .downloads-table {
