@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Collapse artist watchlist settings into a hero Configure dialog with immediate release-type/source updates and remove redundant preset/save controls.
 - Quick-watchlisted artists now default their watchlist catalog source to the artist primary source when one is set.
+- Rework Downloads with status tabs, mobile card-style queue rows, and full-width expandable attempt details.
+
+### Fixed
+
+- Keep grouped download status/source truthful while provider-backed priority jobs are actively searching or downloading, and freeze elapsed time once a download reaches a terminal state.
 
 ## [0.14.0] - 2026-07-31
 

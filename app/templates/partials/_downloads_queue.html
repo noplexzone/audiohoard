@@ -1,6 +1,6 @@
 {% set queue = namespace(active=false) %}
 {% if download_groups %}
-<div class="table-wrap">
+<div class="table-wrap downloads-table">
   <table>
     <thead>
       <tr>
@@ -21,13 +21,17 @@
       {% if group.active %}{% set queue.active = true %}{% endif %}
       {% set sc = "ok" if status == "done" else ("warn" if status in ["pending", "running", "partial"] else ("error" if status in ["failed", "cancelled"] else "info")) %}
 
-      {# Elapsed since created_at #}
+      {# Elapsed runs while active and freezes at updated_at once terminal. #}
       {% set created = download.created_at %}
-      {% if created.tzinfo is none %}
-        {% set elapsed_sec = (now.replace(tzinfo=none) - created).total_seconds() | int %}
+      {% set elapsed_end = now if status in ["pending", "running"] else download.updated_at %}
+      {% if created.tzinfo is none and elapsed_end.tzinfo is not none %}
+        {% set elapsed_sec = (elapsed_end.replace(tzinfo=none) - created).total_seconds() | int %}
+      {% elif created.tzinfo is not none and elapsed_end.tzinfo is none %}
+        {% set elapsed_sec = (elapsed_end - created.replace(tzinfo=none)).total_seconds() | int %}
       {% else %}
-        {% set elapsed_sec = (now - created).total_seconds() | int %}
+        {% set elapsed_sec = (elapsed_end - created).total_seconds() | int %}
       {% endif %}
+      {% if elapsed_sec < 0 %}{% set elapsed_sec = 0 %}{% endif %}
       {% if elapsed_sec < 60 %}
         {% set elapsed_str = elapsed_sec ~ "s" %}
       {% elif elapsed_sec < 3600 %}
@@ -55,8 +59,8 @@
         {% set activity_str = (delta_sec // 86400) ~ "d ago" %}
       {% endif %}
 
-      <tr data-download-group="{{ group.key }}">
-        <td>
+      <tr class="download-summary-row" data-download-group="{{ group.key }}">
+        <td data-label="Release / download">
           <div class="download-release">
             {% if group.artwork_url %}
               {% if group.catalog_album_id %}
@@ -85,25 +89,38 @@
             </div>
           </div>
         </td>
-        <td>
+        <td data-label="Artist">
           {% if group.artist_name %}
             <a href="/library?q={{ group.artist_name | urlencode }}">{{ group.artist_name }}</a>
           {% else %}
             <span class="hint">—</span>
           {% endif %}
         </td>
-        <td><span class="badge info">{{ download.source }}</span></td>
-        <td>
+        <td data-label="Source"><span class="badge info">{{ group.source_display }}</span></td>
+        <td data-label="Status">
           <span class="badge {{ sc }}"><span class="dot"></span>{{ status }}</span>
           {% if group.wanted_track_count > 0 %}
             <progress class="queue-progress" value="{{ group.downloaded_track_count }}" max="{{ group.wanted_track_count }}">{{ group.downloaded_track_count }} / {{ group.wanted_track_count }}</progress>
           {% endif %}
         </td>
-        <td class="queue-time" title="started {{ download.created_at.strftime('%Y-%m-%d %H:%M') }}">{{ elapsed_str }}</td>
-        <td class="queue-time" title="{{ download.updated_at.strftime('%Y-%m-%d %H:%M:%S') }}">{{ activity_str }}<br><time class="hint">{{ download.updated_at.strftime("%Y-%m-%d %H:%M") }}</time></td>
-        <td>
+        <td class="queue-time" data-label="Elapsed" title="started {{ download.created_at.strftime('%Y-%m-%d %H:%M') }}">{{ elapsed_str }}</td>
+        <td class="queue-time" data-label="Last activity" title="{{ download.updated_at.strftime('%Y-%m-%d %H:%M:%S') }}">{{ activity_str }}<br><time class="hint">{{ download.updated_at.strftime("%Y-%m-%d %H:%M") }}</time></td>
+        <td data-label="Details"><a href="#details-{{ group.key | replace(':', '-') }}" class="details-jump">View below</a></td>
+        <td class="action-cell" data-label="Actions">
+          {% if group.action_attempt and group.action_attempt.status.value in ['pending', 'running'] %}
+          <form method="post" action="/downloads/{{ group.action_attempt.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Cancel</button></form>
+          {% elif group.action_attempt and group.action_attempt.status.value in ['failed', 'partial', 'cancelled'] %}
+          <form method="post" action="/downloads/{{ group.action_attempt.id }}/retry"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Retry</button></form>
+          {% endif %}
+          {% if group.attempts | length == 1 and status in ['done', 'failed', 'partial', 'cancelled'] %}
+          <form method="post" action="/downloads/{{ download.id }}/remove" data-confirm="Remove this download from the queue?"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Remove</button></form>
+          {% endif %}
+        </td>
+      </tr>
+      <tr class="download-detail-row" id="details-{{ group.key | replace(':', '-') }}">
+        <td colspan="8">
           <details>
-            <summary>View attempts</summary>
+            <summary>Attempts and track details</summary>
             {% for attempt in group.attempts %}
             {% set attempt_job = attempt.job %}
             {% set meta = attempt.metadata %}
@@ -141,16 +158,6 @@
             </section>
             {% endfor %}
           </details>
-        </td>
-        <td class="action-cell">
-          {% if group.action_attempt and group.action_attempt.status.value in ['pending', 'running'] %}
-          <form method="post" action="/downloads/{{ group.action_attempt.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Cancel</button></form>
-          {% elif group.action_attempt and group.action_attempt.status.value in ['failed', 'partial', 'cancelled'] %}
-          <form method="post" action="/downloads/{{ group.action_attempt.id }}/retry"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Retry</button></form>
-          {% endif %}
-          {% if group.attempts | length == 1 and status in ['done', 'failed', 'partial', 'cancelled'] %}
-          <form method="post" action="/downloads/{{ download.id }}/remove" data-confirm="Remove this download from the queue?"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Remove</button></form>
-          {% endif %}
         </td>
       </tr>
     {% endfor %}

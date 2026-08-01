@@ -11,7 +11,15 @@
   <a class="btn secondary" href="/downloads{% if selected_status %}?status={{ selected_status }}{% endif %}">Refresh</a>
 </header>
 
-{% if selected_status %}<p class="alert info">Showing {{ selected_status }} jobs. <a href="/downloads">Clear filter</a></p>{% endif %}
+<nav class="download-tabs" aria-label="Download queue filters">
+  <a href="/downloads" {% if not selected_status %}class="active" aria-current="page"{% endif %}>All</a>
+  <a href="/downloads?status=running" {% if selected_status == "running" %}class="active" aria-current="page"{% endif %}>Running</a>
+  <a href="/downloads?status=done" {% if selected_status == "done" %}class="active" aria-current="page"{% endif %}>Completed</a>
+  <a href="/downloads?status=failed" {% if selected_status == "failed" %}class="active" aria-current="page"{% endif %}>Failed</a>
+  <a href="#import-review">Import review</a>
+</nav>
+
+{% if selected_status %}<p class="alert info">Showing {{ "completed" if selected_status == "done" else selected_status }} jobs. <a href="/downloads">Clear filter</a></p>{% endif %}
 
 {% if notice %}<div class="alert {{ notice_type }}" role="status">{{ notice }}</div>{% endif %}
 

@@ -12,17 +12,23 @@ window.AudiohoardNavigation.registerPage('downloads', function (region) {
       return ['pending', 'running'].includes(element.textContent.trim());
     });
   }
+  function groupDetails(row) {
+    var ownDetails = row.querySelector('details');
+    if (ownDetails) return ownDetails;
+    var next = row.nextElementSibling;
+    return next && next.classList.contains('download-detail-row') ? next.querySelector('details') : null;
+  }
   function detailsState(container) {
     var state = Object.create(null);
     container.querySelectorAll('[data-download-group]').forEach(function (row) {
-      var details = row.querySelector('details');
+      var details = groupDetails(row);
       if (details) state[row.dataset.downloadGroup] = details.open;
     });
     return state;
   }
   function restoreDetails(container, state) {
     container.querySelectorAll('[data-download-group]').forEach(function (row) {
-      var details = row.querySelector('details');
+      var details = groupDetails(row);
       if (details && Object.prototype.hasOwnProperty.call(state, row.dataset.downloadGroup)) {
         details.open = state[row.dataset.downloadGroup];
       }
