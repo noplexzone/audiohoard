@@ -575,9 +575,8 @@ button.small {
   gap: .8rem;
   padding: .65rem clamp(.8rem, 2vw, 1.4rem) calc(.65rem + env(safe-area-inset-bottom));
   border-top: 1px solid var(--border);
-  background: rgba(17, 20, 18, .98);
+  background: var(--surface-1);
   box-shadow: 0 -12px 34px rgba(0, 0, 0, .28);
-  backdrop-filter: blur(18px);
 }
 
 .player-art {

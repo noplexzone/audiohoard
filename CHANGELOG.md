@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Move artist metadata enrichment into the hero actions, show enrichment state inline, align hero action controls, and tidy watchlist release-type toggles.
+
+### Fixed
+
+- Render artist-page release progress bars with CSP-safe native progress elements and remove the JS inline width update.
+- Remove the global player's backdrop blur to avoid sitewide hover and audio-control repaint lag.
+- Prefer the runtime primary metadata provider for artist library cards when no explicit artist primary or watchlist identity is set, keeping provider counts accurate.
+
 ## [0.13.1] - 2026-07-31
 
 ### Fixed

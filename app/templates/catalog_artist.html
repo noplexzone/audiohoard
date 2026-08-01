@@ -82,7 +82,29 @@
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="btn secondary" type="submit">Scan artist</button>
         </form>
+        <form method="post" action="/artists/catalog/{{ artist.id }}/enrich">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="provider" value="{{ selected_provider }}">
+          <input type="hidden" name="release_type" value="{{ release_type }}">
+          <input type="hidden" name="sort" value="{{ sort }}">
+          <button class="btn secondary" type="submit">Enrich metadata</button>
+        </form>
       </div>
+    </div>
+    <div class="artist-enrichment-status">
+      {% if enrichment == 'failed' or provenance.last_enrichment_error %}
+      <div role="alert" class="alert error dismissible" id="enrichment-error-banner">
+        <span>Last enrichment failed{% if provenance.last_enrichment_error %}: {{ provenance.last_enrichment_error.message | e }}{% endif %}</span>
+        <button type="button" class="dismiss-btn" aria-label="Dismiss">×</button>
+      </div>
+      {% endif %}
+      {% if artist.enrichment_state in ("queued", "running") %}
+      <p class="hint">Enriching…</p>
+      {% elif artist.enrichment_state == "failed" %}
+      <p><span class="badge error">Enrichment failed</span></p>
+      {% else %}
+      <p class="hint">Last enriched: {{ artist.last_enriched_at.strftime("%Y-%m-%d %H:%M") if artist.last_enriched_at else "never" }}</p>
+      {% endif %}
     </div>
   </div>
 </section>
@@ -105,7 +127,7 @@
     <input type="hidden" name="provider" value="{{ selected_provider }}">
     <input type="hidden" name="release_type" value="{{ release_type }}">
     <input type="hidden" name="sort" value="{{ sort }}">
-    <label class="check-label switch-label"><input type="checkbox" name="monitored" value="true" {% if artist.monitored %}checked{% endif %}> <span>Watchlist artist</span></label>
+    <input type="hidden" name="monitored" value="{{ 'true' if artist.monitored else 'false' }}">
     <label>Watchlist discography
       <select name="watchlist_provider">
         {% for name in available_providers %}<option value="{{ name }}" {% if artist.watchlist_provider == name %}selected{% endif %}>{{ display_name(name) }}</option>{% endfor %}
@@ -118,11 +140,13 @@
         <option value="none_new" {% if artist.monitor_policy == "none_new" %}selected{% endif %}>None new</option>
       </select>
     </label>
-    <fieldset class="field-block">
+    <fieldset class="field-block toggle-group">
       <legend>Auto-watchlist release types</legend>
-      <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_albums" value="true" {% if artist.watchlist_release_albums %}checked{% endif %}> Albums</label>
-      <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_singles" value="true" {% if artist.watchlist_release_singles %}checked{% endif %}> Singles</label>
-      <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_eps" value="true" {% if artist.watchlist_release_eps %}checked{% endif %}> EPs</label>
+      <div class="toggle-group-options">
+        <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_albums" value="true" {% if artist.watchlist_release_albums %}checked{% endif %}> Albums</label>
+        <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_singles" value="true" {% if artist.watchlist_release_singles %}checked{% endif %}> Singles</label>
+        <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_eps" value="true" {% if artist.watchlist_release_eps %}checked{% endif %}> EPs</label>
+      </div>
     </fieldset>
     <label class="check-label switch-label"><input type="checkbox" name="watchlist_monitor_upgrades" value="true" {% if artist.watchlist_monitor_upgrades %}checked{% endif %}> <span>Monitor watchlisted releases for quality upgrades</span></label>
     <div class="form-row">
@@ -155,7 +179,7 @@
                 {% if album.year %}{{ album.year }}{% endif %}{% if album.year and album.release_type_raw %} · {% endif %}{% if album.release_type_raw %}{{ album.release_type_raw }}{% else %}{{ album.release_kind | title }}{% endif %}{% if album.track_count %}{% if album.year or album.release_type_raw %} · {% endif %}{{ album.track_count }} tracks{% endif %}
               </p>
               {% if progress.manifest_known and progress.wanted_track_count > 0 %}
-                <div class="card-progress-bar" aria-hidden="true"><div class="card-progress-fill" data-percent="{{ (progress.downloaded_track_count * 100) // progress.wanted_track_count }}"></div></div>
+                <progress class="card-progress" value="{{ progress.downloaded_track_count }}" max="{{ progress.wanted_track_count }}">{{ progress.downloaded_track_count }} / {{ progress.wanted_track_count }}</progress>
               {% endif %}
               <p class="release-progress">{% if progress.manifest_known %}{{ progress.downloaded_track_count }} of {{ progress.wanted_track_count }} tracks in library{% else %}{{ progress.downloaded_track_count }} local · total unknown{% endif %}</p>
               <p class="provider-badges">
@@ -184,27 +208,4 @@
 {% endif %}
 </section>
 
-<details class="card maintenance-options">
-  <summary>Maintenance</summary>
-  {% if enrichment == 'failed' or provenance.last_enrichment_error %}
-  <div role="alert" class="alert error dismissible" id="enrichment-error-banner">
-    <span>Last enrichment failed{% if provenance.last_enrichment_error %}: {{ provenance.last_enrichment_error.message | e }}{% endif %}</span>
-    <button type="button" class="dismiss-btn" aria-label="Dismiss">×</button>
-  </div>
-  {% endif %}
-  <form method="post" action="/artists/catalog/{{ artist.id }}/enrich">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <input type="hidden" name="provider" value="{{ selected_provider }}">
-    <input type="hidden" name="release_type" value="{{ release_type }}">
-    <input type="hidden" name="sort" value="{{ sort }}">
-    <button class="btn secondary" type="submit">Enrich metadata</button>
-  </form>
-  {% if artist.enrichment_state in ("queued", "running") %}
-  <p class="hint">Enriching…</p>
-  {% elif artist.enrichment_state == "failed" %}
-  <p><span class="badge error">Enrichment failed</span></p>
-  {% else %}
-  <p class="hint">Last enriched: {{ artist.last_enriched_at.strftime("%Y-%m-%d %H:%M") if artist.last_enriched_at else "never" }}</p>
-  {% endif %}
-</details>
 {% endblock %}
