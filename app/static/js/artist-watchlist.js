@@ -25,14 +25,6 @@ window.AudiohoardNavigation.registerPage('artist-watchlist', function (region) {
     bar.hidden = unsaved === 0;
   }
 
-  function applyCardProgressBars(root) {
-    root.querySelectorAll('.card-progress-fill[data-percent]').forEach(function (fill) {
-      var percent = Number.parseFloat(fill.dataset.percent || '0');
-      if (!Number.isFinite(percent)) percent = 0;
-      percent = Math.max(0, Math.min(100, percent));
-      fill.style.width = percent + '%';
-    });
-  }
   inputs.forEach(function (input) {
     input.addEventListener('change', updateBar, { signal: signal });
   });
@@ -64,7 +56,6 @@ window.AudiohoardNavigation.registerPage('artist-watchlist', function (region) {
         if (fresh && discography.isConnected) {
           discography.innerHTML = fresh.innerHTML;
           discography.dataset.artistRefresh = fresh.dataset.artistRefresh || 'false';
-          applyCardProgressBars(discography);
         }
         if (discographyTimer) { window.clearInterval(discographyTimer); discographyTimer = null; }
       } catch (error) {
@@ -98,7 +89,6 @@ window.AudiohoardNavigation.registerPage('artist-watchlist', function (region) {
     }
   }, { signal: signal });
 
-  applyCardProgressBars(region);
   updateBar();
   return function () {
     controller.abort();

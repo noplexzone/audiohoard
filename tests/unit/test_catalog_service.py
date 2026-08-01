@@ -35,7 +35,7 @@ from app.services.catalog import (
     list_library_tracks,
     track_meets_quality,
 )
-from app.settings_service import QualityProfile
+from app.settings_service import QualityProfile, save_runtime_settings
 
 
 def test_artist_release_rollup_excludes_manifest_unknown_track_totals() -> None:
@@ -288,6 +288,99 @@ async def test_library_artist_release_count_for_catalog_and_legacy_rows(
 
     assert rows["Catalog Artist"].release_count == 1
     assert rows["Legacy Artist"].release_count == 0
+
+
+async def test_library_artist_card_uses_runtime_provider_when_primary_unset(
+    db_session: AsyncSession,
+) -> None:
+    await save_runtime_settings(
+        db_session,
+        [{"name": "slskd", "enabled": True}],
+        10,
+        metadata_providers=[
+            {"name": "musicbrainz", "enabled": True},
+            {"name": "deezer", "enabled": True},
+        ],
+        primary_metadata_provider="deezer",
+    )
+    artist = CatalogArtist(name="Runtime Default Artist", monitored=True)
+    musicbrainz_identity = CatalogArtistIdentity(
+        provider="musicbrainz", provider_artist_id="runtime-mb", name=artist.name
+    )
+    deezer_identity = CatalogArtistIdentity(
+        provider="deezer", provider_artist_id="runtime-deezer", name=artist.name
+    )
+    artist.identities.extend([musicbrainz_identity, deezer_identity])
+    deezer_albums = [
+        CatalogAlbum(artist=artist, title="Runtime Deezer One"),
+        CatalogAlbum(artist=artist, title="Runtime Deezer Two"),
+    ]
+    for index, album in enumerate(deezer_albums, start=1):
+        deezer_identity.releases.append(
+            CatalogAlbumProvider(
+                provider_album_id=f"runtime-deezer-{index}",
+                title=album.title,
+                catalog_album=album,
+                release_kind="album",
+            )
+        )
+    for index in range(1, 5):
+        musicbrainz_identity.releases.append(
+            CatalogAlbumProvider(
+                provider_album_id=f"runtime-mb-{index}",
+                title=f"Runtime MusicBrainz {index}",
+                release_kind="album",
+            )
+        )
+    db_session.add(artist)
+    await db_session.flush()
+
+    row = (await get_library_artists_page(db_session)).items[0]
+
+    assert row.primary_metadata_provider == "deezer"
+    assert row.release_count == 2
+
+
+async def test_library_artist_card_uses_explicit_primary_provider_regardless_of_identity_age(
+    db_session: AsyncSession,
+) -> None:
+    artist = CatalogArtist(
+        name="Explicit Primary Artist",
+        monitored=True,
+        watchlist_provider="musicbrainz",
+        primary_metadata_provider="deezer",
+    )
+    musicbrainz_identity = CatalogArtistIdentity(
+        provider="musicbrainz", provider_artist_id="explicit-mb", name=artist.name
+    )
+    deezer_identity = CatalogArtistIdentity(
+        provider="deezer", provider_artist_id="explicit-deezer", name=artist.name
+    )
+    artist.identities.extend([musicbrainz_identity, deezer_identity])
+    for index in range(1, 4):
+        musicbrainz_identity.releases.append(
+            CatalogAlbumProvider(
+                provider_album_id=f"explicit-mb-{index}",
+                title=f"Explicit MusicBrainz {index}",
+                release_kind="album",
+            )
+        )
+    deezer_album = CatalogAlbum(artist=artist, title="Explicit Deezer One")
+    deezer_identity.releases.append(
+        CatalogAlbumProvider(
+            provider_album_id="explicit-deezer-1",
+            title=deezer_album.title,
+            catalog_album=deezer_album,
+            release_kind="album",
+        )
+    )
+    db_session.add(artist)
+    await db_session.flush()
+
+    row = (await get_library_artists_page(db_session)).items[0]
+
+    assert row.primary_metadata_provider == "deezer"
+    assert row.release_count == 1
 
 
 async def test_release_progress_uses_hydrated_manifest_as_denominator(

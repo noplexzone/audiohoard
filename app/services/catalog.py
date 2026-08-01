@@ -28,7 +28,7 @@ from app.models.job import Job, JobStatus
 from app.models.track import Track
 from app.models.workflow import AcquisitionState, ImportWorkflowState
 from app.naming.convention import _sanitize_segment
-from app.settings_service import QualityProfile
+from app.settings_service import QualityProfile, get_runtime_settings
 
 UNKNOWN = "Unknown"
 _DEFAULT_PAGE_SIZE = 50
@@ -914,6 +914,7 @@ async def get_library_artists_page(
     per_page: int = _DEFAULT_PAGE_SIZE,
 ) -> Page[LibraryArtistRow]:
     """Return watchlisted artists and every artist with a persisted library artifact."""
+    runtime = await get_runtime_settings(db)
     per_page = _clamp_per_page(per_page)
     page = max(1, page)
     track_artist = func.lower(func.trim(_artist_expr()))
@@ -951,6 +952,17 @@ async def get_library_artists_page(
         .correlate(CatalogArtist)
         .scalar_subquery()
     )
+    runtime_identity_id = (
+        select(CatalogArtistIdentity.id)
+        .where(
+            CatalogArtistIdentity.artist_id == CatalogArtist.id,
+            CatalogArtistIdentity.provider == runtime.primary_metadata_provider,
+        )
+        .order_by(CatalogArtistIdentity.id)
+        .limit(1)
+        .correlate(CatalogArtist)
+        .scalar_subquery()
+    )
     primary_identity_id = (
         select(func.min(CatalogArtistIdentity.id))
         .where(CatalogArtistIdentity.artist_id == CatalogArtist.id)
@@ -958,7 +970,10 @@ async def get_library_artists_page(
         .scalar_subquery()
     )
     canonical_identity_id = func.coalesce(
-        artist_primary_identity_id, watchlist_identity_id, primary_identity_id
+        artist_primary_identity_id,
+        watchlist_identity_id,
+        runtime_identity_id,
+        primary_identity_id,
     )
     canonical_identity_provider = (
         select(CatalogArtistIdentity.provider)
