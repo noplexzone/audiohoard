@@ -38,6 +38,25 @@ async def _create_job(db_session: AsyncSession, source: str = "youtube") -> Job:
     return job
 
 
+def test_slskd_search_timeout_uses_long_enough_bulk_budget() -> None:
+    from types import SimpleNamespace
+
+    legacy_low_budget = SimpleNamespace(
+        source_search_budget_seconds=30, slskd_download_timeout_seconds=600
+    )
+    high_budget = SimpleNamespace(
+        source_search_budget_seconds=850, slskd_download_timeout_seconds=600
+    )
+    excessive_download_timeout = SimpleNamespace(
+        source_search_budget_seconds=300, slskd_download_timeout_seconds=1800
+    )
+
+    assert runner._slskd_search_timeout_seconds(None) == 300.0
+    assert runner._slskd_search_timeout_seconds(legacy_low_budget) == 600.0
+    assert runner._slskd_search_timeout_seconds(high_budget) == 850.0
+    assert runner._slskd_search_timeout_seconds(excessive_download_timeout) == 900.0
+
+
 def test_targeted_query_variants_normalize_and_simplify_titles() -> None:
     assert runner._targeted_query_variants(
         "Colter Wall", "You're Lucky She's Lonely", "You’re Lucky She’s Lonely"

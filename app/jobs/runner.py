@@ -1196,9 +1196,25 @@ async def _call_fetch_results(
     return list(await _fetch_results(job, cfg))  # type: ignore[call-arg]
 
 
-def _source_adapter(source: str, cfg: Settings) -> SourceAdapter:
+def _slskd_search_timeout_seconds(runtime: object | None) -> float:
+    if runtime is None:
+        return 300.0
+    configured_budget = float(getattr(runtime, "source_search_budget_seconds", 300) or 300)
+    download_timeout = float(getattr(runtime, "slskd_download_timeout_seconds", 600) or 600)
+    # slskd can keep valid searches active for several minutes during bulk dispatch.
+    # Never let a legacy low UI value turn those in-flight searches into false
+    # sources_exhausted failures, but cap search waiting at fifteen minutes so a
+    # dead search cannot monopolize the queue forever.
+    return min(900.0, max(configured_budget, min(download_timeout, 900.0)))
+
+
+def _source_adapter(source: str, cfg: Settings, runtime: object | None = None) -> SourceAdapter:
     if source == "slskd":
-        return SlskdAdapter(cfg.slskd_url, cfg.slskd_api_key)
+        return SlskdAdapter(
+            cfg.slskd_url,
+            cfg.slskd_api_key,
+            search_timeout_sec=_slskd_search_timeout_seconds(runtime),
+        )
     if source == "prowlarr":
         return ProwlarrAdapter(cfg.prowlarr_url, cfg.prowlarr_api_key)
     if source == "youtube":
@@ -1206,6 +1222,25 @@ def _source_adapter(source: str, cfg: Settings) -> SourceAdapter:
     if source == "tidal":
         return TidalAdapter(cfg.tidal_config_path, cfg.tidal_session_path, cfg.tidal_quality)
     raise ValueError(f"Unknown source: {source}")
+
+
+def _call_source_adapter(source: str, cfg: Settings, runtime: object | None) -> SourceAdapter:
+    parameters = inspect.signature(_source_adapter).parameters
+    values = tuple(parameters.values())
+    accepts_keywords = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in values)
+    accepts_varargs = any(
+        parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in values
+    )
+    if "runtime" in parameters or accepts_keywords:
+        return _source_adapter(source, cfg, runtime=runtime)
+    positional_count = sum(
+        parameter.kind
+        in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+        for parameter in values
+    )
+    if accepts_varargs or positional_count >= 3:
+        return _source_adapter(source, cfg, runtime)
+    return _source_adapter(source, cfg)
 
 
 def _job_payload(job: Job) -> dict[str, object]:
@@ -1420,7 +1455,7 @@ async def _fetch_results(
 
     for source in priority:
         try:
-            adapter = _source_adapter(source, cfg)
+            adapter = _call_source_adapter(source, cfg, runtime)
             if priority_job:
                 cap = await adapter.health()
                 if not cap.available:

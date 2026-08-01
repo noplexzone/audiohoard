@@ -24,8 +24,33 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SEARCH_POLL_INTERVAL = 1.5
-_SEARCH_TIMEOUT_SEC = 60
+_SEARCH_TIMEOUT_SEC = 300
 _HTTP_TIMEOUT = httpx.Timeout(10.0)
+_TERMINAL_SEARCH_STATE_TOKENS = frozenset(
+    {"completed", "stopped", "timedout", "filelimitreached", "responselimitreached"}
+)
+_FAILED_SEARCH_STATE_TOKENS = frozenset({"errored", "cancelled", "canceled"})
+
+
+def _search_state_tokens(value: object) -> set[str]:
+    normalized = str(value or "").replace(",", " ").replace("_", " ").replace("-", " ").casefold()
+    tokens = set(normalized.split())
+    compact = "".join(normalized.split())
+    for token in _TERMINAL_SEARCH_STATE_TOKENS | _FAILED_SEARCH_STATE_TOKENS:
+        if token in compact:
+            tokens.add(token)
+    return tokens
+
+
+def _search_state_is_terminal(value: object) -> bool:
+    """Return true for slskd's simple or compound terminal search states."""
+    tokens = _search_state_tokens(value)
+    return bool(tokens & (_TERMINAL_SEARCH_STATE_TOKENS | _FAILED_SEARCH_STATE_TOKENS))
+
+
+def _search_state_is_failed(value: object) -> bool:
+    tokens = _search_state_tokens(value)
+    return bool(tokens & _FAILED_SEARCH_STATE_TOKENS)
 
 
 def _error_detail(response: httpx.Response) -> str:
@@ -94,6 +119,25 @@ class SlskdAdapter:
             timeout=_HTTP_TIMEOUT,
         )
 
+    async def _wait_for_search(self, client: httpx.AsyncClient, search_id: str) -> None:
+        elapsed = 0.0
+        while elapsed < self._search_timeout_sec:
+            await asyncio.sleep(_SEARCH_POLL_INTERVAL)
+            elapsed += _SEARCH_POLL_INTERVAL
+            state_resp = await request_with_retry(client, "GET", f"/api/v0/searches/{search_id}")
+            if state_resp.status_code == 200:
+                state = state_resp.json()
+                search_state = state.get("state")
+                if _search_state_is_failed(search_state):
+                    raise ProviderError(
+                        "search_failed",
+                        "slskd search failed before results were available",
+                        "search",
+                        True,
+                    )
+                if _search_state_is_terminal(search_state):
+                    break
+
     async def health(self) -> CapabilityState:
         if not self._base_url or not self._api_key:
             return CapabilityState(available=False, reason="slskd not configured")
@@ -142,17 +186,7 @@ class SlskdAdapter:
                     "search",
                 )
 
-            elapsed = 0.0
-            while elapsed < self._search_timeout_sec:
-                await asyncio.sleep(_SEARCH_POLL_INTERVAL)
-                elapsed += _SEARCH_POLL_INTERVAL
-                state_resp = await request_with_retry(
-                    client, "GET", f"/api/v0/searches/{search_id}"
-                )
-                if state_resp.status_code == 200:
-                    state = state_resp.json()
-                    if state.get("state") in ("Completed", "Stopped", "TimedOut"):
-                        break
+            await self._wait_for_search(client, search_id)
 
             files_resp = await request_with_retry(
                 client, "GET", f"/api/v0/searches/{search_id}/responses"
@@ -188,17 +222,7 @@ class SlskdAdapter:
                     "search",
                 )
 
-            elapsed = 0.0
-            while elapsed < self._search_timeout_sec:
-                await asyncio.sleep(_SEARCH_POLL_INTERVAL)
-                elapsed += _SEARCH_POLL_INTERVAL
-                state_resp = await request_with_retry(
-                    client, "GET", f"/api/v0/searches/{search_id}"
-                )
-                if state_resp.status_code == 200:
-                    state = state_resp.json()
-                    if state.get("state") in ("Completed", "Stopped", "TimedOut"):
-                        break
+            await self._wait_for_search(client, search_id)
 
             files_resp = await request_with_retry(
                 client, "GET", f"/api/v0/searches/{search_id}/responses"

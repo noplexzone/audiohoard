@@ -317,7 +317,7 @@ async def save_runtime_settings_page(
         )
         source_budget = int(
             str(form.get("source_search_budget_seconds", runtime.source_search_budget_seconds))
-            or "15"
+            or "300"
         )
         slskd_timeout = int(
             str(form.get("slskd_download_timeout_seconds", runtime.slskd_download_timeout_seconds))
@@ -340,7 +340,7 @@ async def save_runtime_settings_page(
         and 0 <= library_scan_hours <= 720
         and 0 <= duplicate_scan_hours <= 720
         and 0 <= upgrade_check_hours <= 720
-        and 3 <= source_budget <= 60
+        and 3 <= source_budget <= 900
         and 10 <= slskd_timeout <= 86400
         and 1 <= max_parallel <= 16
         and 0.5 <= acoustid_threshold <= 0.9999

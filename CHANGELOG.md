@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-31
+
+### Fixed
+
+- Wait for slskd compound terminal search states and use a long enough bulk-search timeout so queued albums do not fail as `sources_exhausted` while slskd is still finding results.
+
+### Changed
+
+- Raise the configurable source-search budget ceiling to 15 minutes for high-volume slskd bulk downloads.
+
 ## [0.12.0] - 2026-07-31
 
 ### Changed
