@@ -486,6 +486,18 @@ async def test_downloads_group_album_jobs_and_target_active_attempt(client: Asyn
     assert f'action="/downloads/{independent_id}/retry"' not in running.text
 
 
+def test_downloads_mobile_layout_stacks_import_review_and_queue() -> None:
+    css = Path("app/static/css/pages.css").read_text()
+    mobile = css.split("@media (max-width: 760px)", 1)[1]
+
+    assert ".downloads-layout" in mobile
+    assert "grid-template-columns: 1fr;" in mobile
+    assert ".review-rail" in mobile and "width: 100%;" in mobile
+    assert ".review-actions" in mobile and "grid-template-columns: 1fr;" in mobile
+    assert ".review-actions form," in mobile and ".review-actions .btn" in mobile
+    assert ".review-details-grid" in mobile and "grid-template-columns: 1fr;" in mobile
+
+
 async def test_downloads_tabs_group_status_source_and_row_details(client: AsyncClient) -> None:
     factory = get_session_factory()
     async with factory() as db:
