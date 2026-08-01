@@ -41,7 +41,7 @@ async def test_downloads_show_state_details_and_valid_actions(client: AsyncClien
 
     assert response.status_code == 200
     assert "Download failed" in response.text
-    assert 'src="/static/js/downloads.js?v=0.12.0"' in response.text
+    assert 'src="/static/js/downloads.js?v=0.13.0"' in response.text
     assert f'action="/downloads/{running_id}/cancel"' in response.text
     assert f'action="/downloads/{failed_id}/retry"' in response.text
     assert f'action="/downloads/{partial_id}/retry"' in response.text
@@ -223,7 +223,7 @@ async def test_downloads_shows_elapsed_and_external_transfer_wait(client: AsyncC
     text = response.text
 
     # Auto-refresh is implemented by the external CSP-compatible script.
-    assert 'src="/static/js/downloads.js?v=0.12.0"' in text
+    assert 'src="/static/js/downloads.js?v=0.13.0"' in text
     assert "POLL_INTERVAL_MS = 10000" in DOWNLOADS_JS
 
     # Elapsed and last-activity columns are present
@@ -364,7 +364,7 @@ async def test_downloads_slow_source_page_renders_while_blocked(client: AsyncCli
     assert "downloading via slskd" in second.text
     assert "Elapsed" in second.text
     assert "Last activity" in second.text
-    assert 'src="/static/js/downloads.js?v=0.12.0"' in second.text
+    assert 'src="/static/js/downloads.js?v=0.13.0"' in second.text
 
 
 async def test_downloads_group_album_jobs_and_target_active_attempt(client: AsyncClient) -> None:

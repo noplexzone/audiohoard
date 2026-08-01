@@ -48,7 +48,7 @@ DEFAULT_WATCHLIST_RELEASE_ALBUMS = True
 DEFAULT_WATCHLIST_RELEASE_SINGLES = False
 DEFAULT_WATCHLIST_RELEASE_EPS = False
 DEFAULT_WATCHLIST_MONITOR_UPGRADES = False
-DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS = 15
+DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS = 300
 DEFAULT_MAX_PARALLEL_ACQUISITIONS = 3
 SUPPORTED_FORMAT_PREFERENCES: tuple[str, ...] = ("flac", "mp3", "m4a/aac", "ogg", "opus")
 DEFAULT_FORMAT_PREFERENCE: list[str] = list(SUPPORTED_FORMAT_PREFERENCES)
@@ -295,7 +295,7 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
         default_release_singles,
         default_release_eps,
         default_monitor_upgrades,
-        max(3, min(source_budget, 60)),
+        max(3, min(source_budget, 900)),
         max(1, min(max_parallel, 16)),
         quality_profile=QualityProfile(
             format_preference=fmt_pref,
@@ -403,7 +403,7 @@ async def save_runtime_settings(
         )
         else "false",
         "source_search_budget_seconds": str(
-            max(3, min(source_search_budget_seconds or DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS, 60))
+            max(3, min(source_search_budget_seconds or DEFAULT_SOURCE_SEARCH_BUDGET_SECONDS, 900))
         ),
         "max_parallel_acquisitions": str(
             max(

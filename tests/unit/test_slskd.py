@@ -6,7 +6,7 @@ import pytest
 from pytest_httpx import HTTPXMock
 
 from app.schemas.search import SearchRequest
-from app.sources.slskd import SlskdAdapter
+from app.sources.slskd import SlskdAdapter, _search_state_is_failed, _search_state_is_terminal
 from app.sources.youtube import ProviderError
 
 
@@ -41,6 +41,17 @@ class TestSlskdHealth:
 
 
 class TestSlskdSearch:
+    def test_search_state_accepts_compound_terminal_variants(self) -> None:
+        assert _search_state_is_terminal("Completed, FileLimitReached")
+        assert _search_state_is_terminal("Completed, TimedOut")
+        assert _search_state_is_terminal("Completed, ResponseLimitReached")
+        assert _search_state_is_terminal("Timed Out")
+        assert _search_state_is_terminal("Completed, Errored")
+        assert _search_state_is_failed("Completed, Errored")
+        assert _search_state_is_failed("Completed, Cancelled")
+        assert not _search_state_is_failed("Completed, TimedOut")
+        assert not _search_state_is_terminal("InProgress")
+
     async def test_search_returns_results(self, httpx_mock: HTTPXMock) -> None:
         search_id = "abc123"
         httpx_mock.add_response(
@@ -75,6 +86,68 @@ class TestSlskdSearch:
         assert results[0].source == "slskd"
         assert results[0].format == "flac"
         assert results[0].size_bytes == 30000000
+
+    async def test_search_accepts_compound_completed_state(self, httpx_mock: HTTPXMock) -> None:
+        search_id = "compound123"
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/searches",
+            method="POST",
+            json={"id": search_id},
+        )
+        httpx_mock.add_response(
+            url=f"http://slskd.local/api/v0/searches/{search_id}",
+            json={"state": "Completed, FileLimitReached", "id": search_id},
+        )
+        httpx_mock.add_response(
+            url=f"http://slskd.local/api/v0/searches/{search_id}/responses",
+            json=[
+                {
+                    "username": "peer1",
+                    "files": [
+                        {
+                            "filename": "music/Artist/Album/01 Song.flac",
+                            "size": 30_000_000,
+                        }
+                    ],
+                }
+            ],
+        )
+
+        results = await SlskdAdapter("http://slskd.local", "key123").search(
+            SearchRequest(query="Artist Album Song")
+        )
+
+        assert len(results) == 1
+        assert [request.url.path for request in httpx_mock.get_requests()] == [
+            "/api/v0/searches",
+            f"/api/v0/searches/{search_id}",
+            f"/api/v0/searches/{search_id}/responses",
+        ]
+
+    async def test_search_failed_compound_state_raises_provider_error(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        search_id = "failed123"
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/searches",
+            method="POST",
+            json={"id": search_id},
+        )
+        httpx_mock.add_response(
+            url=f"http://slskd.local/api/v0/searches/{search_id}",
+            json={"state": "Completed, Errored", "id": search_id},
+        )
+
+        with pytest.raises(ProviderError) as exc_info:
+            await SlskdAdapter("http://slskd.local", "key123").search(
+                SearchRequest(query="Artist Album Song")
+            )
+
+        assert exc_info.value.code == "search_failed"
+        assert [request.url.path for request in httpx_mock.get_requests()] == [
+            "/api/v0/searches",
+            f"/api/v0/searches/{search_id}",
+        ]
 
     async def test_search_ignores_lrc_lyrics_files(self, httpx_mock: HTTPXMock) -> None:
         search_id = "lyrics123"
