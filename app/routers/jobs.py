@@ -108,7 +108,10 @@ async def _assemble_downloads_context(
         .limit(500)
     )
     if status is not None:
-        metadata_query = metadata_query.where(Job.status == status)
+        status_candidates = [status]
+        if status == JobStatus.running:
+            status_candidates.append(JobStatus.pending)
+        metadata_query = metadata_query.where(Job.status.in_(status_candidates))
     metadata_rows = (await db.execute(metadata_query)).all()
     parents = {
         int(job_id): int(parent_job_id) if parent_job_id is not None else None
@@ -223,11 +226,7 @@ async def _assemble_downloads_context(
 
     download_groups = project_download_groups(downloads, parents)
     if status is not None:
-        download_groups = [
-            group
-            for group in download_groups
-            if any(attempt.job.status == status for attempt in group.attempts)
-        ]
+        download_groups = [group for group in download_groups if group.status == status]
     download_groups = download_groups[:100]
     review_result = await db.execute(
         select(StagingReviewItem)

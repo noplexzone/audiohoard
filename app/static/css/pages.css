@@ -1207,6 +1207,37 @@ a.metric-card:hover {
 
 }
 
+
+.download-tabs {
+  display: flex;
+  gap: .45rem;
+  align-items: center;
+  margin: 0 0 1rem;
+  overflow-x: auto;
+  padding-bottom: .15rem;
+}
+
+.download-tabs a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  padding: .45rem .8rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: .88rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.download-tabs a.active,
+.download-tabs a:hover {
+  border-color: var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
 .downloads-create-form {
   margin-bottom: 1.5rem;
 }
@@ -1902,4 +1933,111 @@ a.metric-card:hover {
   .release-track-section { padding: .75rem; }
   .release-track-row { gap: .4rem; }
   .track-actions .btn { padding-inline: .75rem; }
+}
+
+@media (max-width: 760px) {
+  .downloads-create-form,
+  .downloads-controls {
+    align-items: stretch;
+  }
+
+  .downloads-create-form > *,
+  .downloads-controls form,
+  .downloads-controls .btn {
+    width: 100%;
+  }
+
+  .downloads-query {
+    min-width: 0;
+  }
+
+  .downloads-layout {
+    gap: .85rem;
+  }
+
+  .review-rail {
+    order: -1;
+  }
+
+  .downloads-table {
+    border: 0;
+    background: transparent;
+    overflow-x: visible;
+  }
+
+  .downloads-table table,
+  .downloads-table thead,
+  .downloads-table tbody,
+  .downloads-table tr,
+  .downloads-table th,
+  .downloads-table td {
+    display: block;
+  }
+
+  .downloads-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .downloads-table .download-summary-row {
+    display: grid;
+    gap: .55rem;
+    margin-bottom: 0;
+    padding: .8rem;
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  .downloads-table .download-summary-row td {
+    display: grid;
+    grid-template-columns: 6.5rem minmax(0, 1fr);
+    gap: .55rem;
+    align-items: start;
+    padding: 0;
+    border: 0;
+  }
+
+  .downloads-table .download-summary-row td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: .72rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+  }
+
+  .downloads-table .download-summary-row td:first-child,
+  .downloads-table .download-summary-row .action-cell {
+    grid-template-columns: 1fr;
+  }
+
+  .downloads-table .download-summary-row td:first-child::before,
+  .downloads-table .download-summary-row .action-cell::before {
+    content: none;
+  }
+
+  .downloads-table .download-detail-row {
+    margin: .35rem 0 .85rem;
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius);
+    background: var(--surface-2);
+  }
+
+  .downloads-table .download-detail-row td {
+    padding: .75rem;
+  }
+
+  .download-detail-row details[open],
+  .download-detail-row summary {
+    max-width: 100%;
+  }
+
+  .track-states {
+    padding-left: 0;
+  }
 }

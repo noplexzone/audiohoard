@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 from httpx import AsyncClient
@@ -472,12 +473,127 @@ async def test_downloads_group_album_jobs_and_target_active_attempt(client: Asyn
 
     failed = await client.get("/downloads?status=failed")
     assert failed.status_code == 200
-    assert failed.text.count(f'data-download-group="album:{album_id}"') == 1
-    assert "Grouped Release" in failed.text
-    assert "2 attempts" in failed.text
-    assert f'action="/downloads/{continuation_id}/cancel"' in failed.text
-    assert f'action="/downloads/{independent_id}/retry"' not in failed.text
+    assert failed.text.count(f'data-download-group="album:{album_id}"') == 0
+    assert "Grouped Release" not in failed.text
     assert "Unrelated Release" in failed.text
+
+    running = await client.get("/downloads?status=running")
+    assert running.status_code == 200
+    assert running.text.count(f'data-download-group="album:{album_id}"') == 1
+    assert "Grouped Release" in running.text
+    assert "2 attempts" in running.text
+    assert f'action="/downloads/{continuation_id}/cancel"' in running.text
+    assert f'action="/downloads/{independent_id}/retry"' not in running.text
+
+
+async def test_downloads_tabs_group_status_source_and_row_details(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(name="Mobile Artist")
+        album = CatalogAlbum(title="Mobile Release", track_count=2)
+        artist.albums.append(album)
+        album.tracks.extend(
+            [
+                CatalogAlbumTrack(position=1, disc=1, title="First"),
+                CatalogAlbumTrack(position=2, disc=1, title="Second"),
+            ]
+        )
+        db.add(artist)
+        await db.flush()
+        root = Job(
+            source="priority",
+            query="Mobile Artist Mobile Release",
+            status=JobStatus.pending,
+            catalog_album_id=album.id,
+        )
+        continuation = Job(
+            source="priority",
+            query="Mobile Artist Second",
+            status=JobStatus.pending,
+            catalog_album_id=album.id,
+            catalog_track_id=album.tracks[1].id,
+            parent_job_id=root.id,
+        )
+        db.add_all([root, continuation])
+        await db.flush()
+        db.add(
+            Track(
+                job_id=continuation.id,
+                source="slskd",
+                title="Second",
+                catalog_album_id=album.id,
+                catalog_track_id=album.tracks[1].id,
+                acquisition_state=AcquisitionState.acquiring,
+                source_status="downloading",
+            )
+        )
+        await db.commit()
+        album_id = album.id
+
+    response = await client.get("/downloads")
+
+    assert response.status_code == 200
+    text = response.text
+    assert 'class="download-tabs"' in text
+    assert 'href="/downloads?status=running"' in text
+    assert 'href="/downloads?status=done"' in text
+    assert 'href="/downloads?status=failed"' in text
+    group = text.split(f'data-download-group="album:{album_id}"', 1)[1].split("</tbody>", 1)[0]
+    assert '<td data-label="Source"><span class="badge info">slskd</span></td>' in group
+    assert '<span class="badge warn"><span class="dot"></span>running</span>' in group
+    assert 'class="download-detail-row"' in group
+    assert 'colspan="8"' in group
+    assert "next.classList.contains('download-detail-row')" in DOWNLOADS_JS
+
+
+async def test_downloads_terminal_priority_attempt_uses_track_provider_source(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        job = Job(source="priority", query="Failed Provider Attempt", status=JobStatus.failed)
+        db.add(job)
+        await db.flush()
+        db.add(
+            Track(
+                job_id=job.id,
+                source="slskd",
+                title="Failed Provider Track",
+                acquisition_state=AcquisitionState.failed,
+            )
+        )
+        await db.commit()
+
+    response = await client.get("/downloads?status=failed")
+
+    assert response.status_code == 200
+    row = response.text.split("Failed Provider Attempt", 1)[1].split("</tr>", 1)[0]
+    assert '<td data-label="Source"><span class="badge info">slskd</span></td>' in row
+    assert "priority" not in row.casefold()
+
+
+async def test_downloads_terminal_elapsed_uses_updated_at(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        job = Job(source="slskd", query="Finished Album", status=JobStatus.done)
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+        await db.execute(
+            Job.__table__.update()
+            .where(Job.id == job_id)
+            .values(
+                created_at=datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
+                updated_at=datetime(2026, 1, 1, 0, 2, 5, tzinfo=UTC),
+            )
+        )
+        await db.commit()
+
+    response = await client.get("/downloads")
+
+    assert response.status_code == 200
+    row = response.text.split("Finished Album", 1)[1].split("</tr>", 1)[0]
+    assert "2m 5s" in row
 
 
 async def test_downloads_group_parent_chain_without_catalog_album(client: AsyncClient) -> None:
@@ -568,6 +684,28 @@ async def test_downloads_queue_honours_status_filter_like_page(client: AsyncClie
     assert page.status_code == queue.status_code == 200
     assert "Failed Queue Item" in page.text and "Failed Queue Item" in queue.text
     assert "Pending Queue Item" not in page.text and "Pending Queue Item" not in queue.text
+
+
+async def test_downloads_status_tabs_search_within_status_before_group_limit(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        db.add_all(
+            [
+                Job(source="slskd", query=f"Noisy Pending {index}", status=JobStatus.pending)
+                for index in range(101)
+            ]
+        )
+        older_failed = Job(source="slskd", query="Older Failed Visible", status=JobStatus.failed)
+        db.add(older_failed)
+        await db.commit()
+
+    failed = await client.get("/downloads?status=failed")
+
+    assert failed.status_code == 200
+    assert "Older Failed Visible" in failed.text
+    assert "Noisy Pending" not in failed.text
 
 
 async def test_downloads_queue_has_no_query_column(client: AsyncClient) -> None:

@@ -10,6 +10,15 @@ from app.models.workflow import AcquisitionState
 
 _ACTIVE = {JobStatus.pending, JobStatus.running}
 _RETRYABLE = {JobStatus.failed, JobStatus.partial, JobStatus.cancelled}
+_IN_FLIGHT_TRACK_STATES = {AcquisitionState.searching, AcquisitionState.acquiring}
+_STATUS_PRIORITY = (
+    JobStatus.running,
+    JobStatus.pending,
+    JobStatus.partial,
+    JobStatus.failed,
+    JobStatus.cancelled,
+    JobStatus.done,
+)
 
 
 @dataclass(frozen=True)
@@ -33,6 +42,7 @@ class DownloadGroup:
     wanted_track_count: int
     downloaded_track_count: int
     action_attempt: Job | None
+    source_display: str
 
     @property
     def active(self) -> bool:
@@ -102,11 +112,39 @@ def _track_identity(track: Track) -> tuple[object, ...]:
 
 
 def _group_status(jobs: list[Job]) -> JobStatus:
-    for statuses in (_ACTIVE, _RETRYABLE):
-        match = next((job.status for job in jobs if job.status in statuses), None)
-        if match is not None:
-            return match
+    if any(
+        track.acquisition_state in _IN_FLIGHT_TRACK_STATES for job in jobs for track in job.tracks
+    ):
+        return JobStatus.running
+    statuses = {job.status for job in jobs}
+    for status in _STATUS_PRIORITY:
+        if status in statuses:
+            return status
     return jobs[0].status
+
+
+def _effective_source(jobs: list[Job]) -> str:
+    track_sources: list[str] = []
+    for state in (
+        AcquisitionState.acquiring,
+        AcquisitionState.searching,
+        AcquisitionState.downloaded,
+        AcquisitionState.failed,
+        AcquisitionState.cancelled,
+    ):
+        track_sources.extend(
+            track.source
+            for job in jobs
+            for track in job.tracks
+            if track.source and track.acquisition_state == state
+        )
+    for source in track_sources:
+        if source != "priority":
+            return source
+    for job in jobs:
+        if job.source != "priority":
+            return job.source
+    return jobs[0].source
 
 
 def _action_attempt(jobs: list[Job]) -> Job | None:
@@ -188,6 +226,7 @@ def project_download_groups(
                 wanted_track_count=wanted_count,
                 downloaded_track_count=min(len(downloaded & wanted), wanted_count),
                 action_attempt=_action_attempt(visible_jobs),
+                source_display=_effective_source(grouped_jobs),
             )
         )
     groups.sort(
