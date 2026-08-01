@@ -3,6 +3,30 @@ from __future__ import annotations
 from httpx import AsyncClient
 
 
+def test_interactive_search_adapters_cap_runtime_bulk_budget(monkeypatch) -> None:
+    from app.config import Settings
+    from app.routers import search as search_router
+
+    observed: dict[str, float] = {}
+
+    class FakeSlskdAdapter:
+        def __init__(self, url: str, api_key: str, search_timeout_sec: float) -> None:
+            observed["slskd"] = search_timeout_sec
+
+    class FakeYouTubeAdapter:
+        def __init__(self, cookies_file: str, search_timeout_sec: float) -> None:
+            observed["youtube"] = search_timeout_sec
+
+    monkeypatch.setattr(search_router, "SlskdAdapter", FakeSlskdAdapter)
+    monkeypatch.setattr(search_router, "YouTubeAdapter", FakeYouTubeAdapter)
+
+    settings = Settings(secret_key="test-secret")
+    assert search_router._build_adapter("slskd", settings, 900) is not None
+    assert search_router._build_adapter("youtube", settings, 900) is not None
+
+    assert observed == {"slskd": 60.0, "youtube": 30.0}
+
+
 async def test_search_returns_200_with_empty_sources(client: AsyncClient) -> None:
     resp = await client.post(
         "/search",
