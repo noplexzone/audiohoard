@@ -6,6 +6,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Collapse artist watchlist settings into a hero Configure dialog with immediate release-type/source updates and remove redundant preset/save controls.
+- Quick-watchlisted artists now default their watchlist catalog source to the artist primary source when one is set.
+
 ## [0.14.0] - 2026-07-31
 
 ### Changed

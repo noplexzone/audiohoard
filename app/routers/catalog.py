@@ -959,8 +959,9 @@ async def monitor_catalog_artist_page(
         if artist.monitored and not was_monitored:
             _apply_runtime_watchlist_defaults(artist, runtime)
         if artist.monitored:
+            primary_provider = _artist_primary_provider(artist, runtime, available)
             artist.watchlist_provider = _selected_provider(
-                runtime.primary_metadata_provider,
+                primary_provider,
                 available,
                 runtime.primary_metadata_provider,
                 artist.watchlist_provider,

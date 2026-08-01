@@ -3,31 +3,42 @@
 window.AudiohoardNavigation.registerPage('artist-watchlist', function (region) {
   var controller = new AbortController();
   var signal = controller.signal;
-  var inputs = Array.from(region.querySelectorAll('input[form="monitor-form"]'));
-  var initialState = new Map(inputs.map(function (input) { return [input, input.checked]; }));
-  var bar = document.createElement('div');
-  var count = document.createElement('span');
-  var save = document.createElement('button');
   var discographyTimer = null;
-  bar.className = 'unsaved-bar';
-  bar.hidden = true;
-  bar.setAttribute('role', 'status');
-  save.type = 'submit';
-  save.className = 'btn';
-  save.setAttribute('form', 'monitor-form');
-  save.textContent = 'Save';
-  bar.append(count, save);
-  region.append(bar);
 
-  function updateBar() {
-    var unsaved = inputs.filter(function (input) { return input.checked !== initialState.get(input); }).length;
-    count.textContent = unsaved + ' unsaved selection' + (unsaved === 1 ? '' : 's');
-    bar.hidden = unsaved === 0;
+  function submitForm(form, status) {
+    if (!form || form.dataset.submitting === 'true') return;
+    form.dataset.submitting = 'true';
+    if (status) status.textContent = 'Saving…';
+    if (form.requestSubmit) {
+      form.requestSubmit();
+    } else {
+      form.submit();
+    }
   }
 
-  inputs.forEach(function (input) {
-    input.addEventListener('change', updateBar, { signal: signal });
+  var dialog = region.querySelector('[data-watchlist-dialog]');
+  region.querySelectorAll('[data-open-watchlist]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      if (!dialog) return;
+      if (dialog.showModal) dialog.showModal();
+      else dialog.setAttribute('open', '');
+    }, { signal: signal });
   });
+  if (dialog) {
+    dialog.addEventListener('click', function (event) {
+      if (event.target === dialog) dialog.close();
+    }, { signal: signal });
+  }
+
+  region.querySelectorAll('[data-auto-submit-form]').forEach(function (form) {
+    var status = form.querySelector('[data-save-status]');
+    var controls = Array.from(form.querySelectorAll('select, input[type="checkbox"]'));
+    controls = controls.concat(Array.from(region.querySelectorAll('input[form="' + form.id + '"]')));
+    controls.forEach(function (control) {
+      control.addEventListener('change', function () { submitForm(form, status); }, { signal: signal });
+    });
+  });
+
   region.querySelectorAll('[data-primary-source-select]').forEach(function (select) {
     select.addEventListener('change', function () {
       if (select.form && select.form.requestSubmit) select.form.requestSubmit();
@@ -89,10 +100,8 @@ window.AudiohoardNavigation.registerPage('artist-watchlist', function (region) {
     }
   }, { signal: signal });
 
-  updateBar();
   return function () {
     controller.abort();
     if (discographyTimer) window.clearInterval(discographyTimer);
-    bar.remove();
   };
 });

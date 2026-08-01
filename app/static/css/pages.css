@@ -877,6 +877,83 @@ a.metric-card:hover {
   padding-bottom: 1.25rem;
 }
 
+
+.artist-watchlist-summary {
+  display: flex;
+  width: max-content;
+  max-width: 100%;
+  flex-wrap: wrap;
+  gap: .25rem;
+  margin: -.35rem 0 .85rem;
+  padding: .42rem .65rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: rgba(147,170,160,.08);
+  color: var(--muted);
+  font-size: .8rem;
+}
+
+.artist-watchlist-summary strong {
+  color: var(--text);
+}
+
+.watchlist-dialog {
+  width: min(94vw, 34rem);
+  padding: 1.2rem;
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 24px 80px rgba(0,0,0,.55);
+}
+
+.watchlist-dialog::backdrop {
+  background: rgba(7, 10, 9, .72);
+  backdrop-filter: blur(2px);
+}
+
+.dialog-close-form {
+  display: flex;
+  justify-content: flex-end;
+  margin: -.35rem -.35rem .35rem 0;
+}
+
+.watchlist-dialog-header {
+  margin-bottom: 1rem;
+}
+
+.watchlist-dialog-header h2 {
+  margin: .15rem 0 .45rem;
+}
+
+.watchlist-dialog .field-block {
+  display: grid;
+  gap: .45rem;
+  margin: .85rem 0;
+}
+
+.watchlist-dialog select {
+  width: 100%;
+}
+
+.watchlist-release-types {
+  max-width: none;
+  background: transparent;
+}
+
+.watchlist-upgrade-toggle {
+  justify-content: flex-start;
+  width: 100%;
+  margin-top: .75rem;
+}
+
+.save-status {
+  min-height: 1.1rem;
+  margin: .7rem 0 0;
+  color: var(--muted);
+  font-size: .78rem;
+}
+
 .artist-enrichment-status {
   margin-top: .65rem;
 }

@@ -35,6 +35,27 @@ def test_catalog_and_legacy_artist_pages_share_discography_semantics() -> None:
     assert "Primary source" in catalog
 
 
+def test_catalog_artist_watchlist_settings_are_collapsed_and_immediate() -> None:
+    catalog = _read(TEMPLATES / "catalog_artist.html")
+    source = _read(STATIC / "js" / "artist-watchlist.js")
+    css = _read(STATIC / "css" / "pages.css")
+
+    assert "artist-watchlist-summary" in catalog
+    assert "data-open-watchlist" in catalog
+    assert "data-watchlist-dialog" in catalog
+    assert "data-auto-submit-form" in catalog
+    assert "Catalog source" in catalog
+    assert "Changes apply immediately" in catalog
+    assert "Auto-watchlist release types" not in catalog
+    assert "New release policy" not in catalog
+    assert "Save watchlist" not in catalog
+    assert "Albums only" not in catalog
+    assert "Singles/EPs off" not in catalog
+    assert "data-open-watchlist" in source
+    assert "Saving…" in source
+    assert "watchlist-dialog" in css
+
+
 def test_release_page_has_compact_actions_autosave_and_safe_file_removal() -> None:
     template = _read(TEMPLATES / "catalog_album.html")
     source = _read(STATIC / "js" / "album.js")

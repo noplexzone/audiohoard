@@ -165,6 +165,36 @@ async def test_quick_monitor_toggles_catalog_artist_and_albums(client: AsyncClie
         assert album.monitored is False
 
 
+async def test_quick_monitor_uses_artist_primary_source_for_watchlist(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Primary Source Artist",
+            mbid="primary-mb",
+            deezer_id="primary-dz",
+            primary_metadata_provider="deezer",
+            last_enriched_at=datetime.now(tz=UTC),
+        )
+        db.add(artist)
+        await db.commit()
+        artist_id = artist.id
+
+    response = await client.post(
+        f"/artists/catalog/{artist_id}/monitor",
+        data={"quick": "1", "csrf_token": client.cookies.get("csrf", "")},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    async with factory() as db:
+        refreshed = await db.get(CatalogArtist, artist_id)
+    assert refreshed is not None
+    assert refreshed.monitored is True
+    assert refreshed.watchlist_provider == "deezer"
+
+
 async def test_search_card_monitor_opens_artist_as_monitored(
     client: AsyncClient, monkeypatch
 ) -> None:
@@ -265,7 +295,8 @@ async def test_artist_page_switches_provider_and_album_filter_excludes_singles(
     assert "DZ Album" in deezer.text
     assert "DZ Single" in deezer.text
     assert "MB Album" not in deezer.text
-    assert 'name="watchlist_provider"' in deezer.text
+    assert 'name="watchlist_provider"' not in deezer.text
+    assert "Configure watchlist" not in deezer.text
     assert "MusicBrainz discography" in deezer.text
 
     albums = await client.get(

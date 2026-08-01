@@ -46,6 +46,14 @@
       {% if artist_rollup.tracks_total > 0 %}<strong>{{ artist_rollup.tracks_in_library }}</strong> of {{ artist_rollup.tracks_total }} tracks · {% endif %}<strong>{{ artist_rollup.releases_complete }}</strong> of {{ artist_rollup.releases_total }} releases complete
     </p>
     {% endif %}
+    {% if artist.monitored %}
+    <p class="artist-watchlist-summary">
+      <strong>Watchlist:</strong>
+      {{ display_name(artist.watchlist_provider or primary_metadata_provider) }} catalog ·
+      {% if artist.watchlist_release_albums %}Albums{% endif %}{% if artist.watchlist_release_albums and (artist.watchlist_release_singles or artist.watchlist_release_eps) %}, {% endif %}{% if artist.watchlist_release_singles %}Singles{% endif %}{% if artist.watchlist_release_singles and artist.watchlist_release_eps %}, {% endif %}{% if artist.watchlist_release_eps %}EPs{% endif %}{% if not artist.watchlist_release_albums and not artist.watchlist_release_singles and not artist.watchlist_release_eps %}No automatic release types{% endif %}
+      · Quality upgrades {{ 'on' if artist.watchlist_monitor_upgrades else 'off' }}
+    </p>
+    {% endif %}
     <div class="artist-actions">
       <div class="artist-actions-primary">
         <form method="post" action="/artists/catalog/{{ artist.id }}/monitor">
@@ -64,6 +72,7 @@
           <input type="hidden" name="sort" value="{{ sort }}">
           <button class="btn secondary" type="submit">Download watchlisted releases</button>
         </form>
+        <button class="btn secondary" type="button" data-open-watchlist>Configure watchlist</button>
         {% endif %}
       </div>
       <div class="artist-actions-secondary">
@@ -109,6 +118,41 @@
   </div>
 </section>
 
+{% if artist.monitored %}
+<dialog class="watchlist-dialog" data-watchlist-dialog aria-labelledby="watchlist-dialog-title">
+  <form method="dialog" class="dialog-close-form"><button type="submit" class="dismiss-btn" aria-label="Close watchlist settings">×</button></form>
+  <div class="watchlist-dialog-header">
+    <p class="eyebrow">Artist watchlist</p>
+    <h2 id="watchlist-dialog-title">Configure {{ display_identity.name if display_identity else artist.name }}</h2>
+    <p class="hint">Changes apply immediately. Catalog source defaults to the primary source unless this artist needs a different provider-specific discography.</p>
+  </div>
+  <form id="monitor-form" method="post" action="/artists/catalog/{{ artist.id }}/monitor" data-auto-submit-form>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="provider" value="{{ selected_provider }}">
+    <input type="hidden" name="release_type" value="{{ release_type }}">
+    <input type="hidden" name="sort" value="{{ sort }}">
+    <input type="hidden" name="monitored" value="true">
+    <input type="hidden" name="monitor_policy" value="all">
+    <label class="field-block">Catalog source
+      <select name="watchlist_provider">
+        {% for name in available_providers %}<option value="{{ name }}" {% if artist.watchlist_provider == name %}selected{% endif %}>{{ display_name(name) }}</option>{% endfor %}
+      </select>
+      <span class="hint">Use the same provider as Primary source unless you want to watch a different provider’s release list.</span>
+    </label>
+    <fieldset class="field-block toggle-group watchlist-release-types">
+      <legend>Release types</legend>
+      <div class="toggle-group-options">
+        <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_albums" value="true" {% if artist.watchlist_release_albums %}checked{% endif %}> Albums</label>
+        <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_singles" value="true" {% if artist.watchlist_release_singles %}checked{% endif %}> Singles</label>
+        <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_eps" value="true" {% if artist.watchlist_release_eps %}checked{% endif %}> EPs</label>
+      </div>
+    </fieldset>
+    <label class="check-label switch-label watchlist-upgrade-toggle"><input type="checkbox" name="watchlist_monitor_upgrades" value="true" {% if artist.watchlist_monitor_upgrades %}checked{% endif %}> <span>Monitor for quality upgrades</span></label>
+    <p class="save-status" data-save-status aria-live="polite"></p>
+  </form>
+</dialog>
+{% endif %}
+
 <nav class="discography-filters" aria-label="Discography filters">
   {% for name, url in provider_links %}
     <a class="filter-chip {% if selected_provider == name %}active{% endif %}" href="{{ url }}">{{ display_name(name) }} discography</a>
@@ -119,45 +163,6 @@
   {% endfor %}
   <a class="filter-chip" href="{{ sort_url }}">Year {{ '↑' if sort == 'asc' else '↓' }}</a>
 </nav>
-
-<details class="card monitoring-options">
-  <summary>Watchlist options</summary>
-  <form id="monitor-form" method="post" action="/artists/catalog/{{ artist.id }}/monitor">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <input type="hidden" name="provider" value="{{ selected_provider }}">
-    <input type="hidden" name="release_type" value="{{ release_type }}">
-    <input type="hidden" name="sort" value="{{ sort }}">
-    <input type="hidden" name="monitored" value="{{ 'true' if artist.monitored else 'false' }}">
-    <label>Watchlist discography
-      <select name="watchlist_provider">
-        {% for name in available_providers %}<option value="{{ name }}" {% if artist.watchlist_provider == name %}selected{% endif %}>{{ display_name(name) }}</option>{% endfor %}
-      </select>
-    </label>
-    <label>New release policy
-      <select name="monitor_policy">
-        <option value="all" {% if artist.monitor_policy == "all" %}selected{% endif %}>Use release-type defaults</option>
-        <option value="albums_only" {% if artist.monitor_policy == "albums_only" %}selected{% endif %}>Albums only</option>
-        <option value="none_new" {% if artist.monitor_policy == "none_new" %}selected{% endif %}>None new</option>
-      </select>
-    </label>
-    <fieldset class="field-block toggle-group">
-      <legend>Auto-watchlist release types</legend>
-      <div class="toggle-group-options">
-        <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_albums" value="true" {% if artist.watchlist_release_albums %}checked{% endif %}> Albums</label>
-        <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_singles" value="true" {% if artist.watchlist_release_singles %}checked{% endif %}> Singles</label>
-        <label class="check-label compact-check"><input type="checkbox" name="watchlist_release_eps" value="true" {% if artist.watchlist_release_eps %}checked{% endif %}> EPs</label>
-      </div>
-    </fieldset>
-    <label class="check-label switch-label"><input type="checkbox" name="watchlist_monitor_upgrades" value="true" {% if artist.watchlist_monitor_upgrades %}checked{% endif %}> <span>Monitor watchlisted releases for quality upgrades</span></label>
-    <div class="form-row">
-      <button class="btn secondary" name="bulk" value="all">All</button>
-      <button class="btn secondary" name="bulk" value="albums_only">Albums only</button>
-      <button class="btn secondary" name="bulk" value="singles_off">Singles/EPs off</button>
-      <button class="btn secondary" name="bulk" value="none">None</button>
-      <button class="btn" type="submit">Save watchlist</button>
-    </div>
-  </form>
-</details>
 
 <section id="discography-region" data-artist-id="{{ artist.id }}" data-artist-refresh="{{ 'true' if discography_loading else 'false' }}">
 <p class="sr-only">Discography grouped into Albums, Singles &amp; EPs, and Compilations.</p>
