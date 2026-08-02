@@ -65,8 +65,11 @@ def track_meets_quality(file_format: str | None, profile: QualityProfile) -> boo
     family = _format_family(file_format)
     if not family:
         return True
-    preferred = {_format_family(value) for value in profile.format_preference}
+    preferred = [_format_family(value) for value in profile.format_preference]
     if family not in preferred:
+        return False
+    best_family = next((value for value in preferred if value), "")
+    if best_family and family != best_family:
         return False
     if family != "mp3":
         return True

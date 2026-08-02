@@ -31,6 +31,7 @@ from app.models.workflow import ReviewDecision
 from app.routers import (
     artwork,
     auth,
+    blocklist,
     health,
     imports,
     jobs,
@@ -276,6 +277,7 @@ def create_app() -> FastAPI:
     app.include_router(catalog_router.router, tags=["catalog"])
     app.include_router(search.router, tags=["search"])
     app.include_router(settings_router.router, tags=["settings"])
+    app.include_router(blocklist.router, tags=["blocklist"])
     app.include_router(jobs.router, tags=["jobs", "downloads"])
     app.include_router(tracks.router, tags=["tracks"])
     app.include_router(naming.router, tags=["naming"])

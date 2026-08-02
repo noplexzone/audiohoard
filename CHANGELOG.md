@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Add a source blocklist page for viewing and removing blocked provider artifacts.
+
+### Fixed
+
+- Count MP3 imports as upgrade-eligible when the quality profile prefers FLAC.
+
 ## [0.15.1] - 2026-08-02
 
 ### Fixed
