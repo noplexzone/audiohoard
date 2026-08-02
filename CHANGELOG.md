@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-08-02
+
+### Fixed
+
+- Retry bounded human-style slskd targeted queries after strict artist/title misses, including title-only and first significant artist-token variants, while preserving post-result catalog identity verification and source-attempt provenance.
+- Back off slskd search-state polling during long acquisition searches to reduce burst pressure and 429 amplification.
+
 ## [0.15.0] - 2026-08-02
 
 ### Changed

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SEARCH_POLL_INTERVAL = 1.5
+_SEARCH_POLL_INTERVAL_MAX = 10.0
 _SEARCH_TIMEOUT_SEC = 300
 _HTTP_TIMEOUT = httpx.Timeout(10.0)
 _TERMINAL_SEARCH_STATE_TOKENS = frozenset(
@@ -122,9 +123,11 @@ class SlskdAdapter:
 
     async def _wait_for_search(self, client: httpx.AsyncClient, search_id: str) -> None:
         elapsed = 0.0
+        interval = _SEARCH_POLL_INTERVAL
         while elapsed < self._search_timeout_sec:
-            await asyncio.sleep(_SEARCH_POLL_INTERVAL)
-            elapsed += _SEARCH_POLL_INTERVAL
+            sleep_for = min(interval, self._search_timeout_sec - elapsed)
+            await asyncio.sleep(sleep_for)
+            elapsed += sleep_for
             state_resp = await request_with_retry(client, "GET", f"/api/v0/searches/{search_id}")
             if state_resp.status_code == 200:
                 state = state_resp.json()
@@ -138,6 +141,7 @@ class SlskdAdapter:
                     )
                 if _search_state_is_terminal(search_state):
                     break
+            interval = min(interval * 1.5, _SEARCH_POLL_INTERVAL_MAX)
 
     async def health(self) -> CapabilityState:
         if not self._base_url or not self._api_key:

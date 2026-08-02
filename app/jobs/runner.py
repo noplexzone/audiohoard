@@ -1305,6 +1305,18 @@ def _provider_safe_text(value: str) -> str:
     return " ".join(value.translate(_PROVIDER_PUNCTUATION).split())
 
 
+_GENERIC_ARTIST_TOKENS = frozenset({"the", "a", "an", "and", "&"})
+
+
+def _first_significant_artist_token(artist: str) -> str:
+    for raw_token in re.findall(r"[\w'’-]+", _provider_safe_text(artist)):
+        token = str(raw_token)
+        normalized = normalize_for_catalog_match(token)
+        if len(normalized) >= 3 and normalized not in _GENERIC_ARTIST_TOKENS:
+            return token
+    return ""
+
+
 def _targeted_query_variants(
     artist: str,
     album: str,
@@ -1322,16 +1334,35 @@ def _targeted_query_variants(
         if normalize_for_catalog_match(term) not in normalize_for_catalog_match(title)
     ]
     safe_required = _provider_safe_text(" ".join(required_for_query))
-    variants = [" ".join(part for part in (safe_artist, title, safe_required) if part)]
-    if safe_required:
-        variants.append(" ".join(part for part in (safe_artist, title) if part))
+    first_artist_token = _first_significant_artist_token(safe_artist)
+    titles = [title]
     simplified = _EDITION_SUFFIX.sub("", title).strip()
     if simplified and simplified.casefold() != title.casefold():
+        titles.append(simplified)
+
+    variants: list[str] = []
+    for current_title in titles:
         variants.append(
-            " ".join(part for part in (safe_artist, simplified, safe_required) if part)
+            " ".join(part for part in (safe_artist, current_title, safe_required) if part)
         )
         if safe_required:
-            variants.append(" ".join(part for part in (safe_artist, simplified) if part))
+            variants.append(" ".join(part for part in (safe_artist, current_title) if part))
+        # Soulseek/slskd can return zero results for full artist names while a
+        # human-style title or first-name query returns the wanted files. Keep
+        # these bounded variants after the precise query; downstream catalog
+        # verification still decides whether any candidate is safe to import.
+        if first_artist_token and first_artist_token != safe_artist:
+            variants.append(
+                " ".join(
+                    part for part in (first_artist_token, current_title, safe_required) if part
+                )
+            )
+            variants.append(
+                " ".join(
+                    part for part in (current_title, first_artist_token, safe_required) if part
+                )
+            )
+        variants.append(" ".join(part for part in (current_title, safe_required) if part))
     return list(dict.fromkeys(variant for variant in variants if variant))
 
 

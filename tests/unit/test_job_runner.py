@@ -60,15 +60,29 @@ def test_slskd_search_timeout_uses_long_enough_bulk_budget() -> None:
 def test_targeted_query_variants_normalize_and_simplify_titles() -> None:
     assert runner._targeted_query_variants(
         "Colter Wall", "You're Lucky She's Lonely", "You’re Lucky She’s Lonely"
-    ) == ["Colter Wall You're Lucky She's Lonely"]
+    ) == [
+        "Colter Wall You're Lucky She's Lonely",
+        "Colter You're Lucky She's Lonely",
+        "You're Lucky She's Lonely Colter",
+        "You're Lucky She's Lonely",
+    ]
     assert runner._targeted_query_variants("Ty Myers", "Valerie", "Valerie") == [
-        "Ty Myers Valerie"
+        "Ty Myers Valerie",
+        "Myers Valerie",
+        "Valerie Myers",
+        "Valerie",
     ]
     assert runner._targeted_query_variants(
         "Ty Myers", "The Select (Deluxe)", "Thought It Was Love (Acoustic)"
     ) == [
         "Ty Myers Thought It Was Love (Acoustic)",
+        "Myers Thought It Was Love (Acoustic)",
+        "Thought It Was Love (Acoustic) Myers",
+        "Thought It Was Love (Acoustic)",
         "Ty Myers Thought It Was Love",
+        "Myers Thought It Was Love",
+        "Thought It Was Love Myers",
+        "Thought It Was Love",
     ]
 
 
@@ -81,6 +95,9 @@ def test_targeted_query_variants_include_required_collaborators_first() -> None:
     ) == [
         "Morgan Wallen Miami Lil Wayne Rick Ross",
         "Morgan Wallen Miami",
+        "Morgan Miami Lil Wayne Rick Ross",
+        "Miami Morgan Lil Wayne Rick Ross",
+        "Miami Lil Wayne Rick Ross",
     ]
 
 
@@ -229,6 +246,9 @@ async def test_queries_for_job_uses_recording_artist_credit_collaborators(
     assert await runner._queries_for_job(job, album, test_settings) == [
         "Morgan Wallen Miami Lil Wayne Rick Ross",
         "Morgan Wallen Miami",
+        "Morgan Miami Lil Wayne Rick Ross",
+        "Miami Morgan Lil Wayne Rick Ross",
+        "Miami Lil Wayne Rick Ross",
     ]
 
 
@@ -1106,17 +1126,78 @@ async def test_targeted_search_uses_simplified_fallback_after_empty_result(
         async def search(self, request: SearchRequest) -> Sequence[SearchResult]:
             query = request.query
             queries.append(query)
-            if query.endswith("(Acoustic)"):
-                return []
-            return [SearchResult(source="youtube", title="Firefly", url="https://example.test")]
+            if query == "Ty Myers Firefly":
+                return [
+                    SearchResult(source="youtube", title="Firefly", url="https://example.test")
+                ]
+            return []
 
     monkeypatch.setattr(runner, "_source_adapter", lambda source, cfg: FakeAdapter())
     results = await runner._fetch_results(job, test_settings, db_session)
 
-    assert queries == ["Ty Myers Firefly (Acoustic)", "Ty Myers Firefly"]
+    assert queries == [
+        "Ty Myers Firefly (Acoustic)",
+        "Myers Firefly (Acoustic)",
+        "Firefly (Acoustic) Myers",
+        "Firefly (Acoustic)",
+        "Ty Myers Firefly",
+    ]
     assert len(results) == 1
     assert '"query": "Ty Myers Firefly (Acoustic)"' in (job.result_json or "")
     assert '"query": "Ty Myers Firefly"' in (job.result_json or "")
+
+
+async def test_targeted_slskd_search_uses_human_style_title_fallback(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.settings_service import save_runtime_settings
+
+    await save_runtime_settings(
+        db_session,
+        [{"name": "slskd", "enabled": True}],
+        10,
+        metadata_providers=[{"name": "musicbrainz", "enabled": True}],
+        primary_metadata_provider="musicbrainz",
+    )
+    artist = CatalogArtist(name="Zach Bryan")
+    album = CatalogAlbum(artist=artist, title="The Great American Bar Scene", track_count=1)
+    track = CatalogAlbumTrack(album=album, position=1, disc=1, title="Pink Skies")
+    db_session.add_all([artist, album, track])
+    await db_session.flush()
+    job = Job(
+        source="slskd",
+        query="legacy query",
+        status=JobStatus.pending,
+        catalog_album_id=album.id,
+        catalog_track_id=track.id,
+    )
+    db_session.add(job)
+    await db_session.flush()
+    queries: list[str] = []
+
+    class FakeAdapter:
+        async def search(self, request: SearchRequest) -> Sequence[SearchResult]:
+            queries.append(request.query)
+            if request.query == "Zach Pink Skies":
+                return [
+                    SearchResult(
+                        source="slskd",
+                        title="Pink Skies",
+                        url="slskd://peer/Zach Bryan - Pink Skies.mp3",
+                        metadata={"username": "peer", "filename": "Zach Bryan - Pink Skies.mp3"},
+                    )
+                ]
+            return []
+
+    monkeypatch.setattr(runner, "_source_adapter", lambda source, cfg: FakeAdapter())
+
+    results = await runner._fetch_results(job, test_settings, db_session)
+
+    assert queries == ["Zach Bryan Pink Skies", "Zach Pink Skies"]
+    assert len(results) == 1
+    assert '"query": "Zach Bryan Pink Skies"' in (job.result_json or "")
+    assert '"query": "Zach Pink Skies"' in (job.result_json or "")
+    assert '"served_source": "slskd"' in (job.result_json or "")
 
 
 async def test_album_prowlarr_results_are_candidates_not_tracks(
