@@ -451,7 +451,7 @@ async def test_acoustid_without_expected_mbid_accepts_multiple_matching_recordin
     )
 
     assert state == AcoustIDVerificationState.verified
-    assert track.mbid == "11111111-1111-1111-1111-111111111111"
+    assert track.mbid is None
     assert (
         await db_session.scalar(
             select(StagingReviewItem).where(StagingReviewItem.track_id == track.id)
