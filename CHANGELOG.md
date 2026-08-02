@@ -14,6 +14,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Auto-verify catalog-bound downloads when AcoustID returns multiple high-confidence recording MBIDs whose titles all match the requested track, while still sending duration outliers to review.
+- Reject targeted slskd candidates before acquisition when provider duration metadata materially contradicts the catalog track duration.
 - Keep grouped download status/source truthful while provider-backed priority jobs are actively searching or downloading, and freeze elapsed time once a download reaches a terminal state.
 - Stack the Downloads import-review rail above the queue on mobile and make review controls/details full-width so cards no longer render as a crushed side column.
 

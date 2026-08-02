@@ -1010,6 +1010,8 @@ def _targeted_catalog_result_matches(
     observed_source = str(filename) if isinstance(filename, str) else result.title or ""
     if not _targeted_title_matches(result.title or "", observed_source, target.title):
         return False
+    if not _targeted_duration_matches(result.duration_sec, target.duration_sec):
+        return False
     if required_terms and not _observed_contains_required_terms(observed_source, required_terms):
         return False
     target_qualifiers = _identity_qualifiers(target.title)
@@ -1030,6 +1032,12 @@ def _targeted_catalog_result_matches(
             for qualifier in target_qualifiers
         ) and not (observed_qualifiers - target_qualifiers)
     return False
+
+
+def _targeted_duration_matches(observed_sec: int | None, expected_sec: int | None) -> bool:
+    if observed_sec is None or expected_sec is None:
+        return True
+    return abs(observed_sec - expected_sec) <= 8
 
 
 def _targeted_title_matches(observed_title: str, observed_source: str, target_title: str) -> bool:
@@ -1603,6 +1611,7 @@ async def _fetch_slskd_album_results(
                 title=guess.title,
                 artist=guess.artist,
                 album=guess.album,
+                duration_sec=slskd_file.duration_sec,
                 size_bytes=slskd_file.size_bytes,
                 format=ext,
                 url=f"slskd://{best.username}/{filename}",

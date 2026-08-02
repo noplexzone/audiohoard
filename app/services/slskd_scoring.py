@@ -47,6 +47,7 @@ class SlskdFile:
     size_bytes: int | None
     bit_rate: int | None
     sample_rate: int | None
+    duration_sec: int | None = None
     disc: int | None = None
 
 
@@ -57,6 +58,18 @@ class AlbumFolder:
     audio_format: str
     files: list[SlskdFile] = field(default_factory=list)
     score: float = 0.0
+
+
+def slskd_file_duration_seconds(file_data: dict[str, object]) -> int | None:
+    for key in ("duration", "durationSeconds", "length", "lengthSeconds", "seconds"):
+        raw = file_data.get(key)
+        if isinstance(raw, (int, float)) and raw > 0:
+            return int(raw)
+    for key in ("durationMs", "lengthMs"):
+        raw = file_data.get(key)
+        if isinstance(raw, (int, float)) and raw > 0:
+            return int(raw / 1000)
+    return None
 
 
 def group_slskd_files_into_folders(
@@ -92,6 +105,7 @@ def group_slskd_files_into_folders(
                     sample_rate=f.get("sampleRate")
                     if isinstance(f.get("sampleRate"), int)
                     else None,
+                    duration_sec=slskd_file_duration_seconds(f),
                     disc=disc,
                 )
             )
