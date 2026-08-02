@@ -248,7 +248,8 @@ async def run_acoustid_verification(
             target_duration_sec=track.duration_sec,
         )
     ):
-        track.mbid = track.mbid or title_matching_mbids[0]
+        if len(title_matching_mbids) == 1:
+            track.mbid = track.mbid or title_matching_mbids[0]
         track.acoustid_verification_state = AcoustIDVerificationState.verified
         return AcoustIDVerificationState.verified
     track.acoustid_verification_state = AcoustIDVerificationState.unavailable
