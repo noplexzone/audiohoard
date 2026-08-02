@@ -237,10 +237,10 @@ def test_track_meets_quality_rejects_known_below_threshold_mp3() -> None:
     assert track_meets_quality("mp3 128kbps", profile) is False
 
 
-def test_track_meets_quality_accepts_unknown_bitrate_mp3() -> None:
+def test_track_meets_quality_rejects_unknown_bitrate_mp3_when_lossless_is_preferred() -> None:
     profile = QualityProfile(["flac", "mp3"], 320, True)
 
-    assert track_meets_quality("mp3", profile) is True
+    assert track_meets_quality("mp3", profile) is False
 
 
 # ── DB-backed service tests ────────────────────────────────────────────────────

@@ -41,6 +41,7 @@
       <a href="/library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") or path.startswith("/albums") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
       <a href="/wanted" {% if path.startswith("/wanted") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Wanted</span></a>
       <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span>{% if request.state.pending_review_count | default(0) > 0 %}<span class="nav-badge">{{ request.state.pending_review_count }}</span>{% endif %}</a>
+    <a href="/blocklist" {% if path.startswith("/blocklist") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Blocklist</span></a>
     </nav>
     <nav class="utility-nav" aria-label="Utilities">
       <a href="/settings" {% if path.startswith("/settings") or path.startswith("/changelog") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-settings"/></svg><span>Settings</span></a>
@@ -99,6 +100,7 @@
     <a href="/library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") or path.startswith("/albums") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
     <a href="/wanted" {% if path.startswith("/wanted") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Wanted</span></a>
     <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span>{% if request.state.pending_review_count | default(0) > 0 %}<span class="nav-badge">{{ request.state.pending_review_count }}</span>{% endif %}</a>
+    <a href="/blocklist" {% if path.startswith("/blocklist") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Blocklist</span></a>
   </nav>
   {% endif %}
 </div>

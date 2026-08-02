@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Source blocklist — Audiohoard{% endblock %}
+{% macro csrf() -%}<input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">{%- endmacro %}
+{% block content %}
+<header class="page-header"><div><p class="eyebrow">Acquisition safety</p><h1>Source blocklist</h1><p>Exact provider artifacts blocked after denial or timeout. Removing a block makes that source eligible for future searches again.</p></div></header>
+{% if removed %}<div class="alert ok" role="status">Source block removed.</div>{% endif %}
+<section class="card">
+  {% if blocks %}
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th scope="col">Provider</th><th scope="col">Peer / source</th><th scope="col">Remote filename</th><th scope="col">Reason</th><th scope="col">Blocked</th><th scope="col">Action</th></tr></thead>
+      <tbody>
+        {% for block in blocks %}
+        <tr>
+          <td>{{ display_name(block.provider) }}</td>
+          <td><code>{{ block.peer }}</code></td>
+          <td><code>{{ block.filename }}</code></td>
+          <td><span class="badge warn">{{ block.reason }}</span></td>
+          <td>{{ block.created_at.strftime('%Y-%m-%d %H:%M') if block.created_at else 'unknown' }}</td>
+          <td><form method="post" action="/blocklist/{{ block.id }}/remove" data-confirm="Remove this block and allow Audiohoard to use this exact source again?">{{ csrf() }}<button class="btn secondary" type="submit">Remove block</button></form></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty-state mini"><h3>No blocked sources</h3><p>Denied provider artifacts will appear here when Audiohoard blocks them from future acquisition attempts.</p></div>
+  {% endif %}
+</section>
+{% endblock %}
