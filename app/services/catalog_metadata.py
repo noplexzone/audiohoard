@@ -235,10 +235,14 @@ def _artist_provider_ref(artist: CatalogArtist) -> tuple[str, str] | None:
 
 
 def _album_provider_ref(album: CatalogAlbum) -> tuple[str, str] | None:
-    if album.mbid:
-        return "musicbrainz", album.mbid
+    # Audiohoard treats Deezer as the catalog authority for monitored artists.
+    # A hybrid row may also carry MusicBrainz IDs for track verification, but
+    # provider hydration must not switch a Deezer-backed release to a different
+    # MusicBrainz edition with a conflicting manifest.
     if album.deezer_id:
         return "deezer", album.deezer_id
+    if album.mbid:
+        return "musicbrainz", album.mbid
     if album.itunes_id:
         return "itunes", album.itunes_id
     return None
