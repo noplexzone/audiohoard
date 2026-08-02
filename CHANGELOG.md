@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-02
+
 ### Changed
 
 - Collapse artist watchlist settings into a hero Configure dialog with immediate release-type/source updates and remove redundant preset/save controls.
@@ -14,6 +16,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Embed canonical artwork in Ogg/Vorbis imports and metadata repairs, and clear album-artist alias tags that can split Navidrome albums.
+- Prefer Deezer album manifests when hydrating hybrid Deezer/MusicBrainz catalog rows so monitored releases stay on the selected Deezer-backed edition.
 - Auto-verify catalog-bound downloads when AcoustID returns multiple high-confidence recording MBIDs whose titles all match the requested track, while still sending duration outliers to review.
 - Reject targeted slskd candidates before acquisition when provider duration metadata materially contradicts the catalog track duration.
 - Keep grouped download status/source truthful while provider-backed priority jobs are actively searching or downloading, and freeze elapsed time once a download reaches a terminal state.

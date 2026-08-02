@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.config import Settings
 from app.database import Base
-from app.metadata.base import AlbumHit, ArtistDetail, ArtistHit
+from app.metadata.base import AlbumDetail, AlbumHit, AlbumTrack, ArtistDetail, ArtistHit
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -231,6 +231,75 @@ async def test_reconcile_duplicate_catalog_albums_merges_legacy_curly_apostrophe
     assert (await db_session.scalars(select(Job.catalog_album_id))).one() == kept.id
     assert (await db_session.scalars(select(Track.catalog_album_id))).one() == kept.id
     assert await reconcile_duplicate_catalog_albums(db_session, artist.id) == 0
+
+
+async def test_fetch_and_store_album_prefers_deezer_identity_for_hybrid_catalog_album(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artist = CatalogArtist(name="Lil Uzi Vert")
+    album = CatalogAlbum(
+        artist=artist,
+        title="RED & WHITE",
+        year="2022",
+        release_type="EP",
+        mbid="musicbrainz-five-track",
+        deezer_id="deezer-nine-track",
+        track_count=9,
+    )
+    db_session.add(artist)
+    await db_session.flush()
+    requested: list[tuple[str, str]] = []
+
+    class FakeProvider:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def get_album(self, id: str) -> AlbumDetail:
+            requested.append((self.name, id))
+            return AlbumDetail(
+                provider=self.name,
+                provider_id=id,
+                deezer_id=id if self.name == "deezer" else None,
+                mbid=id if self.name == "musicbrainz" else None,
+                title="RED & WHITE",
+                year="2022",
+                release_type="ep",
+                release_kind="ep",
+                track_count=9,
+                tracks=[
+                    AlbumTrack(position=1, title="SPACE CADET"),
+                    AlbumTrack(position=2, title="I KNOW"),
+                    AlbumTrack(position=3, title="FLEX UP"),
+                    AlbumTrack(position=4, title="HITTIN MY SHOULDER"),
+                    AlbumTrack(position=5, title="FOR FUN"),
+                    AlbumTrack(position=6, title="CIGARETTE"),
+                    AlbumTrack(position=7, title="ISSA HIT"),
+                    AlbumTrack(position=8, title="GLOCK IN MY PURSE"),
+                    AlbumTrack(position=9, title="F.F."),
+                ],
+            )
+
+    def fake_build_metadata_provider(name: str, settings: Settings) -> FakeProvider:
+        return FakeProvider(name)
+
+    monkeypatch.setattr(catalog_metadata, "build_metadata_provider", fake_build_metadata_provider)
+
+    hydrated = await catalog_metadata.fetch_and_store_album(db_session, test_settings, album)
+
+    assert requested == [("deezer", "deezer-nine-track")]
+    assert hydrated.id == album.id
+    assert hydrated.track_count == 9
+    assert [track.title for track in hydrated.tracks] == [
+        "SPACE CADET",
+        "I KNOW",
+        "FLEX UP",
+        "HITTIN MY SHOULDER",
+        "FOR FUN",
+        "CIGARETTE",
+        "ISSA HIT",
+        "GLOCK IN MY PURSE",
+        "F.F.",
+    ]
 
 
 class FakeMusicBrainzProvider:
