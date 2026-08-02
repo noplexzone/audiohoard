@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -74,8 +75,14 @@ _MANAGED_TAG_KEYS = frozenset(
         "artist",
         "album",
         "album_artist",
+        "album artist",
+        "album_artists",
         "albumartist",
         "albumartists",
+        "albumartist_credit",
+        "albumartists_credit",
+        "albumartists_sort",
+        "albumartistsort",
         "albumversion",
         "musicbrainz_albumcomment",
         "disc",
@@ -550,11 +557,23 @@ class MutagenTagWriter:
             for key in _MANAGED_TAG_KEYS:
                 if key in ogg:
                     del ogg[key]
+            if artwork is not None:
+                for key in ("metadata_block_picture", "coverart"):
+                    if key in ogg:
+                        del ogg[key]
             for key, value in tags.items():
                 ogg[key] = value
             if album_artist := tags.get("album_artist"):
+                ogg["album_artist"] = album_artist
                 ogg["albumartist"] = album_artist
                 ogg["albumartists"] = album_artist
+            if artwork is not None:
+                picture = Picture()
+                picture.type = 3
+                picture.mime = artwork.mime
+                picture.desc = "Cover"
+                picture.data = artwork.data
+                ogg["metadata_block_picture"] = base64.b64encode(picture.write()).decode("ascii")
             ogg.save()
         elif suffix in {".m4a", ".mp4"}:
             mp4 = MP4(path)

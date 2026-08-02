@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import stat
 import threading
@@ -7,7 +8,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from mutagen.flac import FLAC
+from mutagen.flac import FLAC, Picture
 from mutagen.id3 import APIC, ID3, TXXX
 from mutagen.oggvorbis import OggVorbis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -210,8 +211,14 @@ async def _seed_imported_album(
             "title": catalog_track.title,
             "artist": "Juice WRLD",
             "album": album.title,
+            "album artist": "Future & Lil Uzi Vert",
+            "album_artists": "Future; Lil Uzi Vert",
+            "albumartist_credit": "Future & Lil Uzi Vert",
+            "albumartists_credit": "Future; Lil Uzi Vert",
             "albumartist": "Juice Wrld",
             "albumartists": "Juice Wrld",
+            "albumartistsort": "Future & Lil Uzi Vert",
+            "albumartists_sort": "Future; Lil Uzi Vert",
             "date": "2019",
             "musicbrainz_albumid": f"wrong-release-{index}",
             "musicbrainz_albumartistid": f"wrong-artist-{index}",
@@ -270,8 +277,15 @@ async def test_retag_catalog_album_synchronizes_release_tags_without_changing_da
     for path, catalog_track in zip(paths, album.tracks, strict=True):
         tags = {key.casefold(): values for key, values in FLAC(path).tags.items()}
         assert tags["album"] == [album.title]
+        assert "album artist" not in tags
+        assert tags["album_artist"] == [album.artist.name]
         assert tags["albumartist"] == [album.artist.name]
         assert tags["albumartists"] == [album.artist.name]
+        assert "album_artists" not in tags
+        assert "albumartist_credit" not in tags
+        assert "albumartists_credit" not in tags
+        assert "albumartistsort" not in tags
+        assert "albumartists_sort" not in tags
         assert tags["date"] == [album.year]
         assert tags["releasedate"] == [album.year]
         assert tags["release_date"] == [album.year]
@@ -288,6 +302,53 @@ async def test_retag_catalog_album_synchronizes_release_tags_without_changing_da
         (track.album_artist, track.year, track.mbid, track.import_plans[0].destination_path)
         for track in tracks
     ] == original_db_values
+
+
+def test_mutagen_tag_writer_embeds_ogg_cover_art_and_clears_album_artist_aliases(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "track.ogg"
+    exit_code = os.system(
+        "ffmpeg -loglevel error -y -f lavfi -i anullsrc=r=44100:cl=mono "
+        f"-t 0.1 -c:a libvorbis {path}"
+    )
+    assert exit_code == 0
+    original = OggVorbis(path)
+    original["album artist"] = "Future & Lil Uzi Vert"
+    original["albumartist_credit"] = "Future & Lil Uzi Vert"
+    original["albumartists_sort"] = "Future/Lil Uzi Vert"
+    original.save()
+
+    ok = MutagenTagWriter().write_and_verify(
+        path,
+        {
+            "title": "That Way",
+            "artist": "Lil Uzi Vert",
+            "album": "That Way",
+            "album_artist": "Lil Uzi Vert",
+            "date": "2020",
+            "releasedate": "2020",
+            "release_date": "2020",
+            "tracknumber": "1",
+            "discnumber": "1",
+        },
+        CanonicalArtwork(data=b"\xff\xd8canonical-cover", mime="image/jpeg"),
+    )
+
+    assert ok is True
+    repaired = OggVorbis(path)
+    tags = {key.casefold(): values for key, values in repaired.tags.items()}
+    assert tags["albumartist"] == ["Lil Uzi Vert"]
+    assert tags["albumartists"] == ["Lil Uzi Vert"]
+    assert tags["album_artist"] == ["Lil Uzi Vert"]
+    assert "album artist" not in tags
+    assert "albumartist_credit" not in tags
+    assert "albumartists_sort" not in tags
+    pictures = tags.get("metadata_block_picture", [])
+    assert len(pictures) == 1
+    picture = Picture(base64.b64decode(pictures[0]))
+    assert picture.mime == "image/jpeg"
+    assert picture.data == b"\xff\xd8canonical-cover"
 
 
 async def test_retag_catalog_album_overwrites_flac_cover_art(
