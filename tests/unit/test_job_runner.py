@@ -335,6 +335,63 @@ async def test_fingerprint_verification_uses_measured_not_catalog_duration(
     assert observed == {"lookup_duration": 234, "review_duration": 234}
 
 
+async def test_targeted_catalog_duration_outlier_is_rejected_before_acquisition(
+    db_session: AsyncSession,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artist = CatalogArtist(name="Lil Uzi Vert")
+    album = CatalogAlbum(title="Eternal Atake 2", track_count=1)
+    target = CatalogAlbumTrack(position=1, disc=1, title="The Rush", duration_sec=186)
+    artist.albums.append(album)
+    album.tracks.append(target)
+    db_session.add(artist)
+    await db_session.flush()
+    job = Job(
+        source="slskd",
+        query="Lil Uzi Vert The Rush",
+        status=JobStatus.pending,
+        catalog_album_id=album.id,
+        catalog_track_id=target.id,
+    )
+    db_session.add(job)
+    await db_session.flush()
+    acquisition_calls = 0
+
+    async def fake_fetch(*args: object, **kwargs: object) -> Sequence[SearchResult]:
+        return [
+            SearchResult(
+                source="slskd",
+                title="The Rush",
+                artist="Lil Uzi Vert",
+                duration_sec=225,
+                metadata={
+                    "username": "peer",
+                    "filename": "Lil Uzi Vert - The Rush.mp3",
+                },
+            )
+        ]
+
+    async def fail_if_acquired(*args: object, **kwargs: object) -> tuple[None, None]:
+        nonlocal acquisition_calls
+        acquisition_calls += 1
+        return None, None
+
+    async def no_continuation(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(runner, "_prepare_acquisition", fail_if_acquired)
+    monkeypatch.setattr(runner, "_spawn_continuation_jobs", no_continuation)
+
+    await runner.run_job(job.id, db_session, test_settings)
+
+    tracks = list((await db_session.scalars(select(Track).where(Track.job_id == job.id))).all())
+    assert acquisition_calls == 0
+    assert tracks == []
+    assert job.status == JobStatus.partial
+
+
 async def test_targeted_catalog_mismatch_is_rejected_before_acquisition(
     db_session: AsyncSession,
     test_settings: Settings,

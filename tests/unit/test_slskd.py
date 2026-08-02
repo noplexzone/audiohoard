@@ -74,6 +74,7 @@ class TestSlskdSearch:
                             "size": 30000000,
                             "bitRate": 1411,
                             "sampleRate": 44100,
+                            "duration": 186,
                         }
                     ],
                 }
@@ -86,6 +87,7 @@ class TestSlskdSearch:
         assert results[0].source == "slskd"
         assert results[0].format == "flac"
         assert results[0].size_bytes == 30000000
+        assert results[0].duration_sec == 186
 
     async def test_search_accepts_compound_completed_state(self, httpx_mock: HTTPXMock) -> None:
         search_id = "compound123"

@@ -411,6 +411,96 @@ async def test_acoustid_without_expected_mbid_requires_matching_recording_title(
     assert wrong_state == AcoustIDVerificationState.unavailable
 
 
+async def test_acoustid_without_expected_mbid_accepts_multiple_matching_recording_titles(
+    db_session: AsyncSession,
+) -> None:
+    job = Job(source="slskd", query="x", status=JobStatus.running)
+    release = Release(job=job, source="slskd", title="Album")
+    track = Track(
+        job=job,
+        release=release,
+        source="slskd",
+        title="I Don’t Wanna Break Up",
+        catalog_track_id=1,
+        duration_sec=243,
+        acquisition_state=AcquisitionState.downloaded,
+    )
+    db_session.add_all([job, release, track])
+    await db_session.flush()
+
+    state = await run_acoustid_verification(
+        track,
+        acoustid_raw_results=[
+            {
+                "score": 1.0,
+                "recordings": [
+                    {
+                        "id": "11111111-1111-1111-1111-111111111111",
+                        "title": "I Don’t Wanna Break Up",
+                    },
+                    {
+                        "id": "22222222-2222-2222-2222-222222222222",
+                        "title": "I Don't Wanna Break Up",
+                    },
+                ],
+            }
+        ],
+        fingerprint_duration_sec=243,
+        db=db_session,
+        acceptance_threshold=0.90,
+    )
+
+    assert state == AcoustIDVerificationState.verified
+    assert track.mbid == "11111111-1111-1111-1111-111111111111"
+    assert (
+        await db_session.scalar(
+            select(StagingReviewItem).where(StagingReviewItem.track_id == track.id)
+        )
+        is None
+    )
+
+
+async def test_acoustid_without_expected_mbid_rejects_matching_title_duration_outlier(
+    db_session: AsyncSession,
+) -> None:
+    job = Job(source="slskd", query="x", status=JobStatus.running)
+    release = Release(job=job, source="slskd", title="Album")
+    track = Track(
+        job=job,
+        release=release,
+        source="slskd",
+        title="The Rush",
+        catalog_track_id=1,
+        duration_sec=186,
+        acquisition_state=AcquisitionState.downloaded,
+    )
+    db_session.add_all([job, release, track])
+    await db_session.flush()
+
+    state = await run_acoustid_verification(
+        track,
+        acoustid_raw_results=[
+            {
+                "score": 1.0,
+                "recordings": [
+                    {"id": "11111111-1111-1111-1111-111111111111", "title": "The Rush"}
+                ],
+            }
+        ],
+        fingerprint_duration_sec=225,
+        db=db_session,
+        acceptance_threshold=0.90,
+    )
+
+    assert state == AcoustIDVerificationState.unavailable
+    assert (
+        await db_session.scalar(
+            select(StagingReviewItem).where(StagingReviewItem.track_id == track.id)
+        )
+        is not None
+    )
+
+
 async def test_selected_slskd_result_is_discarded_when_durably_blocked(
     db_session: AsyncSession,
 ) -> None:

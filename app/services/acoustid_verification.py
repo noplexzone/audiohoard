@@ -53,17 +53,30 @@ def _extract_mbid_scores(
     return dict(sorted(scores.items(), key=lambda item: item[1], reverse=True))
 
 
-def _recording_title_matches_track(
+def _normalize_recording_title(title: str | None) -> str:
+    return normalize_for_catalog_match(
+        strip_non_identity_descriptors(title or "", preserve_featured_artists=False)
+    )
+
+
+def _duration_matches_target(
+    *, fingerprint_duration_sec: int | None, target_duration_sec: int | None
+) -> bool:
+    if fingerprint_duration_sec is None or target_duration_sec is None:
+        return True
+    return abs(fingerprint_duration_sec - target_duration_sec) <= 8
+
+
+def _matching_recording_title_mbids(
     acoustid_results: list[dict[str, object]],
-    recording_mbid: str,
     track_title: str | None,
     acceptance_threshold: float,
-) -> bool:
-    expected_title = normalize_for_catalog_match(
-        strip_non_identity_descriptors(track_title or "", preserve_featured_artists=False)
-    )
+) -> list[str]:
+    expected_title = _normalize_recording_title(track_title)
     if not expected_title:
-        return False
+        return []
+    matching: dict[str, float] = {}
+    contradictory_title = False
     for result in acoustid_results:
         raw_score = result.get("score")
         if not isinstance(raw_score, (int, float, str)):
@@ -78,17 +91,24 @@ def _recording_title_matches_track(
         if not isinstance(recordings, list):
             continue
         for recording in recordings:
-            if not isinstance(recording, dict) or str(recording.get("id") or "") != recording_mbid:
+            if not isinstance(recording, dict):
+                continue
+            mbid = str(recording.get("id") or "").strip()
+            if not mbid:
                 continue
             observed_title = recording.get("title")
-            if isinstance(observed_title, str) and (
-                normalize_for_catalog_match(
-                    strip_non_identity_descriptors(observed_title, preserve_featured_artists=False)
-                )
-                == expected_title
-            ):
-                return True
-    return False
+            if not isinstance(observed_title, str):
+                contradictory_title = True
+                continue
+            if _normalize_recording_title(observed_title) == expected_title:
+                matching[mbid] = max(result_score, matching.get(mbid, 0.0))
+            else:
+                contradictory_title = True
+    if contradictory_title:
+        return []
+    return [
+        mbid for mbid, _score in sorted(matching.items(), key=lambda item: item[1], reverse=True)
+    ]
 
 
 async def reconcile_matching_acoustid_reviews(
@@ -215,17 +235,20 @@ async def run_acoustid_verification(
 
     # Without an expected MBID, a strict high-confidence fingerprint can verify a
     # catalog-selected track, but never a title-only/unbound download.
+    title_matching_mbids = _matching_recording_title_mbids(
+        acoustid_raw_results, track.title, acceptance_threshold
+    )
     if (
         best_recording_score > acceptance_threshold
-        and len(observed_mbids) == 1
         and track.catalog_track_id is not None
-        and _recording_title_matches_track(
-            acoustid_raw_results,
-            observed_mbids[0],
-            track.title,
-            acceptance_threshold,
+        and title_matching_mbids
+        and set(observed_mbids).issubset(set(title_matching_mbids))
+        and _duration_matches_target(
+            fingerprint_duration_sec=fingerprint_duration_sec,
+            target_duration_sec=track.duration_sec,
         )
     ):
+        track.mbid = track.mbid or title_matching_mbids[0]
         track.acoustid_verification_state = AcoustIDVerificationState.verified
         return AcoustIDVerificationState.verified
     track.acoustid_verification_state = AcoustIDVerificationState.unavailable

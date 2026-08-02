@@ -15,6 +15,7 @@ from app.metadata.filename_parse import (
     parsed_position_evidence,
 )
 from app.schemas.search import SearchRequest, SearchResult
+from app.services.slskd_scoring import slskd_file_duration_seconds
 from app.sources.base import CapabilityState
 from app.sources.youtube import ProviderError
 
@@ -245,6 +246,7 @@ class SlskdAdapter:
                             title=guess.title,
                             artist=guess.artist,
                             album=guess.album,
+                            duration_sec=slskd_file_duration_seconds(f),
                             size_bytes=f.get("size"),
                             format=ext or None,
                             url=f"slskd://{username}/{filename}",
