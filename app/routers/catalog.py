@@ -9,12 +9,14 @@ from types import SimpleNamespace
 from typing import Annotated, Any
 from urllib.parse import urlencode
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from tenacity import RetryError
 
 from app.auth import get_current_user, require_mutation
 from app.config import Settings
@@ -675,6 +677,17 @@ async def open_catalog_artist_page(
             )
         return HTMLResponse(
             "<h1>Invalid artist identity</h1><p>" + message + "</p>", status_code=422
+        )
+    except (httpx.HTTPError, TimeoutError, RetryError):
+        logger.warning("Metadata provider artist lookup failed", exc_info=True)
+        message = "The metadata provider could not be reached. Please try again."
+        if request is not None and _wants_json(request):
+            return JSONResponse(
+                {"error": "metadata_provider_unavailable", "message": message}, status_code=502
+            )
+        return HTMLResponse(
+            "<h1>Metadata provider unavailable</h1><p>" + message + "</p>",
+            status_code=502,
         )
     artist_id: int | None = None
     runtime: RuntimeSettings | None = None

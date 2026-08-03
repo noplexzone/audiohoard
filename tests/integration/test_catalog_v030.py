@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 from httpx import AsyncClient
+from pytest_httpx import HTTPXMock
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import selectinload
@@ -417,6 +419,84 @@ async def test_invalid_direct_artist_open_returns_safe_errors_without_persistenc
         "error": "invalid_artist_identity",
         "message": "The selected artist is no longer available from this provider.",
     }
+    factory = get_session_factory()
+    async with factory() as db:
+        assert await db.scalar(select(func.count(CatalogArtist.id))) == 0
+
+
+async def test_direct_artist_open_maps_provider_transport_failure_to_safe_502(
+    client: AsyncClient, monkeypatch
+) -> None:
+    async def failed_fetch(settings, provider_name: str, provider_id: str):
+        del settings, provider_name, provider_id
+        raise httpx.ReadTimeout("private upstream timeout detail")
+
+    import app.routers.catalog as catalog_router
+
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", failed_fetch)
+
+    html = await client.get("/artists/catalog/open?provider=deezer&provider_id=stale")
+    json_response = await client.post(
+        "/artists/catalog/open",
+        data={
+            "provider": "deezer",
+            "provider_id": "stale",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+    )
+
+    assert html.status_code == 502
+    assert "private upstream timeout detail" not in html.text
+    assert json_response.status_code == 502
+    assert json_response.json() == {
+        "error": "metadata_provider_unavailable",
+        "message": "The metadata provider could not be reached. Please try again.",
+    }
+
+
+async def test_deezer_error_envelope_is_filtered_and_direct_open_never_persists(
+    client: AsyncClient, httpx_mock: HTTPXMock
+) -> None:
+    stale_id = "10002824"
+    error_envelope = {"error": {"type": "DataException", "message": "no data", "code": 800}}
+    httpx_mock.add_response(
+        url="https://api.deezer.com/search/artist?q=stale+artist&limit=10",
+        json={
+            "data": [
+                {
+                    "id": int(stale_id),
+                    "name": "Stale Artist",
+                    "nb_fan": 9000,
+                    "nb_album": 20,
+                }
+            ],
+            "total": 1,
+        },
+    )
+    httpx_mock.add_response(
+        url=f"https://api.deezer.com/artist/{stale_id}/top?limit=5",
+        json={"data": []},
+    )
+    httpx_mock.add_response(url=f"https://api.deezer.com/artist/{stale_id}", json=error_envelope)
+    httpx_mock.add_response(url=f"https://api.deezer.com/artist/{stale_id}", json=error_envelope)
+
+    search = await client.get("/search?q=stale+artist&provider=deezer")
+    direct = await client.post(
+        "/artists/catalog/open",
+        data={
+            "provider": "deezer",
+            "provider_id": stale_id,
+            "monitor": "true",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+    )
+
+    assert search.status_code == 200
+    assert f'data-provider-id="{stale_id}"' not in search.text
+    assert direct.status_code == 422
+    assert direct.json()["error"] == "invalid_artist_identity"
     factory = get_session_factory()
     async with factory() as db:
         assert await db.scalar(select(func.count(CatalogArtist.id))) == 0

@@ -48,7 +48,13 @@ async def test_search_with_unknown_source_excluded(client: AsyncClient) -> None:
     assert data["results"] == []
 
 
-async def test_explicit_tidal_search_reports_unconfigured_profile(client: AsyncClient) -> None:
+async def test_explicit_tidal_search_reports_unconfigured_profile(
+    client: AsyncClient, monkeypatch
+) -> None:
+    from app.sources import tidal as tidal_source
+
+    monkeypatch.setattr(tidal_source, "_tidal_dl_version", lambda: "test-version")
+    monkeypatch.setattr(tidal_source, "_tidal_dl_executable", lambda: "/test/tidal-dl")
     resp = await client.post("/search", json={"query": "test", "sources": ["tidal"]})
     assert resp.status_code == 200
     state = resp.json()["source_states"]["tidal"]
@@ -70,6 +76,33 @@ async def test_search_unconfigured_sources_gracefully_degrade(client: AsyncClien
 async def test_search_rejects_empty_query(client: AsyncClient) -> None:
     resp = await client.post("/search", json={"query": "", "sources": []})
     assert resp.status_code == 422
+
+
+async def test_catalog_search_closes_database_transaction_before_provider_http(
+    client: AsyncClient, monkeypatch
+) -> None:
+    from app.routers import search as search_router
+
+    original_get_runtime_settings = search_router.get_runtime_settings
+    request_db = None
+
+    async def capturing_runtime(db):
+        nonlocal request_db
+        request_db = db
+        return await original_get_runtime_settings(db)
+
+    async def asserting_search(settings, query: str, providers: list[str]):
+        del settings, query, providers
+        assert request_db is not None
+        assert not request_db.in_transaction()
+        return []
+
+    monkeypatch.setattr(search_router, "get_runtime_settings", capturing_runtime)
+    monkeypatch.setattr(search_router, "search_catalog_artists", asserting_search)
+
+    response = await client.get("/search?q=transaction+scope&provider=deezer")
+
+    assert response.status_code == 200
 
 
 async def test_naming_preview_endpoint(client: AsyncClient) -> None:

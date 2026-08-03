@@ -148,6 +148,7 @@ async def search(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> SearchResponse:
     runtime = await get_runtime_settings(db)
+    await db.rollback()
     if req.sources == []:
         requested = [s for s in runtime.enabled_sources if s in _VALID_SOURCES]
     else:
@@ -197,6 +198,8 @@ async def search_page(
         requested = metadata_providers
     else:
         requested = [provider] if provider in metadata_providers else []
+    watched_catalog_artists = await _watched_catalog_artists(db)
+    await db.rollback()
     catalog_outcomes = []
     primary_error = None
     if q and requested:
@@ -214,7 +217,7 @@ async def search_page(
             "primary_error": primary_error,
             "metadata_providers": runtime.metadata_providers,
             "catalog_outcomes": catalog_outcomes,
-            "watched_catalog_artists": await _watched_catalog_artists(db),
+            "watched_catalog_artists": watched_catalog_artists,
             "watchlist_defaults": {
                 "watchlist_release_albums": runtime.default_watchlist_release_albums,
                 "watchlist_release_singles": runtime.default_watchlist_release_singles,
@@ -253,6 +256,7 @@ async def search_ui(
     runtime = await get_runtime_settings(db)
     sources_raw = str(form.get("sources", ",".join(runtime.enabled_sources)))
     sources = [s.strip() for s in sources_raw.split(",") if s.strip() in _VALID_SOURCES]
+    await db.rollback()
 
     if not (query_str or artist or album or track):
         return templates.TemplateResponse(
