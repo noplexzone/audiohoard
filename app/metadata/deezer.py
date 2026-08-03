@@ -10,7 +10,16 @@ import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.http import request_with_retry
-from app.metadata.base import AlbumDetail, AlbumHit, AlbumTrack, ArtistDetail, ArtistHit, TTLCache
+from app.metadata.base import (
+    AlbumDetail,
+    AlbumHit,
+    AlbumTrack,
+    ArtistDetail,
+    ArtistHit,
+    DiscoveryGenre,
+    DiscoveryRelease,
+    TTLCache,
+)
 from app.metadata.content_rating import deezer_content_rating
 from app.sources.base import CapabilityState
 
@@ -53,6 +62,54 @@ class DeezerClient:
 
     async def health(self) -> CapabilityState:
         return CapabilityState(available=True)
+
+    async def discovery_feed(
+        self, feed: str, *, page: int = 1, limit: int = 12, genre_id: str | None = None
+    ) -> list[ArtistHit | DiscoveryGenre | DiscoveryRelease]:
+        """Return a bounded provider-neutral feed from Deezer's global public charts."""
+        limit = max(1, min(limit, 25))
+        index = (max(1, min(page, 20)) - 1) * limit
+        local_start = 0
+        if feed == "popular":
+            path = "/chart/0/artists"
+        elif feed == "genres":
+            path, local_start = "/genre", index
+        elif feed == "genre":
+            if not genre_id or not genre_id.isdigit():
+                raise ValueError("Invalid Deezer genre")
+            path = f"/genre/{genre_id}/artists"
+        elif feed == "new":
+            path = "/editorial/0/releases"
+        elif feed == "trending":
+            path = "/chart/0/albums"
+        else:
+            raise ValueError("Unknown discovery feed")
+        params = {} if feed == "genres" else {"limit": limit, "index": index}
+        async with asyncio.timeout(12), self._client() as client:
+            response = await request_with_retry(client, "GET", path, params=params)
+            response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            raise ValueError("Deezer returned an invalid discovery feed")
+        valid = [row for row in rows[local_start : local_start + limit] if isinstance(row, dict)]
+        if feed in {"popular", "genre"}:
+            return [
+                artist
+                for row in valid
+                if (artist := _parse_artist(row)).provider_id and artist.name
+            ]
+        if feed == "genres":
+            return [
+                genre for row in valid if (genre := _parse_genre(row)).provider_id and genre.name
+            ]
+        return [
+            release
+            for row in valid
+            if (release := _parse_discovery_release(row)).provider_id
+            and release.title
+            and release.artist_provider_id
+        ]
 
     async def search_artists(self, query: str) -> list[ArtistHit]:
         cache_key = f"artist-search:{query}"
@@ -378,12 +435,41 @@ def _parse_artist(data: dict[str, object]) -> ArtistHit:
         external_url=str(data.get("link") or "") or None,
         album_count=_to_int(data.get("nb_album")),
         fan_count=_to_int(data.get("nb_fan")),
+        rank=_to_int(data.get("position") or data.get("rank")),
     )
 
 
 def _parse_artist_detail(data: dict[str, object]) -> ArtistDetail:
     hit = _parse_artist(data)
     return ArtistDetail(**hit.__dict__)
+
+
+def _parse_genre(data: dict[str, object]) -> DiscoveryGenre:
+    return DiscoveryGenre(
+        provider="deezer",
+        provider_id=str(data.get("id") or ""),
+        name=str(data.get("name") or ""),
+        artwork_url=str(data.get("picture_big") or data.get("picture_medium") or "") or None,
+    )
+
+
+def _parse_discovery_release(data: dict[str, object]) -> DiscoveryRelease:
+    artist = data.get("artist")
+    artist_name = str(artist.get("name") or "") if isinstance(artist, dict) else ""
+    artist_id = str(artist.get("id") or "") if isinstance(artist, dict) else ""
+    return DiscoveryRelease(
+        provider="deezer",
+        provider_id=str(data.get("id") or ""),
+        title=str(data.get("title") or ""),
+        artist_name=artist_name,
+        artist_provider_id=artist_id,
+        artwork_url=str(
+            data.get("cover_big") or data.get("cover_medium") or data.get("cover") or ""
+        )
+        or None,
+        release_date=str(data.get("release_date") or "") or None,
+        rank=_to_int(data.get("rank")),
+    )
 
 
 def _parse_album_hit(data: dict[str, object], artist_id: str | None) -> AlbumHit:

@@ -31,10 +31,11 @@
       <h2 id="watchlist-dialog-title-{{ artist_card_id | e }}">Configure {{ artist_hit.name }}</h2>
       <p>Choose which new releases to monitor. Closing this dialog keeps the saved defaults.</p>
     </div>
-    <form method="post" action="{{ '/artists/catalog/' ~ watched_artist_id ~ '/monitor' if watched_artist else '' }}" data-watchlist-config>
+    <form method="{{ 'post' if watched_artist else 'dialog' }}" action="{{ '/artists/catalog/' ~ watched_artist_id ~ '/monitor' if watched_artist else '/artists/catalog/open' }}" data-watchlist-config>
       <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
       <input type="hidden" name="monitored" value="true">
       <input type="hidden" name="provider" value="{{ artist_hit.provider | e }}">
+      {% if not watched_artist %}<input type="hidden" name="provider_id" value="{{ artist_hit.provider_id | e }}"><input type="hidden" name="monitor" value="true">{% endif %}
       <div class="watchlist-release-types">
         <label><input type="checkbox" name="watchlist_release_albums" value="true"{% if artist_state.watchlist_release_albums %} checked{% endif %}> Albums</label>
         <label><input type="checkbox" name="watchlist_release_singles" value="true"{% if artist_state.watchlist_release_singles %} checked{% endif %}> Singles</label>

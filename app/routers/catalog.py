@@ -539,8 +539,23 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
                 if claim_metadata.get("discography_claim_id") != claim_id:
                     await session.rollback()
                     return
+                existing_provider_ids = {
+                    release.provider_album_id for release in stored_identity.releases
+                }
                 for summary in summaries:
-                    await upsert_provider_release(session, stored_artist, stored_identity, summary)
+                    release = await upsert_provider_release(
+                        session, stored_artist, stored_identity, summary
+                    )
+                    if (
+                        summary.provider_id not in existing_provider_ids
+                        and stored_artist.monitored
+                        and stored_artist.watchlist_provider == provider_name
+                    ):
+                        release.monitored = {
+                            "album": stored_artist.watchlist_release_albums,
+                            "single": stored_artist.watchlist_release_singles,
+                            "ep": stored_artist.watchlist_release_eps,
+                        }.get(release.release_kind, False)
                 stored_identity.last_discography_at = datetime.now(tz=UTC)
                 try:
                     metadata = json.loads(stored_identity.metadata_json or "{}")

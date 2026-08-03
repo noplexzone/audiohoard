@@ -5,7 +5,7 @@ import logging
 import time
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
@@ -18,6 +18,7 @@ from app.models.catalog_entities import CatalogArtist, CatalogArtistIdentity
 from app.schemas.health import SourceStatus
 from app.schemas.search import SearchRequest, SearchResponse, SearchResult
 from app.services.catalog_metadata import search_catalog_artists
+from app.services.discovery import discovery_service
 from app.settings_service import effective_settings_dep, get_runtime_settings
 from app.sources.base import SourceAdapter
 from app.sources.prowlarr import ProwlarrAdapter
@@ -202,10 +203,13 @@ async def search_page(
     await db.rollback()
     catalog_outcomes = []
     primary_error = None
+    discovery_sections = []
     if q and requested:
         catalog_outcomes = await search_catalog_artists(settings, q, requested)
         if provider == "primary" and catalog_outcomes and not catalog_outcomes[0].state.available:
             primary_error = catalog_outcomes[0].state.reason or "Primary provider unavailable"
+    elif not q:
+        discovery_sections = await discovery_service.landing(runtime.discovery_region)
     return templates.TemplateResponse(
         request,
         "search.html",
@@ -217,6 +221,8 @@ async def search_page(
             "primary_error": primary_error,
             "metadata_providers": runtime.metadata_providers,
             "catalog_outcomes": catalog_outcomes,
+            "discovery_sections": discovery_sections,
+            "discovery_region": runtime.discovery_region,
             "watched_catalog_artists": watched_catalog_artists,
             "watchlist_defaults": {
                 "watchlist_release_albums": runtime.default_watchlist_release_albums,
@@ -234,6 +240,85 @@ async def search_page(
             "error": None,
         },
     )
+
+
+async def _discover_page(
+    request: Request,
+    db: AsyncSession,
+    feed: str,
+    page: int,
+    genre_id: str | None = None,
+) -> HTMLResponse:
+    runtime = await get_runtime_settings(db)
+    watched = await _watched_catalog_artists(db)
+    await db.rollback()
+    section = await discovery_service.get(
+        feed, runtime.discovery_region, page=page, limit=12, genre_id=genre_id
+    )
+    return _get_templates(request).TemplateResponse(
+        request,
+        "discover_list.html",
+        {
+            "section": section,
+            "page": page,
+            "genre_id": genre_id,
+            "watched_catalog_artists": watched,
+            "watchlist_defaults": {
+                "watchlist_release_albums": runtime.default_watchlist_release_albums,
+                "watchlist_release_singles": runtime.default_watchlist_release_singles,
+                "watchlist_release_eps": runtime.default_watchlist_release_eps,
+                "watchlist_monitor_upgrades": runtime.default_watchlist_monitor_upgrades,
+            },
+        },
+    )
+
+
+@router.get("/discover/popular", response_class=HTMLResponse)
+async def discover_popular(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: Annotated[int, Query(ge=1, le=20)] = 1,
+) -> HTMLResponse:
+    return await _discover_page(request, db, "popular", page)
+
+
+@router.get("/discover/genres", response_class=HTMLResponse)
+async def discover_genres(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: Annotated[int, Query(ge=1, le=20)] = 1,
+) -> HTMLResponse:
+    return await _discover_page(request, db, "genres", page)
+
+
+@router.get("/discover/genres/{genre_id}", response_class=HTMLResponse)
+async def discover_genre(
+    genre_id: str,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: Annotated[int, Query(ge=1, le=20)] = 1,
+) -> HTMLResponse:
+    if not genre_id.isdigit() or len(genre_id) > 12:
+        raise HTTPException(status_code=404, detail="Unknown genre")
+    return await _discover_page(request, db, "genre", page, genre_id)
+
+
+@router.get("/discover/new", response_class=HTMLResponse)
+async def discover_new(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: Annotated[int, Query(ge=1, le=20)] = 1,
+) -> HTMLResponse:
+    return await _discover_page(request, db, "new", page)
+
+
+@router.get("/discover/trending", response_class=HTMLResponse)
+async def discover_trending(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: Annotated[int, Query(ge=1, le=20)] = 1,
+) -> HTMLResponse:
+    return await _discover_page(request, db, "trending", page)
 
 
 @router.get("/search/ui", include_in_schema=False)

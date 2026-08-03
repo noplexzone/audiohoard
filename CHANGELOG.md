@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Add region-selectable discovery with bounded popular artist, genre, new-release, and trending feeds, dedicated paginated pages, global-fallback labels, and stale cache recovery.
 - Add in-place, idempotent artist watchlisting from shared catalog cards with saved release defaults, watched-state feedback, and an optional accessible configuration dialog.
 - Show provider IDs, fan/release counts, top-track previews, missing-image states, and external provider links on catalog artist search cards to support duplicate-artist disambiguation.
 

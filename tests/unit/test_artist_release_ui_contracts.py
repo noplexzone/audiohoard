@@ -21,12 +21,13 @@ def test_artist_cards_report_truthful_complete_partial_unknown_and_local_counts(
 
 
 def test_catalog_and_legacy_artist_pages_share_discography_semantics() -> None:
-    catalog = _read(TEMPLATES / "catalog_artist.html")
+    catalog = _read(TEMPLATES / "catalog_artist.html") + _read(
+        TEMPLATES / "partials" / "_discography.html"
+    )
     legacy = _read(TEMPLATES / "artist_detail.html")
 
     for template in (catalog, legacy):
         assert "artist-view-hero" in template
-        assert "discography-section" in template
         assert "discography-section" in template
     assert "Albums" in catalog
     assert "Singles &amp; EPs" in catalog

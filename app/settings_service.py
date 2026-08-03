@@ -38,6 +38,17 @@ DEFAULT_METADATA_PROVIDERS: list[dict[str, object]] = [
 VALID_METADATA_PROVIDERS = {str(item["name"]) for item in DEFAULT_METADATA_PROVIDERS}
 DEFAULT_FREE_TEXT_RESULT_LIMIT = 10
 DEFAULT_PRIMARY_METADATA_PROVIDER = "musicbrainz"
+DEFAULT_DISCOVERY_REGION = "US"
+DISCOVERY_REGIONS: dict[str, str] = {
+    "US": "United States",
+    "CA": "Canada",
+    "GB": "United Kingdom",
+    "AU": "Australia",
+    "DE": "Germany",
+    "FR": "France",
+    "JP": "Japan",
+    "BR": "Brazil",
+}
 DEFAULT_DISCOGRAPHY_REFRESH_HOURS = 24
 DEFAULT_LIBRARY_SCAN_HOURS = 0
 DEFAULT_DUPLICATE_SCAN_HOURS = 0
@@ -112,6 +123,7 @@ class RuntimeSettings:
     max_partial_attempts: int = DEFAULT_MAX_PARTIAL_ATTEMPTS
     acoustid_acceptance_threshold: float = DEFAULT_ACOUSTID_ACCEPTANCE_THRESHOLD
     slskd_download_timeout_seconds: int = DEFAULT_SLSKD_DOWNLOAD_TIMEOUT_SECONDS
+    discovery_region: str = DEFAULT_DISCOVERY_REGION
 
     @property
     def enabled_sources(self) -> list[str]:
@@ -305,6 +317,11 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
         max_partial_attempts=max(1, min(max_partial, 10)),
         acoustid_acceptance_threshold=max(0.5, min(acoustid_threshold, 0.9999)),
         slskd_download_timeout_seconds=max(10, min(slskd_timeout, 86_400)),
+        discovery_region=(
+            values.get("discovery_region", DEFAULT_DISCOVERY_REGION)
+            if values.get("discovery_region", DEFAULT_DISCOVERY_REGION) in DISCOVERY_REGIONS
+            else DEFAULT_DISCOVERY_REGION
+        ),
     )
 
 
@@ -330,6 +347,7 @@ async def save_runtime_settings(
     acoustid_acceptance_threshold: float | None = None,
     slskd_download_timeout_seconds: int | None = None,
     max_parallel_acquisitions: int | None = None,
+    discovery_region: str | None = None,
 ) -> None:
     global _cache
     normalized = _normalize_priority(source_priority)
@@ -363,6 +381,12 @@ async def save_runtime_settings(
     )
     if qp.min_mp3_bitrate not in ALLOWED_MIN_MP3_BITRATES:
         raise ValueError("Minimum MP3 bitrate must be 192, 256, or 320 kbps")
+    existing_region = await db.get(AppSetting, "discovery_region")
+    region = discovery_region or (
+        existing_region.value if existing_region is not None else DEFAULT_DISCOVERY_REGION
+    )
+    if region not in DISCOVERY_REGIONS:
+        raise ValueError("Unsupported discovery region")
     payloads = {
         "source_priority": json.dumps(normalized),
         "free_text_result_limit": str(max(1, min(free_text_result_limit, 100))),
@@ -446,6 +470,7 @@ async def save_runtime_settings(
                 ),
             )
         ),
+        "discovery_region": region,
     }
     for key, value in payloads.items():
         setting = await db.get(AppSetting, key)
