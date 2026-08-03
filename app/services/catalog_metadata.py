@@ -109,6 +109,7 @@ async def _validated_artist_hits(
         and bool(hit.provider_id)
         and bool(hit.name.strip())
         and getattr(hit, expected_field) == hit.provider_id
+        and (hit.type is None or hit.type.casefold() in _VALID_ARTIST_TYPES)
     ]
     # Deezer can return stale search rows whose detail endpoint is an HTTP-200
     # error envelope. MusicBrainz and iTunes search rows already carry their

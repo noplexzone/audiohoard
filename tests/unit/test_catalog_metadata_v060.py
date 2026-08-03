@@ -118,8 +118,23 @@ async def test_musicbrainz_search_rows_with_native_ids_do_not_require_serial_det
         async def search_artists(self, query: str) -> list[ArtistHit]:
             del query
             return [
-                ArtistHit("musicbrainz", f"mb-{index}", f"Artist {index}", mbid=f"mb-{index}")
-                for index in range(10)
+                *[
+                    ArtistHit(
+                        "musicbrainz",
+                        f"mb-{index}",
+                        f"Artist {index}",
+                        mbid=f"mb-{index}",
+                        type="Group",
+                    )
+                    for index in range(10)
+                ],
+                ArtistHit(
+                    "musicbrainz",
+                    "invalid-event",
+                    "Not an artist",
+                    mbid="invalid-event",
+                    type="Event",
+                ),
             ]
 
         async def get_artist(self, id: str) -> ArtistDetail:

@@ -667,6 +667,9 @@ async def open_catalog_artist_page(
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     monitor: bool = False,
 ) -> Response:
+    # Authentication and effective settings may have opened an implicit read
+    # transaction on the request session. End it before provider network I/O.
+    await db.rollback()
     try:
         detail = await fetch_catalog_artist_detail(settings, provider, provider_id)
     except ValueError:
@@ -698,15 +701,17 @@ async def open_catalog_artist_page(
         artist = await upsert_catalog_artist(db, detail)
         runtime = await get_runtime_settings(db)
         if monitor:
+            was_monitored = bool(artist.monitored)
             artist.monitored = True
-            _apply_runtime_watchlist_defaults(artist, runtime)
-            available = [provider] if provider in VALID_METADATA_PROVIDERS else []
-            artist.watchlist_provider = _selected_provider(
-                runtime.primary_metadata_provider,
-                available,
-                runtime.primary_metadata_provider,
-                provider,
-            )
+            if not was_monitored:
+                _apply_runtime_watchlist_defaults(artist, runtime)
+                available = [provider] if provider in VALID_METADATA_PROVIDERS else []
+                artist.watchlist_provider = _selected_provider(
+                    runtime.primary_metadata_provider,
+                    available,
+                    runtime.primary_metadata_provider,
+                    provider,
+                )
         await db.commit()
         artist_id = artist.id
         watchlist_payload = _artist_watchlist_payload(artist)

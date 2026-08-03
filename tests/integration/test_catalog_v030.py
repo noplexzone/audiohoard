@@ -8,6 +8,7 @@ from httpx import AsyncClient
 from pytest_httpx import HTTPXMock
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_session_factory
@@ -293,6 +294,101 @@ async def test_fetch_watchlisting_is_idempotent_and_returns_saved_defaults(
     async with factory() as db:
         assert await db.scalar(select(func.count(CatalogArtist.id))) == 1
         assert await db.scalar(select(func.count(CatalogArtistIdentity.id))) == 1
+
+
+async def test_duplicate_fetch_watchlisting_preserves_customized_policy(
+    client: AsyncClient, monkeypatch
+) -> None:
+    async def fake_fetch(settings, provider_name: str, provider_id: str):
+        del settings
+        return ArtistDetail(
+            provider=provider_name,
+            provider_id=provider_id,
+            name="Customized Artist",
+            deezer_id=provider_id,
+        )
+
+    async def no_queue(db, artist_id: int) -> bool:
+        del db, artist_id
+        return False
+
+    import app.routers.catalog as catalog_router
+
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", fake_fetch)
+    monkeypatch.setattr(catalog_router, "_queue_artist_enrichment", no_queue)
+    headers = {"Accept": "application/json", "X-Requested-With": "fetch"}
+    form = {
+        "provider": "deezer",
+        "provider_id": "custom-dz",
+        "monitor": "true",
+        "csrf_token": client.cookies.get("csrf", ""),
+    }
+    opened = await client.post("/artists/catalog/open", data=form, headers=headers)
+    artist_id = opened.json()["artist_id"]
+    configured = await client.post(
+        f"/artists/catalog/{artist_id}/monitor",
+        data={
+            "monitored": "true",
+            "provider": "deezer",
+            "watchlist_release_singles": "true",
+            "watchlist_release_eps": "true",
+            "watchlist_monitor_upgrades": "true",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        headers=headers,
+    )
+    repeated = await client.post("/artists/catalog/open", data=form, headers=headers)
+
+    assert configured.status_code == repeated.status_code == 200
+    assert repeated.json()["watchlist_release_albums"] is False
+    assert repeated.json()["watchlist_release_singles"] is True
+    assert repeated.json()["watchlist_release_eps"] is True
+    assert repeated.json()["watchlist_monitor_upgrades"] is True
+
+
+async def test_direct_open_closes_database_transaction_before_provider_http(
+    client: AsyncClient, monkeypatch
+) -> None:
+    import app.routers.catalog as catalog_router
+
+    rolled_back_sessions: list[AsyncSession] = []
+    original_rollback = AsyncSession.rollback
+
+    async def tracking_rollback(session: AsyncSession) -> None:
+        await original_rollback(session)
+        rolled_back_sessions.append(session)
+
+    async def asserting_fetch(settings, provider_name: str, provider_id: str):
+        del settings
+        assert rolled_back_sessions
+        assert not rolled_back_sessions[-1].in_transaction()
+        return ArtistDetail(
+            provider=provider_name,
+            provider_id=provider_id,
+            name="Transaction Artist",
+            deezer_id=provider_id,
+        )
+
+    async def no_queue(db, artist_id: int) -> bool:
+        del db, artist_id
+        return False
+
+    monkeypatch.setattr(AsyncSession, "rollback", tracking_rollback)
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", asserting_fetch)
+    monkeypatch.setattr(catalog_router, "_queue_artist_enrichment", no_queue)
+
+    response = await client.post(
+        "/artists/catalog/open",
+        data={
+            "provider": "deezer",
+            "provider_id": "transaction-dz",
+            "monitor": "true",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+    )
+
+    assert response.status_code == 200
 
 
 async def test_search_cards_mark_only_matching_provider_identity_watched(

@@ -22,12 +22,12 @@ class ArtistHit:
     album_count: int | None = None
     fan_count: int | None = None
     top_tracks: tuple[str, ...] = field(default_factory=tuple)
+    type: str | None = None
 
 
 @dataclass(frozen=True)
 class ArtistDetail(ArtistHit):
     country: str | None = None
-    type: str | None = None
 
 
 @dataclass(frozen=True)
