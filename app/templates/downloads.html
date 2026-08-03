@@ -16,7 +16,7 @@
   <a href="/downloads?status=running" {% if selected_status == "running" %}class="active" aria-current="page"{% endif %}>Running</a>
   <a href="/downloads?status=done" {% if selected_status == "done" %}class="active" aria-current="page"{% endif %}>Completed</a>
   <a href="/downloads?status=failed" {% if selected_status == "failed" %}class="active" aria-current="page"{% endif %}>Failed</a>
-  <a href="#import-review">Import review</a>
+  {% if release_reviews %}<a href="#import-review">Import review</a>{% endif %}
 </nav>
 
 {% if selected_status %}<p class="alert info">Showing {{ "completed" if selected_status == "done" else selected_status }} jobs. <a href="/downloads">Clear filter</a></p>{% endif %}
@@ -42,20 +42,26 @@
   <form method="post" action="/downloads/clear" data-confirm="Clear every failed download from the queue?">
     <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
     <input type="hidden" name="scope" value="failed">
-    <button type="submit" class="btn secondary">Clear failed</button>
+    <button type="submit" class="btn secondary muted-action">Clear failed</button>
   </form>
   <form method="post" action="/downloads/clear" data-confirm="Clear all finished, failed, partial, and cancelled downloads from the queue?">
     <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
     <input type="hidden" name="scope" value="finished">
-    <button type="submit" class="btn secondary">Clear finished</button>
+    <button type="submit" class="btn secondary muted-action">Clear finished</button>
   </form>
 </div>
 
-<div class="downloads-layout">
+<div class="downloads-layout{% if not release_reviews %} downloads-layout--solo{% endif %}">
   <div id="downloads-queue" aria-live="polite">
   {% include "partials/_downloads_queue.html" %}
   </div>
+  {% if release_reviews %}
   {% include "partials/_import_review.html" %}
+  {% else %}
+  <section id="import-review" class="import-review-empty-banner" tabindex="-1" aria-label="Import review" role="status">
+    <strong>Import review:</strong> Nothing waiting on you. Verified tracks import automatically.
+  </section>
+  {% endif %}
 </div>
 <script src="/static/js/downloads.js?v={{ app_version }}" data-page-module="downloads" defer></script>
 {% endblock %}
