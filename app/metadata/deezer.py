@@ -17,8 +17,6 @@ from app.sources.base import CapabilityState
 logger = logging.getLogger(__name__)
 
 _HTTP_TIMEOUT = httpx.Timeout(10.0)
-_DISCOGRAPHY_COUNT_HTTP_TIMEOUT = httpx.Timeout(2.0)
-_DISCOGRAPHY_COUNT_BUDGET_SECONDS = 4.0
 _ARTIST_EVIDENCE_HTTP_TIMEOUT = httpx.Timeout(2.0)
 _ARTIST_EVIDENCE_BUDGET_SECONDS = 3.0
 _DEEZER_PLACEHOLDER_IMAGE_HASH = "d41d8cd98f00b204e9800998ecf8427e"
@@ -49,9 +47,6 @@ class DeezerClient:
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(base_url=self._base_url, timeout=_HTTP_TIMEOUT)
-
-    def _count_client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(base_url=self._base_url, timeout=_DISCOGRAPHY_COUNT_HTTP_TIMEOUT)
 
     def _evidence_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(base_url=self._base_url, timeout=_ARTIST_EVIDENCE_HTTP_TIMEOUT)
@@ -98,27 +93,32 @@ class DeezerClient:
         cached = self._cache.get(cache_key)
         if cached is not None:
             return list(cast(list[AlbumHit], cached))
-        async with self._client() as client:
-            resp = await request_with_retry(
-                client, "GET", f"/artist/{id}/albums", params={"limit": 100}
-            )
-            resp.raise_for_status()
-        album_rows = [item for item in resp.json().get("data", []) if isinstance(item, dict)]
-        await _backfill_discography_track_counts(self, album_rows)
+        next_url = f"/artist/{id}/albums"
+        params: dict[str, int] | None = {"limit": 100}
+        album_rows: list[dict[str, object]] = []
+        visited: set[str] = set()
+        async with asyncio.timeout(30), self._client() as client:
+            for _ in range(20):
+                resp = await request_with_retry(client, "GET", next_url, params=params)
+                resp.raise_for_status()
+                payload = resp.json()
+                if not isinstance(payload, dict) or not isinstance(payload.get("data", []), list):
+                    raise ValueError(f"Deezer artist {id} returned an invalid album page")
+                album_rows.extend(item for item in payload["data"] if isinstance(item, dict))
+                raw_next = payload.get("next")
+                if not raw_next:
+                    break
+                next_url = str(raw_next)
+                if not _same_deezer_origin(self._base_url, next_url) or next_url in visited:
+                    raise ValueError(f"Deezer artist {id} returned an unsafe album page")
+                visited.add(next_url)
+                params = None
+            else:
+                raise ValueError(f"Deezer artist {id} exceeded the album page limit")
         albums = [_parse_album_hit(item, artist_id=id) for item in album_rows]
         albums.sort(key=lambda a: (a.year or "0000", a.title), reverse=True)
         self._cache.set(cache_key, albums, 24 * 60 * 60)
         return albums
-
-    async def _get_album_identity_summary(
-        self, http: httpx.AsyncClient, album_id: str
-    ) -> dict[str, object] | None:
-        # Release identity enrichment is optional page metadata. Do not amplify 429s
-        # or hold rendering through the general three-attempt retry policy.
-        resp = await http.get(f"/album/{album_id}")
-        resp.raise_for_status()
-        payload = resp.json()
-        return payload if isinstance(payload, dict) else None
 
     async def get_album(self, id: str) -> AlbumDetail:
         cache_key = f"album:{id}"
@@ -278,59 +278,6 @@ async def _backfill_artist_search_evidence(client: DeezerClient, hits: list[Arti
             logger.warning(
                 "Deezer artist search evidence backfill exceeded %.1f seconds",
                 _ARTIST_EVIDENCE_BUDGET_SECONDS,
-            )
-
-
-async def _backfill_discography_track_counts(
-    client: DeezerClient, album_rows: list[dict[str, object]]
-) -> None:
-    """Fill release identity fields omitted by Deezer's artist-albums endpoint.
-
-    The artist-albums endpoint can omit track counts, UPCs, and explicitness fields.
-    Fetch the bounded album summary so clean and explicit singles do not remain
-    indistinguishable legacy ``unknown`` releases after enrichment.
-    """
-    semaphore = asyncio.Semaphore(8)
-
-    async with client._count_client() as http:
-
-        async def fill(row: dict[str, object]) -> None:
-            if (
-                _to_int(row.get("nb_tracks")) is not None
-                and row.get("upc")
-                and deezer_content_rating(row) != "unknown"
-            ):
-                return
-            album_id = str(row.get("id") or "")
-            if not album_id:
-                return
-            try:
-                async with semaphore:
-                    summary = await client._get_album_identity_summary(http, album_id)
-            except httpx.HTTPError:
-                logger.warning("Could not load Deezer release identity for album %s", album_id)
-                return
-            if summary is None:
-                return
-            for key in (
-                "nb_tracks",
-                "explicit_lyrics",
-                "explicit_content_lyrics",
-                "explicit_content_cover",
-                "upc",
-                "release_date",
-                "record_type",
-            ):
-                if row.get(key) in (None, "") and summary.get(key) not in (None, ""):
-                    row[key] = summary[key]
-
-        try:
-            async with asyncio.timeout(_DISCOGRAPHY_COUNT_BUDGET_SECONDS):
-                await asyncio.gather(*(fill(row) for row in album_rows))
-        except TimeoutError:
-            logger.warning(
-                "Deezer discography release identity backfill exceeded %.1f seconds",
-                _DISCOGRAPHY_COUNT_BUDGET_SECONDS,
             )
 
 

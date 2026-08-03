@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import re
 
 from pytest_httpx import HTTPXMock
 
-from app.metadata import deezer as deezer_module
 from app.metadata.deezer import DeezerClient
 from app.metadata.itunes import ITunesClient, _parse_album_hit
 from app.metadata.musicbrainz import MusicBrainzClient
@@ -174,107 +172,20 @@ async def test_deezer_catalog_provider(httpx_mock: HTTPXMock) -> None:
     assert album_detail.tracks[0].content_rating == "explicit"
 
 
-async def test_deezer_discography_backfills_release_identity_missing_from_artist_albums(
-    httpx_mock: HTTPXMock,
-) -> None:
-    """Deezer's real artist-albums payload omits counts, explicitness, and UPC."""
-    httpx_mock.add_response(
-        url="https://api.deezer.com/artist/1/albums?limit=100",
-        json={
-            "data": [
-                {
-                    "id": 10,
-                    "title": "Discovery",
-                    "record_type": "album",
-                    "tracklist": "https://api.deezer.com/album/10/tracks",
-                },
-                {
-                    "id": 11,
-                    "title": "One More Time",
-                    "record_type": "single",
-                    "tracklist": "https://api.deezer.com/album/11/tracks",
-                },
-            ]
-        },
-    )
-    httpx_mock.add_response(
-        url="https://api.deezer.com/album/10",
-        json={
-            "id": 10,
-            "title": "Discovery",
-            "nb_tracks": 14,
-            "explicit_lyrics": False,
-            "explicit_content_lyrics": 3,
-            "upc": "clean-upc",
-        },
-    )
-    httpx_mock.add_response(
-        url="https://api.deezer.com/album/11",
-        json={
-            "id": 11,
-            "title": "One More Time",
-            "nb_tracks": 1,
-            "explicit_lyrics": True,
-            "explicit_content_lyrics": 1,
-            "upc": "explicit-upc",
-        },
-    )
-
-    albums = await DeezerClient().get_discography("1")
-
-    assert {album.title: album.track_count for album in albums} == {
-        "Discovery": 14,
-        "One More Time": 1,
-    }
-    assert {album.title: album.content_rating for album in albums} == {
-        "Discovery": "clean",
-        "One More Time": "explicit",
-    }
-    assert {album.title: album.upc for album in albums} == {
-        "Discovery": "clean-upc",
-        "One More Time": "explicit-upc",
-    }
-
-
-async def test_deezer_count_backfill_has_an_overall_latency_budget(
-    httpx_mock: HTTPXMock, monkeypatch
-) -> None:
-    httpx_mock.add_response(
-        url="https://api.deezer.com/artist/1/albums?limit=100",
-        json={"data": [{"id": 10, "title": "Slow Album", "record_type": "album"}]},
-    )
-    monkeypatch.setattr(deezer_module, "_DISCOGRAPHY_COUNT_BUDGET_SECONDS", 0.01)
-
-    async def never_returns(self, http, album_id):
-        await asyncio.Event().wait()
-
-    monkeypatch.setattr(DeezerClient, "_get_album_identity_summary", never_returns)
-
-    albums = await asyncio.wait_for(DeezerClient().get_discography("1"), timeout=0.25)
-
-    assert albums[0].track_count is None
-
-
-async def test_deezer_count_backfill_does_not_retry_rate_limits(
+async def test_deezer_discography_defers_fields_missing_from_artist_albums(
     httpx_mock: HTTPXMock,
 ) -> None:
     httpx_mock.add_response(
         url="https://api.deezer.com/artist/1/albums?limit=100",
-        json={"data": [{"id": 10, "title": "Limited Album", "record_type": "album"}]},
-    )
-    httpx_mock.add_response(
-        url="https://api.deezer.com/album/10",
-        status_code=429,
-        headers={"Retry-After": "60"},
+        json={"data": [{"id": 10, "title": "Discovery", "record_type": "album"}]},
     )
 
-    albums = await DeezerClient().get_discography("1")
+    album = (await DeezerClient().get_discography("1"))[0]
 
-    count_requests = [
-        request for request in httpx_mock.get_requests() if request.url.path == "/album/10"
-    ]
-    assert albums[0].track_count is None
-    assert len(count_requests) == 1
+    assert album.track_count is None
+    assert album.content_rating == "unknown"
+    assert album.upc is None
+    assert [request.url.path for request in httpx_mock.get_requests()] == ["/artist/1/albums"]
 
 
 async def test_itunes_catalog_provider(httpx_mock: HTTPXMock) -> None:

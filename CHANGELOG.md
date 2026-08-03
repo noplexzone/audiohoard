@@ -11,6 +11,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Add in-place, idempotent artist watchlisting from shared catalog cards with saved release defaults, watched-state feedback, and an optional accessible configuration dialog.
 - Show provider IDs, fan/release counts, top-track previews, missing-image states, and external provider links on catalog artist search cards to support duplicate-artist disambiguation.
 
+### Changed
+
+- Load catalog artist discographies progressively from the primary metadata provider, defer secondary providers until requested or watched, and avoid per-album Deezer detail requests during the initial release list.
+
 ### Fixed
 
 - Validate provider-native artist identities before rendering or opening search results, filter malformed provider responses, and rank Deezer artists by fan count without reordering other providers.

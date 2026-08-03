@@ -51,29 +51,42 @@ window.AudiohoardNavigation.registerPage('artist-watchlist', function (region) {
   var discography = region.querySelector('#discography-region');
   if (discography && discography.dataset.artistRefresh === 'true') {
     var artistId = discography.dataset.artistId;
+    var provider = discography.dataset.provider;
+    var attempts = 0;
+    var schedulePoll = function () {
+      if (attempts >= 60 || signal.aborted) return;
+      discographyTimer = window.setTimeout(pollDiscography, 1000);
+    };
     var pollDiscography = async function () {
-      if (document.hidden) return;
+      if (document.hidden) { schedulePoll(); return; }
+      attempts += 1;
       try {
         var stateResponse = await window.fetch('/artists/catalog/' + artistId + '/state', {
           credentials: 'same-origin', signal: signal,
         });
-        if (!stateResponse.ok) return;
+        if (!stateResponse.ok) { schedulePoll(); return; }
         var state = await stateResponse.json();
-        if (state.enrichment_state === 'queued' || state.enrichment_state === 'running') return;
-        var pageResponse = await window.fetch(window.location.href, { credentials: 'same-origin', signal: signal });
-        if (!pageResponse.ok) return;
+        var providerState = state.providers && state.providers[provider];
+        if (!providerState || providerState.state === 'idle' || providerState.state === 'loading') {
+          schedulePoll(); return;
+        }
+        var query = new URLSearchParams(window.location.search);
+        query.set('provider', provider);
+        var pageResponse = await window.fetch('/artists/catalog/' + artistId + '/discography?' + query.toString(), {
+          credentials: 'same-origin', signal: signal,
+        });
+        if (!pageResponse.ok) { schedulePoll(); return; }
         var html = await pageResponse.text();
         var fresh = new DOMParser().parseFromString(html, 'text/html').getElementById('discography-region');
         if (fresh && discography.isConnected) {
-          discography.innerHTML = fresh.innerHTML;
-          discography.dataset.artistRefresh = fresh.dataset.artistRefresh || 'false';
+          discography.replaceWith(fresh);
         }
-        if (discographyTimer) { window.clearInterval(discographyTimer); discographyTimer = null; }
       } catch (error) {
         if (error.name === 'AbortError') return;
+        schedulePoll();
       }
     };
-    discographyTimer = window.setInterval(pollDiscography, 5000);
+    schedulePoll();
   }
 
   region.addEventListener('submit', async function (event) {
@@ -102,6 +115,6 @@ window.AudiohoardNavigation.registerPage('artist-watchlist', function (region) {
 
   return function () {
     controller.abort();
-    if (discographyTimer) window.clearInterval(discographyTimer);
+    if (discographyTimer) window.clearTimeout(discographyTimer);
   };
 });

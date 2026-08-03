@@ -58,6 +58,40 @@ def test_parse_artist_exposes_disambiguation_evidence_and_hides_placeholder_art(
 
 
 class TestDeezerSearch:
+    async def test_discography_uses_only_paginated_artist_album_summaries(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url="https://api.deezer.com/artist/7/albums?limit=100",
+            json={
+                "data": [
+                    {
+                        "id": 42,
+                        "title": "Summary Album",
+                        "release_date": "2026-01-02",
+                        "record_type": "album",
+                        "nb_tracks": 11,
+                        "cover_big": "https://images.test/42.jpg",
+                    }
+                ],
+                "next": "https://api.deezer.com/artist/7/albums?index=100&limit=100",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://api.deezer.com/artist/7/albums?index=100&limit=100",
+            json={"data": [{"id": 43, "title": "Deferred Detail"}]},
+        )
+
+        albums = await DeezerClient().get_discography("7")
+
+        assert [album.provider_id for album in albums] == ["42", "43"]
+        assert albums[0].track_count == 11
+        assert albums[0].artwork_url == "https://images.test/42.jpg"
+        assert albums[1].track_count is None
+        assert albums[1].upc is None
+        assert albums[1].content_rating == "unknown"
+        assert all("/album/" not in str(request.url) for request in httpx_mock.get_requests())
+
     async def test_get_artist_rejects_http_200_error_envelope_for_stale_id(
         self, httpx_mock: HTTPXMock
     ) -> None:

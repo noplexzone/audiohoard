@@ -1,0 +1,40 @@
+<section id="discography-region" data-artist-id="{{ artist.id }}" data-provider="{{ selected_provider }}" data-artist-refresh="{{ 'true' if discography_loading else 'false' }}">
+<p class="sr-only">Discography grouped into Albums, Singles &amp; EPs, and Compilations.</p>
+{% if albums %}
+  {% for heading, section_albums in grouped_albums %}
+    {% if section_albums %}
+      <section class="discography-section">
+        <h2>{{ heading }}</h2>
+        <div class="album-grid">
+        {% for album in section_albums %}
+          {% set progress = release_progress[album.id] %}
+          <article class="album-card">
+            {% if album.catalog_album_id %}<a class="album-art" href="/albums/{{ album.catalog_album_id }}" aria-label="Open {{ album.title }}">{% else %}<span class="album-art">{% endif %}
+              {% if album.artwork_url %}<img loading="lazy" src="/artwork?url={{ album.artwork_url | urlencode }}" alt="">{% else %}<span>{{ album.title[:2] | upper }}</span>{% endif %}
+            {% if album.catalog_album_id %}</a>{% else %}</span>{% endif %}
+            <div class="album-card-body">
+              <h3>{% if album.catalog_album_id %}<a href="/albums/{{ album.catalog_album_id }}" title="{{ album.title | e }}">{{ album.title }}</a>{% else %}{{ album.title }}{% endif %}</h3>
+              <p class="muted-line">{% if album.year %}{{ album.year }}{% endif %}{% if album.year and album.release_type_raw %} · {% endif %}{% if album.release_type_raw %}{{ album.release_type_raw }}{% else %}{{ album.release_kind | title }}{% endif %}{% if album.track_count %}{% if album.year or album.release_type_raw %} · {% endif %}{{ album.track_count }} tracks{% endif %}</p>
+              {% if progress.manifest_known and progress.wanted_track_count > 0 %}<progress class="card-progress" value="{{ progress.downloaded_track_count }}" max="{{ progress.wanted_track_count }}">{{ progress.downloaded_track_count }} / {{ progress.wanted_track_count }}</progress>{% endif %}
+              <p class="release-progress">{% if progress.manifest_known %}{{ progress.downloaded_track_count }} of {{ progress.wanted_track_count }} tracks in library{% else %}{{ progress.downloaded_track_count }} local · total unknown{% endif %}</p>
+              <p class="provider-badges">{% if album.provider and album.provider != selected_provider %}<span class="badge info">{{ display_name(album.provider) }}</span>{% endif %}{% if album.content_rating and album.content_rating != "unknown" %}<span class="badge warn">{{ album.content_rating.replace("_", " ") | title }}</span>{% endif %}</p>
+              <div class="album-card-actions">
+                {% if artist.monitored and artist.watchlist_provider == selected_provider %}<label class="check-label compact-check"><input type="checkbox" name="album_monitored" form="monitor-form" value="{{ album.id }}" {% if album.monitored %}checked{% endif %}> <span>Watchlist</span></label>{% endif %}
+                {% if album.catalog_album_id %}<form method="post" action="/albums/{{ album.catalog_album_id }}/download" data-download-form><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button type="submit" class="btn secondary album-download" aria-label="Download album">Download<span class="sr-only"> album</span></button></form>{% endif %}
+              </div>
+            </div>
+          </article>
+        {% endfor %}
+        </div>
+      </section>
+    {% endif %}
+  {% endfor %}
+{% elif discography_loading %}
+  <div class="empty-state loading-state" role="status" aria-live="polite"><h3>Loading discography…</h3><p>Fetching {{ display_name(selected_provider) }} releases. Primary releases appear as soon as they are stored, and you can keep using this page.</p></div>
+{% elif discography_failed %}
+  <div class="empty-state" role="alert"><h3>Discography could not be loaded</h3><p>The metadata provider did not complete this refresh. Retry when it is available.</p><form method="post" action="/artists/catalog/{{ artist.id }}/discography/refresh"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><input type="hidden" name="provider" value="{{ selected_provider }}"><input type="hidden" name="release_type" value="{{ release_type }}"><input type="hidden" name="sort" value="{{ sort }}"><button class="btn secondary" type="submit">Retry provider</button></form></div>
+{% else %}
+  <div class="empty-state"><h3>No releases found</h3><p>Try another filter or provider result.</p><form method="post" action="/artists/catalog/{{ artist.id }}/discography/refresh"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><input type="hidden" name="provider" value="{{ selected_provider }}"><input type="hidden" name="release_type" value="{{ release_type }}"><input type="hidden" name="sort" value="{{ sort }}"><button class="btn secondary" type="submit">Retry provider</button></form></div>
+{% endif %}
+<noscript><p><a class="btn secondary" href="{{ request.url }}">Refresh discography</a></p></noscript>
+</section>

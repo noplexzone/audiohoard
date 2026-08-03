@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 import httpx
@@ -13,7 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database import get_session_factory
 from app.jobs.runner import _catalog_track_for_result
-from app.metadata.base import ArtistDetail, ArtistHit
+from app.metadata.base import AlbumHit, ArtistDetail, ArtistHit
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -1052,6 +1053,158 @@ async def test_artist_page_renders_loading_state_for_queued_enrichment(
     assert response.status_code == 200
     assert "Loading discography" in response.text
     assert 'data-artist-refresh="true"' in response.text
+
+
+async def test_artist_shell_does_not_await_primary_and_unwatched_skips_secondary(
+    client: AsyncClient, monkeypatch
+) -> None:
+    import time
+
+    from app.routers import catalog as catalog_router
+
+    started: list[str] = []
+    release = asyncio.Event()
+
+    async def delayed_refresh(artist_id: int, provider_name: str) -> None:
+        started.append(provider_name)
+        await release.wait()
+
+    monkeypatch.setattr(catalog_router, "_refresh_discography_task", delayed_refresh)
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(name="Progressive Artist", primary_metadata_provider="deezer")
+        db.add(artist)
+        await db.flush()
+        db.add_all(
+            [
+                CatalogArtistIdentity(
+                    artist_id=artist.id,
+                    provider="deezer",
+                    provider_artist_id="progressive-dz",
+                    name=artist.name,
+                ),
+                CatalogArtistIdentity(
+                    artist_id=artist.id,
+                    provider="musicbrainz",
+                    provider_artist_id="progressive-mb",
+                    name=artist.name,
+                ),
+            ]
+        )
+        await db.commit()
+        artist_id = artist.id
+
+    before = time.perf_counter()
+    response = await client.get(f"/artists/catalog/{artist_id}?provider=deezer")
+    elapsed = time.perf_counter() - before
+    await asyncio.sleep(0)
+
+    assert response.status_code == 200
+    assert elapsed < 1
+    assert "Loading discography" in response.text
+    assert started == ["deezer"]
+    state = await client.get(f"/artists/catalog/{artist_id}/state")
+    assert state.json()["providers"]["deezer"]["state"] == "loading"
+    assert state.json()["providers"]["musicbrainz"]["state"] == "idle"
+    release.set()
+    await asyncio.sleep(0)
+
+
+async def test_watched_primary_becomes_ready_before_delayed_secondary(
+    client: AsyncClient, monkeypatch
+) -> None:
+    from types import SimpleNamespace
+
+    from app.routers import catalog as catalog_router
+
+    secondary_started = asyncio.Event()
+    release_secondary = asyncio.Event()
+
+    class FakeProvider:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def get_discography(self, provider_artist_id: str) -> list[AlbumHit]:
+            if self.name == "musicbrainz":
+                secondary_started.set()
+                await release_secondary.wait()
+            return [
+                AlbumHit(
+                    provider=self.name,
+                    provider_id=f"{provider_artist_id}-album",
+                    title=f"{self.name.title()} Album",
+                    artist_name="Progressive Watched",
+                    release_type="Album",
+                )
+            ]
+
+    def fake_build_provider(name: str, _settings) -> FakeProvider:
+        return FakeProvider(name)
+
+    async def fake_runtime(_db):
+        return SimpleNamespace(
+            primary_metadata_provider="deezer",
+            enabled_metadata_providers=["deezer", "musicbrainz"],
+        )
+
+    async def no_reconcile(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(catalog_router, "build_metadata_provider", fake_build_provider)
+    monkeypatch.setattr(catalog_router, "get_runtime_settings", fake_runtime)
+    monkeypatch.setattr(catalog_router, "reconcile_deezer_catalog_ownership", no_reconcile)
+
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Progressive Watched",
+            monitored=True,
+            primary_metadata_provider="deezer",
+        )
+        db.add(artist)
+        await db.flush()
+        db.add_all(
+            [
+                CatalogArtistIdentity(
+                    artist_id=artist.id,
+                    provider="deezer",
+                    provider_artist_id="watched-dz",
+                    name=artist.name,
+                ),
+                CatalogArtistIdentity(
+                    artist_id=artist.id,
+                    provider="musicbrainz",
+                    provider_artist_id="watched-mb",
+                    name=artist.name,
+                ),
+            ]
+        )
+        await db.commit()
+        artist_id = artist.id
+
+    await catalog_router._refresh_discography_task(artist_id, "deezer")
+    await asyncio.wait_for(secondary_started.wait(), timeout=1)
+
+    state = await client.get(f"/artists/catalog/{artist_id}/state")
+    assert state.status_code == 200
+    assert state.json()["providers"]["deezer"] == {
+        "state": "ready",
+        "release_count": 1,
+        "error": None,
+    }
+    assert state.json()["providers"]["musicbrainz"]["state"] == "loading"
+
+    fragment = await client.get(
+        f"/artists/catalog/{artist_id}/discography?provider=deezer&release_type=Album&sort=asc"
+    )
+    assert fragment.status_code == 200
+    assert "Deezer Album" in fragment.text
+    assert "Musicbrainz Album" not in fragment.text
+    assert fragment.text.count('id="discography-region"') == 1
+
+    release_secondary.set()
+    secondary_task = catalog_router._discography_tasks[(artist_id, "musicbrainz")]
+    await asyncio.wait_for(asyncio.shield(secondary_task), timeout=1)
 
 
 async def test_album_page_links_to_catalog_artist(client: AsyncClient) -> None:
