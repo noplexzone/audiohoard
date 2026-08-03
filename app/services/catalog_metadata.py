@@ -141,8 +141,7 @@ async def _upsert_catalog_artist(db: AsyncSession, hit: ArtistHit | ArtistDetail
             candidates.extend(
                 candidate
                 for candidate in all_artists
-                if _norm_title(candidate.name) == _norm_title(hit.name)
-                and candidate.mbid in {None, ids["mbid"]}
+                if _safe_same_name_artist_identity_candidate(candidate, hit.name, ids)
             )
     candidates = list({candidate.id: candidate for candidate in candidates}.values())
     artist: CatalogArtist | None = None
@@ -749,15 +748,35 @@ async def _merge_artist_id_collisions(
     return artist
 
 
+def _has_non_mbid_provider_id(artist: CatalogArtist) -> bool:
+    return bool(artist.deezer_id or artist.itunes_id)
+
+
+def _safe_same_name_artist_identity_candidate(
+    candidate: CatalogArtist, hit_name: str, incoming_ids: dict[str, str | None]
+) -> bool:
+    if _norm_title(candidate.name) != _norm_title(hit_name):
+        return False
+    if candidate.mbid not in {None, incoming_ids["mbid"]}:
+        return False
+    if candidate.mbid == incoming_ids["mbid"]:
+        return True
+    return not _has_non_mbid_provider_id(candidate)
+
+
 def _artists_should_merge(left: CatalogArtist, right: CatalogArtist) -> bool:
     shared_provider_id = any(
         getattr(left, field) is not None and getattr(left, field) == getattr(right, field)
         for field in ("mbid", "deezer_id", "itunes_id")
     )
-    same_name_one_resolved = _norm_title(left.name) == _norm_title(right.name) and bool(
-        left.mbid
-    ) != bool(right.mbid)
-    return shared_provider_id or same_name_one_resolved
+    if shared_provider_id:
+        return True
+    if _norm_title(left.name) != _norm_title(right.name):
+        return False
+    if bool(left.mbid) == bool(right.mbid):
+        return False
+    unresolved = right if left.mbid else left
+    return not _has_non_mbid_provider_id(unresolved)
 
 
 async def reconcile_duplicate_catalog_artists(db: AsyncSession) -> int:
