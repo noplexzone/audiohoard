@@ -1236,6 +1236,45 @@ async def test_discography_claim_is_atomic_across_sessions(client: AsyncClient) 
         assert await catalog_router._claim_discography_refresh(second, second_identity) is None
 
 
+async def test_preclaim_failure_does_not_mutate_discography_state(
+    client: AsyncClient, monkeypatch
+) -> None:
+    del client
+    from app import settings_service
+    from app.routers import catalog as catalog_router
+
+    async def fail_before_claim(*_args, **_kwargs):
+        raise RuntimeError("settings unavailable")
+
+    monkeypatch.setattr(settings_service, "build_effective_settings", fail_before_claim)
+
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Unclaimed Artist",
+            primary_metadata_provider="deezer",
+            enrichment_state="idle",
+        )
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="deezer",
+            provider_artist_id="unclaimed-dz",
+            name=artist.name,
+        )
+        db.add(identity)
+        await db.commit()
+        artist_id = artist.id
+        identity_id = identity.id
+
+    await catalog_router._refresh_discography_task(artist_id, "deezer")
+
+    async with factory() as db:
+        artist = await db.get(CatalogArtist, artist_id)
+        identity = await db.get(CatalogArtistIdentity, identity_id)
+        assert artist is not None and artist.enrichment_state == "idle"
+        assert identity is not None and identity.metadata_json is None
+
+
 async def test_stale_discography_worker_cannot_overwrite_replacement(
     client: AsyncClient, monkeypatch
 ) -> None:

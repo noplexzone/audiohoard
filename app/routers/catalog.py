@@ -607,6 +607,14 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
                     "Catalog ownership reconciliation failed for artist %s", artist_id
                 )
     except Exception:
+        if claim_id is None:
+            logger.error(
+                "Catalog discography refresh failed before claim for artist %s via %s",
+                artist_id,
+                provider_name,
+                exc_info=True,
+            )
+            return
         async with factory() as session:
             failed = await session.get(CatalogArtist, artist_id)
             if failed is not None:
