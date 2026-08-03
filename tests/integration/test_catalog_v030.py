@@ -333,6 +333,7 @@ async def test_duplicate_fetch_watchlisting_preserves_customized_policy(
             "watchlist_release_singles": "true",
             "watchlist_release_eps": "true",
             "watchlist_monitor_upgrades": "true",
+            "monitor_policy": "none_new",
             "csrf_token": client.cookies.get("csrf", ""),
         },
         headers=headers,
@@ -344,6 +345,10 @@ async def test_duplicate_fetch_watchlisting_preserves_customized_policy(
     assert repeated.json()["watchlist_release_singles"] is True
     assert repeated.json()["watchlist_release_eps"] is True
     assert repeated.json()["watchlist_monitor_upgrades"] is True
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = await db.get(CatalogArtist, artist_id)
+    assert artist is not None and artist.monitor_policy == "none_new"
 
 
 async def test_direct_open_closes_database_transaction_before_provider_http(
