@@ -18,7 +18,7 @@ from app.config import Settings
 from app.jobs import runner
 from app.models.catalog_entities import CatalogAlbum, CatalogArtist
 from app.models.job import Job, JobStatus
-from app.services.download_queue import project_download_groups
+from app.services.download_queue import error_label, project_download_groups
 from app.sources.base import CapabilityState
 from app.sources.youtube import ProviderError  # noqa: F401 (used by type-check below)
 
@@ -130,6 +130,11 @@ def test_download_group_projects_catalog_album_detail_and_fallback_label() -> No
         fallback_group.release_kind,
     ) == (None, None, None, None, None, None)
     assert fallback_group.label == "Fallback Query"
+
+
+def test_error_label_humanizes_known_and_unknown_codes() -> None:
+    assert error_label("candidate_identity_mismatch") == "No matching file found"
+    assert error_label("new_provider_error") == "New provider error"
 
 
 # ---------------------------------------------------------------------------

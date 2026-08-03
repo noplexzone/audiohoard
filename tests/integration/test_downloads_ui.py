@@ -554,7 +554,7 @@ async def test_downloads_tabs_group_status_source_and_row_details(client: AsyncC
     assert '<td data-label="Source"><span class="badge info">slskd</span></td>' in group
     assert '<span class="badge warn"><span class="dot"></span>running</span>' in group
     assert 'class="download-detail-row"' in group
-    assert 'colspan="8"' in group
+    assert 'colspan="7"' in group
     assert "next.classList.contains('download-detail-row')" in DOWNLOADS_JS
 
 

@@ -10,6 +10,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Add a source blocklist page for viewing and removing blocked provider artifacts.
 
+### Changed
+
+- Polish the Downloads queue presentation with counted friendly error chips, stronger progress bars, corrected source casing, quieter bulk-clear actions, and a full-width queue when import review is empty.
+
 ### Fixed
 
 - Count MP3 imports as upgrade-eligible when the quality profile prefers FLAC.

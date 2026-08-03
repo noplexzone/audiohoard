@@ -10,7 +10,6 @@
         <th scope="col">Status</th>
         <th scope="col">Elapsed</th>
         <th scope="col">Last activity</th>
-        <th scope="col">Details</th>
         <th scope="col">Actions</th>
       </tr>
     </thead>
@@ -105,7 +104,6 @@
         </td>
         <td class="queue-time" data-label="Elapsed" title="started {{ download.created_at.strftime('%Y-%m-%d %H:%M') }}">{{ elapsed_str }}</td>
         <td class="queue-time" data-label="Last activity" title="{{ download.updated_at.strftime('%Y-%m-%d %H:%M:%S') }}">{{ activity_str }}<br><time class="hint">{{ download.updated_at.strftime("%Y-%m-%d %H:%M") }}</time></td>
-        <td data-label="Details"><a href="#details-{{ group.key | replace(':', '-') }}" class="details-jump">View below</a></td>
         <td class="action-cell" data-label="Actions">
           {% if group.action_attempt and group.action_attempt.status.value in ['pending', 'running'] %}
           <form method="post" action="/downloads/{{ group.action_attempt.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Cancel</button></form>
@@ -118,16 +116,15 @@
         </td>
       </tr>
       <tr class="download-detail-row" id="details-{{ group.key | replace(':', '-') }}">
-        <td colspan="8">
+        <td colspan="7">
           <details>
             <summary>Attempts and track details</summary>
             {% for attempt in group.attempts %}
             {% set attempt_job = attempt.job %}
             {% set meta = attempt.metadata %}
             <section class="download-attempt" aria-label="Attempt {{ attempt_job.id }}">
-            <p><code>#{{ attempt_job.id }}</code> · <span class="badge info">{{ attempt_job.source }}</span> · <strong>{{ attempt_job.status.value }}</strong><br><span class="hint">{{ attempt_job.query }}</span></p>
-            {% if meta.error %}<p class="alert error compact"><strong>{{ meta.error.code | default('error') }}</strong>{% if meta.error.detail %}: {{ meta.error.detail }}{% endif %}</p>{% endif %}
-            {% if meta.errors %}{% for error in meta.errors %}<p class="alert error compact"><strong>{{ error.code | default('error') }}</strong>{% if error.detail %}: {{ error.detail }}{% endif %}</p>{% endfor %}{% endif %}
+            <p><code>#{{ attempt_job.id }}</code> · <span class="badge info">{{ attempt.source_display }}</span> · <strong>{{ attempt_job.status.value }}</strong><br><span class="hint">{{ attempt_job.query }}</span></p>
+            {% if meta.error_summary %}<div class="download-error-chips" aria-label="Attempt errors">{% for error in meta.error_summary %}<span class="download-error-chip" title="{{ error.code }}"><strong>{{ error.label }}</strong>{% if error.count > 1 %}<span class="download-error-count">×{{ error.count }}</span>{% endif %}{% if error.detail %}<span class="download-error-detail">{{ error.detail }}</span>{% endif %}</span>{% endfor %}</div>{% endif %}
             {% if meta.recovery %}<p class="alert compact">Recovered after {{ meta.recovery.code | replace('_', ' ') }}.</p>{% endif %}
             {% if meta.tracks_created is defined %}<p class="hint">Tracks created: {{ meta.tracks_created }}</p>{% endif %}
             {% if meta.missing_tracks %}<p class="hint">Missing: {{ meta.missing_tracks | join(', ') }}</p>{% endif %}

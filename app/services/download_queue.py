@@ -8,6 +8,40 @@ from app.models.job import Job, JobStatus
 from app.models.track import Track
 from app.models.workflow import AcquisitionState
 
+ERROR_LABELS: dict[str, str] = {
+    "artifact_ambiguous": "Multiple matching files found",
+    "artifact_invalid": "Downloaded file was not audio",
+    "artifact_missing": "Downloaded file missing",
+    "candidate_identity_mismatch": "No matching file found",
+    "cancelled": "Download cancelled",
+    "catalog_track_missing": "Catalog track missing",
+    "catalog_tracks_empty": "No catalog tracks found",
+    "catalog_tracks_incomplete": "Track metadata incomplete",
+    "catalog_tracks_invalid_positions": "Track metadata positions invalid",
+    "catalog_tracks_overfull": "Too many catalog tracks found",
+    "dispatch_lost": "Download dispatcher lost the job",
+    "init_error": "Download setup failed",
+    "job_failed": "Download job failed",
+    "path_traversal": "Downloaded path was unsafe",
+    "result_processing_failed": "Download result could not be processed",
+    "running_transition_error": "Download could not begin",
+    "settings_error": "Download settings failed",
+    "sources_exhausted": "No sources had this track",
+    "transfer_failed": "Download failed mid-transfer",
+    "transfer_lost": "Download disappeared from the source",
+    "transfer_timeout": "Download timed out",
+}
+
+SOURCE_DISPLAY_NAMES: dict[str, str] = {
+    "priority": "Priority",
+    "prowlarr": "Prowlarr",
+    "sabnzbd": "SABnzbd",
+    "slskd": "slskd",
+    "tidal": "TIDAL",
+    "youtube": "YouTube",
+}
+
+
 _ACTIVE = {JobStatus.pending, JobStatus.running}
 _RETRYABLE = {JobStatus.failed, JobStatus.partial, JobStatus.cancelled}
 _IN_FLIGHT_TRACK_STATES = {AcquisitionState.searching, AcquisitionState.acquiring}
@@ -25,6 +59,7 @@ _STATUS_PRIORITY = (
 class DownloadAttempt:
     job: Job
     metadata: dict[str, Any]
+    source_display: str
 
 
 @dataclass(frozen=True)
@@ -57,14 +92,51 @@ def _metadata(job: Job) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     metadata = dict(value)
+    normalized_errors: list[dict[str, Any]] = []
+    raw_error = metadata.get("error")
+    if raw_error is not None:
+        metadata["error"] = _normalized_error(raw_error)
+        normalized_errors.append(metadata["error"])
     raw_errors = metadata.get("errors")
     if raw_errors is not None:
         values = raw_errors if isinstance(raw_errors, list) else [raw_errors]
         metadata["errors"] = [_normalized_error(item) for item in values]
-    raw_error = metadata.get("error")
-    if raw_error is not None:
-        metadata["error"] = _normalized_error(raw_error)
+        normalized_errors.extend(metadata["errors"])
+    if normalized_errors:
+        metadata["error_summary"] = summarize_errors(normalized_errors)
     return metadata
+
+
+def error_label(code: object) -> str:
+    normalized = str(code or "error")
+    label = ERROR_LABELS.get(normalized)
+    if label is not None:
+        return label
+    return normalized.replace("_", " ").strip().capitalize() or "Error"
+
+
+def source_display_name(source: object) -> str:
+    normalized = str(source or "").strip()
+    return SOURCE_DISPLAY_NAMES.get(normalized.casefold(), normalized or "—")
+
+
+def summarize_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summary: dict[str, dict[str, Any]] = {}
+    for error in errors:
+        code = str(error.get("code") or "error")
+        item = summary.get(code)
+        if item is None:
+            item = {
+                "code": code,
+                "label": error_label(code),
+                "detail": error.get("detail"),
+                "count": 0,
+            }
+            summary[code] = item
+        if not item.get("detail") and error.get("detail"):
+            item["detail"] = error.get("detail")
+        item["count"] += 1
+    return list(summary.values())
 
 
 def _normalized_error(value: object) -> dict[str, Any]:
@@ -220,13 +292,18 @@ def project_download_groups(
                 year=year,
                 release_kind=release_kind,
                 attempts=tuple(
-                    DownloadAttempt(job=job, metadata=_metadata(job)) for job in visible_jobs
+                    DownloadAttempt(
+                        job=job,
+                        metadata=_metadata(job),
+                        source_display=source_display_name(job.source),
+                    )
+                    for job in visible_jobs
                 ),
                 status=_group_status(visible_jobs),
                 wanted_track_count=wanted_count,
                 downloaded_track_count=min(len(downloaded & wanted), wanted_count),
                 action_attempt=_action_attempt(visible_jobs),
-                source_display=_effective_source(grouped_jobs),
+                source_display=source_display_name(_effective_source(grouped_jobs)),
             )
         )
     groups.sort(
