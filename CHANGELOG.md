@@ -12,6 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Validate provider-native artist identities before rendering or opening search results, filter malformed provider responses, and rank Deezer artists by fan count without reordering other providers.
 - Keep exact-name catalog artists with distinct provider-native IDs separate during enrichment, so opening a Deezer artist cannot be merged away by a same-name MusicBrainz match and leave the discography URL returning 404.
 - Retry transient SQLite writer locks when opening or watchlisting a catalog artist so background reconciliation does not surface as a 500.
 

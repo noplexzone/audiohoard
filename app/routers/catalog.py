@@ -646,12 +646,23 @@ async def delete_imported_release_files(
 async def open_catalog_artist_page(
     provider: str,
     provider_id: str,
+    request: Request,
     background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     monitor: bool = False,
-) -> RedirectResponse:
-    detail = await fetch_catalog_artist_detail(settings, provider, provider_id)
+) -> Response:
+    try:
+        detail = await fetch_catalog_artist_detail(settings, provider, provider_id)
+    except ValueError:
+        message = "The selected artist is no longer available from this provider."
+        if request is not None and _wants_json(request):
+            return JSONResponse(
+                {"error": "invalid_artist_identity", "message": message}, status_code=422
+            )
+        return HTMLResponse(
+            "<h1>Invalid artist identity</h1><p>" + message + "</p>", status_code=422
+        )
     artist_id = None
     runtime = None
 
@@ -683,6 +694,7 @@ async def open_catalog_artist_page(
 
 @router.post("/artists/catalog/open", include_in_schema=False)
 async def open_catalog_artist_post(
+    request: Request,
     background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(effective_settings_dep)],
@@ -694,6 +706,7 @@ async def open_catalog_artist_post(
     return await open_catalog_artist_page(
         provider,
         provider_id,
+        request,
         background_tasks,
         db,
         settings,

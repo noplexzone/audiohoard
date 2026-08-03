@@ -84,7 +84,12 @@ class DeezerClient:
         async with self._client() as client:
             resp = await request_with_retry(client, "GET", f"/artist/{id}")
             resp.raise_for_status()
-        detail = _parse_artist_detail(resp.json())
+        payload = resp.json()
+        if not isinstance(payload, dict) or payload.get("error") is not None:
+            raise ValueError(f"Deezer artist {id} did not return a valid matching artist identity")
+        detail = _parse_artist_detail(payload)
+        if detail.provider_id != id or detail.deezer_id != id or not detail.name.strip():
+            raise ValueError(f"Deezer artist {id} did not return a valid matching artist identity")
         self._cache.set(cache_key, detail, 24 * 60 * 60)
         return detail
 

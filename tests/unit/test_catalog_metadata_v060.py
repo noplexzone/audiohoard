@@ -27,9 +27,71 @@ from app.services.catalog_metadata import (
     fetch_and_store_discography,
     reconcile_duplicate_catalog_albums,
     reconcile_duplicate_catalog_artists,
+    search_catalog_artists,
     upsert_catalog_artist,
     upsert_provider_release,
 )
+
+
+async def test_artist_search_filters_invalid_identity_and_ranks_deezer_fans(
+    monkeypatch: pytest.MonkeyPatch, test_settings: Settings
+) -> None:
+    class FakeProvider:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def health(self):
+            from app.sources.base import CapabilityState
+
+            return CapabilityState(True)
+
+        async def search_artists(self, query: str) -> list[ArtistHit]:
+            del query
+            if self.name == "deezer":
+                return [
+                    ArtistHit("deezer", "fanless", "Fanless", deezer_id="fanless"),
+                    ArtistHit("deezer", "low", "Low", deezer_id="low", fan_count=5),
+                    ArtistHit("deezer", "10002824", "Stale", deezer_id="10002824", fan_count=99),
+                    ArtistHit("deezer", "high", "High", deezer_id="high", fan_count=50),
+                ]
+            return [
+                ArtistHit(self.name, f"{self.name}-1", "First"),
+                ArtistHit(self.name, f"{self.name}-2", "Second"),
+            ]
+
+        async def get_artist(self, id: str) -> ArtistDetail:
+            if id == "10002824":
+                return ArtistDetail("deezer", "", "", deezer_id=None)
+            return ArtistDetail(
+                self.name,
+                id,
+                id.title(),
+                deezer_id=id if self.name == "deezer" else None,
+                mbid=id if self.name == "musicbrainz" else None,
+                itunes_id=id if self.name == "itunes" else None,
+                type="Group" if self.name == "musicbrainz" else None,
+            )
+
+    monkeypatch.setattr(
+        catalog_metadata,
+        "build_metadata_provider",
+        lambda name, settings: FakeProvider(name),
+    )
+
+    outcomes = await search_catalog_artists(
+        test_settings, "artist", ["musicbrainz", "deezer", "itunes"]
+    )
+
+    assert [outcome.provider for outcome in outcomes] == ["deezer", "musicbrainz", "itunes"]
+    assert [hit.provider_id for outcome in outcomes for hit in outcome.artists] == [
+        "high",
+        "low",
+        "fanless",
+        "musicbrainz-1",
+        "musicbrainz-2",
+        "itunes-1",
+        "itunes-2",
+    ]
 
 
 def test_album_title_normalization_folds_typographic_punctuation() -> None:

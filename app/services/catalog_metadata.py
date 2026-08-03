@@ -43,6 +43,9 @@ from app.models.track import IdentityResolutionState, Track
 from app.sources.base import CapabilityState
 
 VALID_METADATA_PROVIDERS = {"musicbrainz", "deezer", "itunes"}
+_ARTIST_VALIDATION_TIMEOUT_SECONDS = 2.0
+_ARTIST_VALIDATION_BUDGET_SECONDS = 3.0
+_VALID_ARTIST_TYPES = {"person", "group", "orchestra", "choir", "character", "other"}
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,60 @@ def provider_ids_for_hit(
     return {"mbid": hit.mbid, "deezer_id": hit.deezer_id, "itunes_id": hit.itunes_id}
 
 
+def validate_artist_detail(
+    detail: ArtistDetail, provider_name: str, provider_id: str
+) -> ArtistDetail:
+    native_ids = provider_ids_for_hit(detail)
+    expected_field = {
+        "musicbrainz": "mbid",
+        "deezer": "deezer_id",
+        "itunes": "itunes_id",
+    }.get(provider_name)
+    if (
+        provider_name not in VALID_METADATA_PROVIDERS
+        or not provider_id
+        or detail.provider != provider_name
+        or detail.provider_id != provider_id
+        or expected_field is None
+        or native_ids[expected_field] != provider_id
+        or not detail.name.strip()
+        or (detail.type is not None and detail.type.casefold() not in _VALID_ARTIST_TYPES)
+    ):
+        raise ValueError("Provider returned an invalid artist identity")
+    return detail
+
+
+async def _validated_artist_hits(
+    provider: MetadataProvider, name: str, artists: list[ArtistHit]
+) -> list[ArtistHit]:
+    semaphore = asyncio.Semaphore(5)
+    valid = [False] * len(artists)
+
+    async def validate(index: int, hit: ArtistHit) -> None:
+        if hit.provider != name or not hit.provider_id or not hit.name.strip():
+            return
+        try:
+            async with semaphore:
+                detail = await asyncio.wait_for(
+                    provider.get_artist(hit.provider_id),
+                    timeout=_ARTIST_VALIDATION_TIMEOUT_SECONDS,
+                )
+            validate_artist_detail(detail, name, hit.provider_id)
+        except Exception:
+            return
+        valid[index] = True
+
+    try:
+        async with asyncio.timeout(_ARTIST_VALIDATION_BUDGET_SECONDS):
+            await asyncio.gather(*(validate(index, hit) for index, hit in enumerate(artists)))
+    except TimeoutError:
+        pass
+    filtered = [hit for index, hit in enumerate(artists) if valid[index]]
+    if name == "deezer":
+        filtered.sort(key=lambda hit: (hit.fan_count is None, -(hit.fan_count or 0)))
+    return filtered
+
+
 async def search_catalog_artists(
     settings: Settings, query: str, providers: list[str]
 ) -> list[ProviderOutcome]:
@@ -81,6 +138,7 @@ async def search_catalog_artists(
             return ProviderOutcome(name, [], state)
         try:
             artists = await provider.search_artists(query)
+            artists = await _validated_artist_hits(provider, name, artists)
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             return ProviderOutcome(
                 name, artists, CapabilityState(True, extra={"elapsed_ms": elapsed_ms})
@@ -94,9 +152,10 @@ async def search_catalog_artists(
                 ),
             )
 
-    return list(
+    outcomes = list(
         await asyncio.gather(*[_one(p) for p in providers if p in VALID_METADATA_PROVIDERS])
     )
+    return sorted(outcomes, key=lambda outcome: 0 if outcome.provider == "deezer" else 1)
 
 
 async def upsert_catalog_artist(db: AsyncSession, hit: ArtistHit | ArtistDetail) -> CatalogArtist:
@@ -211,7 +270,8 @@ async def fetch_catalog_artist_detail(
     provider = build_metadata_provider(provider_name, settings)
     if provider is None:
         raise ValueError("Unknown metadata provider")
-    return await provider.get_artist(provider_id)
+    detail = await provider.get_artist(provider_id)
+    return validate_artist_detail(detail, provider_name, provider_id)
 
 
 async def open_catalog_artist(

@@ -58,6 +58,23 @@ def test_parse_artist_exposes_disambiguation_evidence_and_hides_placeholder_art(
 
 
 class TestDeezerSearch:
+    async def test_get_artist_rejects_http_200_error_envelope_for_stale_id(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url="https://api.deezer.com/artist/10002824",
+            json={
+                "error": {
+                    "type": "DataException",
+                    "message": "no data",
+                    "code": 800,
+                }
+            },
+        )
+
+        with pytest.raises(ValueError, match="valid matching artist identity"):
+            await DeezerClient().get_artist("10002824")
+
     async def test_artist_search_adds_top_track_evidence(self, httpx_mock: HTTPXMock) -> None:
         httpx_mock.add_response(
             url="https://api.deezer.com/search/artist?q=playboi+carti&limit=10",

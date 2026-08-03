@@ -234,6 +234,45 @@ async def test_search_card_monitor_opens_artist_as_monitored(
         assert artist.monitor_policy == "all"
 
 
+async def test_invalid_direct_artist_open_returns_safe_errors_without_persistence(
+    client: AsyncClient, monkeypatch
+) -> None:
+    async def invalid_fetch(settings, provider_name: str, provider_id: str):
+        del settings, provider_name, provider_id
+        raise ValueError("Provider returned an invalid artist identity")
+
+    import app.routers.catalog as catalog_router
+
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", invalid_fetch)
+
+    html = await client.get(
+        "/artists/catalog/open?provider=deezer&provider_id=10002824",
+        follow_redirects=False,
+    )
+    json_response = await client.post(
+        "/artists/catalog/open",
+        data={
+            "provider": "deezer",
+            "provider_id": "10002824",
+            "monitor": "true",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        follow_redirects=False,
+    )
+
+    assert html.status_code == 422
+    assert "invalid artist identity" in html.text.casefold()
+    assert json_response.status_code == 422
+    assert json_response.json() == {
+        "error": "invalid_artist_identity",
+        "message": "The selected artist is no longer available from this provider.",
+    }
+    factory = get_session_factory()
+    async with factory() as db:
+        assert await db.scalar(select(func.count(CatalogArtist.id))) == 0
+
+
 async def test_search_card_monitor_retries_transient_sqlite_artist_open_lock(
     client: AsyncClient, monkeypatch
 ) -> None:
