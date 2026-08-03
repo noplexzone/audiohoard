@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-08-03
+
 ### Added
 
 - Add a source blocklist page for viewing and removing blocked provider artifacts.
