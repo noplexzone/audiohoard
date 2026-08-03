@@ -147,6 +147,57 @@ async def test_upsert_provider_release_splits_existing_clean_explicit_siblings(d
     }
 
 
+async def test_mbid_upsert_does_not_absorb_distinct_deezer_same_name(db_session) -> None:
+    deezer_artist = CatalogArtist(
+        name="Playboi Carti",
+        deezer_id="10002824",
+        monitored=True,
+        watchlist_provider="deezer",
+    )
+    db_session.add(deezer_artist)
+    await db_session.flush()
+    deezer_artist_id = deezer_artist.id
+
+    mb_artist = await upsert_catalog_artist(
+        db_session,
+        ArtistDetail(
+            provider="musicbrainz",
+            provider_id="2baf3276-ed6a-4349-8d2e-f4601e7b2167",
+            name="Playboi Carti",
+            mbid="2baf3276-ed6a-4349-8d2e-f4601e7b2167",
+        ),
+    )
+    await db_session.flush()
+
+    assert mb_artist.id != deezer_artist_id
+    rows = list((await db_session.scalars(select(CatalogArtist))).all())
+    assert {(row.id, row.deezer_id, row.mbid) for row in rows} == {
+        (deezer_artist_id, "10002824", None),
+        (mb_artist.id, None, "2baf3276-ed6a-4349-8d2e-f4601e7b2167"),
+    }
+
+
+async def test_duplicate_reconciliation_keeps_distinct_provider_same_name_rows(db_session) -> None:
+    resolved = CatalogArtist(
+        name="Playboi Carti",
+        mbid="2baf3276-ed6a-4349-8d2e-f4601e7b2167",
+    )
+    provider_native = CatalogArtist(name="Playboi Carti", deezer_id="10002824")
+    placeholder = CatalogArtist(name="Playboi Carti")
+    db_session.add_all([resolved, provider_native, placeholder])
+    await db_session.flush()
+    provider_native_id = provider_native.id
+
+    merged = await reconcile_duplicate_catalog_artists(db_session)
+    await db_session.flush()
+
+    assert merged == 1
+    remaining = list((await db_session.scalars(select(CatalogArtist))).all())
+    assert len(remaining) == 2
+    assert any(row.id == provider_native_id and row.deezer_id == "10002824" for row in remaining)
+    assert any(row.mbid == "2baf3276-ed6a-4349-8d2e-f4601e7b2167" for row in remaining)
+
+
 async def test_provider_refresh_does_not_erase_a_known_track_count(db_session) -> None:
     artist = CatalogArtist(name="Known Count Artist")
     identity = CatalogArtistIdentity(
