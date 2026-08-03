@@ -8,11 +8,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
 from app.config import Settings
 from app.database import get_db
+from app.models.catalog_entities import CatalogArtist, CatalogArtistIdentity
 from app.schemas.health import SourceStatus
 from app.schemas.search import SearchRequest, SearchResponse, SearchResult
 from app.services.catalog_metadata import search_catalog_artists
@@ -34,6 +36,36 @@ _INTERACTIVE_YOUTUBE_SEARCH_TIMEOUT_SEC = 30
 
 def _get_templates(request: Request) -> Jinja2Templates:
     return request.app.state.templates  # type: ignore[no-any-return]
+
+
+async def _watched_catalog_artists(
+    db: AsyncSession,
+) -> dict[str, dict[str, dict[str, object]]]:
+    rows = (
+        await db.execute(
+            select(
+                CatalogArtistIdentity.provider,
+                CatalogArtistIdentity.provider_artist_id,
+                CatalogArtist.id,
+                CatalogArtist.watchlist_release_albums,
+                CatalogArtist.watchlist_release_singles,
+                CatalogArtist.watchlist_release_eps,
+                CatalogArtist.watchlist_monitor_upgrades,
+            )
+            .join(CatalogArtist, CatalogArtist.id == CatalogArtistIdentity.artist_id)
+            .where(CatalogArtist.monitored.is_(True))
+        )
+    ).all()
+    watched: dict[str, dict[str, dict[str, object]]] = {}
+    for provider, provider_id, artist_id, albums, singles, eps, upgrades in rows:
+        watched.setdefault(provider, {})[provider_id] = {
+            "artist_id": artist_id,
+            "watchlist_release_albums": bool(albums),
+            "watchlist_release_singles": bool(singles),
+            "watchlist_release_eps": bool(eps),
+            "watchlist_monitor_upgrades": bool(upgrades),
+        }
+    return watched
 
 
 def _build_adapter(
@@ -182,6 +214,13 @@ async def search_page(
             "primary_error": primary_error,
             "metadata_providers": runtime.metadata_providers,
             "catalog_outcomes": catalog_outcomes,
+            "watched_catalog_artists": await _watched_catalog_artists(db),
+            "watchlist_defaults": {
+                "watchlist_release_albums": runtime.default_watchlist_release_albums,
+                "watchlist_release_singles": runtime.default_watchlist_release_singles,
+                "watchlist_release_eps": runtime.default_watchlist_release_eps,
+                "watchlist_monitor_upgrades": runtime.default_watchlist_monitor_upgrades,
+            },
             "metadata_enabled": metadata_providers,
             "results": None,
             "source_states": {},

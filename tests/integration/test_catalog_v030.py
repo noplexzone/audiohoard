@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
@@ -9,7 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database import get_session_factory
 from app.jobs.runner import _catalog_track_for_result
-from app.metadata.base import ArtistDetail
+from app.metadata.base import ArtistDetail, ArtistHit
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -20,6 +21,20 @@ from app.models.catalog_entities import (
 from app.models.job import Job
 from app.models.monitoring import MonitoringRecord, MonitoringStatus
 from app.schemas.search import SearchResult
+from app.services.catalog_metadata import ProviderOutcome
+from app.sources.base import CapabilityState
+
+
+@pytest.fixture(autouse=True)
+def _disable_catalog_enrichment_background_tasks(monkeypatch):
+    """Keep catalog integration tests deterministic and off the live provider network."""
+    from app.routers import catalog as catalog_router
+
+    async def do_not_queue(*args, **kwargs):
+        del args, kwargs
+        return False
+
+    monkeypatch.setattr(catalog_router, "_queue_artist_enrichment", do_not_queue)
 
 
 async def _seed_catalog() -> int:
@@ -232,6 +247,140 @@ async def test_search_card_monitor_opens_artist_as_monitored(
         ).one()
         assert artist.monitored is True
         assert artist.monitor_policy == "all"
+
+
+async def test_fetch_watchlisting_is_idempotent_and_returns_saved_defaults(
+    client: AsyncClient, monkeypatch
+) -> None:
+    async def fake_fetch(settings, provider_name: str, provider_id: str):
+        del settings
+        return ArtistDetail(
+            provider=provider_name,
+            provider_id=provider_id,
+            name="Fetch Artist",
+            deezer_id=provider_id,
+        )
+
+    import app.routers.catalog as catalog_router
+
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", fake_fetch)
+    payload = {
+        "provider": "deezer",
+        "provider_id": "fetch-dz",
+        "monitor": "true",
+        "csrf_token": client.cookies.get("csrf", ""),
+    }
+    headers = {"Accept": "application/json", "X-Requested-With": "fetch"}
+
+    first = await client.post("/artists/catalog/open", data=payload, headers=headers)
+    second = await client.post("/artists/catalog/open", data=payload, headers=headers)
+
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+    assert first.json() == {
+        "artist_id": first.json()["artist_id"],
+        "watched": True,
+        "watchlist_release_albums": True,
+        "watchlist_release_singles": False,
+        "watchlist_release_eps": False,
+        "watchlist_monitor_upgrades": False,
+        "configure_url": f"/artists/catalog/{first.json()['artist_id']}/monitor",
+        "discography_url": f"/artists/catalog/{first.json()['artist_id']}",
+    }
+    factory = get_session_factory()
+    async with factory() as db:
+        assert await db.scalar(select(func.count(CatalogArtist.id))) == 1
+        assert await db.scalar(select(func.count(CatalogArtistIdentity.id))) == 1
+
+
+async def test_search_cards_mark_only_matching_provider_identity_watched(
+    client: AsyncClient, monkeypatch
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(name="Same Name", monitored=True, deezer_id="watched-dz")
+        artist.identities.append(
+            CatalogArtistIdentity(
+                provider="deezer", provider_artist_id="watched-dz", name="Same Name"
+            )
+        )
+        db.add(artist)
+        await db.commit()
+
+    async def fake_search(settings, query: str, providers: list[str]):
+        del settings, query, providers
+        return [
+            ProviderOutcome(
+                "deezer",
+                [ArtistHit("deezer", "watched-dz", "Same Name", deezer_id="watched-dz")],
+                CapabilityState(True),
+            ),
+            ProviderOutcome(
+                "musicbrainz",
+                [ArtistHit("musicbrainz", "other-mb", "Same Name", mbid="other-mb")],
+                CapabilityState(True),
+            ),
+        ]
+
+    import app.routers.search as search_router
+
+    monkeypatch.setattr(search_router, "search_catalog_artists", fake_search)
+    response = await client.get("/search?q=Same+Name&provider=all")
+
+    assert response.status_code == 200
+    assert (
+        'data-provider="deezer" data-provider-id="watched-dz" data-watched="true"' in response.text
+    )
+    assert (
+        'data-provider="musicbrainz" data-provider-id="other-mb" data-watched="false"'
+        in response.text
+    )
+
+
+async def test_fetch_dialog_updates_only_selected_artist(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        selected = CatalogArtist(name="Selected", monitored=True, deezer_id="selected-dz")
+        selected.identities.append(
+            CatalogArtistIdentity(
+                provider="deezer", provider_artist_id="selected-dz", name="Selected"
+            )
+        )
+        other = CatalogArtist(
+            name="Other", monitored=True, deezer_id="other-dz", watchlist_release_albums=True
+        )
+        other.identities.append(
+            CatalogArtistIdentity(provider="deezer", provider_artist_id="other-dz", name="Other")
+        )
+        db.add_all([selected, other])
+        await db.commit()
+        selected_id, other_id = selected.id, other.id
+
+    response = await client.post(
+        f"/artists/catalog/{selected_id}/monitor",
+        data={
+            "monitored": "true",
+            "provider": "deezer",
+            "watchlist_release_singles": "true",
+            "watchlist_release_eps": "true",
+            "watchlist_monitor_upgrades": "true",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["artist_id"] == selected_id
+    assert response.json()["watched"] is True
+    async with factory() as db:
+        refreshed_selected = await db.get(CatalogArtist, selected_id)
+        refreshed_other = await db.get(CatalogArtist, other_id)
+    assert refreshed_selected is not None
+    assert refreshed_selected.watchlist_release_albums is False
+    assert refreshed_selected.watchlist_release_singles is True
+    assert refreshed_selected.watchlist_release_eps is True
+    assert refreshed_selected.watchlist_monitor_upgrades is True
+    assert refreshed_other is not None and refreshed_other.watchlist_release_albums is True
 
 
 async def test_invalid_direct_artist_open_returns_safe_errors_without_persistence(

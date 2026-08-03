@@ -42,18 +42,9 @@
     {% for outcome in catalog_outcomes %}
       {% for artist_hit in outcome.artists %}
       {% set any_hits.value = true %}
-      <article class="card catalog-result-card">
-        {% if artist_hit.artwork_url %}<img src="/artwork?url={{ artist_hit.artwork_url | urlencode }}" alt="" class="catalog-result-art">{% else %}<div class="catalog-result-art catalog-result-art-missing" aria-hidden="true">No image</div>{% endif %}
-        <h3>{{ artist_hit.name }}</h3>
-        <p class="catalog-provider-line"><span class="badge info">{{ display_name(artist_hit.provider) }}</span>{% if artist_hit.disambiguation %} {{ artist_hit.disambiguation }}{% endif %}</p>
-        <dl class="catalog-evidence-list">
-          <div><dt>Provider ID</dt><dd>{{ artist_hit.provider_id }}</dd></div>
-          {% if artist_hit.fan_count is not none %}<div><dt>Fans</dt><dd>{{ artist_hit.fan_count }}</dd></div>{% endif %}
-          {% if artist_hit.album_count is not none %}<div><dt>Releases</dt><dd>{{ artist_hit.album_count }}</dd></div>{% endif %}
-        </dl>
-        {% if artist_hit.top_tracks %}<p class="hint catalog-top-tracks"><strong>Top tracks:</strong> {{ artist_hit.top_tracks | join(', ') }}</p>{% endif %}
-        <div class="form-row catalog-result-actions"><a class="btn secondary" href="/artists/catalog/open?provider={{ artist_hit.provider | urlencode }}&provider_id={{ artist_hit.provider_id | urlencode }}">Open discography</a>{% if artist_hit.external_url %}<a class="btn secondary" href="{{ artist_hit.external_url | e }}" target="_blank" rel="noopener noreferrer">Open {{ display_name(artist_hit.provider) }}</a>{% endif %}<form method="post" action="/artists/catalog/open"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><input type="hidden" name="provider" value="{{ artist_hit.provider | e }}"><input type="hidden" name="provider_id" value="{{ artist_hit.provider_id | e }}"><input type="hidden" name="monitor" value="true"><button class="btn" type="submit">Add to watchlist</button></form></div>
-      </article>
+      {% set watched_artist = watched_catalog_artists.get(artist_hit.provider, {}).get(artist_hit.provider_id) %}
+      {% set artist_card_id = artist_hit.provider ~ '-' ~ loop.index %}
+      {% include "partials/_artist_card.html" %}
       {% endfor %}
     {% endfor %}
     </div>
@@ -88,4 +79,7 @@
   {% endif %}
 </section>
 {% endif %}
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/discovery.js?v={{ app_version }}" data-page-module="discovery" defer></script>
 {% endblock %}

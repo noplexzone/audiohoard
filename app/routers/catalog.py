@@ -487,6 +487,19 @@ def _wants_json(request: Request) -> bool:
     )
 
 
+def _artist_watchlist_payload(artist: CatalogArtist) -> dict[str, object]:
+    return {
+        "artist_id": artist.id,
+        "watched": bool(artist.monitored),
+        "watchlist_release_albums": bool(artist.watchlist_release_albums),
+        "watchlist_release_singles": bool(artist.watchlist_release_singles),
+        "watchlist_release_eps": bool(artist.watchlist_release_eps),
+        "watchlist_monitor_upgrades": bool(artist.watchlist_monitor_upgrades),
+        "configure_url": f"/artists/catalog/{artist.id}/monitor",
+        "discography_url": f"/artists/catalog/{artist.id}",
+    }
+
+
 @router.get("/library", response_class=HTMLResponse)
 async def library_page(
     request: Request,
@@ -663,11 +676,12 @@ async def open_catalog_artist_page(
         return HTMLResponse(
             "<h1>Invalid artist identity</h1><p>" + message + "</p>", status_code=422
         )
-    artist_id = None
-    runtime = None
+    artist_id: int | None = None
+    runtime: RuntimeSettings | None = None
+    watchlist_payload: dict[str, object] | None = None
 
     async def save_artist() -> None:
-        nonlocal artist_id, runtime
+        nonlocal artist_id, runtime, watchlist_payload
         artist = await upsert_catalog_artist(db, detail)
         runtime = await get_runtime_settings(db)
         if monitor:
@@ -682,13 +696,16 @@ async def open_catalog_artist_page(
             )
         await db.commit()
         artist_id = artist.id
+        watchlist_payload = _artist_watchlist_payload(artist)
 
     await run_with_sqlite_lock_retry(db, save_artist, attempts=5, delay_seconds=0.35)
-    assert artist_id is not None and runtime is not None
+    assert artist_id is not None and runtime is not None and watchlist_payload is not None
     if await _queue_artist_enrichment(db, artist_id):
         background_tasks.add_task(
             _enrich_artist_task, artist_id, runtime.enabled_metadata_providers
         )
+    if _wants_json(request):
+        return JSONResponse(watchlist_payload)
     return RedirectResponse(f"/artists/catalog/{artist_id}", status_code=303)
 
 
@@ -702,7 +719,7 @@ async def open_catalog_artist_post(
     provider: Annotated[str, Form()],
     provider_id: Annotated[str, Form()],
     monitor: Annotated[str, Form()] = "",
-) -> RedirectResponse:
+) -> Response:
     return await open_catalog_artist_page(
         provider,
         provider_id,
@@ -938,7 +955,7 @@ async def monitor_catalog_artist_page(
     background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
-) -> RedirectResponse:
+) -> Response:
     load = selectinload(CatalogArtist.identities).selectinload(CatalogArtistIdentity.releases)
     artist = (
         await db.execute(
@@ -1060,6 +1077,8 @@ async def monitor_catalog_artist_page(
             _enrich_artist_task, artist.id, runtime.enabled_metadata_providers
         )
     await db.commit()
+    if _wants_json(request):
+        return JSONResponse(_artist_watchlist_payload(artist))
     return RedirectResponse(
         _artist_page_url(artist.id, provider=view_provider, release_type=release_type, sort=sort),
         status_code=303,

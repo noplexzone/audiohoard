@@ -23,6 +23,18 @@ def test_setuptools_includes_web_assets_in_built_distributions() -> None:
     assert "CHANGELOG.md" in data_files["."]
 
 
+def test_discovery_artist_card_assets_are_registered() -> None:
+    search = Path("app/templates/search.html").read_text(encoding="utf-8")
+    partial = Path("app/templates/partials/_artist_card.html")
+    script = Path("app/static/js/discovery.js")
+
+    assert partial.exists()
+    assert script.exists()
+    assert '{% include "partials/_artist_card.html" %}' in search
+    assert 'src="/static/js/discovery.js?v={{ app_version }}"' in search
+    assert 'data-page-module="discovery"' in search
+
+
 def test_branding_assets_exist() -> None:
     branding = Path("app/static/branding")
     for name in (

@@ -1680,6 +1680,33 @@ a.metric-card:hover {
   margin-top: auto;
 }
 
+.catalog-result-actions form {
+  display: inline-flex;
+}
+
+.catalog-watch-status,
+.catalog-inline-error {
+  min-height: 1.25rem;
+  margin: 0;
+  font-size: .78rem;
+}
+
+.catalog-watch-status {
+  color: var(--muted);
+}
+
+.catalog-inline-error[hidden] {
+  display: none;
+}
+
+.catalog-watchlist-dialog .watchlist-release-types {
+  margin-bottom: 1rem;
+}
+
+.catalog-watchlist-dialog .dialog-actions {
+  justify-content: flex-end;
+}
+
 .inline-form {
   display: inline;
 }
