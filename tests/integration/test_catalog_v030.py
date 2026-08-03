@@ -4,10 +4,12 @@ from datetime import UTC, datetime
 
 from httpx import AsyncClient
 from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import selectinload
 
 from app.database import get_session_factory
 from app.jobs.runner import _catalog_track_for_result
+from app.metadata.base import ArtistDetail
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -198,15 +200,18 @@ async def test_quick_monitor_uses_artist_primary_source_for_watchlist(
 async def test_search_card_monitor_opens_artist_as_monitored(
     client: AsyncClient, monkeypatch
 ) -> None:
-    async def fake_open(db, settings, provider_name: str, provider_id: str):
-        artist = CatalogArtist(name="Search Artist", mbid=provider_id)
-        db.add(artist)
-        await db.flush()
-        return artist
+    async def fake_fetch(settings, provider_name: str, provider_id: str):
+        del settings
+        return ArtistDetail(
+            provider=provider_name,
+            provider_id=provider_id,
+            name="Search Artist",
+            mbid=provider_id,
+        )
 
     import app.routers.catalog as catalog_router
 
-    monkeypatch.setattr(catalog_router, "open_catalog_artist", fake_open)
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", fake_fetch)
 
     response = await client.post(
         "/artists/catalog/open",
@@ -227,6 +232,58 @@ async def test_search_card_monitor_opens_artist_as_monitored(
         ).one()
         assert artist.monitored is True
         assert artist.monitor_policy == "all"
+
+
+async def test_search_card_monitor_retries_transient_sqlite_artist_open_lock(
+    client: AsyncClient, monkeypatch
+) -> None:
+    async def fake_fetch(settings, provider_name: str, provider_id: str):
+        del settings
+        return ArtistDetail(
+            provider=provider_name,
+            provider_id=provider_id,
+            name="Locked Search Artist",
+            mbid=provider_id,
+        )
+
+    import app.routers.catalog as catalog_router
+
+    original_upsert = catalog_router.upsert_catalog_artist
+    attempts = 0
+
+    async def flaky_upsert(db, detail):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OperationalError(
+                "INSERT INTO catalog_artists", {}, Exception("database is locked")
+            )
+        return await original_upsert(db, detail)
+
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", fake_fetch)
+    monkeypatch.setattr(catalog_router, "upsert_catalog_artist", flaky_upsert)
+
+    response = await client.post(
+        "/artists/catalog/open",
+        data={
+            "provider": "musicbrainz",
+            "provider_id": "locked-search-artist-mbid",
+            "monitor": "true",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert attempts == 2
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = (
+            await db.scalars(
+                select(CatalogArtist).where(CatalogArtist.name == "Locked Search Artist")
+            )
+        ).one()
+        assert artist.monitored is True
 
 
 async def test_artists_is_single_watchlist_page(client: AsyncClient) -> None:

@@ -18,6 +18,10 @@ class ArtistHit:
     disambiguation: str | None = None
     artwork_url: str | None = None
     sort_name: str | None = None
+    external_url: str | None = None
+    album_count: int | None = None
+    fan_count: int | None = None
+    top_tracks: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

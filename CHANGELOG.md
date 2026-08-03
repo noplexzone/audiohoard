@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Show provider IDs, fan/release counts, top-track previews, missing-image states, and external provider links on catalog artist search cards to support duplicate-artist disambiguation.
+
+### Fixed
+
+- Retry transient SQLite writer locks when opening or watchlisting a catalog artist so background reconciliation does not surface as a 500.
+
 ## [0.16.0] - 2026-08-03
 
 ### Added

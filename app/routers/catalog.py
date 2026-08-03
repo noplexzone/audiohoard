@@ -54,8 +54,9 @@ from app.services.catalog_metadata import (
     ensure_legacy_provider_snapshots,
     fetch_and_store_album,
     fetch_and_store_discography,
-    open_catalog_artist,
+    fetch_catalog_artist_detail,
     release_bucket,
+    upsert_catalog_artist,
 )
 from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
 from app.services.library_import import ImportExecutionError, retag_catalog_album
@@ -650,24 +651,34 @@ async def open_catalog_artist_page(
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     monitor: bool = False,
 ) -> RedirectResponse:
-    artist = await open_catalog_artist(db, settings, provider, provider_id)
-    runtime = await get_runtime_settings(db)
-    if monitor:
-        artist.monitored = True
-        _apply_runtime_watchlist_defaults(artist, runtime)
-        available = [provider] if provider in VALID_METADATA_PROVIDERS else []
-        artist.watchlist_provider = _selected_provider(
-            runtime.primary_metadata_provider,
-            available,
-            runtime.primary_metadata_provider,
-            provider,
-        )
-    await db.commit()
-    if await _queue_artist_enrichment(db, artist.id):
+    detail = await fetch_catalog_artist_detail(settings, provider, provider_id)
+    artist_id = None
+    runtime = None
+
+    async def save_artist() -> None:
+        nonlocal artist_id, runtime
+        artist = await upsert_catalog_artist(db, detail)
+        runtime = await get_runtime_settings(db)
+        if monitor:
+            artist.monitored = True
+            _apply_runtime_watchlist_defaults(artist, runtime)
+            available = [provider] if provider in VALID_METADATA_PROVIDERS else []
+            artist.watchlist_provider = _selected_provider(
+                runtime.primary_metadata_provider,
+                available,
+                runtime.primary_metadata_provider,
+                provider,
+            )
+        await db.commit()
+        artist_id = artist.id
+
+    await run_with_sqlite_lock_retry(db, save_artist, attempts=5, delay_seconds=0.35)
+    assert artist_id is not None and runtime is not None
+    if await _queue_artist_enrichment(db, artist_id):
         background_tasks.add_task(
-            _enrich_artist_task, artist.id, runtime.enabled_metadata_providers
+            _enrich_artist_task, artist_id, runtime.enabled_metadata_providers
         )
-    return RedirectResponse(f"/artists/catalog/{artist.id}", status_code=303)
+    return RedirectResponse(f"/artists/catalog/{artist_id}", status_code=303)
 
 
 @router.post("/artists/catalog/open", include_in_schema=False)
