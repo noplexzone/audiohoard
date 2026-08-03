@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any
 from urllib.parse import urlencode
+from uuid import uuid4
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Request
@@ -98,7 +99,7 @@ def _start_discography_task(artist_id: int, provider_name: str) -> bool:
 
 async def _claim_discography_refresh(
     session: AsyncSession, identity: CatalogArtistIdentity
-) -> bool:
+) -> str | None:
     original = identity.metadata_json
     try:
         metadata = json.loads(original or "{}")
@@ -112,9 +113,11 @@ async def _claim_discography_refresh(
             started = None
         if started is not None and started > datetime.now(tz=UTC) - timedelta(minutes=10):
             await session.rollback()
-            return False
+            return None
+    claim_id = uuid4().hex
     metadata["discography_state"] = "loading"
     metadata["discography_started_at"] = datetime.now(tz=UTC).isoformat()
+    metadata["discography_claim_id"] = claim_id
     metadata.pop("discography_error", None)
     condition = (
         CatalogArtistIdentity.metadata_json.is_(None)
@@ -127,7 +130,7 @@ async def _claim_discography_refresh(
         .values(metadata_json=json.dumps(metadata, sort_keys=True))
     )
     await session.commit()
-    return bool(getattr(result, "rowcount", 0))
+    return claim_id if getattr(result, "rowcount", 0) else None
 
 
 def _is_fetch_request(request: Request | None) -> bool:
@@ -475,6 +478,7 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
     from app.settings_service import build_effective_settings
 
     factory = get_session_factory()
+    claim_id: str | None = None
     try:
         async with factory() as session:
             cfg = await build_effective_settings(session, get_settings())
@@ -491,14 +495,14 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
                 return
             claimed_identity: CatalogArtistIdentity = identity
             provider_id = identity.provider_artist_id
-            claimed = False
+            claim_id = None
 
             async def claim() -> None:
-                nonlocal claimed
-                claimed = await _claim_discography_refresh(session, claimed_identity)
+                nonlocal claim_id
+                claim_id = await _claim_discography_refresh(session, claimed_identity)
 
             await run_with_sqlite_lock_retry(session, claim, attempts=5, delay_seconds=0.35)
-            if not claimed:
+            if claim_id is None:
                 return
 
         metadata_provider = build_metadata_provider(provider_name, cfg)
@@ -508,8 +512,10 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
         summaries = await metadata_provider.get_discography(provider_id)
 
         async with factory() as session:
+            stored = False
 
             async def store() -> None:
+                nonlocal stored
                 load = selectinload(CatalogArtist.identities).selectinload(
                     CatalogArtistIdentity.releases
                 )
@@ -526,6 +532,13 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
                 )
                 if stored_identity is None:
                     return
+                try:
+                    claim_metadata = json.loads(stored_identity.metadata_json or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    claim_metadata = {}
+                if claim_metadata.get("discography_claim_id") != claim_id:
+                    await session.rollback()
+                    return
                 for summary in summaries:
                     await upsert_provider_release(session, stored_artist, stored_identity, summary)
                 stored_identity.last_discography_at = datetime.now(tz=UTC)
@@ -535,6 +548,7 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
                     metadata = {}
                 metadata["discography_state"] = "ready"
                 metadata.pop("discography_started_at", None)
+                metadata.pop("discography_claim_id", None)
                 metadata.pop("discography_error", None)
                 stored_identity.metadata_json = json.dumps(metadata, sort_keys=True)
                 runtime = await get_runtime_settings(session)
@@ -544,8 +558,11 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
                 if provider_name == effective_primary:
                     stored_artist.enrichment_state = "idle"
                 await session.commit()
+                stored = True
 
             await run_with_sqlite_lock_retry(session, store, attempts=5, delay_seconds=0.35)
+            if not stored:
+                return
 
         async with factory() as session:
             artist = await session.get(CatalogArtist, artist_id)
@@ -610,8 +627,12 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
                         metadata = json.loads(identity.metadata_json or "{}")
                     except (json.JSONDecodeError, TypeError):
                         metadata = {}
+                    if metadata.get("discography_claim_id") != claim_id:
+                        await session.rollback()
+                        return
                     metadata["discography_state"] = "failed"
                     metadata.pop("discography_started_at", None)
+                    metadata.pop("discography_claim_id", None)
                     metadata["discography_error"] = "Discography refresh failed"
                     identity.metadata_json = json.dumps(metadata, sort_keys=True)
                 await session.commit()

@@ -1231,8 +1231,116 @@ async def test_discography_claim_is_atomic_across_sessions(client: AsyncClient) 
         first_identity = await first.get(CatalogArtistIdentity, identity_id)
         second_identity = await second.get(CatalogArtistIdentity, identity_id)
         assert first_identity is not None and second_identity is not None
-        assert await catalog_router._claim_discography_refresh(first, first_identity) is True
-        assert await catalog_router._claim_discography_refresh(second, second_identity) is False
+        first_claim = await catalog_router._claim_discography_refresh(first, first_identity)
+        assert isinstance(first_claim, str) and first_claim
+        assert await catalog_router._claim_discography_refresh(second, second_identity) is None
+
+
+async def test_stale_discography_worker_cannot_overwrite_replacement(
+    client: AsyncClient, monkeypatch
+) -> None:
+    del client
+    import json
+    from datetime import timedelta
+
+    from app.routers import catalog as catalog_router
+
+    old_started = asyncio.Event()
+    release_old = asyncio.Event()
+    calls = 0
+
+    class FencedProvider:
+        async def get_discography(self, provider_artist_id: str) -> list[AlbumHit]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                old_started.set()
+                await release_old.wait()
+                title = "Stale Album"
+            else:
+                title = "Replacement Album"
+            return [
+                AlbumHit(
+                    provider="musicbrainz",
+                    provider_id=f"{provider_artist_id}-{calls}",
+                    title=title,
+                    artist_name="Fenced Artist",
+                    release_type="Album",
+                )
+            ]
+
+    provider = FencedProvider()
+    monkeypatch.setattr(
+        catalog_router, "build_metadata_provider", lambda _name, _settings: provider
+    )
+
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Fenced Artist",
+            primary_metadata_provider="musicbrainz",
+        )
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="musicbrainz",
+            provider_artist_id="fenced-mb",
+            name=artist.name,
+        )
+        db.add(identity)
+        await db.commit()
+        artist_id = artist.id
+        identity_id = identity.id
+
+    stale_task = asyncio.create_task(
+        catalog_router._refresh_discography_task(artist_id, "musicbrainz")
+    )
+    await asyncio.wait_for(old_started.wait(), timeout=1)
+
+    async with factory() as db:
+        identity = await db.get(CatalogArtistIdentity, identity_id)
+        assert identity is not None
+        stale_metadata = json.loads(identity.metadata_json or "{}")
+        stale_claim = stale_metadata["discography_claim_id"]
+        stale_metadata["discography_started_at"] = (
+            datetime.now(tz=UTC) - timedelta(minutes=11)
+        ).isoformat()
+        identity.metadata_json = json.dumps(stale_metadata, sort_keys=True)
+        await db.commit()
+
+    await catalog_router._refresh_discography_task(artist_id, "musicbrainz")
+
+    async with factory() as db:
+        identity = await db.get(CatalogArtistIdentity, identity_id)
+        assert identity is not None
+        ready_metadata = json.loads(identity.metadata_json or "{}")
+        assert ready_metadata["discography_state"] == "ready"
+        assert "discography_claim_id" not in ready_metadata
+        releases = list(
+            await db.scalars(
+                select(CatalogAlbumProvider).where(
+                    CatalogAlbumProvider.artist_identity_id == identity_id
+                )
+            )
+        )
+        assert [release.title for release in releases] == ["Replacement Album"]
+
+    release_old.set()
+    await asyncio.wait_for(stale_task, timeout=1)
+
+    async with factory() as db:
+        identity = await db.get(CatalogArtistIdentity, identity_id)
+        assert identity is not None
+        final_metadata = json.loads(identity.metadata_json or "{}")
+        assert final_metadata["discography_state"] == "ready"
+        assert final_metadata.get("discography_claim_id") != stale_claim
+        releases = list(
+            await db.scalars(
+                select(CatalogAlbumProvider).where(
+                    CatalogAlbumProvider.artist_identity_id == identity_id
+                )
+            )
+        )
+        assert [release.title for release in releases] == ["Replacement Album"]
 
 
 async def test_watchlist_configuration_starts_primary_not_legacy_all_provider_enrichment(
