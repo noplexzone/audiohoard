@@ -109,7 +109,10 @@ class DeezerClient:
                 if not raw_next:
                     break
                 next_url = str(raw_next)
-                if not _same_deezer_origin(self._base_url, next_url) or next_url in visited:
+                if (
+                    not _is_deezer_artist_albums_page(self._base_url, next_url, id)
+                    or next_url in visited
+                ):
                     raise ValueError(f"Deezer artist {id} returned an unsafe album page")
                 visited.add(next_url)
                 params = None
@@ -236,6 +239,15 @@ def _same_deezer_origin(base_url: str, candidate: str) -> bool:
         next_page.scheme in {"http", "https"}
         and next_page.scheme == base.scheme
         and next_page.netloc == base.netloc
+    )
+
+
+def _is_deezer_artist_albums_page(base_url: str, candidate: str, artist_id: str) -> bool:
+    next_page = urlsplit(candidate)
+    return (
+        _same_deezer_origin(base_url, candidate)
+        and next_page.path.rstrip("/") == f"/artist/{artist_id}/albums"
+        and not next_page.fragment
     )
 
 

@@ -92,6 +92,22 @@ class TestDeezerSearch:
         assert albums[1].content_rating == "unknown"
         assert all("/album/" not in str(request.url) for request in httpx_mock.get_requests())
 
+    async def test_discography_rejects_same_origin_non_artist_album_next_page(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url="https://api.deezer.com/artist/7/albums?limit=100",
+            json={
+                "data": [{"id": 42, "title": "Summary Album"}],
+                "next": "https://api.deezer.com/album/42",
+            },
+        )
+
+        with pytest.raises(ValueError, match="unsafe album page"):
+            await DeezerClient().get_discography("7")
+
+        assert [request.url.path for request in httpx_mock.get_requests()] == ["/artist/7/albums"]
+
     async def test_get_artist_rejects_http_200_error_envelope_for_stale_id(
         self, httpx_mock: HTTPXMock
     ) -> None:

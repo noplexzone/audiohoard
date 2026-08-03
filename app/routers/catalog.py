@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any
@@ -88,11 +88,46 @@ def _start_discography_task(artist_id: int, provider_name: str) -> bool:
     task = asyncio.create_task(_refresh_discography_task(artist_id, provider_name))
     _discography_tasks[key] = task
 
-    def forget_task(_completed: asyncio.Task[None]) -> None:
-        _discography_tasks.pop(key, None)
+    def forget_task(completed: asyncio.Task[None]) -> None:
+        if _discography_tasks.get(key) is completed:
+            _discography_tasks.pop(key, None)
 
     task.add_done_callback(forget_task)
     return True
+
+
+async def _claim_discography_refresh(
+    session: AsyncSession, identity: CatalogArtistIdentity
+) -> bool:
+    original = identity.metadata_json
+    try:
+        metadata = json.loads(original or "{}")
+    except (json.JSONDecodeError, TypeError):
+        metadata = {}
+    started_at = metadata.get("discography_started_at")
+    if metadata.get("discography_state") == "loading" and isinstance(started_at, str):
+        try:
+            started = datetime.fromisoformat(started_at)
+        except ValueError:
+            started = None
+        if started is not None and started > datetime.now(tz=UTC) - timedelta(minutes=10):
+            await session.rollback()
+            return False
+    metadata["discography_state"] = "loading"
+    metadata["discography_started_at"] = datetime.now(tz=UTC).isoformat()
+    metadata.pop("discography_error", None)
+    condition = (
+        CatalogArtistIdentity.metadata_json.is_(None)
+        if original is None
+        else CatalogArtistIdentity.metadata_json == original
+    )
+    result = await session.execute(
+        update(CatalogArtistIdentity)
+        .where(CatalogArtistIdentity.id == identity.id, condition)
+        .values(metadata_json=json.dumps(metadata, sort_keys=True))
+    )
+    await session.commit()
+    return bool(getattr(result, "rowcount", 0))
 
 
 def _is_fetch_request(request: Request | None) -> bool:
@@ -454,12 +489,21 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
             artist = await session.get(CatalogArtist, artist_id)
             if artist is None or identity is None:
                 return
+            claimed_identity: CatalogArtistIdentity = identity
             provider_id = identity.provider_artist_id
-            await session.rollback()
+            claimed = False
+
+            async def claim() -> None:
+                nonlocal claimed
+                claimed = await _claim_discography_refresh(session, claimed_identity)
+
+            await run_with_sqlite_lock_retry(session, claim, attempts=5, delay_seconds=0.35)
+            if not claimed:
+                return
 
         metadata_provider = build_metadata_provider(provider_name, cfg)
         if metadata_provider is None:
-            return
+            raise RuntimeError("Metadata provider is unavailable")
         # Provider HTTP is deliberately completed before opening the SQLite write session.
         summaries = await metadata_provider.get_discography(provider_id)
 
@@ -490,9 +534,15 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
                 metadata["discography_state"] = "ready"
+                metadata.pop("discography_started_at", None)
                 metadata.pop("discography_error", None)
                 stored_identity.metadata_json = json.dumps(metadata, sort_keys=True)
-                stored_artist.enrichment_state = "idle"
+                runtime = await get_runtime_settings(session)
+                effective_primary = (
+                    stored_artist.primary_metadata_provider or runtime.primary_metadata_provider
+                )
+                if provider_name == effective_primary:
+                    stored_artist.enrichment_state = "idle"
                 await session.commit()
 
             await run_with_sqlite_lock_retry(session, store, attempts=5, delay_seconds=0.35)
@@ -543,7 +593,12 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
         async with factory() as session:
             failed = await session.get(CatalogArtist, artist_id)
             if failed is not None:
-                failed.enrichment_state = "failed"
+                runtime = await get_runtime_settings(session)
+                effective_primary = (
+                    failed.primary_metadata_provider or runtime.primary_metadata_provider
+                )
+                if provider_name == effective_primary:
+                    failed.enrichment_state = "failed"
                 identity = await session.scalar(
                     select(CatalogArtistIdentity).where(
                         CatalogArtistIdentity.artist_id == artist_id,
@@ -556,6 +611,7 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
                     except (json.JSONDecodeError, TypeError):
                         metadata = {}
                     metadata["discography_state"] = "failed"
+                    metadata.pop("discography_started_at", None)
                     metadata["discography_error"] = "Discography refresh failed"
                     identity.metadata_json = json.dumps(metadata, sort_keys=True)
                 await session.commit()
@@ -904,7 +960,7 @@ async def catalog_artist_page(
     if (
         selected_provider == effective_primary_provider
         and not provider_albums
-        and artist.enrichment_state not in {"queued", "running", "failed"}
+        and not discography_failed
     ):
         _start_discography_task(artist.id, selected_provider)
     discography_loading = not provider_albums and (
@@ -1091,7 +1147,6 @@ async def enrich_catalog_artist_page(
 async def monitor_catalog_artist_page(
     artist_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
 ) -> Response:
@@ -1208,14 +1263,18 @@ async def monitor_catalog_artist_page(
                 release.catalog_album.monitored = True
     if selected_identity is not None:
         await _sync_artist_upgrade_monitoring(db, artist, list(selected_identity.releases))
-    should_queue_enrichment = artist.monitored and (
-        selected_identity is None or not list(selected_identity.releases)
+    primary_provider = _artist_primary_provider(artist, runtime, available)
+    primary_identity = next(
+        (identity for identity in artist.identities if identity.provider == primary_provider), None
     )
-    if should_queue_enrichment and await _queue_artist_enrichment(db, artist.id):
-        background_tasks.add_task(
-            _enrich_artist_task, artist.id, runtime.enabled_metadata_providers
-        )
+    refresh_provider = ""
+    if artist.monitored and primary_identity is not None and not primary_identity.releases:
+        refresh_provider = primary_provider
+    elif artist.monitored and selected_identity is not None and not selected_identity.releases:
+        refresh_provider = selected_identity.provider
     await db.commit()
+    if refresh_provider:
+        _start_discography_task(artist.id, refresh_provider)
     if _wants_json(request):
         return JSONResponse(_artist_watchlist_payload(artist))
     return RedirectResponse(

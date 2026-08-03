@@ -35,6 +35,18 @@ def test_discovery_artist_card_assets_are_registered() -> None:
     assert 'data-page-module="discovery"' in search
 
 
+def test_progressive_discography_script_is_bounded_and_delegated() -> None:
+    script = Path("app/static/js/artist-watchlist.js").read_text(encoding="utf-8")
+
+    assert "region.addEventListener('change'" in script
+    assert "control.form.matches('[data-auto-submit-form]')" in script
+    assert "attempts >= 60" in script
+    assert "if (document.hidden)" in script
+    assert "new URLSearchParams(window.location.search)" in script
+    assert "query.set('provider', provider)" in script
+    assert "discography.replaceWith(fresh)" in script
+
+
 def test_branding_assets_exist() -> None:
     branding = Path("app/static/branding")
     for name in (

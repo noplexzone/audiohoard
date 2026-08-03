@@ -30,14 +30,11 @@ window.AudiohoardNavigation.registerPage('artist-watchlist', function (region) {
     }, { signal: signal });
   }
 
-  region.querySelectorAll('[data-auto-submit-form]').forEach(function (form) {
-    var status = form.querySelector('[data-save-status]');
-    var controls = Array.from(form.querySelectorAll('select, input[type="checkbox"]'));
-    controls = controls.concat(Array.from(region.querySelectorAll('input[form="' + form.id + '"]')));
-    controls.forEach(function (control) {
-      control.addEventListener('change', function () { submitForm(form, status); }, { signal: signal });
-    });
-  });
+  region.addEventListener('change', function (event) {
+    var control = event.target.closest('select, input[type="checkbox"]');
+    if (!control || !control.form || !control.form.matches('[data-auto-submit-form]')) return;
+    submitForm(control.form, control.form.querySelector('[data-save-status]'));
+  }, { signal: signal });
 
   region.querySelectorAll('[data-primary-source-select]').forEach(function (select) {
     select.addEventListener('change', function () {
