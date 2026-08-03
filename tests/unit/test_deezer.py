@@ -39,7 +39,52 @@ def test_parse_artist_prefers_picture_big() -> None:
     assert artist.artwork_url == "https://example.test/picture-big.jpg"
 
 
+def test_parse_artist_exposes_disambiguation_evidence_and_hides_placeholder_art() -> None:
+    artist = _parse_artist(
+        {
+            "id": 10002824,
+            "name": "Playboi Carti",
+            "link": "https://www.deezer.com/artist/10002824",
+            "picture_big": "https://cdn-images.dzcdn.net/images/artist/d41d8cd98f00b204e9800998ecf8427e/500x500.jpg",
+            "nb_album": 14,
+            "nb_fan": 825810,
+        }
+    )
+
+    assert artist.artwork_url is None
+    assert artist.external_url == "https://www.deezer.com/artist/10002824"
+    assert artist.album_count == 14
+    assert artist.fan_count == 825810
+
+
 class TestDeezerSearch:
+    async def test_artist_search_adds_top_track_evidence(self, httpx_mock: HTTPXMock) -> None:
+        httpx_mock.add_response(
+            url="https://api.deezer.com/search/artist?q=playboi+carti&limit=10",
+            json={
+                "data": [
+                    {
+                        "id": 10002824,
+                        "name": "Playboi Carti",
+                        "link": "https://www.deezer.com/artist/10002824",
+                        "nb_album": 14,
+                        "nb_fan": 825810,
+                    }
+                ],
+                "total": 1,
+            },
+        )
+        httpx_mock.add_response(
+            url="https://api.deezer.com/artist/10002824/top?limit=5",
+            json={"data": [{"title_short": "MUSIC"}, {"title": "Magnolia"}]},
+        )
+
+        results = await DeezerClient().search_artists("playboi carti")
+
+        assert results[0].provider_id == "10002824"
+        assert results[0].fan_count == 825810
+        assert results[0].top_tracks == ("MUSIC", "Magnolia")
+
     async def test_search_returns_tracks(self, httpx_mock: HTTPXMock) -> None:
         httpx_mock.add_response(
             url=re.compile(r"https://api[.]deezer[.]com/search.*"),

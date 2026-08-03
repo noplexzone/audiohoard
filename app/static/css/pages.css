@@ -1628,6 +1628,58 @@ a.metric-card:hover {
   border-radius: .5rem;
 }
 
+.catalog-result-card {
+  display: flex;
+  flex-direction: column;
+  gap: .65rem;
+}
+
+.catalog-result-art-missing {
+  display: grid;
+  place-items: center;
+  border: 1px dashed var(--border-soft);
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: .78rem;
+}
+
+.catalog-provider-line,
+.catalog-top-tracks {
+  margin: 0;
+}
+
+.catalog-evidence-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  gap: .45rem;
+  margin: 0;
+}
+
+.catalog-evidence-list div {
+  min-width: 0;
+  padding: .45rem .55rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+
+.catalog-evidence-list dt {
+  color: var(--muted);
+  font-size: .68rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+
+.catalog-evidence-list dd {
+  margin: .15rem 0 0;
+  overflow-wrap: anywhere;
+  font-size: .82rem;
+}
+
+.catalog-result-actions {
+  margin-top: auto;
+}
+
 .inline-form {
   display: inline;
 }

@@ -206,13 +206,19 @@ async def upsert_artist_identity(
     return identity
 
 
-async def open_catalog_artist(
-    db: AsyncSession, settings: Settings, provider_name: str, provider_id: str
-) -> CatalogArtist:
+async def fetch_catalog_artist_detail(
+    settings: Settings, provider_name: str, provider_id: str
+) -> ArtistDetail:
     provider = build_metadata_provider(provider_name, settings)
     if provider is None:
         raise ValueError("Unknown metadata provider")
-    detail = await provider.get_artist(provider_id)
+    return await provider.get_artist(provider_id)
+
+
+async def open_catalog_artist(
+    db: AsyncSession, settings: Settings, provider_name: str, provider_id: str
+) -> CatalogArtist:
+    detail = await fetch_catalog_artist_detail(settings, provider_name, provider_id)
     return await upsert_catalog_artist(db, detail)
 
 

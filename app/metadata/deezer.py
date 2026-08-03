@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 from urllib.parse import urlsplit
 
@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 _HTTP_TIMEOUT = httpx.Timeout(10.0)
 _DISCOGRAPHY_COUNT_HTTP_TIMEOUT = httpx.Timeout(2.0)
 _DISCOGRAPHY_COUNT_BUDGET_SECONDS = 4.0
+_ARTIST_EVIDENCE_HTTP_TIMEOUT = httpx.Timeout(2.0)
+_ARTIST_EVIDENCE_BUDGET_SECONDS = 3.0
+_DEEZER_PLACEHOLDER_IMAGE_HASH = "d41d8cd98f00b204e9800998ecf8427e"
 
 
 @dataclass
@@ -50,6 +53,9 @@ class DeezerClient:
     def _count_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(base_url=self._base_url, timeout=_DISCOGRAPHY_COUNT_HTTP_TIMEOUT)
 
+    def _evidence_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(base_url=self._base_url, timeout=_ARTIST_EVIDENCE_HTTP_TIMEOUT)
+
     async def health(self) -> CapabilityState:
         return CapabilityState(available=True)
 
@@ -66,6 +72,7 @@ class DeezerClient:
         hits = [
             _parse_artist(item) for item in resp.json().get("data", []) if isinstance(item, dict)
         ]
+        await _backfill_artist_search_evidence(self, hits)
         self._cache.set(cache_key, hits, 15 * 60)
         return hits
 
@@ -227,6 +234,48 @@ def _same_deezer_origin(base_url: str, candidate: str) -> bool:
     )
 
 
+async def _backfill_artist_search_evidence(client: DeezerClient, hits: list[ArtistHit]) -> None:
+    if not hits:
+        return
+    sem = asyncio.Semaphore(5)
+    async with client._evidence_client() as http:
+
+        async def fill(idx: int, hit: ArtistHit) -> None:
+            if not hit.provider_id or (hit.fan_count is None and hit.album_count is None):
+                return
+            try:
+                async with sem:
+                    r = await http.get(f"/artist/{hit.provider_id}/top", params={"limit": 5})
+                    r.raise_for_status()
+            except httpx.HTTPError:
+                logger.warning("Could not load Deezer artist evidence for %s", hit.provider_id)
+                return
+            payload = r.json()
+            rows = payload.get("data", []) if isinstance(payload, dict) else []
+            if not isinstance(rows, list):
+                return
+            titles: list[str] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                title = str(row.get("title_short") or row.get("title") or "").strip()
+                if title and title not in titles:
+                    titles.append(title)
+                if len(titles) >= 3:
+                    break
+            if titles:
+                hits[idx] = replace(hit, top_tracks=tuple(titles))
+
+        try:
+            async with asyncio.timeout(_ARTIST_EVIDENCE_BUDGET_SECONDS):
+                await asyncio.gather(*(fill(idx, hit) for idx, hit in enumerate(hits)))
+        except TimeoutError:
+            logger.warning(
+                "Deezer artist search evidence backfill exceeded %.1f seconds",
+                _ARTIST_EVIDENCE_BUDGET_SECONDS,
+            )
+
+
 async def _backfill_discography_track_counts(
     client: DeezerClient, album_rows: list[dict[str, object]]
 ) -> None:
@@ -344,19 +393,27 @@ def _year(value: object) -> str | None:
 
 def _parse_artist(data: dict[str, object]) -> ArtistHit:
     did = str(data.get("id") or "")
-    return ArtistHit(
-        provider="deezer",
-        provider_id=did,
-        deezer_id=did or None,
-        name=str(data.get("name") or ""),
-        artwork_url=str(
+    art = (
+        str(
             data.get("picture_big")
             or data.get("picture_xl")
             or data.get("picture_medium")
             or data.get("picture")
             or ""
         )
-        or None,
+        or None
+    )
+    if art and _DEEZER_PLACEHOLDER_IMAGE_HASH in art:
+        art = None
+    return ArtistHit(
+        provider="deezer",
+        provider_id=did,
+        deezer_id=did or None,
+        name=str(data.get("name") or ""),
+        artwork_url=art,
+        external_url=str(data.get("link") or "") or None,
+        album_count=_to_int(data.get("nb_album")),
+        fan_count=_to_int(data.get("nb_fan")),
     )
 
 
