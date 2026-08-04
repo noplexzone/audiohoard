@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.17.3] - 2026-08-04
+
+### Changed
+
+- Import-review Match details now show the acquisition source and original pre-staging filename, including exact persisted slskd remote filenames.
+
 ## [0.17.2] - 2026-08-04
 
 ### Fixed
