@@ -92,7 +92,8 @@ async def test_downloads_hides_stale_review_release_without_actionable_items(
     assert response.status_code == 200
     assert "Fighting Demons (Digital Deluxe)" not in response.text
     assert "2 downloaded track(s) still require review" not in response.text
-    assert "Nothing waiting on you" in response.text
+    assert "tracks awaiting review" not in response.text
+    assert 'class="review-queue-link"' not in response.text
 
 
 async def test_download_job_controls_redirect_with_feedback(
@@ -486,16 +487,15 @@ async def test_downloads_group_album_jobs_and_target_active_attempt(client: Asyn
     assert f'action="/downloads/{independent_id}/retry"' not in running.text
 
 
-def test_downloads_mobile_layout_stacks_import_review_and_queue() -> None:
+def test_downloads_is_single_column_and_review_deck_stacks_on_mobile() -> None:
     css = Path("app/static/css/pages.css").read_text()
-    mobile = css.split("@media (max-width: 760px)", 1)[1]
+    mobile = css.rsplit("@media (max-width: 760px)", 1)[1]
 
-    assert ".downloads-layout" in mobile
+    assert ".downloads-layout" in css
+    assert "grid-template-columns: minmax(0, 1fr);" in css
+    assert ".review-audio-comparison" in mobile
+    assert ".review-deck-actions" in mobile
     assert "grid-template-columns: 1fr;" in mobile
-    assert ".review-rail" in mobile and "width: 100%;" in mobile
-    assert ".review-actions" in mobile and "grid-template-columns: 1fr;" in mobile
-    assert ".review-actions form," in mobile and ".review-actions .btn" in mobile
-    assert ".review-details-grid" in mobile and "grid-template-columns: 1fr;" in mobile
 
 
 async def test_downloads_tabs_group_status_source_and_row_details(client: AsyncClient) -> None:

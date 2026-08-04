@@ -109,6 +109,16 @@ class ITunesClient:
         self._cache.set(cache_key, detail, 24 * 60 * 60)
         return detail
 
+    async def search_track(self, title: str, artist: str | None = None) -> list[AlbumTrack]:
+        term = " ".join(part for part in (artist, title) if part).strip()
+        resp = await self._get("/search", {"term": term, "entity": "song", "limit": 10})
+        resp.raise_for_status()
+        return [
+            _parse_track(item)
+            for item in resp.json().get("results", [])
+            if isinstance(item, dict) and item.get("wrapperType", "track") == "track"
+        ]
+
 
 def _year(value: object) -> str | None:
     text = str(value or "")
@@ -177,5 +187,6 @@ def _parse_track(data: dict[str, object]) -> AlbumTrack:
         title=str(data.get("trackName") or ""),
         duration_sec=duration_ms // 1000 if duration_ms else None,
         provider_track_id=str(data.get("trackId") or "") or None,
+        preview_url=str(data.get("previewUrl") or "") or None,
         content_rating=itunes_content_rating(data),
     )

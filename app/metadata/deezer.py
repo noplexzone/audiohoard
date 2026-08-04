@@ -522,5 +522,6 @@ def _parse_album_track(data: dict[str, object]) -> AlbumTrack:
         title=str(data.get("title") or data.get("title_short") or ""),
         duration_sec=_to_int(data.get("duration")),
         provider_track_id=tid,
+        preview_url=str(data.get("preview") or "") or None,
         content_rating=deezer_content_rating(data),
     )

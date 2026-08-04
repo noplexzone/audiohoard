@@ -13,7 +13,7 @@ from typing import Annotated
 from uuid import uuid4
 from weakref import WeakValueDictionary
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -253,6 +253,11 @@ async def serve_staged_audio(
         return StreamingResponse(iterfile(), status_code=200, headers=headers, media_type=mime)
 
 
+def _review_result_location(return_to: str | None, notice: str) -> str:
+    base = "/review" if return_to == "/review" else "/downloads"
+    return f"{base}?notice={notice}"
+
+
 @router.post("/review/{item_id}/approve", include_in_schema=False)
 async def approve_review_item(
     item_id: int,
@@ -260,13 +265,16 @@ async def approve_review_item(
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     _user: Annotated[object, Depends(require_mutation)],
+    return_to: Annotated[str | None, Form()] = None,
 ) -> RedirectResponse:
     """Approve a staged track for import despite a verification flag."""
     item = await db.get(StagingReviewItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Review item not found")
     if item.review_state != ReviewDecision.pending:
-        return RedirectResponse("/downloads?notice=already_reviewed", status_code=303)
+        return RedirectResponse(
+            _review_result_location(return_to, "already_reviewed"), status_code=303
+        )
 
     item.review_state = ReviewDecision.approved
     item.reviewed_at = datetime.now(UTC)
@@ -288,7 +296,7 @@ async def approve_review_item(
         )
 
     await db.commit()
-    return RedirectResponse("/downloads?notice=approved", status_code=303)
+    return RedirectResponse(_review_result_location(return_to, "approved"), status_code=303)
 
 
 async def _block_denied_slskd_candidate(db: AsyncSession, track: Track) -> None:
@@ -330,13 +338,16 @@ async def deny_review_item(
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     _user: Annotated[object, Depends(require_mutation)],
+    return_to: Annotated[str | None, Form()] = None,
 ) -> RedirectResponse:
     """Deny and remove a staged track, then schedule bounded reacquisition."""
     item = await db.get(StagingReviewItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Review item not found")
     if item.review_state != ReviewDecision.pending:
-        return RedirectResponse("/downloads?notice=already_reviewed", status_code=303)
+        return RedirectResponse(
+            _review_result_location(return_to, "already_reviewed"), status_code=303
+        )
 
     track = await db.get(Track, item.track_id)
     continuation_id: int | None = None
@@ -460,7 +471,7 @@ async def deny_review_item(
     delete_quarantine()  # noqa: ASYNC240
     if continuation_id is not None:
         await job_dispatcher.dispatch(continuation_id)
-    return RedirectResponse("/downloads?notice=denied", status_code=303)
+    return RedirectResponse(_review_result_location(return_to, "denied"), status_code=303)
 
 
 @router.post("/release/{release_id}/dismiss", include_in_schema=False)

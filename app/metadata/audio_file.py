@@ -16,6 +16,7 @@ class AudioFileMetadata:
     album_artist: str | None
     album: str | None
     year: str | None
+    genre: str | None
     disc: int | None
     disc_total: int | None
     track: int | None
@@ -63,6 +64,7 @@ def read_audio_file_metadata(path: Path, *, suffix_hint: str | None = None) -> A
         album_artist=tags.get("album_artist"),
         album=tags.get("album"),
         year=date[:4] if date and len(date) >= 4 else None,
+        genre=tags.get("genre"),
         disc=_number(tags.get("discnumber")),
         disc_total=_total(tags.get("discnumber"), tags.get("disctotal") or tags.get("totaldiscs")),
         track=_number(tags.get("tracknumber")),

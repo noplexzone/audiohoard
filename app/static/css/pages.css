@@ -2232,3 +2232,196 @@ a.metric-card:hover {
     padding-left: 0;
   }
 }
+
+.downloads-layout {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.review-queue-link {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.review-queue-link:hover {
+  border-color: var(--accent);
+}
+
+.review-deck-card {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.review-deck-heading {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+.review-deck-heading h2,
+.review-deck-heading p {
+  margin-bottom: var(--space-2);
+}
+
+.review-deck-art {
+  flex: 0 0 112px;
+  width: 112px;
+  height: 112px;
+  border-radius: var(--radius-sm);
+  object-fit: cover;
+}
+
+.review-audio-comparison {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+.review-audio-panel,
+.review-tag-diff,
+.review-verification-strip {
+  min-width: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.review-audio-panel.unavailable {
+  color: var(--muted);
+}
+
+.review-player-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.review-player-heading h3 {
+  margin: 0;
+}
+
+.review-source-badge {
+  display: inline-flex;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-size: .78rem;
+  font-weight: 700;
+}
+
+.review-source-badge.reference {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.review-source-badge.fallback {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.review-source-badge.unavailable {
+  color: var(--faint);
+}
+
+.review-deck-audio {
+  width: 100%;
+  margin-bottom: var(--space-3);
+}
+
+.review-tag-diff {
+  margin-bottom: var(--space-4);
+}
+
+.tag-diff-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.tag-diff-table th,
+.tag-diff-table td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.tag-diff-table tbody th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.tag-diff-table tr.tag-mismatch {
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
+
+.tag-diff-table tr.tag-mismatch th {
+  color: var(--warn);
+}
+
+.review-verification-strip {
+  margin-bottom: var(--space-4);
+}
+
+.review-deck-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.review-deck-actions form,
+.review-deck-actions .btn {
+  width: 100%;
+}
+
+.review-shortcuts {
+  margin: var(--space-3) 0 0;
+  text-align: center;
+}
+
+.review-empty-state {
+  max-width: 760px;
+  margin: var(--space-6) auto;
+}
+
+@media (max-width: 760px) {
+  .review-deck-card {
+    padding: var(--space-4);
+  }
+
+  .review-deck-heading {
+    align-items: flex-start;
+  }
+
+  .review-deck-art {
+    flex-basis: 80px;
+    width: 80px;
+    height: 80px;
+  }
+
+  .review-audio-comparison,
+  .review-deck-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .review-shortcuts {
+    display: none;
+  }
+}

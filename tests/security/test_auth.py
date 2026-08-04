@@ -215,7 +215,7 @@ async def test_html_security_headers_and_docs_csp_exemption(client: AsyncClient)
     assert login.headers["X-Content-Type-Options"] == "nosniff"
     assert login.headers["Referrer-Policy"] == "no-referrer"
     assert login.headers["Content-Security-Policy"] == (
-        "default-src 'self'; img-src 'self' data:; media-src 'self'; "
+        "default-src 'self'; img-src 'self' data:; media-src 'self' https:; "
         "script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'self'"
     )
 
