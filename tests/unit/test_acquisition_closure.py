@@ -1053,3 +1053,37 @@ async def test_cleanup_marker_retry_refetches_and_clears_current_obligation(
         assert current is not None
         assert current.staging_path is None
         assert current.cleanup_attempted_at is not None
+
+
+async def test_quarantine_cleanup_preserves_replacement_at_original_path(
+    db_session: AsyncSession, monkeypatch, tmp_path
+) -> None:
+    item, plan, track = await _pending_cleanup_fixture(db_session, tmp_path)
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+
+    class ReplacingAdapter:
+        def __init__(self, url: str, api_key: str) -> None:
+            pass
+
+        async def cancel(
+            self, username: str, filename: str, transfer_id: str | None = None
+        ) -> bool:
+            item.staged_path.write_bytes(b"replacement")
+            return True
+
+    async def fake_effective_settings(db, settings):  # noqa: ANN001
+        return SimpleNamespace(slskd_url="", slskd_api_key="")
+
+    monkeypatch.setattr(acquisition_cleanup, "SlskdAdapter", ReplacingAdapter)
+    monkeypatch.setattr(acquisition_cleanup, "build_effective_settings", fake_effective_settings)
+
+    await cleanup_imported_sources((item,))
+
+    assert item.staged_path.read_bytes() == b"replacement"
+    assert list(tmp_path.glob(".*.audiohoard-cleanup-*")) == []
+    async with factory() as verify:
+        persisted_plan = await verify.get(ImportPlan, plan.id)
+        persisted_track = await verify.get(Track, track.id)
+        assert persisted_plan is not None and persisted_plan.staging_path is None
+        assert persisted_track is not None and persisted_track.staging_path is None

@@ -4,12 +4,14 @@ import asyncio
 import contextlib
 import json
 import logging
-from dataclasses import dataclass, field
+import os
+import uuid
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from sqlalchemy import and_, case, or_, select
+from sqlalchemy import and_, case, or_, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -558,6 +560,60 @@ async def _revalidate_cleanup_obligation(
         )
 
 
+async def _claim_cleanup_quarantine(item: ImportedSourceCleanup) -> ImportedSourceCleanup | None:
+    """Move the exact owned inode to a durable unique path under a SQLite writer claim."""
+    if item.plan_id is None or item.track_id is None:
+        return None
+    factory = item.session_factory or get_session_factory()
+    for attempt in range(1, 4):
+        quarantine: Path | None = None
+        moved = False
+        async with factory() as db:
+            try:
+                await db.execute(text("BEGIN IMMEDIATE"))
+                if not await _cleanup_obligation_is_current(db, item, protect_destination=True):
+                    await db.rollback()
+                    return None
+                quarantine = item.staged_path.with_name(
+                    f".{item.staged_path.name}.audiohoard-cleanup-{uuid.uuid4().hex}"
+                )
+                await asyncio.to_thread(os.replace, item.staged_path, quarantine)
+                moved = True
+                current = await asyncio.to_thread(quarantine.stat, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (
+                    item.expected_device,
+                    item.expected_inode,
+                ):
+                    if not item.staged_path.exists():
+                        await asyncio.to_thread(os.replace, quarantine, item.staged_path)
+                    await db.rollback()
+                    return None
+                plan = await db.get(ImportPlan, item.plan_id)
+                track = await db.get(Track, item.track_id)
+                if plan is None or track is None:
+                    await asyncio.to_thread(os.replace, quarantine, item.staged_path)
+                    await db.rollback()
+                    return None
+                plan.staging_path = str(quarantine)
+                track.staging_path = str(quarantine)
+                await db.commit()
+                return replace(item, staged_path=quarantine)
+            except Exception as exc:
+                await db.rollback()
+                if (
+                    moved
+                    and quarantine is not None
+                    and quarantine.exists()
+                    and not item.staged_path.exists()
+                ):
+                    with contextlib.suppress(OSError):
+                        await asyncio.to_thread(os.replace, quarantine, item.staged_path)
+                if attempt == 3 or not _transient_cleanup_error(exc):
+                    raise
+        await _cleanup_retry_delay(attempt)
+    return None
+
+
 def _unlink_if_identity_matches(item: ImportedSourceCleanup) -> bool:
     if item.expected_device is None or item.expected_inode is None:
         return False
@@ -591,6 +647,10 @@ async def _mark_cleanup_attempted(
                 plan.cleanup_attempted_at = datetime.now(UTC)
                 if completed:
                     plan.staging_path = None
+                    if item.track_id is not None:
+                        track = await db.get(Track, item.track_id)
+                        if track is not None and track.staging_path == str(item.staged_path):
+                            track.staging_path = None
                 await db.commit()
                 return
             except Exception as exc:
@@ -612,12 +672,17 @@ async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> 
         except Exception:
             logger.exception("post-import slskd cleanup setup failed")
 
-    for item in items:
-        if not await _revalidate_cleanup_obligation(item):
+    for original_item in items:
+        item = (
+            await _claim_cleanup_quarantine(original_item)
+            if original_item.plan_id is not None
+            else original_item
+        )
+        if item is None:
             continue
         failed = False
         identity = _slskd_identity(item.provenance_json)
-        if identity is not None:
+        if identity is not None and not _source_cleanup_completed(item.provenance_json):
             if adapter is None:
                 failed = True
             else:
@@ -627,6 +692,13 @@ async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> 
                     cleanup_result = await adapter.cancel(*identity, item.source_job_id)
                     if cleanup_result is False:
                         failed = True
+                    elif item.track_id is not None:
+                        factory = item.session_factory or get_session_factory()
+                        await _mark_durable_source_cleanups(
+                            factory,
+                            {item.track_id: (identity, item.source_job_id)},
+                            max_attempts=3,
+                        )
                 except Exception:
                     failed = True
                     logger.exception("post-import slskd transfer cleanup failed")

@@ -13,10 +13,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Keep each configured acquisition permit for the complete provider queue and polling lifecycle, preserving truthful runtime increase and decrease bounds.
 - Coalesce concurrent slskd download polling into short-lived endpoint- and credential-isolated snapshots, with bounded jittered backoff, sanitized retryable HTTP 429 failures, and fresh exact-transfer reads before destructive cleanup.
 - Retry startup and watchdog job recovery as complete rollback-safe SQLite transactions, using conditional stale-state claims so concurrent heartbeats or terminal updates cannot be overwritten or dispatched twice.
-- Persist runner job-envelope transitions through rollback-safe re-fetch retries so transient SQLite locks cannot strand jobs or repeat provider work, while concurrent terminal advances remain authoritative.
+- Persist runner job-envelope transitions through atomic conditional claims and rollback-safe retries so concurrent workers cannot execute the same provider job, queued cancellation remains durable, and concurrent terminal advances remain authoritative.
 - Serialize idempotent continuation creation before duplicate checks and dispatch only newly committed child jobs, preventing lock retries or concurrent callers from creating or launching duplicates.
-- Fence provider and staged-artifact cleanup against reassigned transfers, paths, active destination owners, and replaced filesystem inodes while retrying only short database markers after external work succeeds.
-- Add a dry-run-first backlog reconciliation command that strictly rechecks historical fingerprint evidence, closes only same-catalog destination projections, dismisses fully resolved rollbacks, reports unresolved precedence buckets, and retries complete apply transactions under SQLite contention.
+- Fence provider and staged-artifact cleanup against reassigned transfers, paths, active destination owners, and replaced filesystem inodes by durably quarantining the owned inode before unlink and checkpointing exact provider cleanup.
+- Add a dry-run-first backlog reconciliation command that strictly rechecks historical fingerprint evidence, closes only byte-identical same-catalog destination projections, dismisses only explicit duplicate rollbacks with no surviving source, reports unresolved precedence buckets, and retries complete apply transactions under SQLite contention.
 
 ## [0.17.0] - 2026-08-03
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -102,7 +103,7 @@ async def _fixture(db: AsyncSession, tmp_path: Path) -> dict[str, object]:
         import_state=ImportWorkflowState.imported,
     )
     candidate_source = tmp_path / "projection.flac"
-    candidate_source.write_bytes(b"projection")
+    candidate_source.write_bytes(b"owned")
     projection_track = Track(
         job=job,
         release=release,
@@ -171,6 +172,7 @@ async def _fixture(db: AsyncSession, tmp_path: Path) -> dict[str, object]:
         destination_path=str(tmp_path / "old.flac"),
         status=ImportWorkflowState.rolled_back,
         collision_state=CollisionState.duplicate,
+        rollback_detail="duplicate destination already imported",
     )
     no_plan_track = Track(
         job=job,
@@ -296,3 +298,19 @@ async def test_reconciliation_apply_is_idempotent_and_leaves_ambiguous_rows(
     assert second.stale_projections_normalized == 0
     remaining = list((await db_session.scalars(select(StagingReviewItem))).all())
     assert remaining == [rows["ambiguous_review"]]
+
+
+async def test_destination_identity_without_byte_equality_remains_for_review(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    rows = await _fixture(db_session, tmp_path)
+    plan = rows["projection_plan"]
+    assert isinstance(plan, ImportPlan)
+    assert plan.staging_path is not None
+    await asyncio.to_thread(Path(plan.staging_path).write_bytes, b"different bytes")
+
+    report = await reconcile_import_backlog(db_session, acceptance_threshold=0.90, apply=True)
+
+    assert report.destination_candidates == ()
+    assert report.destinations_closed == 0
+    assert plan.status == ImportWorkflowState.needs_review

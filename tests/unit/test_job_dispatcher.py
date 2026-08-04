@@ -1227,3 +1227,39 @@ async def test_startup_pending_recovery_does_not_dispatch_concurrent_terminal_jo
             assert current.status == JobStatus.done
     finally:
         await engine.dispose()
+
+
+async def test_cancel_waiting_job_persists_cancelled_before_task_exit(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    first = await _make_job(session_factory, status=JobStatus.pending)
+    second = await _make_job(session_factory, status=JobStatus.pending)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def runner(job_id: int) -> None:
+        if job_id == first.id:
+            first_started.set()
+            await release_first.wait()
+
+    dispatcher = JobDispatcher(
+        runner=runner,
+        session_factory=session_factory,
+        max_concurrent_jobs=1,
+    )
+    first_task = await dispatcher.dispatch(first.id)
+    second_task = await dispatcher.dispatch(second.id)
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    await dispatcher.cancel_job(second.id)
+    with pytest.raises(asyncio.CancelledError):
+        await second_task
+
+    async with session_factory() as db:
+        persisted = await db.get(Job, second.id)
+        assert persisted is not None
+        assert persisted.status == JobStatus.cancelled
+
+    release_first.set()
+    await first_task
+    await dispatcher.shutdown()

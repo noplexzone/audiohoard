@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 
 from sqlalchemy import select
@@ -61,6 +62,32 @@ def _path_is_file(raw: str) -> bool:
 def _source_exists(track: Track) -> bool:
     raw = track.staging_path or track.source_path
     return bool(raw and _path_is_file(raw))
+
+
+def _file_sha256(raw: str) -> str | None:
+    try:
+        digest = sha256()
+        with Path(raw).open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _destination_payload_matches(
+    plan: ImportPlan, owner: ImportPlan, *, require_existing_files: bool
+) -> bool:
+    source_path = plan.staging_path or plan.source_path
+    if require_existing_files:
+        if not source_path:
+            return False
+        source_hash = _file_sha256(source_path)
+        destination_hash = _file_sha256(owner.destination_path)
+        return source_hash is not None and source_hash == destination_hash
+    candidate_hash = plan.track.content_sha256 if plan.track is not None else None
+    owner_hash = owner.track.content_sha256 if owner.track is not None else None
+    return bool(candidate_hash and candidate_hash == owner_hash)
 
 
 async def reconcile_import_backlog(
@@ -162,7 +189,9 @@ async def reconcile_import_backlog(
         ]
         if len(matching_owners) != 1:
             continue
-        if require_existing_files and not _path_is_file(plan.destination_path):
+        if not _destination_payload_matches(
+            plan, matching_owners[0], require_existing_files=require_existing_files
+        ):
             continue
         destination_candidates.append(plan)
 
@@ -204,6 +233,9 @@ async def reconcile_import_backlog(
             continue
         if (
             latest.status == ImportWorkflowState.rolled_back
+            and latest.collision_state == CollisionState.duplicate
+            and "duplicate" in (latest.rollback_detail or "").casefold()
+            and not _source_exists(track)
             and latest.release.review_dismissed_at is None
             and latest.release_id not in pending_review_release_ids
             and all(

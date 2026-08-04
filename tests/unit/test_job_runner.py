@@ -2466,3 +2466,29 @@ async def test_first_complete_album_run_is_done_not_partial(
         (await db_session.scalars(select(Job).where(Job.parent_job_id == job.id))).all()
     )
     assert len(continuation_jobs) == 0, "complete first run must not spawn continuation jobs"
+
+
+async def test_pending_job_claim_is_atomic_across_sessions(
+    db_session: AsyncSession,
+) -> None:
+    job = await _create_job(db_session)
+    await db_session.commit()
+    job_id = job.id
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+
+    async def claim() -> bool:
+        async with factory() as session:
+            return await runner._persist_job_envelope(
+                session,
+                job_id,
+                expected_statuses={JobStatus.pending},
+                status=JobStatus.running,
+            )
+
+    results = await asyncio.gather(claim(), claim())
+
+    assert sorted(results) == [False, True]
+    db_session.expire_all()
+    persisted = await db_session.get(Job, job_id)
+    assert persisted is not None
+    assert persisted.status == JobStatus.running

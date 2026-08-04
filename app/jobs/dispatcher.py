@@ -132,13 +132,20 @@ class JobDispatcher:
                 raise JobNotFoundError(job_id)
             if job.status not in {JobStatus.pending, JobStatus.running}:
                 raise JobStateError(job_id, job.status)
-            if not self.cancel(job_id):
-                job.status = JobStatus.cancelled
-                job.result_json = json.dumps(
-                    {"error": {"code": "cancelled", "operation": "job", "retryable": True}}
-                )
-                job.updated_at = datetime.now(UTC)
-                await db.commit()
+            from app.jobs.runner import _job_error_result, _persist_job_envelope
+
+            transitioned = await _persist_job_envelope(
+                db,
+                job_id,
+                expected_statuses={JobStatus.pending, JobStatus.running},
+                status=JobStatus.cancelled,
+                result_json=_job_error_result("cancelled", "job", retryable=True),
+                cancel_active_tracks=True,
+            )
+            if not transitioned:
+                await db.refresh(job)
+                raise JobStateError(job_id, job.status)
+        self.cancel(job_id)
 
     async def retry(
         self,

@@ -174,8 +174,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await quality_upgrade_scheduler.stop()
         await maintenance_scheduler.stop()
         await scheduler.stop()
-        await wait_for_imported_source_cleanups(raise_errors=False)
         await job_dispatcher.shutdown()
+        await wait_for_imported_source_cleanups(raise_errors=False)
 
 
 def create_app() -> FastAPI:

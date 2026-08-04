@@ -12,12 +12,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import ParseResult, urlparse
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings, get_settings
-from app.database import get_session_factory, run_with_sqlite_lock_retry
+from app.database import (
+    get_session_factory,
+    is_sqlite_database_locked,
+    run_with_sqlite_lock_retry,
+)
 from app.fingerprint.acoustid import fingerprint_file
 from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS, is_importable_audio
 from app.metadata.deezer import DeezerClient
@@ -312,32 +317,40 @@ async def _persist_job_envelope(
     async def operation() -> None:
         nonlocal transitioned
         transitioned = False
-        job = await db.get(Job, job_id, populate_existing=True)
-        if job is None or job.status not in expected_statuses:
-            return
-        job.status = status
+        values: dict[str, object] = {"status": status, "updated_at": _now()}
         if result_json is not None:
-            job.result_json = result_json
-        job.updated_at = _now()
-        if cancel_active_tracks:
-            tracks = (
-                await db.scalars(
-                    select(Track).where(
-                        Track.job_id == job_id,
-                        Track.acquisition_state.in_(
-                            {
-                                AcquisitionState.queued,
-                                AcquisitionState.searching,
-                                AcquisitionState.acquiring,
-                            }
-                        ),
-                    )
+            values["result_json"] = result_json
+        result = await db.execute(
+            update(Job)
+            .where(Job.id == job_id, Job.status.in_(expected_statuses))
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        transitioned = isinstance(result, CursorResult) and result.rowcount == 1
+        if transitioned:
+            # Refresh only after the SQL CAS succeeds. This never participates in
+            # the claim decision, but keeps retry instrumentation/session observers
+            # aligned with the committed transition.
+            claimed_job = await db.get(Job, job_id, populate_existing=True)
+            if claimed_job is None:
+                transitioned = False
+        if transitioned and cancel_active_tracks:
+            await db.execute(
+                update(Track)
+                .where(
+                    Track.job_id == job_id,
+                    Track.acquisition_state.in_(
+                        {
+                            AcquisitionState.queued,
+                            AcquisitionState.searching,
+                            AcquisitionState.acquiring,
+                        }
+                    ),
                 )
-            ).all()
-            for track in tracks:
-                track.acquisition_state = AcquisitionState.cancelled
+                .values(acquisition_state=AcquisitionState.cancelled)
+                .execution_options(synchronize_session=False)
+            )
         await db.commit()
-        transitioned = True
 
     await run_with_sqlite_lock_retry(db, operation)
     return transitioned
@@ -448,15 +461,25 @@ async def run_job(
                 JobStatus.failed,
             }:
                 raise RuntimeError(f"job {job_id} execution did not reach a terminal status")
-            await session.rollback()
-            terminal_committed = await _persist_job_envelope(
-                session,
-                job_id,
-                expected_statuses={JobStatus.running},
-                status=terminal_status,
-                result_json=terminal_result,
-            )
-            if terminal_committed and continuation is not None:
+            # Real execution has already committed the complete terminal unit. This
+            # extra commit supports caller/test implementations; if it alone locks,
+            # reconstruct only their terminal envelope without replaying execution.
+            try:
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()
+                if not is_sqlite_database_locked(exc):
+                    raise
+                committed = await _persist_job_envelope(
+                    session,
+                    job_id,
+                    expected_statuses={JobStatus.running},
+                    status=terminal_status,
+                    result_json=terminal_result,
+                )
+                if not committed:
+                    return
+            if continuation is not None:
                 continuation_ids = await _spawn_continuation_jobs(
                     continuation.parent_job_id,
                     list(continuation.missing_catalog_track_ids),
@@ -936,6 +959,8 @@ async def _run_job_in_session(
         job.updated_at = _now()
 
     await db.flush()
+    if commit_progress:
+        await db.commit()
     return continuation_request
 
 
