@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import random
+import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
@@ -28,10 +32,28 @@ _SEARCH_POLL_INTERVAL = 1.5
 _SEARCH_POLL_INTERVAL_MAX = 10.0
 _SEARCH_TIMEOUT_SEC = 300
 _HTTP_TIMEOUT = httpx.Timeout(10.0)
+_DOWNLOAD_SNAPSHOT_TTL_SEC = 1.0
+_TRANSFER_429_MAX_ATTEMPTS = 4
+_TRANSFER_429_BACKOFF_INITIAL_SEC = 0.25
+_TRANSFER_429_BACKOFF_MAX_SEC = 2.0
+_TRANSFER_429_JITTER_MAX_SEC = 0.1
+_monotonic = time.monotonic
+_transfer_sleep = asyncio.sleep
+_transfer_jitter = random.uniform
 _TERMINAL_SEARCH_STATE_TOKENS = frozenset(
     {"completed", "stopped", "timedout", "filelimitreached", "responselimitreached"}
 )
 _FAILED_SEARCH_STATE_TOKENS = frozenset({"errored", "cancelled", "canceled"})
+
+
+@dataclass
+class _DownloadSnapshot:
+    downloads: list[dict[str, object]] | None = None
+    expires_at: float = 0.0
+    in_flight: asyncio.Task[list[dict[str, object]]] | None = None
+
+
+_download_snapshots: dict[tuple[str, bytes], _DownloadSnapshot] = {}
 
 
 def _search_state_tokens(value: object) -> set[str]:
@@ -298,11 +320,59 @@ class SlskdAdapter:
         transfer_id = str(response_id or f"{username}:{filename}")
         return transfer_id
 
-    async def downloads(self) -> list[dict[str, object]]:
+    async def _fetch_downloads(self) -> list[dict[str, object]]:
         async with self._client() as client:
-            resp = await request_with_retry(client, "GET", "/api/v0/transfers/downloads")
-            resp.raise_for_status()
-        return _flatten_downloads(resp.json())
+            for attempt in range(_TRANSFER_429_MAX_ATTEMPTS):
+                resp = await request_with_retry(
+                    client,
+                    "GET",
+                    "/api/v0/transfers/downloads",
+                    retry_status_codes=frozenset({500, 502, 503, 504}),
+                )
+                if resp.status_code != 429:
+                    resp.raise_for_status()
+                    return _flatten_downloads(resp.json())
+                if attempt == _TRANSFER_429_MAX_ATTEMPTS - 1:
+                    raise ProviderError(
+                        "slskd_http_429",
+                        "slskd download status polling was rate limited",
+                        "acquire",
+                        True,
+                    )
+                exponential_delay = min(
+                    _TRANSFER_429_BACKOFF_INITIAL_SEC * (2.0**attempt),
+                    _TRANSFER_429_BACKOFF_MAX_SEC,
+                )
+                jitter = max(0.0, _transfer_jitter(0.0, _TRANSFER_429_JITTER_MAX_SEC))
+                await _transfer_sleep(
+                    min(exponential_delay + jitter, _TRANSFER_429_BACKOFF_MAX_SEC)
+                )
+        raise RuntimeError("slskd download polling exhausted without a response")
+
+    async def downloads(self) -> list[dict[str, object]]:
+        """Return a short-lived, configuration-isolated downloads snapshot."""
+        credential_key = hashlib.sha256(self._api_key.encode()).digest()
+        key = (self._base_url, credential_key)
+        snapshot = _download_snapshots.setdefault(key, _DownloadSnapshot())
+        if snapshot.downloads is not None and _monotonic() < snapshot.expires_at:
+            return snapshot.downloads
+
+        task = snapshot.in_flight
+        if task is None:
+            task = asyncio.create_task(self._fetch_downloads())
+            snapshot.in_flight = task
+        try:
+            downloads = await asyncio.shield(task)
+        except BaseException:
+            if task.done() and _download_snapshots.get(key) is snapshot:
+                _download_snapshots.pop(key)
+            raise
+
+        if _download_snapshots.get(key) is snapshot:
+            snapshot.downloads = downloads
+            snapshot.expires_at = _monotonic() + _DOWNLOAD_SNAPSHOT_TTL_SEC
+            snapshot.in_flight = None
+        return downloads
 
     async def status(self, transfer_id: str) -> CapabilityState:
         for item in await self.downloads():
