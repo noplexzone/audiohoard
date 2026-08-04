@@ -18,10 +18,6 @@ from sqlalchemy.orm import selectinload
 from app.config import Settings, get_settings
 from app.database import get_session_factory
 from app.fingerprint.acoustid import fingerprint_file
-from app.jobs.dispatcher import (
-    reacquire_current_acquisition_slot,
-    release_current_acquisition_slot,
-)
 from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS, is_importable_audio
 from app.metadata.deezer import DeezerClient
 from app.metadata.filename_parse import (
@@ -189,7 +185,6 @@ async def _poll_slskd_transfer(
     import time as _time
 
     deadline = _time.monotonic() + poll_timeout
-    slot_released = False
     try:
         while True:
             remaining = deadline - _time.monotonic()
@@ -206,11 +201,6 @@ async def _poll_slskd_transfer(
                     await on_provider_id(transfer_id)
 
             acq_state = map_slskd_transfer_state(state)
-            if acq_state == AcquisitionState.queued and not slot_released:
-                slot_released = await release_current_acquisition_slot()
-            elif acq_state != AcquisitionState.queued and slot_released:
-                await reacquire_current_acquisition_slot()
-                slot_released = False
 
             if acq_state == AcquisitionState.downloaded:
                 staged = await _locate_slskd_artifact(filename, state.extra, staging_root)
@@ -234,10 +224,6 @@ async def _poll_slskd_transfer(
     except asyncio.CancelledError:
         with contextlib.suppress(Exception):
             await adapter.cancel(username, filename, transfer_id)
-        raise
-    except Exception:
-        if slot_released:
-            await reacquire_current_acquisition_slot()
         raise
 
 

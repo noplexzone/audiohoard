@@ -17,13 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 os.environ.setdefault("SECRET_KEY", "test-secret")
 
 from app.database import Base
-from app.jobs.dispatcher import (
-    JobDispatcher,
-    JobNotFoundError,
-    JobNotRetryableError,
-    reacquire_current_acquisition_slot,
-    release_current_acquisition_slot,
-)
+from app.jobs import runner as job_runner
+from app.jobs.dispatcher import JobDispatcher, JobNotFoundError, JobNotRetryableError
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.track import Track
@@ -33,6 +28,7 @@ from app.services.acquisition_cleanup import (
     cleanup_terminal_acquisitions,
     hide_completed_and_timed_out_jobs,
 )
+from app.sources.base import CapabilityState
 
 _TEST_DB = "sqlite+aiosqlite:///:memory:"
 
@@ -781,17 +777,37 @@ async def test_increasing_parallel_limit_starts_waiting_jobs() -> None:
     await dispatcher.shutdown()
 
 
-async def test_external_queue_wait_releases_slot_for_later_job() -> None:
+async def test_queued_transfer_keeps_slot_until_terminal_completion(tmp_path: Path) -> None:
     first_queued = asyncio.Event()
     allow_first_to_finish = asyncio.Event()
     second_started = asyncio.Event()
+    staged = tmp_path / "song.flac"
+    staged.write_bytes(b"audio")
+
+    class QueuedAdapter:
+        async def status(self, transfer_id: str) -> CapabilityState:
+            assert transfer_id == "transfer-1"
+            if not allow_first_to_finish.is_set():
+                first_queued.set()
+                return CapabilityState(True, "Queued")
+            return CapabilityState(True, "Completed")
+
+        async def cancel(
+            self, username: str, filename: str, transfer_id: str | None = None
+        ) -> bool:
+            return True
 
     async def runner(job_id: int) -> None:
         if job_id == 1:
-            assert await release_current_acquisition_slot() is True
-            first_queued.set()
-            await allow_first_to_finish.wait()
-            assert await reacquire_current_acquisition_slot() is True
+            await job_runner._poll_slskd_transfer(
+                transfer_id="transfer-1",
+                username="peer",
+                filename=staged.name,
+                adapter=QueuedAdapter(),  # type: ignore[arg-type]
+                staging_root=tmp_path,
+                poll_interval=0.001,
+                poll_timeout=1,
+            )
         else:
             second_started.set()
 
@@ -800,10 +816,12 @@ async def test_external_queue_wait_releases_slot_for_later_job() -> None:
     second = await dispatcher.dispatch(2)
 
     await asyncio.wait_for(first_queued.wait(), timeout=1)
-    await asyncio.wait_for(second_started.wait(), timeout=1)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(second_started.wait(), timeout=0.05)
     assert not first.done()
 
     allow_first_to_finish.set()
+    await asyncio.wait_for(second_started.wait(), timeout=1)
     await asyncio.gather(first, second)
     await dispatcher.shutdown()
 

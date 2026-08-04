@@ -5,7 +5,6 @@ import contextlib
 import json
 import logging
 from collections.abc import Callable, Coroutine
-from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -33,41 +32,6 @@ class JobStateError(ValueError):
 
 class JobNotRetryableError(JobStateError):
     pass
-
-
-class _AcquisitionSlotLease:
-    def __init__(self, dispatcher: JobDispatcher) -> None:
-        self._dispatcher = dispatcher
-        self.held = False
-
-    async def acquire(self) -> bool:
-        if self.held:
-            return False
-        await self._dispatcher._acquire_slot()
-        self.held = True
-        return True
-
-    async def release(self) -> bool:
-        if not self.held:
-            return False
-        await self._dispatcher._release_slot()
-        self.held = False
-        return True
-
-
-_current_acquisition_lease: ContextVar[_AcquisitionSlotLease | None] = ContextVar(
-    "current_acquisition_lease", default=None
-)
-
-
-async def release_current_acquisition_slot() -> bool:
-    lease = _current_acquisition_lease.get()
-    return await lease.release() if lease is not None else False
-
-
-async def reacquire_current_acquisition_slot() -> bool:
-    lease = _current_acquisition_lease.get()
-    return await lease.acquire() if lease is not None else False
 
 
 def _default_runner(job_id: int) -> Coroutine[Any, Any, None]:  # pragma: no cover
@@ -124,14 +88,11 @@ class JobDispatcher:
             self._limit_condition.notify_all()
 
     async def _run_with_limit(self, job_id: int) -> None:
-        lease = _AcquisitionSlotLease(self)
-        await lease.acquire()
-        token = _current_acquisition_lease.set(lease)
+        await self._acquire_slot()
         try:
             await self._runner(job_id)
         finally:
-            _current_acquisition_lease.reset(token)
-            await lease.release()
+            await self._release_slot()
 
     async def dispatch(self, job_id: int) -> asyncio.Task[None]:
         existing = self._tasks.get(job_id)
