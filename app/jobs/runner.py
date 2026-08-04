@@ -7,11 +7,12 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import ParseResult, urlparse
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -55,6 +56,14 @@ from app.sources.tidal import TidalAdapter
 from app.sources.youtube import ProviderError, YouTubeAdapter
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ContinuationRequest:
+    parent_job_id: int
+    catalog_album_id: int
+    missing_catalog_track_ids: tuple[int, ...]
+
 
 # Compound disc-track prefix: "2-01 - Title", "cd2-01 - Title", "2.01. Title"
 _DISC_TRACK_PREFIX_RE = re.compile(
@@ -343,7 +352,18 @@ async def run_job(
 ) -> None:
     if db is not None:
         cfg = settings or await build_effective_settings(db, get_settings())
-        await _run_job_in_session(job_id, db, cfg)
+        continuation = await _run_job_in_session(job_id, db, cfg)
+        if continuation is not None:
+            # This legacy caller-owned session path intentionally commits execution
+            # state before continuation creation starts its isolated transaction.
+            await db.commit()
+            direct_continuation_ids = await _spawn_continuation_jobs(
+                continuation.parent_job_id,
+                list(continuation.missing_catalog_track_ids),
+                continuation.catalog_album_id,
+                db,
+            )
+            await _dispatch_continuation_jobs(direct_continuation_ids or [])
         return
 
     # Background path: short independent sessions with committed checkpoints.
@@ -414,8 +434,9 @@ async def run_job(
     # Phase 3: provider/filesystem execution occurs once. Only primitive terminal
     # envelope data crosses into the rollback-safe persistence closure.
     try:
+        continuation_ids: list[int] = []
         async with factory() as session:
-            await _run_job_in_session(job_id, session, cfg, commit_progress=True)
+            continuation = await _run_job_in_session(job_id, session, cfg, commit_progress=True)
             current = await session.get(Job, job_id)
             if current is None:
                 return
@@ -428,13 +449,21 @@ async def run_job(
             }:
                 raise RuntimeError(f"job {job_id} execution did not reach a terminal status")
             await session.rollback()
-            await _persist_job_envelope(
+            terminal_committed = await _persist_job_envelope(
                 session,
                 job_id,
                 expected_statuses={JobStatus.running},
                 status=terminal_status,
                 result_json=terminal_result,
             )
+            if terminal_committed and continuation is not None:
+                continuation_ids = await _spawn_continuation_jobs(
+                    continuation.parent_job_id,
+                    list(continuation.missing_catalog_track_ids),
+                    continuation.catalog_album_id,
+                    session,
+                )
+        await _dispatch_continuation_jobs(continuation_ids)
     except asyncio.CancelledError:
         async with factory() as session:
             await _persist_job_envelope(
@@ -472,11 +501,11 @@ async def run_job(
 
 async def _run_job_in_session(
     job_id: int, db: AsyncSession, cfg: Settings, *, commit_progress: bool = False
-) -> None:
+) -> _ContinuationRequest | None:
     job = await db.get(Job, job_id)
     if job is None:
         logger.error("Job %d not found", job_id)
-        return
+        return None
 
     job.status = JobStatus.running
     job.updated_at = _now()
@@ -486,6 +515,7 @@ async def _run_job_in_session(
     if commit_progress:
         await db.commit()
 
+    continuation_request: _ContinuationRequest | None = None
     try:
         runtime_settings = await get_runtime_settings(db)
         cfg = cfg.model_copy(
@@ -556,7 +586,7 @@ async def _run_job_in_session(
                 )
                 job.updated_at = _now()
                 await db.flush()
-                return
+                return None
 
         if job.catalog_track_id is not None:
             catalog_tracks = [
@@ -581,7 +611,7 @@ async def _run_job_in_session(
             )
             job.updated_at = _now()
             await db.flush()
-            return
+            return None
 
         if (
             catalog_album is not None
@@ -837,7 +867,11 @@ async def _run_job_in_session(
             job.result_json = json.dumps(payload, sort_keys=True)
             runtime = await get_runtime_settings(db)
             if missing_catalog_ids and job.partial_attempt < runtime.max_partial_attempts:
-                await _spawn_continuation_jobs(job, missing_catalog_ids, catalog_album, db)
+                continuation_request = _ContinuationRequest(
+                    parent_job_id=job.id,
+                    catalog_album_id=catalog_album.id,
+                    missing_catalog_track_ids=tuple(missing_catalog_ids),
+                )
             elif not missing_catalog_ids:
                 await _reconcile_catalog_album_jobs(db, catalog_album.id, acquired_ids)
         elif failures and tracks_created:
@@ -902,6 +936,7 @@ async def _run_job_in_session(
         job.updated_at = _now()
 
     await db.flush()
+    return continuation_request
 
 
 async def _load_catalog_album(db: AsyncSession, album_id: int | None) -> CatalogAlbum | None:
@@ -2048,44 +2083,79 @@ async def _root_job(job: Job, db: AsyncSession) -> Job:
 
 
 async def _spawn_continuation_jobs(
-    parent_job: Job,
+    parent_job_id: int,
     missing_catalog_track_ids: list[int],
-    catalog_album: CatalogAlbum,
+    catalog_album_id: int,
     db: AsyncSession,
-) -> None:
-    """Spawn idempotent follow-up jobs, one targeted search per missing track."""
+) -> list[int]:
+    """Commit idempotent targeted continuations with rollback-safe retries."""
+    requested_track_ids = tuple(dict.fromkeys(missing_catalog_track_ids))
+    committed_ids: list[int] = []
+
+    # Never allow this helper's commit to sweep caller-owned pending mutations into
+    # the continuation transaction. Every retry below reconstructs ORM state.
+    await db.rollback()
+
+    async def operation() -> None:
+        attempt_ids: list[int] = []
+        # SQLite's deferred transactions permit two callers to observe no duplicate
+        # before either writes. Acquire the writer reservation before the duplicate
+        # query so a follower rechecks after the first commit.
+        await db.execute(text("BEGIN IMMEDIATE"))
+        parent_job = await db.get(Job, parent_job_id, populate_existing=True)
+        catalog_album = await _load_catalog_album(db, catalog_album_id)
+        if parent_job is None or catalog_album is None:
+            committed_ids.clear()
+            return
+
+        artist = catalog_album.artist.name if catalog_album.artist else ""
+        tracks_by_id = {track.id: track for track in catalog_album.tracks}
+        next_attempt = parent_job.partial_attempt + 1
+        for track_id in requested_track_ids:
+            catalog_track = tracks_by_id.get(track_id)
+            if catalog_track is None:
+                continue
+            duplicate = await db.scalar(
+                select(Job.id).where(
+                    Job.catalog_album_id == catalog_album_id,
+                    Job.catalog_track_id == track_id,
+                    (
+                        (
+                            (Job.parent_job_id == parent_job_id)
+                            & (Job.partial_attempt == next_attempt)
+                        )
+                        | Job.status.in_([JobStatus.pending, JobStatus.running])
+                    ),
+                )
+            )
+            if duplicate is not None:
+                continue
+            continuation = Job(
+                source="priority",
+                query=_targeted_query_variants(artist, catalog_album.title, catalog_track.title)[
+                    0
+                ],
+                status=JobStatus.pending,
+                catalog_album_id=catalog_album_id,
+                catalog_track_id=track_id,
+                parent_job_id=parent_job_id,
+                partial_attempt=next_attempt,
+                result_json=json.dumps({"continuation_of": parent_job_id}, sort_keys=True),
+            )
+            db.add(continuation)
+            await db.flush()
+            attempt_ids.append(continuation.id)
+        await db.commit()
+        committed_ids[:] = attempt_ids
+
+    await run_with_sqlite_lock_retry(db, operation)
+    return committed_ids
+
+
+async def _dispatch_continuation_jobs(continuation_ids: Sequence[int]) -> None:
+    """Dispatch only continuation rows returned by a successful creation commit."""
     from app.jobs.dispatcher import job_dispatcher
 
-    artist = catalog_album.artist.name if catalog_album.artist else ""
-    tracks_by_id = {track.id: track for track in catalog_album.tracks}
-    continuation_ids: list[int] = []
-    for track_id in missing_catalog_track_ids:
-        duplicate = await db.scalar(
-            select(Job.id).where(
-                Job.catalog_album_id == catalog_album.id,
-                Job.catalog_track_id == track_id,
-                Job.status.in_([JobStatus.pending, JobStatus.running]),
-            )
-        )
-        if duplicate is not None:
-            continue
-        catalog_track = tracks_by_id.get(track_id)
-        if catalog_track is None:
-            continue
-        continuation = Job(
-            source="priority",
-            query=_targeted_query_variants(artist, catalog_album.title, catalog_track.title)[0],
-            status=JobStatus.pending,
-            catalog_album_id=catalog_album.id,
-            catalog_track_id=track_id,
-            parent_job_id=parent_job.id,
-            partial_attempt=parent_job.partial_attempt + 1,
-            result_json=json.dumps({"continuation_of": parent_job.id}, sort_keys=True),
-        )
-        db.add(continuation)
-        await db.flush()
-        continuation_ids.append(continuation.id)
-    await db.commit()
     for continuation_id in continuation_ids:
         await job_dispatcher.dispatch(continuation_id)
 

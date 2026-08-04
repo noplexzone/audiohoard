@@ -12,6 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Coalesce concurrent slskd download polling into short-lived endpoint- and credential-isolated snapshots, with bounded jittered backoff and sanitized retryable failures for HTTP 429 responses.
 - Retry startup and watchdog job recovery as complete rollback-safe SQLite transactions, using conditional stale-state claims so concurrent heartbeats or terminal updates cannot be overwritten or dispatched twice.
 - Persist runner job-envelope transitions through rollback-safe re-fetch retries so transient SQLite locks cannot strand jobs or repeat provider work, while concurrent terminal advances remain authoritative.
+- Serialize idempotent continuation creation before duplicate checks and dispatch only newly committed child jobs, preventing lock retries or concurrent callers from creating or launching duplicates.
 
 ## [0.17.0] - 2026-08-03
 

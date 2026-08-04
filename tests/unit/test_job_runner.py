@@ -770,6 +770,139 @@ async def test_running_retry_does_not_regress_concurrent_terminal_advance(
     assert json.loads(persisted.result_json or "{}")["history"] == ["other-worker"]
 
 
+async def test_background_continuation_retries_commit_and_dispatches_only_after_commit(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.jobs import dispatcher as dispatcher_module
+
+    artist = CatalogArtist(name="Artist")
+    album = CatalogAlbum(artist=artist, title="Album", track_count=1)
+    catalog_track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+    job = Job(
+        source="slskd",
+        query="Artist Album",
+        status=JobStatus.pending,
+        catalog_album=album,
+    )
+    db_session.add_all([artist, album, catalog_track, job])
+    await db_session.commit()
+    job_id, album_id, catalog_track_id = job.id, album.id, catalog_track.id
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    execution_calls = 0
+    injected_lock = False
+    dispatched: list[int] = []
+
+    async def complete_job(
+        current_job_id: int,
+        session: AsyncSession,
+        cfg: Settings,
+        *,
+        commit_progress: bool = False,
+    ) -> runner._ContinuationRequest:
+        nonlocal execution_calls
+        execution_calls += 1
+        current = await session.get(Job, current_job_id)
+        assert current is not None
+        current.status = JobStatus.partial
+        current.result_json = json.dumps({"missing_catalog_track_ids": [catalog_track_id]})
+        return runner._ContinuationRequest(
+            parent_job_id=current_job_id,
+            catalog_album_id=album_id,
+            missing_catalog_track_ids=(catalog_track_id,),
+        )
+
+    original_commit = AsyncSession.commit
+
+    async def lock_continuation_once(self: AsyncSession) -> None:
+        nonlocal injected_lock
+        jobs = [obj for obj in self.sync_session.identity_map.values() if isinstance(obj, Job)]
+        if not injected_lock and any(current.parent_job_id == job_id for current in jobs):
+            injected_lock = True
+            raise OperationalError("INSERT INTO jobs", {}, Exception("database is locked"))
+        await original_commit(self)
+
+    async def assert_committed_then_dispatch(continuation_id: int) -> None:
+        async with factory() as observer:
+            continuation = await observer.get(Job, continuation_id)
+            persisted_parent = await observer.get(Job, job_id)
+            assert continuation is not None
+            assert continuation.status == JobStatus.pending
+            assert persisted_parent is not None
+            assert persisted_parent.status == JobStatus.partial
+        dispatched.append(continuation_id)
+
+    monkeypatch.setattr(runner, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", complete_job)
+    monkeypatch.setattr(AsyncSession, "commit", lock_continuation_once)
+    monkeypatch.setattr(
+        dispatcher_module.job_dispatcher, "dispatch", assert_committed_then_dispatch
+    )
+
+    await runner.run_job(job_id, settings=test_settings)
+
+    async with factory() as observer:
+        continuations = list(
+            (await observer.scalars(select(Job).where(Job.parent_job_id == job_id))).all()
+        )
+    assert injected_lock is True
+    assert execution_calls == 1
+    assert len(continuations) == 1
+    assert dispatched == [continuations[0].id]
+
+
+async def test_concurrent_equivalent_continuations_create_and_dispatch_once(
+    tmp_path, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.jobs import dispatcher as dispatcher_module
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'continuations.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as seed:
+            artist = CatalogArtist(name="Artist")
+            album = CatalogAlbum(artist=artist, title="Album", track_count=1)
+            catalog_track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+            parent = Job(
+                source="slskd",
+                query="Artist Album",
+                status=JobStatus.partial,
+                catalog_album=album,
+            )
+            seed.add_all([artist, album, catalog_track, parent])
+            await seed.commit()
+            parent_id, album_id, track_id = parent.id, album.id, catalog_track.id
+
+        async def create_equivalent() -> list[int]:
+            async with factory() as session:
+                return await runner._spawn_continuation_jobs(
+                    parent_id, [track_id], album_id, session
+                )
+
+        created_by_call = await asyncio.gather(create_equivalent(), create_equivalent())
+        dispatched: list[int] = []
+
+        async def fake_dispatch(continuation_id: int) -> None:
+            dispatched.append(continuation_id)
+
+        monkeypatch.setattr(dispatcher_module.job_dispatcher, "dispatch", fake_dispatch)
+        for continuation_ids in created_by_call:
+            await runner._dispatch_continuation_jobs(continuation_ids)
+
+        async with factory() as observer:
+            continuations = list(
+                (await observer.scalars(select(Job).where(Job.parent_job_id == parent_id))).all()
+            )
+        assert len(continuations) == 1
+        assert sorted([job_id for ids in created_by_call for job_id in ids]) == [
+            continuations[0].id
+        ]
+        assert dispatched == [continuations[0].id]
+    finally:
+        await engine.dispose()
+
+
 async def test_provider_error_persists_typed_failure_without_secret(
     db_session: AsyncSession, test_settings: Settings, monkeypatch: object, caplog: object
 ) -> None:

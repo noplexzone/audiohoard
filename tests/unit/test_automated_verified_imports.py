@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.jobs.runner import (
@@ -398,7 +400,7 @@ async def test_missing_track_continuations_are_targeted_and_idempotent(
         source="slskd", query="Artist Album", status=JobStatus.partial, catalog_album=album
     )
     db_session.add_all([artist, album, *tracks, parent])
-    await db_session.flush()
+    await db_session.commit()
     dispatched: list[int] = []
 
     async def fake_dispatch(job_id: int):
@@ -407,8 +409,10 @@ async def test_missing_track_continuations_are_targeted_and_idempotent(
 
     monkeypatch.setattr(dispatcher_module.job_dispatcher, "dispatch", fake_dispatch)
     missing = [tracks[1].id]
-    await _spawn_continuation_jobs(parent, missing, album, db_session)
-    await _spawn_continuation_jobs(parent, missing, album, db_session)
+    first_ids = await _spawn_continuation_jobs(parent.id, missing, album.id, db_session)
+    second_ids = await _spawn_continuation_jobs(parent.id, missing, album.id, db_session)
+    for continuation_id in [*first_ids, *second_ids]:
+        await dispatcher_module.job_dispatcher.dispatch(continuation_id)
     children = list(
         (
             await db_session.scalars(
@@ -422,6 +426,56 @@ async def test_missing_track_continuations_are_targeted_and_idempotent(
     assert children[0].query == "Artist Two"
     assert children[0].source == "priority"
     assert dispatched == [children[0].id]
+
+
+async def test_continuation_locked_commit_reconstructs_without_committing_caller_mutation(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artist = CatalogArtist(name="Artist")
+    album = CatalogAlbum(artist=artist, title="Album", track_count=1)
+    track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+    parent = Job(
+        source="slskd", query="Artist Album", status=JobStatus.partial, catalog_album=album
+    )
+    db_session.add_all([artist, album, track, parent])
+    await db_session.commit()
+    parent_id, album_id, track_id = parent.id, album.id, track.id
+
+    # This stale caller-side mutation must be rolled back, not swept into the
+    # continuation transaction by its commit.
+    parent.status = JobStatus.done
+    original_commit = AsyncSession.commit
+    injected_lock = False
+
+    async def lock_first_continuation_commit(self: AsyncSession) -> None:
+        nonlocal injected_lock
+        jobs = [obj for obj in self.sync_session.identity_map.values() if isinstance(obj, Job)]
+        if not injected_lock and any(job.parent_job_id == parent_id for job in jobs):
+            injected_lock = True
+            raise OperationalError("INSERT INTO jobs", {}, Exception("database is locked"))
+        await original_commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", lock_first_continuation_commit)
+
+    continuation_ids = await _spawn_continuation_jobs(parent_id, [track_id], album_id, db_session)
+
+    db_session.expire_all()
+    persisted_parent = await db_session.get(Job, parent_id)
+    continuations = list(
+        (
+            await db_session.scalars(
+                select(Job).where(
+                    Job.parent_job_id == parent_id,
+                    Job.catalog_track_id == track_id,
+                )
+            )
+        ).all()
+    )
+    assert injected_lock is True
+    assert persisted_parent is not None
+    assert persisted_parent.status == JobStatus.partial
+    assert [job.id for job in continuations] == continuation_ids
+    assert len(continuations) == 1
 
 
 def test_normalize_for_catalog_match_strips_space_separated_prefix() -> None:
