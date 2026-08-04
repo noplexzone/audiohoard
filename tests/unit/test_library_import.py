@@ -23,6 +23,7 @@ from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import Track
 from app.models.workflow import ImportWorkflowState
+from app.services.acquisition_cleanup import wait_for_imported_source_cleanups
 from app.services.library_import import (
     ImportExecutionError,
     MutagenTagWriter,
@@ -213,7 +214,7 @@ async def test_execute_import_copies_to_destination_temp_writes_verified_tags_an
     assert plans[0].planned_operations_json is not None
 
     await db_session.commit()
-    await asyncio.sleep(0)
+    await wait_for_imported_source_cleanups()
     assert not source.exists()  # noqa: ASYNC240
     assert destination.exists()  # noqa: ASYNC240
 

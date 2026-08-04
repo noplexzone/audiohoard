@@ -579,6 +579,71 @@ class TestAutomaticTerminalCleanup:
             assert "source_cleanup_completed_at" not in provenance
 
 
+async def test_slskd_cleanup_retries_only_marker_after_provider_cancel(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with session_factory() as session:
+        job = Job(source="slskd", query="marker-lock", status=JobStatus.failed)
+        session.add(job)
+        await session.flush()
+        track = Track(
+            job_id=job.id,
+            source="slskd",
+            source_job_id="exact-transfer",
+            source_status="transfer_timeout",
+            acquisition_provenance_json=json.dumps(
+                {"source": "slskd", "username": "peer", "filename": "song.flac"}
+            ),
+            acquisition_state=AcquisitionState.failed,
+        )
+        session.add(track)
+        await session.commit()
+        track_id = track.id
+
+    cancel_calls = 0
+
+    class FakeAdapter:
+        async def cancel(
+            self, username: str, filename: str, transfer_id: str | None = None
+        ) -> None:
+            nonlocal cancel_calls
+            cancel_calls += 1
+            assert (username, filename, transfer_id) == ("peer", "song.flac", "exact-transfer")
+
+    original_commit = AsyncSession.commit
+    marker_commits = 0
+
+    async def lock_first_marker_commit(session: AsyncSession) -> None:
+        nonlocal marker_commits
+        marking = any(
+            isinstance(row, Track)
+            and "source_cleanup_completed_at" in (row.acquisition_provenance_json or "")
+            for row in session.dirty
+        )
+        if marking:
+            marker_commits += 1
+            if marker_commits == 1:
+                raise OperationalError("UPDATE tracks", {}, Exception("database is locked"))
+        await original_commit(session)
+
+    async def no_sleep(delay: float) -> None:
+        assert delay == 0.25
+
+    monkeypatch.setattr(AsyncSession, "commit", lock_first_marker_commit)
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    assert await cleanup_durable_slskd_transfers(session_factory, FakeAdapter()) == 1
+
+    assert cancel_calls == 1
+    assert marker_commits == 2
+    async with session_factory() as session:
+        current = await session.get(Track, track_id)
+        assert current is not None
+        assert json.loads(current.acquisition_provenance_json or "{}")[
+            "source_cleanup_completed_at"
+        ]
+
+
 class TestRetry:
     async def test_retry_failed_dispatches(
         self,
@@ -697,13 +762,13 @@ async def test_terminal_cleanup_retries_transient_sqlite_lock(
             raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
         return []
 
-    async def no_transfers(factory, adapter, job_ids=None):
+    async def no_transfers(factory, adapter, job_ids=None, *, max_attempts=3):
         return 0
 
     async def no_sleep(delay):
         assert delay == 0.25
 
-    monkeypatch.setattr(acquisition_cleanup, "hide_completed_and_timed_out_jobs", flaky_hide)
+    monkeypatch.setattr(acquisition_cleanup, "_hide_completed_and_timed_out_jobs_once", flaky_hide)
     monkeypatch.setattr(acquisition_cleanup, "cleanup_durable_slskd_transfers", no_transfers)
     monkeypatch.setattr(acquisition_cleanup.asyncio, "sleep", no_sleep)
 
