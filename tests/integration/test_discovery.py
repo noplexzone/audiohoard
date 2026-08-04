@@ -119,3 +119,17 @@ async def test_dedicated_discovery_routes_bound_page_and_genre(client, monkeypat
     assert calls[-1][0:5] == ("genre", "US", 3, 12, "132")
     assert (await client.get("/discover/genres/not-a-number")).status_code == 404
     assert (await client.get("/discover/popular?page=21")).status_code == 422
+
+
+async def test_advanced_search_skips_discovery_network(client, monkeypatch) -> None:
+    from app.routers import search as search_router
+
+    async def unexpected_landing(_region: str):
+        raise AssertionError("advanced search must not load discovery")
+
+    monkeypatch.setattr(search_router.discovery_service, "landing", unexpected_landing)
+
+    response = await client.get("/search?tab=advanced")
+
+    assert response.status_code == 200
+    assert "Advanced source search" in response.text

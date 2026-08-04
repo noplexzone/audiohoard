@@ -208,7 +208,7 @@ async def search_page(
         catalog_outcomes = await search_catalog_artists(settings, q, requested)
         if provider == "primary" and catalog_outcomes and not catalog_outcomes[0].state.available:
             primary_error = catalog_outcomes[0].state.reason or "Primary provider unavailable"
-    elif not q:
+    elif not q and tab == "catalog":
         discovery_sections = await discovery_service.landing(runtime.discovery_region)
     return templates.TemplateResponse(
         request,

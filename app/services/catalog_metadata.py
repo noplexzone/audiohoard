@@ -93,7 +93,7 @@ def validate_artist_detail(
     return detail
 
 
-async def _validated_artist_hits(
+async def validated_artist_hits(
     provider: MetadataProvider, name: str, artists: list[ArtistHit]
 ) -> list[ArtistHit]:
     expected_field = {
@@ -156,7 +156,7 @@ async def search_catalog_artists(
             return ProviderOutcome(name, [], state)
         try:
             artists = await provider.search_artists(query)
-            artists = await _validated_artist_hits(provider, name, artists)
+            artists = await validated_artist_hits(provider, name, artists)
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             return ProviderOutcome(
                 name, artists, CapabilityState(True, extra={"elapsed_ms": elapsed_ms})

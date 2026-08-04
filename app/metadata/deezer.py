@@ -89,6 +89,8 @@ class DeezerClient:
             response = await request_with_retry(client, "GET", path, params=params)
             response.raise_for_status()
         payload = response.json()
+        if isinstance(payload, dict) and payload.get("error"):
+            raise ValueError("Deezer returned an error envelope")
         rows = payload.get("data", []) if isinstance(payload, dict) else []
         if not isinstance(rows, list):
             raise ValueError("Deezer returned an invalid discovery feed")

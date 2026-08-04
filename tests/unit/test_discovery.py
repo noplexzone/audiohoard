@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
-from app.metadata.base import ArtistHit, DiscoveryRelease
+from app.metadata.base import ArtistDetail, ArtistHit, DiscoveryRelease
 from app.metadata.deezer import DeezerClient
 from app.services.discovery import DiscoveryService
 
@@ -14,11 +15,22 @@ class FakeDiscoveryProvider:
 
     async def discovery_feed(
         self, feed: str, *, page: int = 1, limit: int = 12, genre_id: str | None = None
-    ) -> list[ArtistHit]:
+    ) -> list[ArtistHit | DiscoveryRelease]:
         self.calls.append((feed, page))
         if self.fail:
             raise OSError("provider details must not leak")
-        return [ArtistHit("deezer", f"{feed}-{page}", feed.title())][:limit]
+        result: list[ArtistHit | DiscoveryRelease] = [
+            ArtistHit("deezer", f"{feed}-{page}", feed.title())
+        ]
+        return result[:limit]
+
+    async def get_artist(self, provider_id: str) -> ArtistDetail:
+        return ArtistDetail(
+            provider="deezer",
+            provider_id=provider_id,
+            deezer_id=provider_id,
+            name="Validated artist",
+        )
 
 
 async def test_cache_is_partitioned_by_region_page_and_can_invalidate() -> None:
@@ -54,7 +66,7 @@ async def test_landing_sections_fail_independently_and_report_global_fallback() 
     class PartialProvider(FakeDiscoveryProvider):
         async def discovery_feed(
             self, feed: str, *, page: int = 1, limit: int = 12, genre_id: str | None = None
-        ) -> list[ArtistHit]:
+        ) -> list[ArtistHit | DiscoveryRelease]:
             if feed == "genres":
                 raise OSError("down")
             return await super().discovery_feed(feed, page=page, limit=limit, genre_id=genre_id)
@@ -116,3 +128,66 @@ async def test_deezer_discovery_maps_rank_release_identity_and_genre_pages(monke
     assert isinstance(releases[0], DiscoveryRelease)
     assert releases[0].artist_provider_id == "9"
     assert releases[0].release_date == "2026-08-01"
+
+
+async def test_deezer_discovery_rejects_http_200_error_envelope(monkeypatch) -> None:
+    provider = DeezerClient()
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com",
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, json={"error": {"code": 800}})
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="error envelope"):
+        await provider.discovery_feed("popular")
+
+
+async def test_discovery_filters_definitively_invalid_artist_identity() -> None:
+    class InvalidProvider(FakeDiscoveryProvider):
+        async def discovery_feed(
+            self,
+            feed: str,
+            *,
+            page: int = 1,
+            limit: int = 12,
+            genre_id: str | None = None,
+        ) -> list[ArtistHit | DiscoveryRelease]:
+            if feed == "new":
+                return [
+                    DiscoveryRelease(
+                        "deezer", "release-bad", "Bad release", "Bad artist", "10002824"
+                    )
+                ]
+            return await super().discovery_feed(feed, page=page, limit=limit, genre_id=genre_id)
+
+        async def get_artist(self, provider_id: str) -> ArtistDetail:
+            raise ValueError("Deezer returned an error envelope")
+
+    service = DiscoveryService(InvalidProvider())  # type: ignore[arg-type]
+
+    section = await service.get("popular", "US")
+    release_section = await service.get("new", "US")
+
+    assert section.items == ()
+    assert release_section.items == ()
+
+
+async def test_discovery_cache_is_bounded_and_expires_stale_entries() -> None:
+    provider = FakeDiscoveryProvider()
+    service = DiscoveryService(
+        provider,
+        ttl_seconds=0,
+        stale_seconds=0,
+        max_entries=2,  # type: ignore[arg-type]
+    )
+
+    await service.get("trending", "US", page=1)
+    await service.get("trending", "US", page=2)
+    await service.get("new", "US", page=1)
+
+    assert len(service._cache) <= 2

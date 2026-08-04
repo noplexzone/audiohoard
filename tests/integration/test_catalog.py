@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest_asyncio
@@ -1117,6 +1118,34 @@ async def test_search_page_watchlist_defaults_monitor_all_enriched_release_types
     assert artist.watchlist_release_eps is True
     assert artist.watchlist_monitor_upgrades is True
     assert release_monitoring == {"album": True, "single": True, "ep": True}
+
+    async with factory() as session:
+        single = await session.scalar(
+            select(CatalogAlbumProvider).where(
+                CatalogAlbumProvider.provider_album_id == "default-single"
+            )
+        )
+        identity = await session.scalar(
+            select(CatalogArtistIdentity).where(CatalogArtistIdentity.artist_id == artist_id)
+        )
+        assert single is not None and identity is not None
+        single.monitored = False
+        metadata = json.loads(identity.metadata_json or "{}")
+        metadata["discography_state"] = "idle"
+        metadata.pop("discography_claim_id", None)
+        identity.metadata_json = json.dumps(metadata)
+        await session.commit()
+
+    await catalog_router._refresh_discography_task(artist_id, "deezer")
+
+    async with factory() as session:
+        single = await session.scalar(
+            select(CatalogAlbumProvider).where(
+                CatalogAlbumProvider.provider_album_id == "default-single"
+            )
+        )
+        assert single is not None
+        assert single.monitored is False
 
 
 async def test_release_progress_does_not_treat_untracked_library_folder_as_owned(
