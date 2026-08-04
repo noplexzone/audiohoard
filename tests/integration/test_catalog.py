@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest_asyncio
@@ -814,23 +815,9 @@ async def test_catalog_artist_unifies_release_progress_on_existing_cards(
     client: AsyncClient, monkeypatch
 ) -> None:
     artist_id, partial_id, _ = await _seed_release_progress_artist()
-    refreshes = 0
-
-    async def backfill_missing_counts(db, settings, artist, provider_name):
-        nonlocal refreshes
-        refreshes += 1
-        identity = next(item for item in artist.identities if item.provider == provider_name)
-        for release in identity.releases:
-            if release.title == "Unknown Empty Album":
-                release.track_count = 2
-        await db.flush()
-        return identity.releases
-
-    monkeypatch.setattr("app.routers.catalog.fetch_and_store_discography", backfill_missing_counts)
     response = await client.get(f"/artists/catalog/{artist_id}")
 
     assert response.status_code == 200
-    assert refreshes == 0
     assert 'data-section="downloaded-files"' not in response.text
     assert 'data-section="wanted-releases"' not in response.text
     assert "Downloaded files</h2>" not in response.text
@@ -901,12 +888,14 @@ async def test_watchlisting_unhydrated_artist_queues_enrichment(
         await session.commit()
         artist_id = artist.id
 
-    queued_tasks = []
+    from app.routers import catalog as catalog_router
 
-    def capture_task(self, func, *args, **kwargs):
-        queued_tasks.append((func, args, kwargs))
-
-    monkeypatch.setattr("app.routers.catalog.BackgroundTasks.add_task", capture_task)
+    scheduled: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        catalog_router,
+        "_start_discography_task",
+        lambda queued_artist_id, provider: scheduled.append((queued_artist_id, provider)) or True,
+    )
 
     response = await client.post(
         f"/artists/catalog/{artist_id}/monitor",
@@ -918,10 +907,8 @@ async def test_watchlisting_unhydrated_artist_queues_enrichment(
     async with factory() as session:
         refreshed = await session.get(CatalogArtist, artist_id)
     assert refreshed is not None
-    assert refreshed.enrichment_state == "queued"
-    assert len(queued_tasks) == 1
-    assert queued_tasks[0][0].__name__ == "_enrich_artist_task"
-    assert queued_tasks[0][1][0] == artist_id
+    assert refreshed.enrichment_state == "idle"
+    assert scheduled == [(artist_id, "deezer")]
 
 
 async def test_watchlisting_populated_artist_does_not_queue_enrichment(
@@ -989,15 +976,17 @@ async def test_search_page_watchlisted_artist_redirect_shows_loading_discography
         async def get_discography(self, id):
             return []
 
-    queued_tasks = []
+    from app.routers import catalog as catalog_router
 
-    def capture_task(self, func, *args, **kwargs):
-        queued_tasks.append((func, args, kwargs))
-
+    scheduled: list[tuple[int, str]] = []
     monkeypatch.setattr(
         catalog_metadata, "build_metadata_provider", lambda name, settings: FakeDeezerProvider()
     )
-    monkeypatch.setattr("app.routers.catalog.BackgroundTasks.add_task", capture_task)
+    monkeypatch.setattr(
+        catalog_router,
+        "_start_discography_task",
+        lambda artist_id, provider: scheduled.append((artist_id, provider)) or True,
+    )
 
     response = await client.post(
         "/artists/catalog/open",
@@ -1011,10 +1000,9 @@ async def test_search_page_watchlisted_artist_redirect_shows_loading_discography
     )
 
     assert response.status_code == 200
-    assert "Loading discography" in response.text
-    assert 'data-artist-refresh="true"' in response.text
-    assert len(queued_tasks) == 1
-    assert queued_tasks[0][0].__name__ == "_enrich_artist_task"
+    assert "No releases found" in response.text
+    assert scheduled
+    assert {provider for _, provider in scheduled} == {"deezer"}
 
 
 async def test_search_page_watchlist_defaults_monitor_all_enriched_release_types(
@@ -1024,6 +1012,8 @@ async def test_search_page_watchlist_defaults_monitor_all_enriched_release_types
     from app.metadata.base import AlbumHit, ArtistDetail
     from app.services import catalog_metadata
     from app.settings_service import save_runtime_settings
+
+    monkeypatch.setattr(settings_service, "_cache", None)
 
     class FakeDeezerProvider:
         async def search_artists(self, query):
@@ -1077,9 +1067,15 @@ async def test_search_page_watchlist_defaults_monitor_all_enriched_release_types
         )
         await session.commit()
 
+    from app.routers import catalog as catalog_router
+
     monkeypatch.setattr(
         catalog_metadata, "build_metadata_provider", lambda name, settings: FakeDeezerProvider()
     )
+    monkeypatch.setattr(
+        catalog_router, "build_metadata_provider", lambda name, settings: FakeDeezerProvider()
+    )
+    monkeypatch.setattr(catalog_router, "_start_discography_task", lambda *_args: True)
 
     response = await client.post(
         "/artists/catalog/open",
@@ -1093,7 +1089,12 @@ async def test_search_page_watchlist_defaults_monitor_all_enriched_release_types
     )
 
     assert response.status_code == 303
-    settings_service._cache = None
+    async with factory() as session:
+        artist_id = await session.scalar(
+            select(CatalogArtist.id).where(CatalogArtist.name == "Search Default Artist")
+        )
+    assert artist_id is not None
+    await catalog_router._refresh_discography_task(artist_id, "deezer")
     async with factory() as session:
         artist = (
             await session.execute(
@@ -1117,6 +1118,34 @@ async def test_search_page_watchlist_defaults_monitor_all_enriched_release_types
     assert artist.watchlist_release_eps is True
     assert artist.watchlist_monitor_upgrades is True
     assert release_monitoring == {"album": True, "single": True, "ep": True}
+
+    async with factory() as session:
+        single = await session.scalar(
+            select(CatalogAlbumProvider).where(
+                CatalogAlbumProvider.provider_album_id == "default-single"
+            )
+        )
+        identity = await session.scalar(
+            select(CatalogArtistIdentity).where(CatalogArtistIdentity.artist_id == artist_id)
+        )
+        assert single is not None and identity is not None
+        single.monitored = False
+        metadata = json.loads(identity.metadata_json or "{}")
+        metadata["discography_state"] = "idle"
+        metadata.pop("discography_claim_id", None)
+        identity.metadata_json = json.dumps(metadata)
+        await session.commit()
+
+    await catalog_router._refresh_discography_task(artist_id, "deezer")
+
+    async with factory() as session:
+        single = await session.scalar(
+            select(CatalogAlbumProvider).where(
+                CatalogAlbumProvider.provider_album_id == "default-single"
+            )
+        )
+        assert single is not None
+        assert single.monitored is False
 
 
 async def test_release_progress_does_not_treat_untracked_library_folder_as_owned(

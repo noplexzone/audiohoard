@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
+import httpx
+import pytest
 from httpx import AsyncClient
+from pytest_httpx import HTTPXMock
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_session_factory
 from app.jobs.runner import _catalog_track_for_result
-from app.metadata.base import ArtistDetail
+from app.metadata.base import AlbumHit, ArtistDetail, ArtistHit
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -20,6 +25,20 @@ from app.models.catalog_entities import (
 from app.models.job import Job
 from app.models.monitoring import MonitoringRecord, MonitoringStatus
 from app.schemas.search import SearchResult
+from app.services.catalog_metadata import ProviderOutcome
+from app.sources.base import CapabilityState
+
+
+@pytest.fixture(autouse=True)
+def _disable_catalog_enrichment_background_tasks(monkeypatch):
+    """Keep catalog integration tests deterministic and off the live provider network."""
+    from app.routers import catalog as catalog_router
+
+    async def do_not_queue(*args, **kwargs):
+        del args, kwargs
+        return False
+
+    monkeypatch.setattr(catalog_router, "_queue_artist_enrichment", do_not_queue)
 
 
 async def _seed_catalog() -> int:
@@ -232,6 +251,357 @@ async def test_search_card_monitor_opens_artist_as_monitored(
         ).one()
         assert artist.monitored is True
         assert artist.monitor_policy == "all"
+
+
+async def test_fetch_watchlisting_is_idempotent_and_returns_saved_defaults(
+    client: AsyncClient, monkeypatch
+) -> None:
+    async def fake_fetch(settings, provider_name: str, provider_id: str):
+        del settings
+        return ArtistDetail(
+            provider=provider_name,
+            provider_id=provider_id,
+            name="Fetch Artist",
+            deezer_id=provider_id,
+        )
+
+    import app.routers.catalog as catalog_router
+
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", fake_fetch)
+    payload = {
+        "provider": "deezer",
+        "provider_id": "fetch-dz",
+        "monitor": "true",
+        "csrf_token": client.cookies.get("csrf", ""),
+    }
+    headers = {"Accept": "application/json", "X-Requested-With": "fetch"}
+
+    first = await client.post("/artists/catalog/open", data=payload, headers=headers)
+    second = await client.post("/artists/catalog/open", data=payload, headers=headers)
+
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+    assert first.json() == {
+        "artist_id": first.json()["artist_id"],
+        "watched": True,
+        "watchlist_release_albums": True,
+        "watchlist_release_singles": False,
+        "watchlist_release_eps": False,
+        "watchlist_monitor_upgrades": False,
+        "configure_url": f"/artists/catalog/{first.json()['artist_id']}/monitor",
+        "discography_url": f"/artists/catalog/{first.json()['artist_id']}",
+    }
+    factory = get_session_factory()
+    async with factory() as db:
+        assert await db.scalar(select(func.count(CatalogArtist.id))) == 1
+        assert await db.scalar(select(func.count(CatalogArtistIdentity.id))) == 1
+
+
+async def test_duplicate_fetch_watchlisting_preserves_customized_policy(
+    client: AsyncClient, monkeypatch
+) -> None:
+    async def fake_fetch(settings, provider_name: str, provider_id: str):
+        del settings
+        return ArtistDetail(
+            provider=provider_name,
+            provider_id=provider_id,
+            name="Customized Artist",
+            deezer_id=provider_id,
+        )
+
+    async def no_queue(db, artist_id: int) -> bool:
+        del db, artist_id
+        return False
+
+    import app.routers.catalog as catalog_router
+
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", fake_fetch)
+    monkeypatch.setattr(catalog_router, "_queue_artist_enrichment", no_queue)
+    headers = {"Accept": "application/json", "X-Requested-With": "fetch"}
+    form = {
+        "provider": "deezer",
+        "provider_id": "custom-dz",
+        "monitor": "true",
+        "csrf_token": client.cookies.get("csrf", ""),
+    }
+    opened = await client.post("/artists/catalog/open", data=form, headers=headers)
+    artist_id = opened.json()["artist_id"]
+    configured = await client.post(
+        f"/artists/catalog/{artist_id}/monitor",
+        data={
+            "monitored": "true",
+            "provider": "deezer",
+            "watchlist_release_singles": "true",
+            "watchlist_release_eps": "true",
+            "watchlist_monitor_upgrades": "true",
+            "monitor_policy": "none_new",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        headers=headers,
+    )
+    repeated = await client.post("/artists/catalog/open", data=form, headers=headers)
+
+    assert configured.status_code == repeated.status_code == 200
+    assert repeated.json()["watchlist_release_albums"] is False
+    assert repeated.json()["watchlist_release_singles"] is True
+    assert repeated.json()["watchlist_release_eps"] is True
+    assert repeated.json()["watchlist_monitor_upgrades"] is True
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = await db.get(CatalogArtist, artist_id)
+    assert artist is not None and artist.monitor_policy == "none_new"
+
+
+async def test_direct_open_closes_database_transaction_before_provider_http(
+    client: AsyncClient, monkeypatch
+) -> None:
+    import app.routers.catalog as catalog_router
+
+    rolled_back_sessions: list[AsyncSession] = []
+    original_rollback = AsyncSession.rollback
+
+    async def tracking_rollback(session: AsyncSession) -> None:
+        await original_rollback(session)
+        rolled_back_sessions.append(session)
+
+    async def asserting_fetch(settings, provider_name: str, provider_id: str):
+        del settings
+        assert rolled_back_sessions
+        assert not rolled_back_sessions[-1].in_transaction()
+        return ArtistDetail(
+            provider=provider_name,
+            provider_id=provider_id,
+            name="Transaction Artist",
+            deezer_id=provider_id,
+        )
+
+    async def no_queue(db, artist_id: int) -> bool:
+        del db, artist_id
+        return False
+
+    monkeypatch.setattr(AsyncSession, "rollback", tracking_rollback)
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", asserting_fetch)
+    monkeypatch.setattr(catalog_router, "_queue_artist_enrichment", no_queue)
+
+    response = await client.post(
+        "/artists/catalog/open",
+        data={
+            "provider": "deezer",
+            "provider_id": "transaction-dz",
+            "monitor": "true",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+    )
+
+    assert response.status_code == 200
+
+
+async def test_search_cards_mark_only_matching_provider_identity_watched(
+    client: AsyncClient, monkeypatch
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(name="Same Name", monitored=True, deezer_id="watched-dz")
+        artist.identities.append(
+            CatalogArtistIdentity(
+                provider="deezer", provider_artist_id="watched-dz", name="Same Name"
+            )
+        )
+        db.add(artist)
+        await db.commit()
+
+    async def fake_search(settings, query: str, providers: list[str]):
+        del settings, query, providers
+        return [
+            ProviderOutcome(
+                "deezer",
+                [ArtistHit("deezer", "watched-dz", "Same Name", deezer_id="watched-dz")],
+                CapabilityState(True),
+            ),
+            ProviderOutcome(
+                "musicbrainz",
+                [ArtistHit("musicbrainz", "other-mb", "Same Name", mbid="other-mb")],
+                CapabilityState(True),
+            ),
+        ]
+
+    import app.routers.search as search_router
+
+    monkeypatch.setattr(search_router, "search_catalog_artists", fake_search)
+    response = await client.get("/search?q=Same+Name&provider=all")
+
+    assert response.status_code == 200
+    assert (
+        'data-provider="deezer" data-provider-id="watched-dz" data-watched="true"' in response.text
+    )
+    assert (
+        'data-provider="musicbrainz" data-provider-id="other-mb" data-watched="false"'
+        in response.text
+    )
+
+
+async def test_fetch_dialog_updates_only_selected_artist(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        selected = CatalogArtist(name="Selected", monitored=True, deezer_id="selected-dz")
+        selected.identities.append(
+            CatalogArtistIdentity(
+                provider="deezer", provider_artist_id="selected-dz", name="Selected"
+            )
+        )
+        other = CatalogArtist(
+            name="Other", monitored=True, deezer_id="other-dz", watchlist_release_albums=True
+        )
+        other.identities.append(
+            CatalogArtistIdentity(provider="deezer", provider_artist_id="other-dz", name="Other")
+        )
+        db.add_all([selected, other])
+        await db.commit()
+        selected_id, other_id = selected.id, other.id
+
+    response = await client.post(
+        f"/artists/catalog/{selected_id}/monitor",
+        data={
+            "monitored": "true",
+            "provider": "deezer",
+            "watchlist_release_singles": "true",
+            "watchlist_release_eps": "true",
+            "watchlist_monitor_upgrades": "true",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["artist_id"] == selected_id
+    assert response.json()["watched"] is True
+    async with factory() as db:
+        refreshed_selected = await db.get(CatalogArtist, selected_id)
+        refreshed_other = await db.get(CatalogArtist, other_id)
+    assert refreshed_selected is not None
+    assert refreshed_selected.watchlist_release_albums is False
+    assert refreshed_selected.watchlist_release_singles is True
+    assert refreshed_selected.watchlist_release_eps is True
+    assert refreshed_selected.watchlist_monitor_upgrades is True
+    assert refreshed_other is not None and refreshed_other.watchlist_release_albums is True
+
+
+async def test_invalid_direct_artist_open_returns_safe_errors_without_persistence(
+    client: AsyncClient, monkeypatch
+) -> None:
+    async def invalid_fetch(settings, provider_name: str, provider_id: str):
+        del settings, provider_name, provider_id
+        raise ValueError("Provider returned an invalid artist identity")
+
+    import app.routers.catalog as catalog_router
+
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", invalid_fetch)
+
+    html = await client.get(
+        "/artists/catalog/open?provider=deezer&provider_id=10002824",
+        follow_redirects=False,
+    )
+    json_response = await client.post(
+        "/artists/catalog/open",
+        data={
+            "provider": "deezer",
+            "provider_id": "10002824",
+            "monitor": "true",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        follow_redirects=False,
+    )
+
+    assert html.status_code == 422
+    assert "invalid artist identity" in html.text.casefold()
+    assert json_response.status_code == 422
+    assert json_response.json() == {
+        "error": "invalid_artist_identity",
+        "message": "The selected artist is no longer available from this provider.",
+    }
+    factory = get_session_factory()
+    async with factory() as db:
+        assert await db.scalar(select(func.count(CatalogArtist.id))) == 0
+
+
+async def test_direct_artist_open_maps_provider_transport_failure_to_safe_502(
+    client: AsyncClient, monkeypatch
+) -> None:
+    async def failed_fetch(settings, provider_name: str, provider_id: str):
+        del settings, provider_name, provider_id
+        raise httpx.ReadTimeout("private upstream timeout detail")
+
+    import app.routers.catalog as catalog_router
+
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", failed_fetch)
+
+    html = await client.get("/artists/catalog/open?provider=deezer&provider_id=stale")
+    json_response = await client.post(
+        "/artists/catalog/open",
+        data={
+            "provider": "deezer",
+            "provider_id": "stale",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+    )
+
+    assert html.status_code == 502
+    assert "private upstream timeout detail" not in html.text
+    assert json_response.status_code == 502
+    assert json_response.json() == {
+        "error": "metadata_provider_unavailable",
+        "message": "The metadata provider could not be reached. Please try again.",
+    }
+
+
+async def test_deezer_error_envelope_is_filtered_and_direct_open_never_persists(
+    client: AsyncClient, httpx_mock: HTTPXMock
+) -> None:
+    stale_id = "10002824"
+    error_envelope = {"error": {"type": "DataException", "message": "no data", "code": 800}}
+    httpx_mock.add_response(
+        url="https://api.deezer.com/search/artist?q=stale+artist&limit=10",
+        json={
+            "data": [
+                {
+                    "id": int(stale_id),
+                    "name": "Stale Artist",
+                    "nb_fan": 9000,
+                    "nb_album": 20,
+                }
+            ],
+            "total": 1,
+        },
+    )
+    httpx_mock.add_response(
+        url=f"https://api.deezer.com/artist/{stale_id}/top?limit=5",
+        json={"data": []},
+    )
+    httpx_mock.add_response(url=f"https://api.deezer.com/artist/{stale_id}", json=error_envelope)
+    httpx_mock.add_response(url=f"https://api.deezer.com/artist/{stale_id}", json=error_envelope)
+
+    search = await client.get("/search?q=stale+artist&provider=deezer")
+    direct = await client.post(
+        "/artists/catalog/open",
+        data={
+            "provider": "deezer",
+            "provider_id": stale_id,
+            "monitor": "true",
+            "csrf_token": client.cookies.get("csrf", ""),
+        },
+        headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+    )
+
+    assert search.status_code == 200
+    assert f'data-provider-id="{stale_id}"' not in search.text
+    assert direct.status_code == 422
+    assert direct.json()["error"] == "invalid_artist_identity"
+    factory = get_session_factory()
+    async with factory() as db:
+        assert await db.scalar(select(func.count(CatalogArtist.id))) == 0
 
 
 async def test_search_card_monitor_retries_transient_sqlite_artist_open_lock(
@@ -683,6 +1053,464 @@ async def test_artist_page_renders_loading_state_for_queued_enrichment(
     assert response.status_code == 200
     assert "Loading discography" in response.text
     assert 'data-artist-refresh="true"' in response.text
+
+
+async def test_artist_shell_does_not_await_primary_and_unwatched_skips_secondary(
+    client: AsyncClient, monkeypatch
+) -> None:
+    import time
+
+    from app.routers import catalog as catalog_router
+
+    started: list[str] = []
+    release = asyncio.Event()
+
+    async def delayed_refresh(artist_id: int, provider_name: str) -> None:
+        started.append(provider_name)
+        await release.wait()
+
+    monkeypatch.setattr(catalog_router, "_refresh_discography_task", delayed_refresh)
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(name="Progressive Artist", primary_metadata_provider="deezer")
+        db.add(artist)
+        await db.flush()
+        db.add_all(
+            [
+                CatalogArtistIdentity(
+                    artist_id=artist.id,
+                    provider="deezer",
+                    provider_artist_id="progressive-dz",
+                    name=artist.name,
+                ),
+                CatalogArtistIdentity(
+                    artist_id=artist.id,
+                    provider="musicbrainz",
+                    provider_artist_id="progressive-mb",
+                    name=artist.name,
+                ),
+            ]
+        )
+        await db.commit()
+        artist_id = artist.id
+
+    before = time.perf_counter()
+    response = await client.get(f"/artists/catalog/{artist_id}?provider=deezer")
+    elapsed = time.perf_counter() - before
+    await asyncio.sleep(0)
+
+    assert response.status_code == 200
+    assert elapsed < 1
+    assert "Loading discography" in response.text
+    assert started == ["deezer"]
+    state = await client.get(f"/artists/catalog/{artist_id}/state")
+    assert state.json()["providers"]["deezer"]["state"] == "loading"
+    assert state.json()["providers"]["musicbrainz"]["state"] == "idle"
+    release.set()
+    await asyncio.sleep(0)
+
+
+async def test_watched_primary_becomes_ready_before_delayed_secondary(
+    client: AsyncClient, monkeypatch
+) -> None:
+    from types import SimpleNamespace
+
+    from app.routers import catalog as catalog_router
+
+    secondary_started = asyncio.Event()
+    release_secondary = asyncio.Event()
+
+    class FakeProvider:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def get_discography(self, provider_artist_id: str) -> list[AlbumHit]:
+            if self.name == "musicbrainz":
+                secondary_started.set()
+                await release_secondary.wait()
+            return [
+                AlbumHit(
+                    provider=self.name,
+                    provider_id=f"{provider_artist_id}-album",
+                    title=f"{self.name.title()} Album",
+                    artist_name="Progressive Watched",
+                    release_type="Album",
+                )
+            ]
+
+    def fake_build_provider(name: str, _settings) -> FakeProvider:
+        return FakeProvider(name)
+
+    async def fake_runtime(_db):
+        return SimpleNamespace(
+            primary_metadata_provider="deezer",
+            enabled_metadata_providers=["deezer", "musicbrainz"],
+        )
+
+    async def no_reconcile(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(catalog_router, "build_metadata_provider", fake_build_provider)
+    monkeypatch.setattr(catalog_router, "get_runtime_settings", fake_runtime)
+    monkeypatch.setattr(catalog_router, "reconcile_deezer_catalog_ownership", no_reconcile)
+
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Progressive Watched",
+            monitored=True,
+            primary_metadata_provider="deezer",
+        )
+        db.add(artist)
+        await db.flush()
+        db.add_all(
+            [
+                CatalogArtistIdentity(
+                    artist_id=artist.id,
+                    provider="deezer",
+                    provider_artist_id="watched-dz",
+                    name=artist.name,
+                ),
+                CatalogArtistIdentity(
+                    artist_id=artist.id,
+                    provider="musicbrainz",
+                    provider_artist_id="watched-mb",
+                    name=artist.name,
+                ),
+            ]
+        )
+        await db.commit()
+        artist_id = artist.id
+
+    before = asyncio.get_running_loop().time()
+    await catalog_router._refresh_discography_task(artist_id, "deezer")
+    primary_elapsed = asyncio.get_running_loop().time() - before
+    await asyncio.wait_for(secondary_started.wait(), timeout=1)
+    assert primary_elapsed < 5
+
+    state = await client.get(f"/artists/catalog/{artist_id}/state")
+    assert state.status_code == 200
+    assert state.json()["providers"]["deezer"] == {
+        "state": "ready",
+        "release_count": 1,
+        "error": None,
+    }
+    assert state.json()["providers"]["musicbrainz"]["state"] == "loading"
+
+    fragment = await client.get(
+        f"/artists/catalog/{artist_id}/discography?provider=deezer&release_type=Album&sort=asc"
+    )
+    assert fragment.status_code == 200
+    assert "Deezer Album" in fragment.text
+    assert "Musicbrainz Album" not in fragment.text
+    assert fragment.text.count('id="discography-region"') == 1
+
+    release_secondary.set()
+    secondary_task = catalog_router._discography_tasks[(artist_id, "musicbrainz")]
+    await asyncio.wait_for(asyncio.shield(secondary_task), timeout=1)
+
+
+async def test_discography_claim_is_atomic_across_sessions(client: AsyncClient) -> None:
+    del client
+    from app.routers import catalog as catalog_router
+
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(name="Claimed Artist")
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="deezer",
+            provider_artist_id="claim-dz",
+            name=artist.name,
+        )
+        db.add(identity)
+        await db.commit()
+        identity_id = identity.id
+
+    async with factory() as first, factory() as second:
+        first_identity = await first.get(CatalogArtistIdentity, identity_id)
+        second_identity = await second.get(CatalogArtistIdentity, identity_id)
+        assert first_identity is not None and second_identity is not None
+        first_claim = await catalog_router._claim_discography_refresh(first, first_identity)
+        assert isinstance(first_claim, str) and first_claim
+        assert await catalog_router._claim_discography_refresh(second, second_identity) is None
+
+
+async def test_preclaim_failure_does_not_mutate_discography_state(
+    client: AsyncClient, monkeypatch
+) -> None:
+    del client
+    from app import settings_service
+    from app.routers import catalog as catalog_router
+
+    async def fail_before_claim(*_args, **_kwargs):
+        raise RuntimeError("settings unavailable")
+
+    monkeypatch.setattr(settings_service, "build_effective_settings", fail_before_claim)
+
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Unclaimed Artist",
+            primary_metadata_provider="deezer",
+            enrichment_state="idle",
+        )
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="deezer",
+            provider_artist_id="unclaimed-dz",
+            name=artist.name,
+        )
+        db.add(identity)
+        await db.commit()
+        artist_id = artist.id
+        identity_id = identity.id
+
+    await catalog_router._refresh_discography_task(artist_id, "deezer")
+
+    async with factory() as db:
+        artist = await db.get(CatalogArtist, artist_id)
+        identity = await db.get(CatalogArtistIdentity, identity_id)
+        assert artist is not None and artist.enrichment_state == "idle"
+        assert identity is not None and identity.metadata_json is None
+
+
+async def test_stale_discography_worker_cannot_overwrite_replacement(
+    client: AsyncClient, monkeypatch
+) -> None:
+    del client
+    import json
+    from datetime import timedelta
+
+    from app.routers import catalog as catalog_router
+
+    old_started = asyncio.Event()
+    release_old = asyncio.Event()
+    calls = 0
+
+    class FencedProvider:
+        async def get_discography(self, provider_artist_id: str) -> list[AlbumHit]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                old_started.set()
+                await release_old.wait()
+                title = "Stale Album"
+            else:
+                title = "Replacement Album"
+            return [
+                AlbumHit(
+                    provider="musicbrainz",
+                    provider_id=f"{provider_artist_id}-{calls}",
+                    title=title,
+                    artist_name="Fenced Artist",
+                    release_type="Album",
+                )
+            ]
+
+    provider = FencedProvider()
+    monkeypatch.setattr(
+        catalog_router, "build_metadata_provider", lambda _name, _settings: provider
+    )
+
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Fenced Artist",
+            primary_metadata_provider="musicbrainz",
+        )
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="musicbrainz",
+            provider_artist_id="fenced-mb",
+            name=artist.name,
+        )
+        db.add(identity)
+        await db.commit()
+        artist_id = artist.id
+        identity_id = identity.id
+
+    stale_task = asyncio.create_task(
+        catalog_router._refresh_discography_task(artist_id, "musicbrainz")
+    )
+    await asyncio.wait_for(old_started.wait(), timeout=1)
+
+    async with factory() as db:
+        identity = await db.get(CatalogArtistIdentity, identity_id)
+        assert identity is not None
+        stale_metadata = json.loads(identity.metadata_json or "{}")
+        stale_claim = stale_metadata["discography_claim_id"]
+        stale_metadata["discography_started_at"] = (
+            datetime.now(tz=UTC) - timedelta(minutes=11)
+        ).isoformat()
+        identity.metadata_json = json.dumps(stale_metadata, sort_keys=True)
+        await db.commit()
+
+    await catalog_router._refresh_discography_task(artist_id, "musicbrainz")
+
+    async with factory() as db:
+        identity = await db.get(CatalogArtistIdentity, identity_id)
+        assert identity is not None
+        ready_metadata = json.loads(identity.metadata_json or "{}")
+        assert ready_metadata["discography_state"] == "ready"
+        assert "discography_claim_id" not in ready_metadata
+        releases = list(
+            await db.scalars(
+                select(CatalogAlbumProvider).where(
+                    CatalogAlbumProvider.artist_identity_id == identity_id
+                )
+            )
+        )
+        assert [release.title for release in releases] == ["Replacement Album"]
+
+    release_old.set()
+    await asyncio.wait_for(stale_task, timeout=1)
+
+    async with factory() as db:
+        identity = await db.get(CatalogArtistIdentity, identity_id)
+        assert identity is not None
+        final_metadata = json.loads(identity.metadata_json or "{}")
+        assert final_metadata["discography_state"] == "ready"
+        assert final_metadata.get("discography_claim_id") != stale_claim
+        releases = list(
+            await db.scalars(
+                select(CatalogAlbumProvider).where(
+                    CatalogAlbumProvider.artist_identity_id == identity_id
+                )
+            )
+        )
+        assert [release.title for release in releases] == ["Replacement Album"]
+
+
+async def test_watchlist_configuration_starts_primary_not_legacy_all_provider_enrichment(
+    client: AsyncClient, monkeypatch
+) -> None:
+    from app.routers import catalog as catalog_router
+
+    started: list[str] = []
+
+    def capture_start(_artist_id: int, provider_name: str) -> bool:
+        started.append(provider_name)
+        return True
+
+    async def legacy_enrichment_must_not_run(*_args, **_kwargs):
+        raise AssertionError("legacy all-provider enrichment was queued")
+
+    monkeypatch.setattr(catalog_router, "_start_discography_task", capture_start)
+    monkeypatch.setattr(catalog_router, "_queue_artist_enrichment", legacy_enrichment_must_not_run)
+
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Primary First Watch",
+            primary_metadata_provider="deezer",
+            watchlist_provider="musicbrainz",
+        )
+        db.add(artist)
+        await db.flush()
+        db.add_all(
+            [
+                CatalogArtistIdentity(
+                    artist_id=artist.id,
+                    provider="deezer",
+                    provider_artist_id="primary-watch-dz",
+                    name=artist.name,
+                ),
+                CatalogArtistIdentity(
+                    artist_id=artist.id,
+                    provider="musicbrainz",
+                    provider_artist_id="primary-watch-mb",
+                    name=artist.name,
+                ),
+            ]
+        )
+        await db.commit()
+        artist_id = artist.id
+
+    response = await client.post(
+        f"/artists/catalog/{artist_id}/monitor",
+        data={
+            "csrf_token": client.cookies.get("csrf", ""),
+            "monitored": "true",
+            "provider": "musicbrainz",
+            "watchlist_provider": "musicbrainz",
+            "watchlist_release_albums": "true",
+        },
+        headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+    )
+
+    assert response.status_code == 200
+    assert started == ["deezer"]
+
+
+async def test_secondary_discography_failure_does_not_fail_primary_artist_state(
+    client: AsyncClient, monkeypatch
+) -> None:
+    del client
+    from app.routers import catalog as catalog_router
+
+    class FailingProvider:
+        async def get_discography(self, _provider_artist_id: str) -> list[AlbumHit]:
+            raise httpx.ConnectError("secondary unavailable")
+
+    monkeypatch.setattr(
+        catalog_router, "build_metadata_provider", lambda _name, _settings: FailingProvider()
+    )
+
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Independent Failure",
+            primary_metadata_provider="deezer",
+            enrichment_state="idle",
+        )
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="musicbrainz",
+            provider_artist_id="failure-mb",
+            name=artist.name,
+        )
+        db.add(identity)
+        await db.commit()
+        artist_id = artist.id
+        identity_id = identity.id
+
+    await catalog_router._refresh_discography_task(artist_id, "musicbrainz")
+
+    async with factory() as db:
+        artist = await db.get(CatalogArtist, artist_id)
+        identity = await db.get(CatalogArtistIdentity, identity_id)
+        assert artist is not None and artist.enrichment_state == "idle"
+        assert identity is not None
+        metadata = __import__("json").loads(identity.metadata_json or "{}")
+        assert metadata["discography_state"] == "failed"
+        assert metadata["discography_error"] == "Discography refresh failed"
+        assert "discography_started_at" not in metadata
+
+
+async def test_completed_discography_task_cannot_remove_replacement(monkeypatch) -> None:
+    from app.routers import catalog as catalog_router
+
+    release_old = asyncio.Event()
+
+    async def old_refresh(_artist_id: int, _provider_name: str) -> None:
+        await release_old.wait()
+
+    monkeypatch.setattr(catalog_router, "_refresh_discography_task", old_refresh)
+    assert catalog_router._start_discography_task(999, "deezer") is True
+    old_task = catalog_router._discography_tasks[(999, "deezer")]
+    replacement = asyncio.create_task(asyncio.sleep(60))
+    catalog_router._discography_tasks[(999, "deezer")] = replacement
+
+    release_old.set()
+    await old_task
+    await asyncio.sleep(0)
+    assert catalog_router._discography_tasks[(999, "deezer")] is replacement
+
+    replacement.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await replacement
+    catalog_router._discography_tasks.pop((999, "deezer"), None)
 
 
 async def test_album_page_links_to_catalog_artist(client: AsyncClient) -> None:

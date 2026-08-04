@@ -43,6 +43,8 @@ from app.models.track import IdentityResolutionState, Track
 from app.sources.base import CapabilityState
 
 VALID_METADATA_PROVIDERS = {"musicbrainz", "deezer", "itunes"}
+_ARTIST_VALIDATION_TIMEOUT_SECONDS = 2.0
+_VALID_ARTIST_TYPES = {"person", "group", "orchestra", "choir", "character", "other"}
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,79 @@ def provider_ids_for_hit(
     return {"mbid": hit.mbid, "deezer_id": hit.deezer_id, "itunes_id": hit.itunes_id}
 
 
+def validate_artist_detail(
+    detail: ArtistDetail, provider_name: str, provider_id: str
+) -> ArtistDetail:
+    native_ids = provider_ids_for_hit(detail)
+    expected_field = {
+        "musicbrainz": "mbid",
+        "deezer": "deezer_id",
+        "itunes": "itunes_id",
+    }.get(provider_name)
+    if (
+        provider_name not in VALID_METADATA_PROVIDERS
+        or not provider_id
+        or detail.provider != provider_name
+        or detail.provider_id != provider_id
+        or expected_field is None
+        or native_ids[expected_field] != provider_id
+        or not detail.name.strip()
+        or (detail.type is not None and detail.type.casefold() not in _VALID_ARTIST_TYPES)
+    ):
+        raise ValueError("Provider returned an invalid artist identity")
+    return detail
+
+
+async def validated_artist_hits(
+    provider: MetadataProvider, name: str, artists: list[ArtistHit]
+) -> list[ArtistHit]:
+    expected_field = {
+        "musicbrainz": "mbid",
+        "deezer": "deezer_id",
+        "itunes": "itunes_id",
+    }.get(name)
+    structurally_valid = [
+        hit
+        for hit in artists
+        if expected_field is not None
+        and hit.provider == name
+        and bool(hit.provider_id)
+        and bool(hit.name.strip())
+        and getattr(hit, expected_field) == hit.provider_id
+        and (hit.type is None or hit.type.casefold() in _VALID_ARTIST_TYPES)
+    ]
+    # Deezer can return stale search rows whose detail endpoint is an HTTP-200
+    # error envelope. MusicBrainz and iTunes search rows already carry their
+    # provider-native identity, so serial detail requests add latency but no
+    # stronger identity evidence.
+    if name != "deezer":
+        return structurally_valid
+
+    semaphore = asyncio.Semaphore(5)
+
+    async def validate(hit: ArtistHit) -> ArtistHit | None:
+        try:
+            async with semaphore:
+                detail = await asyncio.wait_for(
+                    provider.get_artist(hit.provider_id),
+                    timeout=_ARTIST_VALIDATION_TIMEOUT_SECONDS,
+                )
+            validate_artist_detail(detail, name, hit.provider_id)
+        except ValueError:
+            # Error envelopes and mismatched identities are definitive.
+            return None
+        except Exception:
+            # Timeouts and provider transport failures are transient. Keep the
+            # usable search identity rather than silently truncating the row set.
+            return hit
+        return hit
+
+    checked = await asyncio.gather(*(validate(hit) for hit in structurally_valid))
+    filtered = [hit for hit in checked if hit is not None]
+    filtered.sort(key=lambda hit: (hit.fan_count is None, -(hit.fan_count or 0)))
+    return filtered
+
+
 async def search_catalog_artists(
     settings: Settings, query: str, providers: list[str]
 ) -> list[ProviderOutcome]:
@@ -81,6 +156,7 @@ async def search_catalog_artists(
             return ProviderOutcome(name, [], state)
         try:
             artists = await provider.search_artists(query)
+            artists = await validated_artist_hits(provider, name, artists)
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             return ProviderOutcome(
                 name, artists, CapabilityState(True, extra={"elapsed_ms": elapsed_ms})
@@ -94,9 +170,10 @@ async def search_catalog_artists(
                 ),
             )
 
-    return list(
+    outcomes = list(
         await asyncio.gather(*[_one(p) for p in providers if p in VALID_METADATA_PROVIDERS])
     )
+    return sorted(outcomes, key=lambda outcome: 0 if outcome.provider == "deezer" else 1)
 
 
 async def upsert_catalog_artist(db: AsyncSession, hit: ArtistHit | ArtistDetail) -> CatalogArtist:
@@ -130,19 +207,20 @@ async def _upsert_catalog_artist(db: AsyncSession, hit: ArtistHit | ArtistDetail
                     ).all()
                 )
             )
-        if ids["mbid"]:
-            all_artists = list(
-                (
-                    await db.scalars(
-                        select(CatalogArtist).options(selectinload(CatalogArtist.albums))
-                    )
-                ).all()
+        identity_artist = (
+            await db.scalars(
+                select(CatalogArtist)
+                .join(CatalogArtistIdentity)
+                .where(
+                    CatalogArtistIdentity.provider == hit.provider,
+                    CatalogArtistIdentity.provider_artist_id == hit.provider_id,
+                )
+                .options(selectinload(CatalogArtist.albums))
+                .limit(1)
             )
-            candidates.extend(
-                candidate
-                for candidate in all_artists
-                if _safe_same_name_artist_identity_candidate(candidate, hit.name, ids)
-            )
+        ).first()
+        if identity_artist is not None:
+            candidates.append(identity_artist)
     candidates = list({candidate.id: candidate for candidate in candidates}.values())
     artist: CatalogArtist | None = None
     if candidates:
@@ -178,7 +256,7 @@ async def upsert_artist_identity(
         )
     ).first()
     if identity is None:
-        identity = (
+        conflicting_identity = (
             await db.scalars(
                 select(CatalogArtistIdentity).where(
                     CatalogArtistIdentity.artist_id == artist.id,
@@ -186,7 +264,8 @@ async def upsert_artist_identity(
                 )
             )
         ).first()
-    if identity is None:
+        if conflicting_identity is not None:
+            raise ValueError("Artist already has a different provider identity")
         identity = CatalogArtistIdentity(
             artist_id=artist.id,
             provider=hit.provider,
@@ -196,7 +275,6 @@ async def upsert_artist_identity(
         db.add(identity)
     else:
         identity.artist_id = artist.id
-        identity.provider_artist_id = hit.provider_id
     identity.name = hit.name or identity.name
     identity.artwork_url = hit.artwork_url or identity.artwork_url
     identity.metadata_json = json.dumps({"source": "provider", "complete": True}, sort_keys=True)
@@ -211,7 +289,8 @@ async def fetch_catalog_artist_detail(
     provider = build_metadata_provider(provider_name, settings)
     if provider is None:
         raise ValueError("Unknown metadata provider")
-    return await provider.get_artist(provider_id)
+    detail = await provider.get_artist(provider_id)
+    return validate_artist_detail(detail, provider_name, provider_id)
 
 
 async def open_catalog_artist(
@@ -748,35 +827,39 @@ async def _merge_artist_id_collisions(
     return artist
 
 
-def _has_non_mbid_provider_id(artist: CatalogArtist) -> bool:
-    return bool(artist.deezer_id or artist.itunes_id)
-
-
-def _safe_same_name_artist_identity_candidate(
-    candidate: CatalogArtist, hit_name: str, incoming_ids: dict[str, str | None]
-) -> bool:
-    if _norm_title(candidate.name) != _norm_title(hit_name):
-        return False
-    if candidate.mbid not in {None, incoming_ids["mbid"]}:
-        return False
-    if candidate.mbid == incoming_ids["mbid"]:
-        return True
-    return not _has_non_mbid_provider_id(candidate)
+def _artist_identity_evidence(artist: CatalogArtist) -> dict[str, set[str]]:
+    evidence: dict[str, set[str]] = {
+        "musicbrainz": set(),
+        "deezer": set(),
+        "itunes": set(),
+    }
+    canonical = {
+        "musicbrainz": artist.mbid,
+        "deezer": artist.deezer_id,
+        "itunes": artist.itunes_id,
+    }
+    for provider, provider_id in canonical.items():
+        if provider_id:
+            evidence[provider].add(provider_id)
+    for identity in artist.identities:
+        if identity.provider in evidence and identity.provider_artist_id:
+            evidence[identity.provider].add(identity.provider_artist_id)
+    return evidence
 
 
 def _artists_should_merge(left: CatalogArtist, right: CatalogArtist) -> bool:
-    shared_provider_id = any(
-        getattr(left, field) is not None and getattr(left, field) == getattr(right, field)
-        for field in ("mbid", "deezer_id", "itunes_id")
+    left_evidence = _artist_identity_evidence(left)
+    right_evidence = _artist_identity_evidence(right)
+    if any(
+        left_evidence[provider]
+        and right_evidence[provider]
+        and left_evidence[provider].isdisjoint(right_evidence[provider])
+        for provider in VALID_METADATA_PROVIDERS
+    ):
+        return False
+    return any(
+        left_evidence[provider] & right_evidence[provider] for provider in VALID_METADATA_PROVIDERS
     )
-    if shared_provider_id:
-        return True
-    if _norm_title(left.name) != _norm_title(right.name):
-        return False
-    if bool(left.mbid) == bool(right.mbid):
-        return False
-    unresolved = right if left.mbid else left
-    return not _has_non_mbid_provider_id(unresolved)
 
 
 async def reconcile_duplicate_catalog_artists(db: AsyncSession) -> int:
@@ -788,7 +871,10 @@ async def reconcile_duplicate_catalog_artists(db: AsyncSession) -> int:
                 (
                     await db.scalars(
                         select(CatalogArtist)
-                        .options(selectinload(CatalogArtist.albums))
+                        .options(
+                            selectinload(CatalogArtist.albums),
+                            selectinload(CatalogArtist.identities),
+                        )
                         .order_by(CatalogArtist.id)
                     )
                 ).all()

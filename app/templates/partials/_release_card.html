@@ -1,0 +1,9 @@
+{% set watched_artist = watched_catalog_artists.get(item.provider, {}).get(item.artist_provider_id) %}
+<article class="card catalog-result-card" data-provider="{{ item.provider | e }}" data-provider-id="{{ item.artist_provider_id | e }}" data-watched="{{ 'true' if watched_artist else 'false' }}">
+  {% if item.artwork_url %}<img src="/artwork?url={{ item.artwork_url | urlencode }}" alt="" class="catalog-result-art">{% else %}<div class="catalog-result-art catalog-result-art-missing" aria-hidden="true">No image</div>{% endif %}
+  <h3>{{ item.title }}</h3><p>{{ item.artist_name }}</p>{% if item.release_date %}<p class="hint">{{ item.release_date }}</p>{% endif %}
+  <div class="form-row catalog-result-actions">
+    <a class="btn secondary" data-discography-link href="{{ '/artists/catalog/' ~ watched_artist.artist_id if watched_artist else '/artists/catalog/open?provider=' ~ (item.provider | urlencode) ~ '&provider_id=' ~ (item.artist_provider_id | urlencode) }}">View artist</a>
+    <form method="post" action="/artists/catalog/open" data-watchlist-form><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><input type="hidden" name="provider" value="{{ item.provider | e }}"><input type="hidden" name="provider_id" value="{{ item.artist_provider_id | e }}"><input type="hidden" name="monitor" value="true"><button class="btn" type="submit" data-watchlist-submit{% if watched_artist %} disabled{% endif %}>{{ 'Watched' if watched_artist else 'Watch artist' }}</button></form>
+  </div><p data-watchlist-status aria-live="polite">{% if watched_artist %}Watched{% endif %}</p><p class="alert error" data-watchlist-error role="alert" hidden></p>
+</article>

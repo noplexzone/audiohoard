@@ -21,12 +21,14 @@ from app.models.auth import AppUser
 from app.naming.convention import render_path
 from app.schemas.health import SourceStatus
 from app.schemas.settings import SettingField, SettingsSaveRequest, SettingsTestRequest
+from app.services.discovery import discovery_service
 from app.services.health_status import CachedProviderStatus, get_health_status_service
 from app.settings_service import (
     ALLOWED_MIN_MP3_BITRATES,
     DEFAULT_FORMAT_PREFERENCE,
     DEFAULT_METADATA_PROVIDERS,
     DEFAULT_SOURCE_PRIORITY,
+    DISCOVERY_REGIONS,
     QualityProfile,
     get_all_effective,
     get_runtime_settings,
@@ -254,6 +256,7 @@ async def settings_section_page(
             "runtime": runtime,
             "default_sources": DEFAULT_SOURCE_PRIORITY,
             "default_metadata_providers": DEFAULT_METADATA_PROVIDERS,
+            "discovery_regions": DISCOVERY_REGIONS,
             "saved": request.query_params.get("saved", ""),
             "test_result": request.query_params.get("test", ""),
             "validation_error": request.query_params.get("error", ""),
@@ -353,6 +356,11 @@ async def save_runtime_settings_page(
     if metadata_order and primary not in metadata_enabled:
         primary = next(name for name in metadata_order if name in metadata_enabled)
     section = str(form.get("section", ""))
+    discovery_region = str(form.get("discovery_region", runtime.discovery_region)).upper()
+    if section == "metadata" and discovery_region not in DISCOVERY_REGIONS:
+        return RedirectResponse(
+            "/settings/metadata?error=Unsupported+discovery+region", status_code=303
+        )
     auto_download = (
         str(form.get("auto_download_wanted", "")).lower() in {"1", "true", "yes", "on"}
         if section == "behavior"
@@ -499,9 +507,15 @@ async def save_runtime_settings_page(
             max_parallel_acquisitions=(
                 max_parallel if section == "behavior" else current.max_parallel_acquisitions
             ),
+            discovery_region=(
+                discovery_region if section == "metadata" else current.discovery_region
+            ),
         )
         await db.commit()
         persisted = await get_runtime_settings(db)
+        if persisted.discovery_region != current.discovery_region:
+            discovery_service.invalidate_region(current.discovery_region)
+            discovery_service.invalidate_region(persisted.discovery_region)
         await job_dispatcher.set_max_concurrent_jobs(persisted.max_parallel_acquisitions)
     redirect_target = section if section in SETTINGS_SECTIONS else "download-sources"
     return RedirectResponse(f"/settings/{redirect_target}?saved=1", status_code=303)

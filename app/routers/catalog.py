@@ -3,18 +3,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any
 from urllib.parse import urlencode
+from uuid import uuid4
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from tenacity import RetryError
 
 from app.auth import get_current_user, require_mutation
 from app.config import Settings
@@ -50,13 +53,14 @@ from app.services.catalog_metadata import (
     VALID_METADATA_PROVIDERS,
     album_providers,
     available_artist_providers,
+    build_metadata_provider,
     enrich_catalog_artist,
     ensure_legacy_provider_snapshots,
     fetch_and_store_album,
-    fetch_and_store_discography,
     fetch_catalog_artist_detail,
     release_bucket,
     upsert_catalog_artist,
+    upsert_provider_release,
 )
 from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
 from app.services.library_import import ImportExecutionError, retag_catalog_album
@@ -74,6 +78,59 @@ from app.settings_service import RuntimeSettings, effective_settings_dep, get_ru
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 logger = logging.getLogger(__name__)
+_discography_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
+
+
+def _start_discography_task(artist_id: int, provider_name: str) -> bool:
+    key = (artist_id, provider_name)
+    existing = _discography_tasks.get(key)
+    if existing is not None and not existing.done():
+        return False
+    task = asyncio.create_task(_refresh_discography_task(artist_id, provider_name))
+    _discography_tasks[key] = task
+
+    def forget_task(completed: asyncio.Task[None]) -> None:
+        if _discography_tasks.get(key) is completed:
+            _discography_tasks.pop(key, None)
+
+    task.add_done_callback(forget_task)
+    return True
+
+
+async def _claim_discography_refresh(
+    session: AsyncSession, identity: CatalogArtistIdentity
+) -> str | None:
+    original = identity.metadata_json
+    try:
+        metadata = json.loads(original or "{}")
+    except (json.JSONDecodeError, TypeError):
+        metadata = {}
+    started_at = metadata.get("discography_started_at")
+    if metadata.get("discography_state") == "loading" and isinstance(started_at, str):
+        try:
+            started = datetime.fromisoformat(started_at)
+        except ValueError:
+            started = None
+        if started is not None and started > datetime.now(tz=UTC) - timedelta(minutes=10):
+            await session.rollback()
+            return None
+    claim_id = uuid4().hex
+    metadata["discography_state"] = "loading"
+    metadata["discography_started_at"] = datetime.now(tz=UTC).isoformat()
+    metadata["discography_claim_id"] = claim_id
+    metadata.pop("discography_error", None)
+    condition = (
+        CatalogArtistIdentity.metadata_json.is_(None)
+        if original is None
+        else CatalogArtistIdentity.metadata_json == original
+    )
+    result = await session.execute(
+        update(CatalogArtistIdentity)
+        .where(CatalogArtistIdentity.id == identity.id, condition)
+        .values(metadata_json=json.dumps(metadata, sort_keys=True))
+    )
+    await session.commit()
+    return claim_id if getattr(result, "rowcount", 0) else None
 
 
 def _is_fetch_request(request: Request | None) -> bool:
@@ -421,27 +478,141 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
     from app.settings_service import build_effective_settings
 
     factory = get_session_factory()
-    async with factory() as session:
-        cfg = await build_effective_settings(session, get_settings())
-        load = selectinload(CatalogArtist.identities).selectinload(CatalogArtistIdentity.releases)
-        artist = (
-            await session.execute(
-                select(CatalogArtist).where(CatalogArtist.id == artist_id).options(load)
+    claim_id: str | None = None
+    try:
+        async with factory() as session:
+            cfg = await build_effective_settings(session, get_settings())
+            identity = (
+                await session.scalars(
+                    select(CatalogArtistIdentity).where(
+                        CatalogArtistIdentity.artist_id == artist_id,
+                        CatalogArtistIdentity.provider == provider_name,
+                    )
+                )
+            ).first()
+            artist = await session.get(CatalogArtist, artist_id)
+            if artist is None or identity is None:
+                return
+            claimed_identity: CatalogArtistIdentity = identity
+            provider_id = identity.provider_artist_id
+            claim_id = None
+
+            async def claim() -> None:
+                nonlocal claim_id
+                claim_id = await _claim_discography_refresh(session, claimed_identity)
+
+            await run_with_sqlite_lock_retry(session, claim, attempts=5, delay_seconds=0.35)
+            if claim_id is None:
+                return
+
+        metadata_provider = build_metadata_provider(provider_name, cfg)
+        if metadata_provider is None:
+            raise RuntimeError("Metadata provider is unavailable")
+        # Provider HTTP is deliberately completed before opening the SQLite write session.
+        summaries = await metadata_provider.get_discography(provider_id)
+
+        async with factory() as session:
+            stored = False
+
+            async def store() -> None:
+                nonlocal stored
+                load = selectinload(CatalogArtist.identities).selectinload(
+                    CatalogArtistIdentity.releases
+                )
+                stored_artist = (
+                    await session.execute(
+                        select(CatalogArtist).where(CatalogArtist.id == artist_id).options(load)
+                    )
+                ).scalar_one_or_none()
+                if stored_artist is None:
+                    return
+                stored_identity = next(
+                    (item for item in stored_artist.identities if item.provider == provider_name),
+                    None,
+                )
+                if stored_identity is None:
+                    return
+                try:
+                    claim_metadata = json.loads(stored_identity.metadata_json or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    claim_metadata = {}
+                if claim_metadata.get("discography_claim_id") != claim_id:
+                    await session.rollback()
+                    return
+                existing_provider_ids = {
+                    release.provider_album_id for release in stored_identity.releases
+                }
+                for summary in summaries:
+                    release = await upsert_provider_release(
+                        session, stored_artist, stored_identity, summary
+                    )
+                    if (
+                        summary.provider_id not in existing_provider_ids
+                        and stored_artist.monitored
+                        and stored_artist.watchlist_provider == provider_name
+                    ):
+                        release.monitored = {
+                            "album": stored_artist.watchlist_release_albums,
+                            "single": stored_artist.watchlist_release_singles,
+                            "ep": stored_artist.watchlist_release_eps,
+                        }.get(release.release_kind, False)
+                stored_identity.last_discography_at = datetime.now(tz=UTC)
+                try:
+                    metadata = json.loads(stored_identity.metadata_json or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+                metadata["discography_state"] = "ready"
+                metadata.pop("discography_started_at", None)
+                metadata.pop("discography_claim_id", None)
+                metadata.pop("discography_error", None)
+                stored_identity.metadata_json = json.dumps(metadata, sort_keys=True)
+                runtime = await get_runtime_settings(session)
+                effective_primary = (
+                    stored_artist.primary_metadata_provider or runtime.primary_metadata_provider
+                )
+                if provider_name == effective_primary:
+                    stored_artist.enrichment_state = "idle"
+                await session.commit()
+                stored = True
+
+            await run_with_sqlite_lock_retry(session, store, attempts=5, delay_seconds=0.35)
+            if not stored:
+                return
+
+        async with factory() as session:
+            artist = await session.get(CatalogArtist, artist_id)
+            runtime = await get_runtime_settings(session)
+            effective_primary = (
+                artist.primary_metadata_provider or runtime.primary_metadata_provider
+                if artist is not None
+                else runtime.primary_metadata_provider
             )
-        ).scalar_one_or_none()
-        if artist is None:
-            return
-        try:
-            artist.enrichment_state = "running"
-            await session.commit()
-            await fetch_and_store_discography(
-                session,
-                cfg,
-                artist,
-                provider_name=provider_name,
-            )
-            artist.enrichment_state = "idle"
-            await session.commit()
+            if artist is not None and artist.monitored and provider_name == effective_primary:
+                for secondary in runtime.enabled_metadata_providers:
+                    if secondary == provider_name:
+                        continue
+                    secondary_identity = await session.scalar(
+                        select(CatalogArtistIdentity)
+                        .where(
+                            CatalogArtistIdentity.artist_id == artist_id,
+                            CatalogArtistIdentity.provider == secondary,
+                        )
+                        .options(selectinload(CatalogArtistIdentity.releases))
+                    )
+                    if secondary_identity is not None:
+                        try:
+                            secondary_metadata = json.loads(
+                                secondary_identity.metadata_json or "{}"
+                            )
+                        except (json.JSONDecodeError, TypeError):
+                            secondary_metadata = {}
+                        if (
+                            secondary_metadata.get("discography_state") != "ready"
+                            and not secondary_identity.releases
+                        ):
+                            _start_discography_task(artist_id, secondary)
+            await session.rollback()
+        if provider_name == "deezer":
             try:
                 await reconcile_deezer_catalog_ownership(
                     get_session_factory(), cfg, artist_id=artist_id
@@ -450,18 +621,50 @@ async def _refresh_discography_task(artist_id: int, provider_name: str) -> None:
                 logger.exception(
                     "Catalog ownership reconciliation failed for artist %s", artist_id
                 )
-        except Exception:
-            await session.rollback()
-            failed = await session.get(CatalogArtist, artist_id)
-            if failed is not None:
-                failed.enrichment_state = "failed"
-                await session.commit()
+    except Exception:
+        if claim_id is None:
             logger.error(
-                "Catalog discography refresh failed for artist %s via %s",
+                "Catalog discography refresh failed before claim for artist %s via %s",
                 artist_id,
                 provider_name,
                 exc_info=True,
             )
+            return
+        async with factory() as session:
+            failed = await session.get(CatalogArtist, artist_id)
+            if failed is not None:
+                runtime = await get_runtime_settings(session)
+                effective_primary = (
+                    failed.primary_metadata_provider or runtime.primary_metadata_provider
+                )
+                if provider_name == effective_primary:
+                    failed.enrichment_state = "failed"
+                identity = await session.scalar(
+                    select(CatalogArtistIdentity).where(
+                        CatalogArtistIdentity.artist_id == artist_id,
+                        CatalogArtistIdentity.provider == provider_name,
+                    )
+                )
+                if identity is not None:
+                    try:
+                        metadata = json.loads(identity.metadata_json or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                    if metadata.get("discography_claim_id") != claim_id:
+                        await session.rollback()
+                        return
+                    metadata["discography_state"] = "failed"
+                    metadata.pop("discography_started_at", None)
+                    metadata.pop("discography_claim_id", None)
+                    metadata["discography_error"] = "Discography refresh failed"
+                    identity.metadata_json = json.dumps(metadata, sort_keys=True)
+                await session.commit()
+        logger.error(
+            "Catalog discography refresh failed for artist %s via %s",
+            artist_id,
+            provider_name,
+            exc_info=True,
+        )
 
 
 def _templates(request: Request) -> Jinja2Templates:
@@ -485,6 +688,19 @@ def _wants_json(request: Request) -> bool:
         or request.headers.get("x-requested-with", "").casefold() == "fetch"
         or request.headers.get("content-type", "").casefold().startswith("application/json")
     )
+
+
+def _artist_watchlist_payload(artist: CatalogArtist) -> dict[str, object]:
+    return {
+        "artist_id": artist.id,
+        "watched": bool(artist.monitored),
+        "watchlist_release_albums": bool(artist.watchlist_release_albums),
+        "watchlist_release_singles": bool(artist.watchlist_release_singles),
+        "watchlist_release_eps": bool(artist.watchlist_release_eps),
+        "watchlist_monitor_upgrades": bool(artist.watchlist_monitor_upgrades),
+        "configure_url": f"/artists/catalog/{artist.id}/monitor",
+        "discography_url": f"/artists/catalog/{artist.id}",
+    }
 
 
 @router.get("/library", response_class=HTMLResponse)
@@ -646,43 +862,78 @@ async def delete_imported_release_files(
 async def open_catalog_artist_page(
     provider: str,
     provider_id: str,
+    request: Request,
     background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     monitor: bool = False,
-) -> RedirectResponse:
-    detail = await fetch_catalog_artist_detail(settings, provider, provider_id)
-    artist_id = None
-    runtime = None
+) -> Response:
+    # Authentication and effective settings may have opened an implicit read
+    # transaction on the request session. End it before provider network I/O.
+    await db.rollback()
+    try:
+        detail = await fetch_catalog_artist_detail(settings, provider, provider_id)
+    except ValueError:
+        message = "The selected artist is no longer available from this provider."
+        if request is not None and _wants_json(request):
+            return JSONResponse(
+                {"error": "invalid_artist_identity", "message": message}, status_code=422
+            )
+        return HTMLResponse(
+            "<h1>Invalid artist identity</h1><p>" + message + "</p>", status_code=422
+        )
+    except (httpx.HTTPError, TimeoutError, RetryError):
+        logger.warning("Metadata provider artist lookup failed", exc_info=True)
+        message = "The metadata provider could not be reached. Please try again."
+        if request is not None and _wants_json(request):
+            return JSONResponse(
+                {"error": "metadata_provider_unavailable", "message": message}, status_code=502
+            )
+        return HTMLResponse(
+            "<h1>Metadata provider unavailable</h1><p>" + message + "</p>",
+            status_code=502,
+        )
+    artist_id: int | None = None
+    runtime: RuntimeSettings | None = None
+    watchlist_payload: dict[str, object] | None = None
 
     async def save_artist() -> None:
-        nonlocal artist_id, runtime
+        nonlocal artist_id, runtime, watchlist_payload
         artist = await upsert_catalog_artist(db, detail)
         runtime = await get_runtime_settings(db)
         if monitor:
+            was_monitored = bool(artist.monitored)
             artist.monitored = True
-            _apply_runtime_watchlist_defaults(artist, runtime)
-            available = [provider] if provider in VALID_METADATA_PROVIDERS else []
-            artist.watchlist_provider = _selected_provider(
-                runtime.primary_metadata_provider,
-                available,
-                runtime.primary_metadata_provider,
-                provider,
-            )
+            if not was_monitored:
+                _apply_runtime_watchlist_defaults(artist, runtime)
+                available = [provider] if provider in VALID_METADATA_PROVIDERS else []
+                artist.watchlist_provider = _selected_provider(
+                    runtime.primary_metadata_provider,
+                    available,
+                    runtime.primary_metadata_provider,
+                    provider,
+                )
         await db.commit()
         artist_id = artist.id
+        watchlist_payload = _artist_watchlist_payload(artist)
 
     await run_with_sqlite_lock_retry(db, save_artist, attempts=5, delay_seconds=0.35)
-    assert artist_id is not None and runtime is not None
-    if await _queue_artist_enrichment(db, artist_id):
-        background_tasks.add_task(
-            _enrich_artist_task, artist_id, runtime.enabled_metadata_providers
-        )
+    assert artist_id is not None and runtime is not None and watchlist_payload is not None
+    primary_provider = _selected_provider(
+        runtime.primary_metadata_provider,
+        [provider],
+        runtime.primary_metadata_provider,
+        provider,
+    )
+    _start_discography_task(artist_id, primary_provider)
+    if _wants_json(request):
+        return JSONResponse(watchlist_payload)
     return RedirectResponse(f"/artists/catalog/{artist_id}", status_code=303)
 
 
 @router.post("/artists/catalog/open", include_in_schema=False)
 async def open_catalog_artist_post(
+    request: Request,
     background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(effective_settings_dep)],
@@ -690,10 +941,11 @@ async def open_catalog_artist_post(
     provider: Annotated[str, Form()],
     provider_id: Annotated[str, Form()],
     monitor: Annotated[str, Form()] = "",
-) -> RedirectResponse:
+) -> Response:
     return await open_catalog_artist_page(
         provider,
         provider_id,
+        request,
         background_tasks,
         db,
         settings,
@@ -734,6 +986,13 @@ async def catalog_artist_page(
         (identity for identity in artist.identities if identity.provider == selected_provider),
         None,
     )
+    try:
+        selected_metadata = (
+            json.loads(selected_identity.metadata_json or "{}") if selected_identity else {}
+        )
+    except (json.JSONDecodeError, TypeError):
+        selected_metadata = {}
+    discography_failed = selected_metadata.get("discography_state") == "failed"
     # GET navigation must stay read-only. Provider refreshes and legacy snapshot repairs
     # can involve slow network calls and SQLite writer locks; run them only from explicit
     # actions so artist pages remain usable while acquisition/monitoring jobs are active.
@@ -742,7 +1001,16 @@ async def catalog_artist_page(
         if selected_identity is not None
         else _legacy_provider_album_rows(artist, selected_provider)
     )
-    discography_loading = artist.enrichment_state in {"queued", "running"} and not provider_albums
+    if (
+        selected_provider == effective_primary_provider
+        and not provider_albums
+        and not discography_failed
+    ):
+        _start_discography_task(artist.id, selected_provider)
+    discography_loading = not provider_albums and (
+        (artist.id, selected_provider) in _discography_tasks
+        or artist.enrichment_state in {"queued", "running"}
+    )
     canonical_progress = await get_release_progress(
         db,
         {
@@ -854,6 +1122,7 @@ async def catalog_artist_page(
             "release_progress": release_progress,
             "artist_rollup": artist_rollup,
             "discography_loading": discography_loading,
+            "discography_failed": discography_failed,
         },
     )
 
@@ -922,10 +1191,9 @@ async def enrich_catalog_artist_page(
 async def monitor_catalog_artist_page(
     artist_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[object, Depends(require_mutation)],
-) -> RedirectResponse:
+) -> Response:
     load = selectinload(CatalogArtist.identities).selectinload(CatalogArtistIdentity.releases)
     artist = (
         await db.execute(
@@ -1039,14 +1307,20 @@ async def monitor_catalog_artist_page(
                 release.catalog_album.monitored = True
     if selected_identity is not None:
         await _sync_artist_upgrade_monitoring(db, artist, list(selected_identity.releases))
-    should_queue_enrichment = artist.monitored and (
-        selected_identity is None or not list(selected_identity.releases)
+    primary_provider = _artist_primary_provider(artist, runtime, available)
+    primary_identity = next(
+        (identity for identity in artist.identities if identity.provider == primary_provider), None
     )
-    if should_queue_enrichment and await _queue_artist_enrichment(db, artist.id):
-        background_tasks.add_task(
-            _enrich_artist_task, artist.id, runtime.enabled_metadata_providers
-        )
+    refresh_provider = ""
+    if artist.monitored and primary_identity is not None and not primary_identity.releases:
+        refresh_provider = primary_provider
+    elif artist.monitored and selected_identity is not None and not selected_identity.releases:
+        refresh_provider = selected_identity.provider
     await db.commit()
+    if refresh_provider:
+        _start_discography_task(artist.id, refresh_provider)
+    if _wants_json(request):
+        return JSONResponse(_artist_watchlist_payload(artist))
     return RedirectResponse(
         _artist_page_url(artist.id, provider=view_provider, release_type=release_type, sort=sort),
         status_code=303,
@@ -1058,10 +1332,91 @@ async def catalog_artist_state(
     artist_id: int,
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> JSONResponse:
-    artist = await db.get(CatalogArtist, artist_id)
+    artist = (
+        await db.execute(
+            select(CatalogArtist)
+            .where(CatalogArtist.id == artist_id)
+            .options(
+                selectinload(CatalogArtist.identities).selectinload(CatalogArtistIdentity.releases)
+            )
+        )
+    ).scalar_one_or_none()
     if artist is None:
         raise HTTPException(status_code=404, detail="Catalog artist not found")
-    return JSONResponse({"enrichment_state": artist.enrichment_state})
+    providers: dict[str, dict[str, object]] = {}
+    for identity in artist.identities:
+        try:
+            metadata = json.loads(identity.metadata_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+        state = str(metadata.get("discography_state") or "idle")
+        if (artist_id, identity.provider) in _discography_tasks:
+            state = "loading"
+        elif identity.releases:
+            state = "ready"
+        providers[identity.provider] = {
+            "state": state,
+            "release_count": len(identity.releases),
+            "error": metadata.get("discography_error") if state == "failed" else None,
+        }
+    return JSONResponse({"providers": providers})
+
+
+@router.get("/artists/catalog/{artist_id}/discography", response_class=HTMLResponse)
+async def catalog_artist_discography_fragment(
+    request: Request,
+    artist_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    provider: str = "",
+    release_type: str = "",
+    sort: str = "desc",
+) -> HTMLResponse:
+    page = await catalog_artist_page(
+        request,
+        artist_id,
+        BackgroundTasks(),
+        db,
+        settings,
+        provider=provider,
+        release_type=release_type,
+        sort=sort,
+    )
+    context = getattr(page, "context", None)
+    if not isinstance(context, dict):
+        raise HTTPException(status_code=500, detail="Discography fragment unavailable")
+    return _templates(request).TemplateResponse(request, "partials/_discography.html", context)
+
+
+@router.post("/artists/catalog/{artist_id}/discography/refresh", include_in_schema=False)
+async def refresh_catalog_artist_discography(
+    artist_id: int,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> Response:
+    form = await request.form()
+    provider = str(form.get("provider", ""))
+    identity = await db.scalar(
+        select(CatalogArtistIdentity.id).where(
+            CatalogArtistIdentity.artist_id == artist_id,
+            CatalogArtistIdentity.provider == provider,
+        )
+    )
+    if provider not in VALID_METADATA_PROVIDERS or identity is None:
+        raise HTTPException(status_code=400, detail="Unavailable metadata provider")
+    started = _start_discography_task(artist_id, provider)
+    if _wants_json(request):
+        return JSONResponse({"provider": provider, "state": "loading", "started": started})
+    return RedirectResponse(
+        _artist_page_url(
+            artist_id,
+            provider=provider,
+            release_type=str(form.get("release_type", "")),
+            sort=str(form.get("sort", "desc")),
+        ),
+        status_code=303,
+    )
 
 
 @router.get("/artists/monitored", include_in_schema=False)

@@ -98,8 +98,15 @@ async def _native_submit(client: AsyncClient, page_url: str, form: ParsedForm) -
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/search", "/downloads", "/settings/download-sources"])
 async def test_authenticated_page_forms_replay_as_native_browser_posts(
-    client: AsyncClient, path: str
+    client: AsyncClient, path: str, monkeypatch
 ) -> None:
+    if path == "/search":
+        from app.routers import search as search_router
+
+        async def empty_discovery(_region: str):
+            return []
+
+        monkeypatch.setattr(search_router.discovery_service, "landing", empty_discovery)
     client.headers.pop("X-CSRF-Token", None)
     page = await client.get(path)
     assert page.status_code == 200

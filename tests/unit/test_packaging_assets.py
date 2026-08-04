@@ -23,6 +23,30 @@ def test_setuptools_includes_web_assets_in_built_distributions() -> None:
     assert "CHANGELOG.md" in data_files["."]
 
 
+def test_discovery_artist_card_assets_are_registered() -> None:
+    search = Path("app/templates/search.html").read_text(encoding="utf-8")
+    partial = Path("app/templates/partials/_artist_card.html")
+    script = Path("app/static/js/discovery.js")
+
+    assert partial.exists()
+    assert script.exists()
+    assert '{% include "partials/_artist_card.html" %}' in search
+    assert 'src="/static/js/discovery.js?v={{ app_version }}"' in search
+    assert 'data-page-module="discovery"' in search
+
+
+def test_progressive_discography_script_is_bounded_and_delegated() -> None:
+    script = Path("app/static/js/artist-watchlist.js").read_text(encoding="utf-8")
+
+    assert "region.addEventListener('change'" in script
+    assert "control.form.matches('[data-auto-submit-form]')" in script
+    assert "attempts >= 60" in script
+    assert "if (document.hidden)" in script
+    assert "new URLSearchParams(window.location.search)" in script
+    assert "query.set('provider', provider)" in script
+    assert "discography.replaceWith(fresh)" in script
+
+
 def test_branding_assets_exist() -> None:
     branding = Path("app/static/branding")
     for name in (
@@ -103,7 +127,7 @@ def test_favicon_ico_uses_the_requested_artwork_at_every_size() -> None:
 
 def test_dockerfile_version_and_healthcheck_match_current_runtime_contract() -> None:
     dockerfile = Path("docker/Dockerfile").read_text(encoding="utf-8")
-    assert 'org.opencontainers.image.version="0.16.0"' in dockerfile
+    assert 'org.opencontainers.image.version="0.17.0"' in dockerfile
     assert "http://localhost:8000/health/ready" in dockerfile
 
 

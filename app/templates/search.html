@@ -42,24 +42,32 @@
     {% for outcome in catalog_outcomes %}
       {% for artist_hit in outcome.artists %}
       {% set any_hits.value = true %}
-      <article class="card catalog-result-card">
-        {% if artist_hit.artwork_url %}<img src="/artwork?url={{ artist_hit.artwork_url | urlencode }}" alt="" class="catalog-result-art">{% else %}<div class="catalog-result-art catalog-result-art-missing" aria-hidden="true">No image</div>{% endif %}
-        <h3>{{ artist_hit.name }}</h3>
-        <p class="catalog-provider-line"><span class="badge info">{{ display_name(artist_hit.provider) }}</span>{% if artist_hit.disambiguation %} {{ artist_hit.disambiguation }}{% endif %}</p>
-        <dl class="catalog-evidence-list">
-          <div><dt>Provider ID</dt><dd>{{ artist_hit.provider_id }}</dd></div>
-          {% if artist_hit.fan_count is not none %}<div><dt>Fans</dt><dd>{{ artist_hit.fan_count }}</dd></div>{% endif %}
-          {% if artist_hit.album_count is not none %}<div><dt>Releases</dt><dd>{{ artist_hit.album_count }}</dd></div>{% endif %}
-        </dl>
-        {% if artist_hit.top_tracks %}<p class="hint catalog-top-tracks"><strong>Top tracks:</strong> {{ artist_hit.top_tracks | join(', ') }}</p>{% endif %}
-        <div class="form-row catalog-result-actions"><a class="btn secondary" href="/artists/catalog/open?provider={{ artist_hit.provider | urlencode }}&provider_id={{ artist_hit.provider_id | urlencode }}">Open discography</a>{% if artist_hit.external_url %}<a class="btn secondary" href="{{ artist_hit.external_url | e }}" target="_blank" rel="noopener noreferrer">Open {{ display_name(artist_hit.provider) }}</a>{% endif %}<form method="post" action="/artists/catalog/open"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><input type="hidden" name="provider" value="{{ artist_hit.provider | e }}"><input type="hidden" name="provider_id" value="{{ artist_hit.provider_id | e }}"><input type="hidden" name="monitor" value="true"><button class="btn" type="submit">Add to watchlist</button></form></div>
-      </article>
+      {% set watched_artist = watched_catalog_artists.get(artist_hit.provider, {}).get(artist_hit.provider_id) %}
+      {% set artist_card_id = artist_hit.provider ~ '-' ~ loop.index %}
+      {% include "partials/_artist_card.html" %}
       {% endfor %}
     {% endfor %}
     </div>
     {% if not any_hits.value %}<div class="empty-state"><h3>No catalog results</h3><p>Try another artist or provider.</p></div>{% endif %}
   {% endif %}
 </section>
+{% if not catalog_query %}
+<div class="discovery-region-note" role="status">Discovery region: <strong>{{ discovery_region }}</strong>. Global fallback is labeled below.</div>
+{% for section in discovery_sections %}
+<section class="card discovery-section" aria-labelledby="discovery-{{ section.feed }}">
+  <div class="page-header"><div><h2 id="discovery-{{ section.feed }}">{{ section.title }}</h2>{% if section.fallback_global %}<span class="badge info">Global fallback</span>{% endif %}{% if section.stale %}<span class="badge info">Cached</span>{% endif %}</div><a class="btn secondary" href="/discover/{{ section.feed }}">View all</a></div>
+  {% if section.state == 'error' %}<div class="alert error" role="alert">{{ section.message }}</div>
+  {% elif not section.items %}<div class="empty-state" role="status"><h3>Nothing to show</h3><p>This feed is currently empty.</p></div>
+  {% else %}<div class="grid catalog-result-grid">
+    {% for item in section.items %}
+      {% if section.feed == 'popular' %}{% set artist_hit = item %}{% set watched_artist = watched_catalog_artists.get(item.provider, {}).get(item.provider_id) %}{% set artist_card_id = 'discover-' ~ section.feed ~ '-' ~ loop.index %}{% include "partials/_artist_card.html" %}
+      {% elif section.feed == 'genres' %}<a class="card discovery-genre-card" href="/discover/genres/{{ item.provider_id }}">{% if item.artwork_url %}<img src="/artwork?url={{ item.artwork_url | urlencode }}" alt="" class="catalog-result-art">{% endif %}<h3>{{ item.name }}</h3></a>
+      {% else %}{% include "partials/_release_card.html" %}{% endif %}
+    {% endfor %}
+  </div>{% endif %}
+</section>
+{% endfor %}
+{% endif %}
 {% else %}
 <section class="card">
   <h2>Advanced source search</h2><p class="hint">Use this for raw source listings and direct TIDAL track URL downloads.</p>
@@ -88,4 +96,7 @@
   {% endif %}
 </section>
 {% endif %}
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/discovery.js?v={{ app_version }}" data-page-module="discovery" defer></script>
 {% endblock %}

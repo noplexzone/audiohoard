@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+import httpx
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -27,9 +28,161 @@ from app.services.catalog_metadata import (
     fetch_and_store_discography,
     reconcile_duplicate_catalog_albums,
     reconcile_duplicate_catalog_artists,
+    search_catalog_artists,
     upsert_catalog_artist,
     upsert_provider_release,
 )
+
+
+async def test_artist_search_filters_invalid_identity_and_ranks_deezer_fans(
+    monkeypatch: pytest.MonkeyPatch, test_settings: Settings
+) -> None:
+    class FakeProvider:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def health(self):
+            from app.sources.base import CapabilityState
+
+            return CapabilityState(True)
+
+        async def search_artists(self, query: str) -> list[ArtistHit]:
+            del query
+            if self.name == "deezer":
+                return [
+                    ArtistHit("deezer", "fanless", "Fanless", deezer_id="fanless"),
+                    ArtistHit("deezer", "low", "Low", deezer_id="low", fan_count=5),
+                    ArtistHit("deezer", "10002824", "Stale", deezer_id="10002824", fan_count=99),
+                    ArtistHit("deezer", "high", "High", deezer_id="high", fan_count=50),
+                ]
+            native_field = {"musicbrainz": "mbid", "itunes": "itunes_id"}[self.name]
+            return [
+                ArtistHit(
+                    self.name,
+                    f"{self.name}-1",
+                    "First",
+                    **{native_field: f"{self.name}-1"},
+                ),
+                ArtistHit(
+                    self.name,
+                    f"{self.name}-2",
+                    "Second",
+                    **{native_field: f"{self.name}-2"},
+                ),
+            ]
+
+        async def get_artist(self, id: str) -> ArtistDetail:
+            if id == "10002824":
+                return ArtistDetail("deezer", "", "", deezer_id=None)
+            return ArtistDetail(
+                self.name,
+                id,
+                id.title(),
+                deezer_id=id if self.name == "deezer" else None,
+                mbid=id if self.name == "musicbrainz" else None,
+                itunes_id=id if self.name == "itunes" else None,
+                type="Group" if self.name == "musicbrainz" else None,
+            )
+
+    monkeypatch.setattr(
+        catalog_metadata,
+        "build_metadata_provider",
+        lambda name, settings: FakeProvider(name),
+    )
+
+    outcomes = await search_catalog_artists(
+        test_settings, "artist", ["musicbrainz", "deezer", "itunes"]
+    )
+
+    assert [outcome.provider for outcome in outcomes] == ["deezer", "musicbrainz", "itunes"]
+    assert [hit.provider_id for outcome in outcomes for hit in outcome.artists] == [
+        "high",
+        "low",
+        "fanless",
+        "musicbrainz-1",
+        "musicbrainz-2",
+        "itunes-1",
+        "itunes-2",
+    ]
+
+
+async def test_musicbrainz_search_rows_with_native_ids_do_not_require_serial_detail_validation(
+    monkeypatch: pytest.MonkeyPatch, test_settings: Settings
+) -> None:
+    class MusicBrainzSearchProvider:
+        async def health(self):
+            from app.sources.base import CapabilityState
+
+            return CapabilityState(True)
+
+        async def search_artists(self, query: str) -> list[ArtistHit]:
+            del query
+            return [
+                *[
+                    ArtistHit(
+                        "musicbrainz",
+                        f"mb-{index}",
+                        f"Artist {index}",
+                        mbid=f"mb-{index}",
+                        type="Group",
+                    )
+                    for index in range(10)
+                ],
+                ArtistHit(
+                    "musicbrainz",
+                    "invalid-event",
+                    "Not an artist",
+                    mbid="invalid-event",
+                    type="Event",
+                ),
+            ]
+
+        async def get_artist(self, id: str) -> ArtistDetail:
+            raise AssertionError(f"MusicBrainz search row {id} was unnecessarily revalidated")
+
+    monkeypatch.setattr(
+        catalog_metadata,
+        "build_metadata_provider",
+        lambda name, settings: MusicBrainzSearchProvider(),
+    )
+
+    outcomes = await search_catalog_artists(test_settings, "artist", ["musicbrainz"])
+
+    assert [hit.provider_id for hit in outcomes[0].artists] == [
+        f"mb-{index}" for index in range(10)
+    ]
+
+
+async def test_deezer_validation_fails_open_for_transport_errors_but_rejects_invalid_identity(
+    monkeypatch: pytest.MonkeyPatch, test_settings: Settings
+) -> None:
+    class DeezerSearchProvider:
+        async def health(self):
+            from app.sources.base import CapabilityState
+
+            return CapabilityState(True)
+
+        async def search_artists(self, query: str) -> list[ArtistHit]:
+            del query
+            return [
+                ArtistHit("deezer", "transient", "Transient", deezer_id="transient"),
+                ArtistHit("deezer", "invalid", "Invalid", deezer_id="invalid"),
+            ]
+
+        async def get_artist(self, id: str) -> ArtistDetail:
+            if id == "transient":
+                raise httpx.ReadTimeout("temporary provider timeout")
+            raise ValueError("definitive provider error envelope")
+
+    monkeypatch.setattr(
+        catalog_metadata,
+        "build_metadata_provider",
+        lambda name, settings: DeezerSearchProvider(),
+    )
+
+    outcomes = await search_catalog_artists(test_settings, "artist", ["deezer"])
+
+    assert [hit.provider_id for hit in outcomes[0].artists] == ["transient"]
 
 
 def test_album_title_normalization_folds_typographic_punctuation() -> None:
@@ -191,11 +344,12 @@ async def test_duplicate_reconciliation_keeps_distinct_provider_same_name_rows(d
     merged = await reconcile_duplicate_catalog_artists(db_session)
     await db_session.flush()
 
-    assert merged == 1
+    assert merged == 0
     remaining = list((await db_session.scalars(select(CatalogArtist))).all())
-    assert len(remaining) == 2
+    assert len(remaining) == 3
     assert any(row.id == provider_native_id and row.deezer_id == "10002824" for row in remaining)
     assert any(row.mbid == "2baf3276-ed6a-4349-8d2e-f4601e7b2167" for row in remaining)
+    assert any(row.id == placeholder.id for row in remaining)
 
 
 async def test_provider_refresh_does_not_erase_a_known_track_count(db_session) -> None:
@@ -407,7 +561,7 @@ async def test_enrichment_resolves_mbid_from_conservative_discography_overlap(
     assert json.loads(artist.provenance_json or "{}")["mbid"] == "musicbrainz"
 
 
-async def test_upsert_reuses_normalized_unresolved_artist_for_resolved_mbid(db_session) -> None:
+async def test_upsert_does_not_reuse_name_only_artist_for_resolved_mbid(db_session) -> None:
     existing = CatalogArtist(name="Juice  WRLD")
     db_session.add(existing)
     await db_session.flush()
@@ -422,9 +576,42 @@ async def test_upsert_reuses_normalized_unresolved_artist_for_resolved_mbid(db_s
         ),
     )
 
-    assert result.id == existing.id
+    assert result.id != existing.id
     assert result.mbid == "juice-mbid"
-    assert len(list((await db_session.scalars(select(CatalogArtist))).all())) == 1
+    assert len(list((await db_session.scalars(select(CatalogArtist))).all())) == 2
+
+
+async def test_upsert_keeps_same_name_provider_identities_distinct_when_canonical_ids_are_blank(
+    db_session,
+) -> None:
+    first = CatalogArtist(name="Shared Stage Name")
+    first.identities.append(
+        CatalogArtistIdentity(
+            provider="musicbrainz", provider_artist_id="first-mbid", name=first.name
+        )
+    )
+    db_session.add(first)
+    await db_session.flush()
+
+    second = await upsert_catalog_artist(
+        db_session,
+        ArtistDetail(
+            provider="musicbrainz",
+            provider_id="second-mbid",
+            name="Shared Stage Name",
+            mbid="second-mbid",
+        ),
+    )
+    await db_session.flush()
+
+    assert second.id != first.id
+    rows = list((await db_session.scalars(select(CatalogArtist))).all())
+    assert len(rows) == 2
+    identities = list((await db_session.scalars(select(CatalogArtistIdentity))).all())
+    assert {(identity.artist_id, identity.provider_artist_id) for identity in identities} == {
+        (first.id, "first-mbid"),
+        (second.id, "second-mbid"),
+    }
 
 
 async def test_enrichment_merges_artist_before_assigning_colliding_mbid(
@@ -464,7 +651,12 @@ async def test_enrichment_merges_artist_before_assigning_colliding_mbid(
 async def test_repair_merges_exact_juice_wrld_fixture_and_success_clears_error(
     db_session, monkeypatch, test_settings: Settings
 ) -> None:
-    owner = CatalogArtist(name="Juice WRLD", mbid="juice-mbid", monitor_policy="albums_only")
+    owner = CatalogArtist(
+        name="Juice WRLD",
+        mbid="juice-mbid",
+        deezer_id="juice-deezer",
+        monitor_policy="albums_only",
+    )
     duplicate = CatalogArtist(
         name="Juice  WRLD",
         monitored=True,
@@ -563,7 +755,7 @@ async def test_repair_merges_exact_juice_wrld_fixture_and_success_clears_error(
     assert "last_enrichment_error" not in json.loads(survivor.provenance_json or "{}")
 
 
-async def test_artist_merge_preserves_distinct_releases_from_same_provider(
+async def test_reconciliation_does_not_merge_distinct_identities_from_same_provider(
     db_session,
 ) -> None:
     owner = CatalogArtist(name="Same Provider", mbid="owner-mbid")
@@ -607,21 +799,25 @@ async def test_artist_merge_preserves_distinct_releases_from_same_provider(
     )
     await db_session.flush()
 
-    assert await reconcile_duplicate_catalog_artists(db_session) == 1
+    assert await reconcile_duplicate_catalog_artists(db_session) == 0
     await db_session.commit()
 
     artists = list((await db_session.scalars(select(CatalogArtist))).all())
     identities = list((await db_session.scalars(select(CatalogArtistIdentity))).all())
     releases = list((await db_session.scalars(select(CatalogAlbumProvider))).all())
-    assert len(artists) == 1
-    assert artists[0].watchlist_provider == "deezer"
-    assert len(identities) == 1
-    assert identities[0].artist_id == artists[0].id
+    assert len(artists) == 2
+    assert len(identities) == 2
+    assert {identity.provider_artist_id for identity in identities} == {
+        "owner-deezer",
+        "duplicate-deezer",
+    }
     assert {release.provider_album_id for release in releases} == {
         "owner-release",
         "duplicate-release",
     }
-    assert all(release.artist_identity_id == identities[0].id for release in releases)
+    assert {release.artist_identity_id for release in releases} == {
+        identity.id for identity in identities
+    }
 
 
 @pytest.mark.asyncio

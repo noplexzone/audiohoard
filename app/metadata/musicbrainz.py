@@ -386,6 +386,7 @@ def _parse_artist_hit(data: dict[str, object]) -> ArtistHit:
         name=str(data.get("name") or ""),
         disambiguation=str(data.get("disambiguation") or "") or None,
         sort_name=str(data.get("sort-name") or "") or None,
+        type=str(data.get("type") or "") or None,
     )
 
 
@@ -394,7 +395,6 @@ def _parse_artist_detail(data: dict[str, object]) -> ArtistDetail:
     return ArtistDetail(
         **hit.__dict__,
         country=str(data.get("country") or "") or None,
-        type=str(data.get("type") or "") or None,
     )
 
 

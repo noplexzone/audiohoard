@@ -22,12 +22,46 @@ class ArtistHit:
     album_count: int | None = None
     fan_count: int | None = None
     top_tracks: tuple[str, ...] = field(default_factory=tuple)
+    type: str | None = None
+    rank: int | None = None
 
 
 @dataclass(frozen=True)
 class ArtistDetail(ArtistHit):
     country: str | None = None
-    type: str | None = None
+
+
+@dataclass(frozen=True)
+class DiscoveryGenre:
+    provider: str
+    provider_id: str
+    name: str
+    artwork_url: str | None = None
+
+
+@dataclass(frozen=True)
+class DiscoveryRelease:
+    provider: str
+    provider_id: str
+    title: str
+    artist_name: str
+    artist_provider_id: str
+    artwork_url: str | None = None
+    release_date: str | None = None
+    rank: int | None = None
+
+
+@dataclass(frozen=True)
+class DiscoverySection:
+    feed: str
+    title: str
+    requested_region: str
+    effective_region: str
+    fallback_global: bool
+    items: tuple[ArtistHit | DiscoveryGenre | DiscoveryRelease, ...] = field(default_factory=tuple)
+    state: str = "ready"
+    message: str | None = None
+    stale: bool = False
 
 
 @dataclass(frozen=True)
