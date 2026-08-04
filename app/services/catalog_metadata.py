@@ -488,6 +488,36 @@ def _apply_album_hit(
         )
 
 
+def _store_track_previews(album: CatalogAlbum, provider: str, tracks: list[AlbumTrack]) -> None:
+    """Persist provider previews in existing catalog metadata, keyed to track identity."""
+    provider = provider.casefold()
+    if provider not in {"deezer", "itunes"}:
+        return
+    previews = {
+        f"{track.disc}:{track.position}": track.preview_url.strip()
+        for track in tracks
+        if isinstance(track.preview_url, str) and track.preview_url.strip()
+    }
+    if not previews:
+        return
+    try:
+        provenance = json.loads(album.provenance_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        provenance = {}
+    if not isinstance(provenance, dict):
+        provenance = {}
+    stored = provenance.get("track_previews")
+    if not isinstance(stored, dict):
+        stored = {}
+        provenance["track_previews"] = stored
+    provider_previews = stored.get(provider)
+    if not isinstance(provider_previews, dict):
+        provider_previews = {}
+        stored[provider] = provider_previews
+    provider_previews.update(previews)
+    album.provenance_json = json.dumps(provenance, sort_keys=True)
+
+
 async def fetch_and_store_album(
     db: AsyncSession, settings: Settings, album: CatalogAlbum
 ) -> CatalogAlbum:
@@ -504,6 +534,7 @@ async def fetch_and_store_album(
         raise RuntimeError(f"Catalog artist {album.artist_id} not found for album {album.id}")
     detail = await provider.get_album(provider_id)
     album = await upsert_catalog_album(db, artist, detail)
+    _store_track_previews(album, provider_name, detail.tracks)
     existing_tracks = list(
         (
             await db.scalars(

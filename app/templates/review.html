@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+{% block title %}Review – Audiohoard{% endblock %}
+
+{% block content %}
+<header class="page-header review-page-header">
+  <div>
+    <p class="eyebrow">Import verification</p>
+    <h1>Review</h1>
+    <p>Compare the downloaded file with the catalog reference before import.</p>
+  </div>
+  <a class="btn secondary" href="/review">Refresh</a>
+</header>
+
+{% if review %}
+<article class="review-deck-card" data-review-deck>
+  <header class="review-deck-heading">
+    {% if review.artwork_url %}
+    <img class="review-deck-art" src="/artwork?url={{ review.artwork_url | urlencode }}" width="112" height="112" alt="">
+    {% else %}
+    <div class="cover-tile review-deck-art">{{ (review.album_title or "Unknown album")[:2] | upper }}</div>
+    {% endif %}
+    <div>
+      <p class="eyebrow">Track 1 of {{ pending_count }} to review</p>
+      <h2>{{ review.artist_name or "Unknown artist" }} — {{ review.album_title or "Unknown album" }}</h2>
+      <p>{{ review.should_be.title or review.item.expected_title or "Unknown track" }}</p>
+    </div>
+  </header>
+
+  <section class="review-audio-comparison" aria-label="A/B audio comparison">
+    <div class="review-audio-panel">
+      <div class="review-player-heading"><h3>Downloaded file</h3><span class="review-source-badge acquisition">Full file</span></div>
+      <audio class="review-deck-audio" controls preload="metadata" data-downloaded-audio src="/staging/audio/{{ review.item.id }}">Your browser does not support audio playback.</audio>
+      <button class="btn secondary compact" type="button" data-jump-midpoint>Jump downloaded file to midpoint</button>
+    </div>
+    <div class="review-audio-panel{% if not review.reference %} unavailable{% endif %}">
+      <div class="review-player-heading">
+        <h3>Reference</h3>
+        {% if review.reference and review.reference.source == "deezer" %}<span class="review-source-badge reference">Deezer</span>
+        {% elif review.reference and review.reference.source == "itunes" %}<span class="review-source-badge reference fallback">iTunes (fallback)</span>
+        {% else %}<span class="review-source-badge unavailable">No reference available</span>{% endif %}
+      </div>
+      {% if review.reference %}
+      <audio class="review-deck-audio" controls preload="metadata" data-reference-audio src="{{ review.reference.url }}">Your browser does not support audio playback.</audio>
+      {% else %}
+      <audio class="review-deck-audio" controls data-reference-audio aria-disabled="true"></audio>
+      <p class="hint">No reference available</p>
+      {% endif %}
+      <p class="hint">The reference is an approximately 30-second mid-track clip. Players remain independent.</p>
+    </div>
+  </section>
+
+  <section class="review-tag-diff" aria-labelledby="tag-diff-heading">
+    <h3 id="tag-diff-heading">Tag comparison</h3>
+    <div class="table-wrap">
+      <table class="tag-diff-table">
+        <thead><tr><th scope="col">Field</th><th scope="col">As tagged in file</th><th scope="col">Should be (catalog)</th></tr></thead>
+        <tbody>
+          {% for field, label in tag_fields %}
+          <tr{% if review.diff[field] %} class="tag-mismatch"{% endif %}>
+            <th scope="row">{{ label }}</th>
+            <td>{{ review.as_tagged[field] if review.as_tagged[field] is not none else "—" }}</td>
+            <td>{{ review.should_be[field] if review.should_be[field] is not none else "—" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="review-verification-strip" aria-label="Verification details">
+    <dl class="review-details-grid">
+      <dt>Acquisition source</dt><dd>{{ review.source_label or "—" }}</dd>
+      <dt>Original filename</dt><dd><code>{{ review.original_filename or "—" }}</code></dd>
+      <dt>AcoustID score</dt><dd>{{ "%.3f"|format(review.acoustid_score) if review.acoustid_score is not none else "—" }}</dd>
+      <dt>MBID match</dt><dd>{{ "Yes" if review.mbid_match else "No" }}</dd>
+      <dt>Expected MBID</dt><dd><code>{{ review.expected_recording_mbid or "—" }}</code></dd>
+      <dt>Observed MBIDs</dt><dd>{% if review.observed_acoustid_mbids %}{% for mbid in review.observed_acoustid_mbids %}<code>{{ mbid }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% else %}—{% endif %}</dd>
+      <dt>Fingerprint duration</dt><dd>{{ review.fingerprint_duration_sec ~ "s" if review.fingerprint_duration_sec is not none else "—" }}</dd>
+      <dt>Duration delta</dt><dd>{% if review.duration_delta_sec is not none %}{{ "+" if review.duration_delta_sec >= 0 else "" }}{{ review.duration_delta_sec }}s{% else %}—{% endif %}</dd>
+    </dl>
+  </section>
+
+  <div class="review-deck-actions">
+    <form method="post" action="/staging/review/{{ review.item.id }}/deny" data-review-action data-confirm="Remove this review item and delete its staged file?">
+      <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+      <input type="hidden" name="return_to" value="/review">
+      <button class="btn secondary" type="submit" data-deny-button>Deny <span aria-hidden="true">←</span></button>
+    </form>
+    <form method="post" action="/staging/review/{{ review.item.id }}/approve" data-review-action>
+      <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+      <input type="hidden" name="return_to" value="/review">
+      <button class="btn" type="submit" data-approve-button>Approve <span aria-hidden="true">→</span></button>
+    </form>
+  </div>
+  <p class="review-shortcuts hint">Keyboard: ← deny · → approve · Space downloaded · R reference</p>
+</article>
+{% elif release_recovery %}
+<article class="review-deck-card review-recovery-card">
+  <header class="review-deck-heading">
+    <div class="cover-tile review-deck-art">{{ (release_recovery.release.title or "Review")[:2] | upper }}</div>
+    <div>
+      <p class="eyebrow">Release recovery</p>
+      <h2>{{ release_recovery.release.album_artist or "Unknown artist" }} — {{ release_recovery.release.title or "Unknown release" }}</h2>
+      <p class="alert {% if release_recovery.missing_source %}error{% else %}warn{% endif %} compact"><strong>Reason:</strong> {{ release_recovery.reason }}</p>
+    </div>
+  </header>
+  <div class="review-deck-actions">
+    {% if release_recovery.missing_source %}
+    <form method="post" action="/staging/release/{{ release_recovery.release.id }}/reacquire">
+      <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+      <button class="btn" type="submit">Re-acquire</button>
+    </form>
+    {% endif %}
+    <form method="post" action="/staging/release/{{ release_recovery.release.id }}/dismiss" data-confirm="Hide this import-review entry without deleting staged files?">
+      <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+      <button class="btn secondary" type="submit">Dismiss — hide</button>
+    </form>
+  </div>
+</article>
+{% else %}
+<section class="empty-state review-empty-state" role="status">
+  <h2>All caught up.</h2>
+  <p>No tracks are awaiting import review.</p>
+  <a class="btn secondary" href="/downloads">Back to downloads</a>
+</section>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/review-deck.js?v={{ app_version }}" data-page-module="review-deck" defer></script>
+{% endblock %}

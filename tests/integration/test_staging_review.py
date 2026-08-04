@@ -308,7 +308,7 @@ async def test_deny_preserves_unrelated_release_failure(
         release_id = release.id
 
     denied = await client.post(f"/staging/review/{item_id}/deny", follow_redirects=False)
-    page = await client.get("/downloads")
+    page = await client.get("/review")
 
     assert denied.status_code == 303
     assert "import execution error: destination race" in page.text
@@ -425,7 +425,7 @@ async def test_deny_clears_review_with_unsafe_stale_staging_path(
 
 
 async def test_review_page_has_only_approve_and_deny_actions(
-    client: AsyncClient, test_settings: Settings
+    client: AsyncClient, test_settings: Settings, monkeypatch
 ) -> None:
     item_id, track_id, staged_path = await _review_fixture(test_settings, "reason")
     factory = get_session_factory()
@@ -441,15 +441,17 @@ async def test_review_page_has_only_approve_and_deny_actions(
         )
         await db.commit()
 
-    page = await client.get("/downloads")
+    async def no_reference(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("app.services.staging.resolve_reference_audio", no_reference)
+    page = await client.get("/review")
     assert page.status_code == 200
     assert "Artist — Album" in page.text
-    assert "AcoustID mismatch on track 7" in page.text
     assert f"/staging/review/{item_id}/approve" in page.text
     assert f"/staging/review/{item_id}/deny" in page.text
-    assert ">Deny — remove<" in page.text
-    assert "<dt>Source</dt><dd>Soulseek (slskd)</dd>" in page.text
-    assert "<dt>Original filename</dt><dd><code>07 Original Track.flac</code></dd>" in page.text
+    assert "Acquisition source</dt><dd>Soulseek (slskd)</dd>" in page.text
+    assert "Original filename</dt><dd><code>07 Original Track.flac</code></dd>" in page.text
     assert "/dismiss" not in page.text
 
     dismissed = await client.post(f"/staging/review/{item_id}/dismiss", follow_redirects=False)
@@ -521,7 +523,7 @@ async def test_missing_source_review_exposes_reacquire_and_queues_continuation(
 
     monkeypatch.setattr("app.routers.staging.job_dispatcher.dispatch", fake_dispatch)
 
-    page = await client.get("/downloads")
+    page = await client.get("/review")
     assert f"missing staged source: {missing}" in page.text
     assert f"/staging/release/{release_id}/reacquire" in page.text
     assert ">Re-acquire<" in page.text
@@ -567,7 +569,7 @@ async def test_release_review_dismiss_hides_actionless_release_review(
         await db.commit()
         release_id = release.id
 
-    page = await client.get("/downloads")
+    page = await client.get("/review")
     assert f"/staging/release/{release_id}/dismiss" in page.text
     assert ">Dismiss — hide<" in page.text
 
@@ -580,7 +582,7 @@ async def test_release_review_dismiss_hides_actionless_release_review(
         assert release is not None
         assert release.review_dismissed_at is not None
 
-    page = await client.get("/downloads")
+    page = await client.get("/review")
     assert f"/staging/release/{release_id}/dismiss" not in page.text
 
 
@@ -696,7 +698,7 @@ async def test_reacquire_stops_after_persisted_continuation_attempt_cap(
         assert attempts == list(range(1, DEFAULT_MAX_PARTIAL_ATTEMPTS + 1))
 
 
-async def test_downloads_renders_review_rail_with_approve_action_unchanged(
+async def test_downloads_replaces_review_rail_with_deck_link(
     client: AsyncClient, test_settings: Settings
 ) -> None:
     item_id, _, _ = await _review_fixture(test_settings, "rail")
@@ -704,8 +706,10 @@ async def test_downloads_renders_review_rail_with_approve_action_unchanged(
     response = await client.get("/downloads")
 
     assert response.status_code == 200
-    assert 'class="review-rail" aria-label="Import review"' in response.text
-    assert f'<form method="post" action="/staging/review/{item_id}/approve">' in response.text
+    assert 'class="review-rail" aria-label="Import review"' not in response.text
+    assert f"/staging/review/{item_id}/approve" not in response.text
+    assert 'class="review-queue-link" href="/review"' in response.text
+    assert "1 tracks awaiting review" in response.text
 
 
 async def test_pending_review_count_nav_badge_appears_only_when_needed(

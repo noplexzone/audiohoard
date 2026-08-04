@@ -92,6 +92,7 @@ class AlbumTrack:
     duration_sec: int | None = None
     recording_mbid: str | None = None
     provider_track_id: str | None = None
+    preview_url: str | None = None
     content_rating: str = "unknown"
 
 

@@ -37,6 +37,7 @@ from app.routers import (
     jobs,
     maintenance,
     naming,
+    review,
     search,
     staging,
     tracks,
@@ -267,7 +268,7 @@ def create_app() -> FastAPI:
             response.headers["Referrer-Policy"] = "no-referrer"
             if not request.url.path.startswith(("/api/docs", "/api/redoc")):
                 response.headers["Content-Security-Policy"] = (
-                    "default-src 'self'; img-src 'self' data:; media-src 'self'; "
+                    "default-src 'self'; img-src 'self' data:; media-src 'self' https:; "
                     "script-src 'self'; style-src 'self'; frame-ancestors 'none'; "
                     "base-uri 'self'"
                 )
@@ -281,6 +282,7 @@ def create_app() -> FastAPI:
     app.include_router(settings_router.router, tags=["settings"])
     app.include_router(blocklist.router, tags=["blocklist"])
     app.include_router(jobs.router, tags=["jobs", "downloads"])
+    app.include_router(review.router, tags=["review"])
     app.include_router(tracks.router, tags=["tracks"])
     app.include_router(naming.router, tags=["naming"])
     app.include_router(imports.router, tags=["imports"])

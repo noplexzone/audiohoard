@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-08-04
+
+### Added
+
+- Add a dedicated authenticated import-review deck with independent downloaded/reference audio, Deezer-first and iTunes-fallback preview badges, midpoint seeking, keyboard actions, file-vs-catalog tag differences, and verification details.
+
+### Changed
+
+- Move pending import review out of the Downloads rail into `/review`, retain acquisition source and original filename details, and replace the rail with a compact queue link while keeping Downloads full-width.
+
 ## [0.17.3] - 2026-08-04
 
 ### Changed
