@@ -400,7 +400,7 @@ async def test_runner_partial_16_expected_10_matched_spawns_6_continuations(
 
     monkeypatch.setattr(job_dispatcher, "dispatch", fake_dispatch)
 
-    await runner._run_job_in_session(job.id, db_session, test_settings)
+    await runner.run_job(job.id, db_session, test_settings)
 
     assert hydration_calls == [album.id]
     assert job.status == JobStatus.partial, f"Expected partial, got {job.status}"

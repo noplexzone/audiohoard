@@ -40,7 +40,7 @@ from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 from sqlalchemy import delete, or_, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.database import register_transaction_callbacks
@@ -1586,6 +1586,10 @@ async def execute_release_import(
                 Path(plan.staging_path or plan.source_path),
                 plan.track.acquisition_provenance_json if plan.track else None,
                 plan.track.source_job_id if plan.track else None,
+                plan.track_id,
+                session_factory=async_sessionmaker(db.bind, expire_on_commit=False)
+                if db.bind is not None
+                else None,
             )
             for plan in plans
         )

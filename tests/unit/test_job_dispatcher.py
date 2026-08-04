@@ -17,13 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 os.environ.setdefault("SECRET_KEY", "test-secret")
 
 from app.database import Base
-from app.jobs.dispatcher import (
-    JobDispatcher,
-    JobNotFoundError,
-    JobNotRetryableError,
-    reacquire_current_acquisition_slot,
-    release_current_acquisition_slot,
-)
+from app.jobs import runner as job_runner
+from app.jobs.dispatcher import JobDispatcher, JobNotFoundError, JobNotRetryableError
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.track import Track
@@ -33,6 +28,7 @@ from app.services.acquisition_cleanup import (
     cleanup_terminal_acquisitions,
     hide_completed_and_timed_out_jobs,
 )
+from app.sources.base import CapabilityState
 
 _TEST_DB = "sqlite+aiosqlite:///:memory:"
 
@@ -583,6 +579,71 @@ class TestAutomaticTerminalCleanup:
             assert "source_cleanup_completed_at" not in provenance
 
 
+async def test_slskd_cleanup_retries_only_marker_after_provider_cancel(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with session_factory() as session:
+        job = Job(source="slskd", query="marker-lock", status=JobStatus.failed)
+        session.add(job)
+        await session.flush()
+        track = Track(
+            job_id=job.id,
+            source="slskd",
+            source_job_id="exact-transfer",
+            source_status="transfer_timeout",
+            acquisition_provenance_json=json.dumps(
+                {"source": "slskd", "username": "peer", "filename": "song.flac"}
+            ),
+            acquisition_state=AcquisitionState.failed,
+        )
+        session.add(track)
+        await session.commit()
+        track_id = track.id
+
+    cancel_calls = 0
+
+    class FakeAdapter:
+        async def cancel(
+            self, username: str, filename: str, transfer_id: str | None = None
+        ) -> None:
+            nonlocal cancel_calls
+            cancel_calls += 1
+            assert (username, filename, transfer_id) == ("peer", "song.flac", "exact-transfer")
+
+    original_commit = AsyncSession.commit
+    marker_commits = 0
+
+    async def lock_first_marker_commit(session: AsyncSession) -> None:
+        nonlocal marker_commits
+        marking = any(
+            isinstance(row, Track)
+            and "source_cleanup_completed_at" in (row.acquisition_provenance_json or "")
+            for row in session.dirty
+        )
+        if marking:
+            marker_commits += 1
+            if marker_commits == 1:
+                raise OperationalError("UPDATE tracks", {}, Exception("database is locked"))
+        await original_commit(session)
+
+    async def no_sleep(delay: float) -> None:
+        assert delay == 0.25
+
+    monkeypatch.setattr(AsyncSession, "commit", lock_first_marker_commit)
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    assert await cleanup_durable_slskd_transfers(session_factory, FakeAdapter()) == 1
+
+    assert cancel_calls == 1
+    assert marker_commits == 2
+    async with session_factory() as session:
+        current = await session.get(Track, track_id)
+        assert current is not None
+        assert json.loads(current.acquisition_provenance_json or "{}")[
+            "source_cleanup_completed_at"
+        ]
+
+
 class TestRetry:
     async def test_retry_failed_dispatches(
         self,
@@ -701,13 +762,13 @@ async def test_terminal_cleanup_retries_transient_sqlite_lock(
             raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
         return []
 
-    async def no_transfers(factory, adapter, job_ids=None):
+    async def no_transfers(factory, adapter, job_ids=None, *, max_attempts=3):
         return 0
 
     async def no_sleep(delay):
         assert delay == 0.25
 
-    monkeypatch.setattr(acquisition_cleanup, "hide_completed_and_timed_out_jobs", flaky_hide)
+    monkeypatch.setattr(acquisition_cleanup, "_hide_completed_and_timed_out_jobs_once", flaky_hide)
     monkeypatch.setattr(acquisition_cleanup, "cleanup_durable_slskd_transfers", no_transfers)
     monkeypatch.setattr(acquisition_cleanup.asyncio, "sleep", no_sleep)
 
@@ -781,17 +842,37 @@ async def test_increasing_parallel_limit_starts_waiting_jobs() -> None:
     await dispatcher.shutdown()
 
 
-async def test_external_queue_wait_releases_slot_for_later_job() -> None:
+async def test_queued_transfer_keeps_slot_until_terminal_completion(tmp_path: Path) -> None:
     first_queued = asyncio.Event()
     allow_first_to_finish = asyncio.Event()
     second_started = asyncio.Event()
+    staged = tmp_path / "song.flac"
+    staged.write_bytes(b"audio")
+
+    class QueuedAdapter:
+        async def status(self, transfer_id: str) -> CapabilityState:
+            assert transfer_id == "transfer-1"
+            if not allow_first_to_finish.is_set():
+                first_queued.set()
+                return CapabilityState(True, "Queued")
+            return CapabilityState(True, "Completed")
+
+        async def cancel(
+            self, username: str, filename: str, transfer_id: str | None = None
+        ) -> bool:
+            return True
 
     async def runner(job_id: int) -> None:
         if job_id == 1:
-            assert await release_current_acquisition_slot() is True
-            first_queued.set()
-            await allow_first_to_finish.wait()
-            assert await reacquire_current_acquisition_slot() is True
+            await job_runner._poll_slskd_transfer(
+                transfer_id="transfer-1",
+                username="peer",
+                filename=staged.name,
+                adapter=QueuedAdapter(),  # type: ignore[arg-type]
+                staging_root=tmp_path,
+                poll_interval=0.001,
+                poll_timeout=1,
+            )
         else:
             second_started.set()
 
@@ -800,10 +881,12 @@ async def test_external_queue_wait_releases_slot_for_later_job() -> None:
     second = await dispatcher.dispatch(2)
 
     await asyncio.wait_for(first_queued.wait(), timeout=1)
-    await asyncio.wait_for(second_started.wait(), timeout=1)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(second_started.wait(), timeout=0.05)
     assert not first.done()
 
     allow_first_to_finish.set()
+    await asyncio.wait_for(second_started.wait(), timeout=1)
     await asyncio.gather(first, second)
     await dispatcher.shutdown()
 
@@ -886,4 +969,297 @@ async def test_dispatcher_waiting_job_is_not_watchdog_redispatched(
         waiting = await session.get(Job, second_id)
         assert waiting is not None
         assert waiting.result_json is None
+    await dispatcher.shutdown()
+
+
+async def test_startup_running_recovery_retries_complete_transaction_after_sqlite_lock(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services import acquisition_cleanup
+
+    job = await _make_job(session_factory, status=JobStatus.running)
+    original_commit = AsyncSession.commit
+    original_execute = AsyncSession.execute
+    commit_attempts = 0
+    recovery_reads = 0
+    dispatched: list[int] = []
+
+    async def no_cleanup(*args, **kwargs):
+        return [], 0
+
+    async def locked_once(session, *args, **kwargs):
+        nonlocal commit_attempts
+        commit_attempts += 1
+        if commit_attempts == 1:
+            raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
+        return await original_commit(session, *args, **kwargs)
+
+    async def count_recovery_reads(session, statement, *args, **kwargs):
+        nonlocal recovery_reads
+        rendered = str(statement)
+        if "FROM jobs" in rendered and "jobs.status IN" in rendered:
+            recovery_reads += 1
+        return await original_execute(session, statement, *args, **kwargs)
+
+    async def record_dispatch(job_id: int):
+        dispatched.append(job_id)
+
+    monkeypatch.setattr(acquisition_cleanup, "cleanup_terminal_acquisitions", no_cleanup)
+    monkeypatch.setattr(AsyncSession, "commit", locked_once)
+    monkeypatch.setattr(AsyncSession, "execute", count_recovery_reads)
+    dispatcher = JobDispatcher(runner=AsyncMock(), session_factory=session_factory)
+    monkeypatch.setattr(dispatcher, "dispatch", record_dispatch)
+
+    recovered = await dispatcher.recover()
+
+    assert commit_attempts == 2
+    assert recovery_reads == 2
+    assert recovered == [job.id]
+    assert dispatched == [job.id]
+    async with session_factory() as session:
+        current = await session.get(Job, job.id)
+        assert current is not None
+        assert current.status == JobStatus.pending
+        assert json.loads(current.result_json or "{}")["recovery"] == {
+            "code": "interrupted_by_restart",
+            "retryable": True,
+        }
+
+
+async def test_watchdog_dispatches_once_only_after_successful_retry_commit(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = await _make_job(session_factory, status=JobStatus.running)
+    async with session_factory() as session:
+        current = await session.get(Job, job.id)
+        assert current is not None
+        current.updated_at = datetime.now(UTC) - timedelta(seconds=600)
+        await session.commit()
+
+    original_commit = AsyncSession.commit
+    original_execute = AsyncSession.execute
+    commit_attempts = 0
+    watchdog_reads = 0
+    dispatched: list[int] = []
+
+    async def locked_once(session, *args, **kwargs):
+        nonlocal commit_attempts
+        commit_attempts += 1
+        if commit_attempts == 1:
+            raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
+        return await original_commit(session, *args, **kwargs)
+
+    async def count_watchdog_reads(session, statement, *args, **kwargs):
+        nonlocal watchdog_reads
+        rendered = str(statement)
+        if "FROM jobs" in rendered and "jobs.updated_at <" in rendered:
+            watchdog_reads += 1
+        return await original_execute(session, statement, *args, **kwargs)
+
+    async def record_committed_dispatch(job_id: int):
+        async with session_factory() as session:
+            committed = await session.get(Job, job_id)
+            assert committed is not None
+            assert committed.status == JobStatus.pending
+            assert json.loads(committed.result_json or "{}")["watchdog_recovery"] == {"attempt": 1}
+        dispatched.append(job_id)
+
+    monkeypatch.setattr(AsyncSession, "commit", locked_once)
+    monkeypatch.setattr(AsyncSession, "execute", count_watchdog_reads)
+    dispatcher = JobDispatcher(runner=AsyncMock(), session_factory=session_factory)
+    monkeypatch.setattr(dispatcher, "dispatch", record_committed_dispatch)
+
+    await dispatcher._watchdog_tick(threshold_seconds=300)
+
+    assert commit_attempts == 2
+    assert watchdog_reads == 2
+    assert dispatched == [job.id]
+
+
+@pytest.mark.parametrize("concurrent_change", ["heartbeat", "status"])
+async def test_watchdog_cas_does_not_overwrite_concurrent_job_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, concurrent_change: str
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'watchdog-cas.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory: async_sessionmaker[AsyncSession] = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        job = await _make_job(factory, status=JobStatus.running)
+        stale_at = datetime.now(UTC) - timedelta(seconds=600)
+        async with factory() as session:
+            current = await session.get(Job, job.id)
+            assert current is not None
+            current.updated_at = stale_at
+            await session.commit()
+
+        original_execute = AsyncSession.execute
+        raced = False
+        dispatched: list[int] = []
+
+        async def race_before_watchdog_update(session, statement, *args, **kwargs):
+            nonlocal raced
+            rendered = str(statement)
+            if not raced and rendered.startswith("UPDATE jobs SET"):
+                raced = True
+                async with factory() as writer:
+                    current = await writer.get(Job, job.id)
+                    assert current is not None
+                    if concurrent_change == "heartbeat":
+                        current.result_json = json.dumps({"heartbeat": 1})
+                        current.updated_at = datetime.now(UTC)
+                    else:
+                        current.status = JobStatus.done
+                        current.updated_at = stale_at
+                    await writer.commit()
+            return await original_execute(session, statement, *args, **kwargs)
+
+        async def record_dispatch(job_id: int):
+            dispatched.append(job_id)
+
+        monkeypatch.setattr(AsyncSession, "execute", race_before_watchdog_update)
+        dispatcher = JobDispatcher(runner=AsyncMock(), session_factory=factory)
+        monkeypatch.setattr(dispatcher, "dispatch", record_dispatch)
+
+        await dispatcher._watchdog_tick(threshold_seconds=300)
+
+        assert raced is True
+        assert dispatched == []
+        async with factory() as session:
+            current = await session.get(Job, job.id)
+            assert current is not None
+            if concurrent_change == "heartbeat":
+                assert current.status == JobStatus.running
+                assert json.loads(current.result_json or "{}") == {"heartbeat": 1}
+            else:
+                assert current.status == JobStatus.done
+                assert current.result_json is None
+    finally:
+        await engine.dispose()
+
+
+async def test_watchdog_fences_recurrent_stale_recovery_as_dispatch_lost(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with session_factory() as session:
+        job = Job(
+            source="youtube",
+            query="lost twice",
+            status=JobStatus.pending,
+            result_json=json.dumps({"watchdog_recovery": {"attempt": 1}}),
+            updated_at=datetime.now(UTC) - timedelta(seconds=600),
+        )
+        session.add(job)
+        await session.commit()
+        job_id = job.id
+
+    dispatched: list[int] = []
+
+    async def record_dispatch(job_id: int):
+        dispatched.append(job_id)
+
+    dispatcher = JobDispatcher(runner=AsyncMock(), session_factory=session_factory)
+    monkeypatch.setattr(dispatcher, "dispatch", record_dispatch)
+
+    await dispatcher._watchdog_tick(threshold_seconds=300)
+
+    assert dispatched == []
+    async with session_factory() as session:
+        current = await session.get(Job, job_id)
+        assert current is not None
+        assert current.status == JobStatus.failed
+        assert json.loads(current.result_json or "{}") == {
+            "error": {
+                "code": "dispatch_lost",
+                "operation": "watchdog",
+                "retryable": False,
+            }
+        }
+
+
+async def test_startup_pending_recovery_does_not_dispatch_concurrent_terminal_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services import acquisition_cleanup
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'startup-pending-cas.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory: async_sessionmaker[AsyncSession] = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        job = await _make_job(factory, status=JobStatus.pending)
+        original_execute = AsyncSession.execute
+        raced = False
+        dispatched: list[int] = []
+
+        async def no_cleanup(*args, **kwargs):
+            return [], 0
+
+        async def finish_before_recovery_claim(session, statement, *args, **kwargs):
+            nonlocal raced
+            rendered = str(statement)
+            if not raced and rendered.startswith("UPDATE jobs SET"):
+                raced = True
+                async with factory() as writer:
+                    current = await writer.get(Job, job.id)
+                    assert current is not None
+                    current.status = JobStatus.done
+                    current.updated_at = datetime.now(UTC)
+                    await writer.commit()
+            return await original_execute(session, statement, *args, **kwargs)
+
+        async def record_dispatch(job_id: int):
+            dispatched.append(job_id)
+
+        monkeypatch.setattr(acquisition_cleanup, "cleanup_terminal_acquisitions", no_cleanup)
+        monkeypatch.setattr(AsyncSession, "execute", finish_before_recovery_claim)
+        dispatcher = JobDispatcher(runner=AsyncMock(), session_factory=factory)
+        monkeypatch.setattr(dispatcher, "dispatch", record_dispatch)
+
+        recovered = await dispatcher.recover()
+
+        assert raced is True
+        assert recovered == []
+        assert dispatched == []
+        async with factory() as session:
+            current = await session.get(Job, job.id)
+            assert current is not None
+            assert current.status == JobStatus.done
+    finally:
+        await engine.dispose()
+
+
+async def test_cancel_waiting_job_persists_cancelled_before_task_exit(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    first = await _make_job(session_factory, status=JobStatus.pending)
+    second = await _make_job(session_factory, status=JobStatus.pending)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def runner(job_id: int) -> None:
+        if job_id == first.id:
+            first_started.set()
+            await release_first.wait()
+
+    dispatcher = JobDispatcher(
+        runner=runner,
+        session_factory=session_factory,
+        max_concurrent_jobs=1,
+    )
+    first_task = await dispatcher.dispatch(first.id)
+    second_task = await dispatcher.dispatch(second.id)
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    await dispatcher.cancel_job(second.id)
+    with pytest.raises(asyncio.CancelledError):
+        await second_task
+
+    async with session_factory() as db:
+        persisted = await db.get(Job, second.id)
+        assert persisted is not None
+        assert persisted.status == JobStatus.cancelled
+
+    release_first.set()
+    await first_task
     await dispatcher.shutdown()

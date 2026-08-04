@@ -47,6 +47,7 @@ from app.services.acquisition_cleanup import (
     cleanup_imported_sources,
     pending_imported_source_cleanups,
     prune_orphaned_terminal_records,
+    wait_for_imported_source_cleanups,
 )
 from app.services.acquisition_recovery import recover_approved_downloads
 from app.services.artist_monitoring import DiscographyRefreshScheduler
@@ -174,6 +175,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await maintenance_scheduler.stop()
         await scheduler.stop()
         await job_dispatcher.shutdown()
+        await wait_for_imported_source_cleanups(raise_errors=False)
 
 
 def create_app() -> FastAPI:

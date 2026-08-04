@@ -5,14 +5,14 @@ import contextlib
 import json
 import logging
 from collections.abc import Callable, Coroutine
-from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.database import get_session_factory
+from app.database import get_session_factory, run_with_sqlite_lock_retry
 from app.models.job import Job, JobStatus
 
 logger = logging.getLogger(__name__)
@@ -33,41 +33,6 @@ class JobStateError(ValueError):
 
 class JobNotRetryableError(JobStateError):
     pass
-
-
-class _AcquisitionSlotLease:
-    def __init__(self, dispatcher: JobDispatcher) -> None:
-        self._dispatcher = dispatcher
-        self.held = False
-
-    async def acquire(self) -> bool:
-        if self.held:
-            return False
-        await self._dispatcher._acquire_slot()
-        self.held = True
-        return True
-
-    async def release(self) -> bool:
-        if not self.held:
-            return False
-        await self._dispatcher._release_slot()
-        self.held = False
-        return True
-
-
-_current_acquisition_lease: ContextVar[_AcquisitionSlotLease | None] = ContextVar(
-    "current_acquisition_lease", default=None
-)
-
-
-async def release_current_acquisition_slot() -> bool:
-    lease = _current_acquisition_lease.get()
-    return await lease.release() if lease is not None else False
-
-
-async def reacquire_current_acquisition_slot() -> bool:
-    lease = _current_acquisition_lease.get()
-    return await lease.acquire() if lease is not None else False
 
 
 def _default_runner(job_id: int) -> Coroutine[Any, Any, None]:  # pragma: no cover
@@ -124,14 +89,11 @@ class JobDispatcher:
             self._limit_condition.notify_all()
 
     async def _run_with_limit(self, job_id: int) -> None:
-        lease = _AcquisitionSlotLease(self)
-        await lease.acquire()
-        token = _current_acquisition_lease.set(lease)
+        await self._acquire_slot()
         try:
             await self._runner(job_id)
         finally:
-            _current_acquisition_lease.reset(token)
-            await lease.release()
+            await self._release_slot()
 
     async def dispatch(self, job_id: int) -> asyncio.Task[None]:
         existing = self._tasks.get(job_id)
@@ -170,13 +132,20 @@ class JobDispatcher:
                 raise JobNotFoundError(job_id)
             if job.status not in {JobStatus.pending, JobStatus.running}:
                 raise JobStateError(job_id, job.status)
-            if not self.cancel(job_id):
-                job.status = JobStatus.cancelled
-                job.result_json = json.dumps(
-                    {"error": {"code": "cancelled", "operation": "job", "retryable": True}}
-                )
-                job.updated_at = datetime.now(UTC)
-                await db.commit()
+            from app.jobs.runner import _job_error_result, _persist_job_envelope
+
+            transitioned = await _persist_job_envelope(
+                db,
+                job_id,
+                expected_statuses={JobStatus.pending, JobStatus.running},
+                status=JobStatus.cancelled,
+                result_json=_job_error_result("cancelled", "job", retryable=True),
+                cancel_active_tracks=True,
+            )
+            if not transitioned:
+                await db.refresh(job)
+                raise JobStateError(job_id, job.status)
+        self.cancel(job_id)
 
     async def retry(
         self,
@@ -255,16 +224,44 @@ class JobDispatcher:
             )
         except Exception:
             logger.exception("Startup terminal acquisition cleanup failed")
+        recovered_ids: list[int] = []
         async with factory() as db:
-            result = await db.execute(
-                select(Job).where(Job.status.in_([JobStatus.pending, JobStatus.running]))
-            )
-            jobs = list(result.scalars().all())
-            for job in jobs:
-                if job.status == JobStatus.running:
-                    job.status = JobStatus.pending
+
+            async def recover_jobs() -> None:
+                attempt_ids: list[int] = []
+                rows = (
+                    await db.execute(
+                        select(
+                            Job.id,
+                            Job.status,
+                            Job.result_json,
+                            Job.updated_at,
+                        ).where(Job.status.in_([JobStatus.pending, JobStatus.running]))
+                    )
+                ).all()
+                for job_id, status, result_json, updated_at in rows:
+                    result_match = (
+                        Job.result_json.is_(None)
+                        if result_json is None
+                        else Job.result_json == result_json
+                    )
+                    if status == JobStatus.pending:
+                        result = await db.execute(
+                            update(Job)
+                            .where(
+                                Job.id == job_id,
+                                Job.status == JobStatus.pending,
+                                func.julianday(Job.updated_at) == func.julianday(updated_at),
+                                result_match,
+                            )
+                            .values(updated_at=datetime.now(UTC))
+                            .execution_options(synchronize_session=False)
+                        )
+                        if isinstance(result, CursorResult) and result.rowcount == 1:
+                            attempt_ids.append(job_id)
+                        continue
                     try:
-                        payload = json.loads(job.result_json) if job.result_json else {}
+                        payload = json.loads(result_json) if result_json else {}
                     except (json.JSONDecodeError, TypeError):
                         payload = {}
                     if not isinstance(payload, dict):
@@ -273,62 +270,109 @@ class JobDispatcher:
                         "code": "interrupted_by_restart",
                         "retryable": True,
                     }
-                    job.result_json = json.dumps(payload)
-                    job.updated_at = datetime.now(UTC)
-            await db.commit()
-        for job in jobs:
-            await self.dispatch(job.id)
-        return [job.id for job in jobs]
+                    result = await db.execute(
+                        update(Job)
+                        .where(
+                            Job.id == job_id,
+                            Job.status == JobStatus.running,
+                            func.julianday(Job.updated_at) == func.julianday(updated_at),
+                        )
+                        .values(
+                            status=JobStatus.pending,
+                            result_json=json.dumps(payload),
+                            updated_at=datetime.now(UTC),
+                        )
+                        .execution_options(synchronize_session=False)
+                    )
+                    if isinstance(result, CursorResult) and result.rowcount == 1:
+                        attempt_ids.append(job_id)
+                await db.commit()
+                recovered_ids[:] = attempt_ids
+
+            await run_with_sqlite_lock_retry(db, recover_jobs)
+        for job_id in recovered_ids:
+            await self.dispatch(job_id)
+        return recovered_ids
 
     async def _watchdog_tick(self, threshold_seconds: int) -> None:
         threshold_dt = datetime.now(UTC) - timedelta(seconds=threshold_seconds)
-        to_dispatch: list[int] = []
+        committed_actions: list[tuple[int, bool]] = []
         async with self._factory()() as db:
-            result = await db.execute(
-                select(Job).where(
-                    Job.status.in_([JobStatus.pending, JobStatus.running]),
-                    Job.updated_at < threshold_dt,
-                )
-            )
-            jobs = list(result.scalars().all())
-            for job in jobs:
-                live = self._tasks.get(job.id)
-                if live is not None and not live.done():
-                    continue
-                try:
-                    current: dict[str, Any] = (
-                        json.loads(job.result_json) if job.result_json else {}
+
+            async def claim_stale_jobs() -> None:
+                attempt_actions: list[tuple[int, bool]] = []
+                rows = (
+                    await db.execute(
+                        select(
+                            Job.id,
+                            Job.status,
+                            Job.result_json,
+                            Job.updated_at,
+                        ).where(
+                            Job.status.in_([JobStatus.pending, JobStatus.running]),
+                            Job.updated_at < threshold_dt,
+                        )
                     )
-                except (json.JSONDecodeError, TypeError):
-                    current = {}
-                if "watchdog_recovery" in current:
-                    job.status = JobStatus.failed
-                    job.result_json = json.dumps(
-                        {
-                            "error": {
-                                "code": "dispatch_lost",
-                                "operation": "watchdog",
-                                "retryable": False,
+                ).all()
+                for job_id, status, result_json, updated_at in rows:
+                    live = self._tasks.get(job_id)
+                    if live is not None and not live.done():
+                        continue
+                    try:
+                        current: dict[str, Any] = json.loads(result_json) if result_json else {}
+                    except (json.JSONDecodeError, TypeError):
+                        current = {}
+                    recurrent = "watchdog_recovery" in current
+                    if recurrent:
+                        next_status = JobStatus.failed
+                        next_result = json.dumps(
+                            {
+                                "error": {
+                                    "code": "dispatch_lost",
+                                    "operation": "watchdog",
+                                    "retryable": False,
+                                }
                             }
-                        }
+                        )
+                    else:
+                        next_status = JobStatus.pending if status == JobStatus.running else status
+                        current["watchdog_recovery"] = {"attempt": 1}
+                        next_result = json.dumps(current)
+                    result_match = (
+                        Job.result_json.is_(None)
+                        if result_json is None
+                        else Job.result_json == result_json
                     )
-                    job.updated_at = datetime.now(UTC)
-                    logger.error(
-                        "Job %d lost after watchdog recovery attempt; marking dispatch_lost",
-                        job.id,
+                    result = await db.execute(
+                        update(Job)
+                        .where(
+                            Job.id == job_id,
+                            Job.status == status,
+                            func.julianday(Job.updated_at) == func.julianday(updated_at),
+                            Job.updated_at < threshold_dt,
+                            result_match,
+                        )
+                        .values(
+                            status=next_status,
+                            result_json=next_result,
+                            updated_at=datetime.now(UTC),
+                        )
+                        .execution_options(synchronize_session=False)
                     )
-                else:
-                    if job.status == JobStatus.running:
-                        job.status = JobStatus.pending
-                    current["watchdog_recovery"] = {"attempt": 1}
-                    job.result_json = json.dumps(current)
-                    job.updated_at = datetime.now(UTC)
-                    to_dispatch.append(job.id)
-                    logger.warning(
-                        "Job %d stale with no live task; dispatching watchdog recovery", job.id
-                    )
-            await db.commit()
-        for job_id in to_dispatch:
+                    if isinstance(result, CursorResult) and result.rowcount == 1:
+                        attempt_actions.append((job_id, recurrent))
+                await db.commit()
+                committed_actions[:] = attempt_actions
+
+            await run_with_sqlite_lock_retry(db, claim_stale_jobs)
+        for job_id, recurrent in committed_actions:
+            if recurrent:
+                logger.error(
+                    "Job %d lost after watchdog recovery attempt; marking dispatch_lost",
+                    job_id,
+                )
+                continue
+            logger.warning("Job %d stale with no live task; dispatching watchdog recovery", job_id)
             await self.dispatch(job_id)
 
     async def _watchdog_loop(self, threshold_seconds: int, interval_seconds: int) -> None:

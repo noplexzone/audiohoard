@@ -47,6 +47,9 @@ async def db_session(test_settings: Settings) -> AsyncGenerator[AsyncSession, No
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with factory() as session:
         yield session
+        from app.services.acquisition_cleanup import wait_for_imported_source_cleanups
+
+        await wait_for_imported_source_cleanups(raise_errors=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
     await engine.dispose()
@@ -71,6 +74,9 @@ async def unauthenticated_client(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
 
+    from app.services.acquisition_cleanup import wait_for_imported_source_cleanups
+
+    await wait_for_imported_source_cleanups(raise_errors=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
     await engine.dispose()

@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
+import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
+import app.sources.slskd as slskd_module
 from app.schemas.search import SearchRequest
 from app.sources.slskd import SlskdAdapter, _search_state_is_failed, _search_state_is_terminal
 from app.sources.youtube import ProviderError
+
+
+@pytest.fixture(autouse=True)
+def clear_download_snapshot_cache() -> None:
+    getattr(slskd_module, "_download_snapshots", {}).clear()
 
 
 class TestSlskdHealth:
@@ -275,6 +283,48 @@ class TestSlskdTransfers:
         assert result is True
         assert [request.method for request in httpx_mock.get_requests()] == ["GET"]
 
+    async def test_cleanup_cancel_refreshes_stale_snapshot_before_matching_transfer(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        adapter = SlskdAdapter("http://slskd.local", "key123")
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer1",
+                    "files": [
+                        {
+                            "id": "old-transfer",
+                            "filename": "Music\\same.flac",
+                            "state": "Completed, Succeeded",
+                        }
+                    ],
+                }
+            ],
+        )
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer1",
+                    "files": [
+                        {
+                            "id": "replacement-transfer",
+                            "filename": "Music\\same.flac",
+                            "state": "InProgress",
+                        }
+                    ],
+                }
+            ],
+        )
+
+        assert (await adapter.status("old-transfer")).available is True
+        result = await adapter.cancel("peer1", "Music\\same.flac", "old-transfer")
+
+        assert result is True
+        requests = httpx_mock.get_requests()
+        assert [request.method for request in requests] == ["GET", "GET"]
+
     async def test_cleanup_cancel_keeps_fallback_identity_pending_when_ambiguous(
         self, httpx_mock: HTTPXMock
     ) -> None:
@@ -393,3 +443,166 @@ class TestSlskdTransfers:
         assert status.available is True
         assert status.reason == "completed, succeeded"
         assert status.extra["id"] == "4dd4add9-96ce-4ab2-80d4-5b171b324e3e"
+
+    async def test_concurrent_status_calls_share_one_download_snapshot(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer1",
+                    "files": [
+                        {"id": "transfer-1", "filename": "one.flac", "state": "Queued"},
+                        {"id": "transfer-2", "filename": "two.flac", "state": "InProgress"},
+                    ],
+                }
+            ],
+        )
+        first, second = await asyncio.gather(
+            SlskdAdapter("http://slskd.local", "key123").status("transfer-1"),
+            SlskdAdapter("http://slskd.local", "key123").status("transfer-2"),
+        )
+
+        assert first.reason == "queued"
+        assert second.reason == "inprogress"
+        assert len(httpx_mock.get_requests()) == 1
+
+    async def test_download_snapshot_reuses_ttl_then_refreshes(
+        self, httpx_mock: HTTPXMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = 100.0
+        monkeypatch.setattr(slskd_module, "_monotonic", lambda: now)
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer",
+                    "files": [{"id": "t1", "filename": "one.flac", "state": "Queued"}],
+                }
+            ],
+        )
+        adapter = SlskdAdapter("http://slskd.local", "key123")
+
+        assert (await adapter.status("t1")).reason == "queued"
+        now += slskd_module._DOWNLOAD_SNAPSHOT_TTL_SEC / 2
+        assert (await adapter.status("t1")).reason == "queued"
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer",
+                    "files": [{"id": "t1", "filename": "one.flac", "state": "Completed"}],
+                }
+            ],
+        )
+        now += slskd_module._DOWNLOAD_SNAPSHOT_TTL_SEC
+        assert (await adapter.status("t1")).reason == "completed"
+        assert len(httpx_mock.get_requests()) == 2
+
+    async def test_download_snapshots_are_isolated_by_endpoint_and_credential(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        for url, state in (
+            ("http://slskd.local/api/v0/transfers/downloads", "Queued"),
+            ("http://slskd.local/api/v0/transfers/downloads", "Completed"),
+            ("http://other-slskd.local/api/v0/transfers/downloads", "InProgress"),
+        ):
+            httpx_mock.add_response(
+                url=url,
+                json=[
+                    {
+                        "username": "peer",
+                        "files": [{"id": "t1", "filename": "one.flac", "state": state}],
+                    }
+                ],
+            )
+
+        first = await SlskdAdapter("http://slskd.local", "first-key").status("t1")
+        second = await SlskdAdapter("http://slskd.local", "second-key").status("t1")
+        other_endpoint = await SlskdAdapter("http://other-slskd.local", "first-key").status("t1")
+
+        assert (first.reason, second.reason, other_endpoint.reason) == (
+            "queued",
+            "completed",
+            "inprogress",
+        )
+        assert len(httpx_mock.get_requests()) == 3
+
+    async def test_failed_snapshot_does_not_poison_future_fetch(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads", status_code=400
+        )
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer",
+                    "files": [{"id": "t1", "filename": "one.flac", "state": "Completed"}],
+                }
+            ],
+        )
+        adapter = SlskdAdapter("http://slskd.local", "key123")
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await adapter.status("t1")
+        assert (await adapter.status("t1")).reason == "completed"
+        assert len(httpx_mock.get_requests()) == 2
+
+    async def test_download_poll_429_uses_bounded_backoff_without_real_sleep(
+        self, httpx_mock: HTTPXMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sleeps: list[float] = []
+
+        async def capture_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        monkeypatch.setattr(slskd_module, "_transfer_sleep", capture_sleep)
+        monkeypatch.setattr(slskd_module, "_transfer_jitter", lambda _low, _high: 0.0)
+        for _ in range(2):
+            httpx_mock.add_response(
+                url="http://slskd.local/api/v0/transfers/downloads",
+                status_code=429,
+                text="api_key=do-not-expose",
+            )
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer",
+                    "files": [{"id": "t1", "filename": "one.flac", "state": "Completed"}],
+                }
+            ],
+        )
+
+        status = await SlskdAdapter("http://slskd.local", "key123").status("t1")
+
+        assert status.reason == "completed"
+        assert sleeps == [0.25, 0.5]
+        assert len(httpx_mock.get_requests()) == 3
+
+    async def test_download_poll_429_exhaustion_is_sanitized_and_retryable(
+        self, httpx_mock: HTTPXMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def no_sleep(_delay: float) -> None:
+            return None
+
+        monkeypatch.setattr(slskd_module, "_transfer_sleep", no_sleep)
+        monkeypatch.setattr(slskd_module, "_transfer_jitter", lambda _low, _high: 0.0)
+        for _ in range(slskd_module._TRANSFER_429_MAX_ATTEMPTS):
+            httpx_mock.add_response(
+                url="http://slskd.local/api/v0/transfers/downloads",
+                status_code=429,
+                text="secret response api_key=do-not-expose",
+            )
+
+        with pytest.raises(ProviderError) as exc_info:
+            await SlskdAdapter("http://slskd.local", "key123").downloads()
+
+        assert exc_info.value.code == "slskd_http_429"
+        assert exc_info.value.retryable is True
+        assert "key123" not in exc_info.value.message
+        assert "do-not-expose" not in exc_info.value.message
+        assert "?" not in exc_info.value.message

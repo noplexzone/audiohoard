@@ -7,21 +7,23 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import ParseResult, urlparse
 
-from sqlalchemy import select
+from sqlalchemy import select, text, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings, get_settings
-from app.database import get_session_factory
-from app.fingerprint.acoustid import fingerprint_file
-from app.jobs.dispatcher import (
-    reacquire_current_acquisition_slot,
-    release_current_acquisition_slot,
+from app.database import (
+    get_session_factory,
+    is_sqlite_database_locked,
+    run_with_sqlite_lock_retry,
 )
+from app.fingerprint.acoustid import fingerprint_file
 from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS, is_importable_audio
 from app.metadata.deezer import DeezerClient
 from app.metadata.filename_parse import (
@@ -59,6 +61,14 @@ from app.sources.tidal import TidalAdapter
 from app.sources.youtube import ProviderError, YouTubeAdapter
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ContinuationRequest:
+    parent_job_id: int
+    catalog_album_id: int
+    missing_catalog_track_ids: tuple[int, ...]
+
 
 # Compound disc-track prefix: "2-01 - Title", "cd2-01 - Title", "2.01. Title"
 _DISC_TRACK_PREFIX_RE = re.compile(
@@ -189,7 +199,6 @@ async def _poll_slskd_transfer(
     import time as _time
 
     deadline = _time.monotonic() + poll_timeout
-    slot_released = False
     try:
         while True:
             remaining = deadline - _time.monotonic()
@@ -206,11 +215,6 @@ async def _poll_slskd_transfer(
                     await on_provider_id(transfer_id)
 
             acq_state = map_slskd_transfer_state(state)
-            if acq_state == AcquisitionState.queued and not slot_released:
-                slot_released = await release_current_acquisition_slot()
-            elif acq_state != AcquisitionState.queued and slot_released:
-                await reacquire_current_acquisition_slot()
-                slot_released = False
 
             if acq_state == AcquisitionState.downloaded:
                 staged = await _locate_slskd_artifact(filename, state.extra, staging_root)
@@ -234,10 +238,6 @@ async def _poll_slskd_transfer(
     except asyncio.CancelledError:
         with contextlib.suppress(Exception):
             await adapter.cancel(username, filename, transfer_id)
-        raise
-    except Exception:
-        if slot_released:
-            await reacquire_current_acquisition_slot()
         raise
 
 
@@ -302,12 +302,81 @@ async def _poll_sab_job(
         await asyncio.sleep(min(poll_interval, max(0.01, remaining)))
 
 
+async def _persist_job_envelope(
+    db: AsyncSession,
+    job_id: int,
+    *,
+    expected_statuses: set[JobStatus],
+    status: JobStatus,
+    result_json: str | None = None,
+    cancel_active_tracks: bool = False,
+) -> bool:
+    """Persist one short job-envelope transition with rollback-safe retries."""
+    transitioned = False
+
+    async def operation() -> None:
+        nonlocal transitioned
+        transitioned = False
+        values: dict[str, object] = {"status": status, "updated_at": _now()}
+        if result_json is not None:
+            values["result_json"] = result_json
+        result = await db.execute(
+            update(Job)
+            .where(Job.id == job_id, Job.status.in_(expected_statuses))
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        transitioned = isinstance(result, CursorResult) and result.rowcount == 1
+        if transitioned:
+            # Refresh only after the SQL CAS succeeds. This never participates in
+            # the claim decision, but keeps retry instrumentation/session observers
+            # aligned with the committed transition.
+            claimed_job = await db.get(Job, job_id, populate_existing=True)
+            if claimed_job is None:
+                transitioned = False
+        if transitioned and cancel_active_tracks:
+            await db.execute(
+                update(Track)
+                .where(
+                    Track.job_id == job_id,
+                    Track.acquisition_state.in_(
+                        {
+                            AcquisitionState.queued,
+                            AcquisitionState.searching,
+                            AcquisitionState.acquiring,
+                        }
+                    ),
+                )
+                .values(acquisition_state=AcquisitionState.cancelled)
+                .execution_options(synchronize_session=False)
+            )
+        await db.commit()
+
+    await run_with_sqlite_lock_retry(db, operation)
+    return transitioned
+
+
+def _job_error_result(code: str, operation: str, *, retryable: bool) -> str:
+    return json.dumps({"error": {"code": code, "operation": operation, "retryable": retryable}})
+
+
 async def run_job(
     job_id: int, db: AsyncSession | None = None, settings: Settings | None = None
 ) -> None:
     if db is not None:
         cfg = settings or await build_effective_settings(db, get_settings())
-        await _run_job_in_session(job_id, db, cfg)
+        continuation = await _run_job_in_session(job_id, db, cfg)
+        if continuation is not None:
+            # This legacy caller-owned session path intentionally commits execution
+            # state before continuation creation starts its isolated transaction.
+            await db.commit()
+            direct_continuation_ids = await _spawn_continuation_jobs(
+                continuation.parent_job_id,
+                list(continuation.missing_catalog_track_ids),
+                continuation.catalog_album_id,
+                db,
+            )
+            await _dispatch_continuation_jobs(direct_continuation_ids or [])
         return
 
     # Background path: short independent sessions with committed checkpoints.
@@ -315,111 +384,130 @@ async def run_job(
 
     # Phase 1: guarded initial lookup and effective-settings load.
     cfg_built: Settings | None = None
-    _phase1_error: str | None = None
+    phase1_error: str | None = None
     try:
-        async with factory() as s:
+        async with factory() as session:
             try:
-                job = await s.get(Job, job_id)
+                job = await session.get(Job, job_id)
             except Exception:
-                _phase1_error = "init_error"
+                phase1_error = "init_error"
                 raise
             if job is None:
                 logger.error("Job %d not found", job_id)
                 return
             try:
-                cfg_built = settings or await build_effective_settings(s, get_settings())
+                cfg_built = settings or await build_effective_settings(session, get_settings())
             except Exception:
-                _phase1_error = "settings_error"
+                phase1_error = "settings_error"
                 raise
     except Exception:
         logger.exception("Job %d phase-1 failed", job_id)
-        if _phase1_error is not None:
+        if phase1_error is not None:
             with contextlib.suppress(Exception):
-                async with factory() as s:
-                    j = await s.get(Job, job_id)
-                    if j is not None:
-                        j.status = JobStatus.failed
-                        j.result_json = json.dumps(
-                            {
-                                "error": {
-                                    "code": _phase1_error,
-                                    "operation": "init",
-                                    "retryable": False,
-                                }
-                            }
-                        )
-                        j.updated_at = _now()
-                        await s.commit()
+                async with factory() as session:
+                    await _persist_job_envelope(
+                        session,
+                        job_id,
+                        expected_statuses={JobStatus.pending},
+                        status=JobStatus.failed,
+                        result_json=_job_error_result(phase1_error, "init", retryable=False),
+                    )
         return
 
     cfg = cfg_built
 
     # Phase 2: commit pending->running before any provider work so observers see it.
     try:
-        async with factory() as s:
-            job = await s.get(Job, job_id)
-            if job is None:
-                return
-            job.status = JobStatus.running
-            job.updated_at = _now()
-            await s.commit()
+        async with factory() as session:
+            claimed = await _persist_job_envelope(
+                session,
+                job_id,
+                expected_statuses={JobStatus.pending},
+                status=JobStatus.running,
+            )
+        if not claimed:
+            return
     except asyncio.CancelledError:
         raise
     except Exception:
         logger.exception("Job %d phase-2 running transition failed", job_id)
         with contextlib.suppress(Exception):
-            async with factory() as s:
-                j = await s.get(Job, job_id)
-                if j is not None:
-                    j.status = JobStatus.failed
-                    j.result_json = json.dumps(
-                        {
-                            "error": {
-                                "code": "running_transition_error",
-                                "operation": "init",
-                                "retryable": False,
-                            }
-                        }
-                    )
-                    j.updated_at = _now()
-                    await s.commit()
+            async with factory() as session:
+                await _persist_job_envelope(
+                    session,
+                    job_id,
+                    expected_statuses={JobStatus.pending, JobStatus.running},
+                    status=JobStatus.failed,
+                    result_json=_job_error_result(
+                        "running_transition_error", "init", retryable=False
+                    ),
+                )
         return
 
-    # Phase 3: execute with per-result progress commits; terminal state persisted on failure.
+    # Phase 3: provider/filesystem execution occurs once. Only primitive terminal
+    # envelope data crosses into the rollback-safe persistence closure.
     try:
-        async with factory() as s:
-            await _run_job_in_session(job_id, s, cfg, commit_progress=True)
-            await s.commit()
-    except asyncio.CancelledError:
-        async with factory() as s:
-            job = await s.get(Job, job_id)
-            if job is not None:
-                job.status = JobStatus.cancelled
-                tracks = (await s.execute(select(Track).where(Track.job_id == job_id))).scalars()
-                for track in tracks:
-                    if track.acquisition_state in {
-                        AcquisitionState.queued,
-                        AcquisitionState.searching,
-                        AcquisitionState.acquiring,
-                    }:
-                        track.acquisition_state = AcquisitionState.cancelled
-                job.result_json = json.dumps(
-                    {"error": {"code": "cancelled", "operation": "job", "retryable": True}}
+        continuation_ids: list[int] = []
+        async with factory() as session:
+            continuation = await _run_job_in_session(job_id, session, cfg, commit_progress=True)
+            current = await session.get(Job, job_id)
+            if current is None:
+                return
+            terminal_status = current.status
+            terminal_result = current.result_json
+            if terminal_status not in {
+                JobStatus.done,
+                JobStatus.partial,
+                JobStatus.failed,
+            }:
+                raise RuntimeError(f"job {job_id} execution did not reach a terminal status")
+            # Real execution has already committed the complete terminal unit. This
+            # extra commit supports caller/test implementations; if it alone locks,
+            # reconstruct only their terminal envelope without replaying execution.
+            try:
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()
+                if not is_sqlite_database_locked(exc):
+                    raise
+                committed = await _persist_job_envelope(
+                    session,
+                    job_id,
+                    expected_statuses={JobStatus.running},
+                    status=terminal_status,
+                    result_json=terminal_result,
                 )
-                job.updated_at = _now()
-                await s.commit()
+                if not committed:
+                    return
+            if continuation is not None:
+                continuation_ids = await _spawn_continuation_jobs(
+                    continuation.parent_job_id,
+                    list(continuation.missing_catalog_track_ids),
+                    continuation.catalog_album_id,
+                    session,
+                )
+        await _dispatch_continuation_jobs(continuation_ids)
+    except asyncio.CancelledError:
+        async with factory() as session:
+            await _persist_job_envelope(
+                session,
+                job_id,
+                expected_statuses={JobStatus.pending, JobStatus.running},
+                status=JobStatus.cancelled,
+                result_json=_job_error_result("cancelled", "job", retryable=True),
+                cancel_active_tracks=True,
+            )
         raise
     except Exception:
         logger.exception("Job %d failed", job_id)
-        async with factory() as s:
-            job = await s.get(Job, job_id)
-            if job is not None:
-                job.status = JobStatus.failed
-                job.result_json = json.dumps(
-                    {"error": {"code": "job_failed", "operation": "job", "retryable": True}}
-                )
-                job.updated_at = _now()
-                await s.commit()
+        async with factory() as session:
+            await _persist_job_envelope(
+                session,
+                job_id,
+                expected_statuses={JobStatus.pending, JobStatus.running},
+                status=JobStatus.failed,
+                result_json=_job_error_result("job_failed", "job", retryable=True),
+            )
     finally:
         try:
             from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
@@ -436,11 +524,11 @@ async def run_job(
 
 async def _run_job_in_session(
     job_id: int, db: AsyncSession, cfg: Settings, *, commit_progress: bool = False
-) -> None:
+) -> _ContinuationRequest | None:
     job = await db.get(Job, job_id)
     if job is None:
         logger.error("Job %d not found", job_id)
-        return
+        return None
 
     job.status = JobStatus.running
     job.updated_at = _now()
@@ -450,6 +538,7 @@ async def _run_job_in_session(
     if commit_progress:
         await db.commit()
 
+    continuation_request: _ContinuationRequest | None = None
     try:
         runtime_settings = await get_runtime_settings(db)
         cfg = cfg.model_copy(
@@ -520,7 +609,7 @@ async def _run_job_in_session(
                 )
                 job.updated_at = _now()
                 await db.flush()
-                return
+                return None
 
         if job.catalog_track_id is not None:
             catalog_tracks = [
@@ -545,7 +634,7 @@ async def _run_job_in_session(
             )
             job.updated_at = _now()
             await db.flush()
-            return
+            return None
 
         if (
             catalog_album is not None
@@ -801,7 +890,11 @@ async def _run_job_in_session(
             job.result_json = json.dumps(payload, sort_keys=True)
             runtime = await get_runtime_settings(db)
             if missing_catalog_ids and job.partial_attempt < runtime.max_partial_attempts:
-                await _spawn_continuation_jobs(job, missing_catalog_ids, catalog_album, db)
+                continuation_request = _ContinuationRequest(
+                    parent_job_id=job.id,
+                    catalog_album_id=catalog_album.id,
+                    missing_catalog_track_ids=tuple(missing_catalog_ids),
+                )
             elif not missing_catalog_ids:
                 await _reconcile_catalog_album_jobs(db, catalog_album.id, acquired_ids)
         elif failures and tracks_created:
@@ -866,6 +959,9 @@ async def _run_job_in_session(
         job.updated_at = _now()
 
     await db.flush()
+    if commit_progress:
+        await db.commit()
+    return continuation_request
 
 
 async def _load_catalog_album(db: AsyncSession, album_id: int | None) -> CatalogAlbum | None:
@@ -2012,44 +2108,79 @@ async def _root_job(job: Job, db: AsyncSession) -> Job:
 
 
 async def _spawn_continuation_jobs(
-    parent_job: Job,
+    parent_job_id: int,
     missing_catalog_track_ids: list[int],
-    catalog_album: CatalogAlbum,
+    catalog_album_id: int,
     db: AsyncSession,
-) -> None:
-    """Spawn idempotent follow-up jobs, one targeted search per missing track."""
+) -> list[int]:
+    """Commit idempotent targeted continuations with rollback-safe retries."""
+    requested_track_ids = tuple(dict.fromkeys(missing_catalog_track_ids))
+    committed_ids: list[int] = []
+
+    # Never allow this helper's commit to sweep caller-owned pending mutations into
+    # the continuation transaction. Every retry below reconstructs ORM state.
+    await db.rollback()
+
+    async def operation() -> None:
+        attempt_ids: list[int] = []
+        # SQLite's deferred transactions permit two callers to observe no duplicate
+        # before either writes. Acquire the writer reservation before the duplicate
+        # query so a follower rechecks after the first commit.
+        await db.execute(text("BEGIN IMMEDIATE"))
+        parent_job = await db.get(Job, parent_job_id, populate_existing=True)
+        catalog_album = await _load_catalog_album(db, catalog_album_id)
+        if parent_job is None or catalog_album is None:
+            committed_ids.clear()
+            return
+
+        artist = catalog_album.artist.name if catalog_album.artist else ""
+        tracks_by_id = {track.id: track for track in catalog_album.tracks}
+        next_attempt = parent_job.partial_attempt + 1
+        for track_id in requested_track_ids:
+            catalog_track = tracks_by_id.get(track_id)
+            if catalog_track is None:
+                continue
+            duplicate = await db.scalar(
+                select(Job.id).where(
+                    Job.catalog_album_id == catalog_album_id,
+                    Job.catalog_track_id == track_id,
+                    (
+                        (
+                            (Job.parent_job_id == parent_job_id)
+                            & (Job.partial_attempt == next_attempt)
+                        )
+                        | Job.status.in_([JobStatus.pending, JobStatus.running])
+                    ),
+                )
+            )
+            if duplicate is not None:
+                continue
+            continuation = Job(
+                source="priority",
+                query=_targeted_query_variants(artist, catalog_album.title, catalog_track.title)[
+                    0
+                ],
+                status=JobStatus.pending,
+                catalog_album_id=catalog_album_id,
+                catalog_track_id=track_id,
+                parent_job_id=parent_job_id,
+                partial_attempt=next_attempt,
+                result_json=json.dumps({"continuation_of": parent_job_id}, sort_keys=True),
+            )
+            db.add(continuation)
+            await db.flush()
+            attempt_ids.append(continuation.id)
+        await db.commit()
+        committed_ids[:] = attempt_ids
+
+    await run_with_sqlite_lock_retry(db, operation)
+    return committed_ids
+
+
+async def _dispatch_continuation_jobs(continuation_ids: Sequence[int]) -> None:
+    """Dispatch only continuation rows returned by a successful creation commit."""
     from app.jobs.dispatcher import job_dispatcher
 
-    artist = catalog_album.artist.name if catalog_album.artist else ""
-    tracks_by_id = {track.id: track for track in catalog_album.tracks}
-    continuation_ids: list[int] = []
-    for track_id in missing_catalog_track_ids:
-        duplicate = await db.scalar(
-            select(Job.id).where(
-                Job.catalog_album_id == catalog_album.id,
-                Job.catalog_track_id == track_id,
-                Job.status.in_([JobStatus.pending, JobStatus.running]),
-            )
-        )
-        if duplicate is not None:
-            continue
-        catalog_track = tracks_by_id.get(track_id)
-        if catalog_track is None:
-            continue
-        continuation = Job(
-            source="priority",
-            query=_targeted_query_variants(artist, catalog_album.title, catalog_track.title)[0],
-            status=JobStatus.pending,
-            catalog_album_id=catalog_album.id,
-            catalog_track_id=track_id,
-            parent_job_id=parent_job.id,
-            partial_attempt=parent_job.partial_attempt + 1,
-            result_json=json.dumps({"continuation_of": parent_job.id}, sort_keys=True),
-        )
-        db.add(continuation)
-        await db.flush()
-        continuation_ids.append(continuation.id)
-    await db.commit()
     for continuation_id in continuation_ids:
         await job_dispatcher.dispatch(continuation_id)
 

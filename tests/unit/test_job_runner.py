@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.database as _db_module
@@ -538,6 +539,368 @@ async def test_background_cleanup_failure_does_not_rewrite_committed_success(
     persisted = await db_session.get(Job, job_id)
     assert persisted is not None
     assert persisted.status == JobStatus.done
+
+
+async def test_background_pending_to_running_retries_locked_commit(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = await _create_job(db_session)
+    await db_session.commit()
+    job_id = job.id
+    execution_calls = 0
+    injected_lock = False
+
+    async def complete_job(
+        current_job_id: int,
+        session: AsyncSession,
+        cfg: Settings,
+        *,
+        commit_progress: bool = False,
+    ) -> None:
+        nonlocal execution_calls
+        execution_calls += 1
+        current = await session.get(Job, current_job_id)
+        assert current is not None
+        current.status = JobStatus.done
+        current.result_json = json.dumps({"history": ["provider-call"]})
+
+    original_commit = AsyncSession.commit
+
+    async def lock_running_once(self: AsyncSession) -> None:
+        nonlocal injected_lock
+        jobs = [obj for obj in self.sync_session.identity_map.values() if isinstance(obj, Job)]
+        if not injected_lock and any(current.status == JobStatus.running for current in jobs):
+            injected_lock = True
+            raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
+        await original_commit(self)
+
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(runner, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", complete_job)
+    monkeypatch.setattr(AsyncSession, "commit", lock_running_once)
+
+    await runner.run_job(job_id, settings=test_settings)
+
+    db_session.expire_all()
+    persisted = await db_session.get(Job, job_id)
+    assert injected_lock is True
+    assert execution_calls == 1
+    assert persisted is not None
+    assert persisted.status == JobStatus.done
+    assert "running_transition_error" not in (persisted.result_json or "")
+
+
+async def test_background_final_terminal_write_retries_without_repeating_work(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = await _create_job(db_session)
+    await db_session.commit()
+    job_id = job.id
+    provider_calls = 0
+    acquisition_calls = 0
+    injected_lock = False
+
+    async def complete_job(
+        current_job_id: int,
+        session: AsyncSession,
+        cfg: Settings,
+        *,
+        commit_progress: bool = False,
+    ) -> None:
+        nonlocal provider_calls, acquisition_calls
+        provider_calls += 1
+        acquisition_calls += 1
+        current = await session.get(Job, current_job_id)
+        assert current is not None
+        current.status = JobStatus.partial
+        current.result_json = json.dumps({"history": ["provider", "acquisition"]})
+
+    original_commit = AsyncSession.commit
+
+    async def lock_terminal_once(self: AsyncSession) -> None:
+        nonlocal injected_lock
+        jobs = [obj for obj in self.sync_session.identity_map.values() if isinstance(obj, Job)]
+        if not injected_lock and any(current.status == JobStatus.partial for current in jobs):
+            injected_lock = True
+            raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
+        await original_commit(self)
+
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(runner, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", complete_job)
+    monkeypatch.setattr(AsyncSession, "commit", lock_terminal_once)
+
+    await runner.run_job(job_id, settings=test_settings)
+
+    db_session.expire_all()
+    persisted = await db_session.get(Job, job_id)
+    assert injected_lock is True
+    assert provider_calls == 1
+    assert acquisition_calls == 1
+    assert persisted is not None
+    assert persisted.status == JobStatus.partial
+    assert json.loads(persisted.result_json or "{}")["history"] == ["provider", "acquisition"]
+
+
+async def test_background_cancellation_retries_job_and_active_tracks_together(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = await _create_job(db_session)
+    db_session.add(
+        Track(job_id=job.id, source="youtube", acquisition_state=AcquisitionState.acquiring)
+    )
+    await db_session.commit()
+    job_id = job.id
+    injected_lock = False
+
+    async def cancel_job(*args: object, **kwargs: object) -> None:
+        raise asyncio.CancelledError
+
+    original_commit = AsyncSession.commit
+
+    async def lock_cancel_once(self: AsyncSession) -> None:
+        nonlocal injected_lock
+        jobs = [obj for obj in self.sync_session.identity_map.values() if isinstance(obj, Job)]
+        if not injected_lock and any(current.status == JobStatus.cancelled for current in jobs):
+            injected_lock = True
+            raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
+        await original_commit(self)
+
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(runner, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", cancel_job)
+    monkeypatch.setattr(AsyncSession, "commit", lock_cancel_once)
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run_job(job_id, settings=test_settings)
+
+    db_session.expire_all()
+    persisted = await db_session.get(Job, job_id)
+    track = await db_session.scalar(select(Track).where(Track.job_id == job_id))
+    assert injected_lock is True
+    assert persisted is not None
+    assert persisted.status == JobStatus.cancelled
+    assert track is not None
+    assert track.acquisition_state == AcquisitionState.cancelled
+
+
+async def test_background_unhandled_failure_retries_locked_terminal_write(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = await _create_job(db_session)
+    await db_session.commit()
+    job_id = job.id
+    execution_calls = 0
+    injected_lock = False
+
+    async def fail_job(*args: object, **kwargs: object) -> None:
+        nonlocal execution_calls
+        execution_calls += 1
+        raise RuntimeError("execution failed")
+
+    original_commit = AsyncSession.commit
+
+    async def lock_failure_once(self: AsyncSession) -> None:
+        nonlocal injected_lock
+        jobs = [obj for obj in self.sync_session.identity_map.values() if isinstance(obj, Job)]
+        if not injected_lock and any(current.status == JobStatus.failed for current in jobs):
+            injected_lock = True
+            raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
+        await original_commit(self)
+
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(runner, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", fail_job)
+    monkeypatch.setattr(AsyncSession, "commit", lock_failure_once)
+
+    await runner.run_job(job_id, settings=test_settings)
+
+    db_session.expire_all()
+    persisted = await db_session.get(Job, job_id)
+    assert injected_lock is True
+    assert execution_calls == 1
+    assert persisted is not None
+    assert persisted.status == JobStatus.failed
+    assert json.loads(persisted.result_json or "{}")["error"]["code"] == "job_failed"
+
+
+async def test_running_retry_does_not_regress_concurrent_terminal_advance(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = await _create_job(db_session)
+    await db_session.commit()
+    job_id = job.id
+    execution_calls = 0
+    injected_lock = False
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+
+    async def should_not_execute(*args: object, **kwargs: object) -> None:
+        nonlocal execution_calls
+        execution_calls += 1
+
+    original_commit = AsyncSession.commit
+
+    async def commit_then_advance(self: AsyncSession) -> None:
+        nonlocal injected_lock
+        jobs = [obj for obj in self.sync_session.identity_map.values() if isinstance(obj, Job)]
+        if not injected_lock and any(current.status == JobStatus.running for current in jobs):
+            injected_lock = True
+            await original_commit(self)
+            async with factory() as concurrent:
+                current = await concurrent.get(Job, job_id)
+                assert current is not None
+                current.status = JobStatus.done
+                current.result_json = json.dumps({"history": ["other-worker"]})
+                await original_commit(concurrent)
+            raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
+        await original_commit(self)
+
+    monkeypatch.setattr(runner, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", should_not_execute)
+    monkeypatch.setattr(AsyncSession, "commit", commit_then_advance)
+
+    await runner.run_job(job_id, settings=test_settings)
+
+    db_session.expire_all()
+    persisted = await db_session.get(Job, job_id)
+    assert injected_lock is True
+    assert execution_calls == 0
+    assert persisted is not None
+    assert persisted.status == JobStatus.done
+    assert json.loads(persisted.result_json or "{}")["history"] == ["other-worker"]
+
+
+async def test_background_continuation_retries_commit_and_dispatches_only_after_commit(
+    db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.jobs import dispatcher as dispatcher_module
+
+    artist = CatalogArtist(name="Artist")
+    album = CatalogAlbum(artist=artist, title="Album", track_count=1)
+    catalog_track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+    job = Job(
+        source="slskd",
+        query="Artist Album",
+        status=JobStatus.pending,
+        catalog_album=album,
+    )
+    db_session.add_all([artist, album, catalog_track, job])
+    await db_session.commit()
+    job_id, album_id, catalog_track_id = job.id, album.id, catalog_track.id
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    execution_calls = 0
+    injected_lock = False
+    dispatched: list[int] = []
+
+    async def complete_job(
+        current_job_id: int,
+        session: AsyncSession,
+        cfg: Settings,
+        *,
+        commit_progress: bool = False,
+    ) -> runner._ContinuationRequest:
+        nonlocal execution_calls
+        execution_calls += 1
+        current = await session.get(Job, current_job_id)
+        assert current is not None
+        current.status = JobStatus.partial
+        current.result_json = json.dumps({"missing_catalog_track_ids": [catalog_track_id]})
+        return runner._ContinuationRequest(
+            parent_job_id=current_job_id,
+            catalog_album_id=album_id,
+            missing_catalog_track_ids=(catalog_track_id,),
+        )
+
+    original_commit = AsyncSession.commit
+
+    async def lock_continuation_once(self: AsyncSession) -> None:
+        nonlocal injected_lock
+        jobs = [obj for obj in self.sync_session.identity_map.values() if isinstance(obj, Job)]
+        if not injected_lock and any(current.parent_job_id == job_id for current in jobs):
+            injected_lock = True
+            raise OperationalError("INSERT INTO jobs", {}, Exception("database is locked"))
+        await original_commit(self)
+
+    async def assert_committed_then_dispatch(continuation_id: int) -> None:
+        async with factory() as observer:
+            continuation = await observer.get(Job, continuation_id)
+            persisted_parent = await observer.get(Job, job_id)
+            assert continuation is not None
+            assert continuation.status == JobStatus.pending
+            assert persisted_parent is not None
+            assert persisted_parent.status == JobStatus.partial
+        dispatched.append(continuation_id)
+
+    monkeypatch.setattr(runner, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", complete_job)
+    monkeypatch.setattr(AsyncSession, "commit", lock_continuation_once)
+    monkeypatch.setattr(
+        dispatcher_module.job_dispatcher, "dispatch", assert_committed_then_dispatch
+    )
+
+    await runner.run_job(job_id, settings=test_settings)
+
+    async with factory() as observer:
+        continuations = list(
+            (await observer.scalars(select(Job).where(Job.parent_job_id == job_id))).all()
+        )
+    assert injected_lock is True
+    assert execution_calls == 1
+    assert len(continuations) == 1
+    assert dispatched == [continuations[0].id]
+
+
+async def test_concurrent_equivalent_continuations_create_and_dispatch_once(
+    tmp_path, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.jobs import dispatcher as dispatcher_module
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'continuations.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as seed:
+            artist = CatalogArtist(name="Artist")
+            album = CatalogAlbum(artist=artist, title="Album", track_count=1)
+            catalog_track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+            parent = Job(
+                source="slskd",
+                query="Artist Album",
+                status=JobStatus.partial,
+                catalog_album=album,
+            )
+            seed.add_all([artist, album, catalog_track, parent])
+            await seed.commit()
+            parent_id, album_id, track_id = parent.id, album.id, catalog_track.id
+
+        async def create_equivalent() -> list[int]:
+            async with factory() as session:
+                return await runner._spawn_continuation_jobs(
+                    parent_id, [track_id], album_id, session
+                )
+
+        created_by_call = await asyncio.gather(create_equivalent(), create_equivalent())
+        dispatched: list[int] = []
+
+        async def fake_dispatch(continuation_id: int) -> None:
+            dispatched.append(continuation_id)
+
+        monkeypatch.setattr(dispatcher_module.job_dispatcher, "dispatch", fake_dispatch)
+        for continuation_ids in created_by_call:
+            await runner._dispatch_continuation_jobs(continuation_ids)
+
+        async with factory() as observer:
+            continuations = list(
+                (await observer.scalars(select(Job).where(Job.parent_job_id == parent_id))).all()
+            )
+        assert len(continuations) == 1
+        assert sorted([job_id for ids in created_by_call for job_id in ids]) == [
+            continuations[0].id
+        ]
+        assert dispatched == [continuations[0].id]
+    finally:
+        await engine.dispose()
 
 
 async def test_provider_error_persists_typed_failure_without_secret(
@@ -1472,12 +1835,25 @@ async def test_background_init_get_raises_persists_failed(
             raise RuntimeError("DB read failed")
         return await _orig_get(self, *args, **kwargs)
 
+    original_commit = AsyncSession.commit
+    injected_lock = False
+
+    async def lock_failed_once(self: AsyncSession) -> None:
+        nonlocal injected_lock
+        jobs = [obj for obj in self.sync_session.identity_map.values() if isinstance(obj, Job)]
+        if not injected_lock and any(current.status == JobStatus.failed for current in jobs):
+            injected_lock = True
+            raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
+        await original_commit(self)
+
     monkeypatch.setattr(AsyncSession, "get", failing_first_get)
+    monkeypatch.setattr(AsyncSession, "commit", lock_failed_once)
 
     await runner.run_job(job_id, settings=None)
 
     async with bg_factory() as s:
         loaded = await s.get(Job, job_id)
+        assert injected_lock is True
         assert loaded is not None
         assert loaded.status == JobStatus.failed
         assert loaded.result_json is not None
@@ -2090,3 +2466,29 @@ async def test_first_complete_album_run_is_done_not_partial(
         (await db_session.scalars(select(Job).where(Job.parent_job_id == job.id))).all()
     )
     assert len(continuation_jobs) == 0, "complete first run must not spawn continuation jobs"
+
+
+async def test_pending_job_claim_is_atomic_across_sessions(
+    db_session: AsyncSession,
+) -> None:
+    job = await _create_job(db_session)
+    await db_session.commit()
+    job_id = job.id
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+
+    async def claim() -> bool:
+        async with factory() as session:
+            return await runner._persist_job_envelope(
+                session,
+                job_id,
+                expected_statuses={JobStatus.pending},
+                status=JobStatus.running,
+            )
+
+    results = await asyncio.gather(claim(), claim())
+
+    assert sorted(results) == [False, True]
+    db_session.expire_all()
+    persisted = await db_session.get(Job, job_id)
+    assert persisted is not None
+    assert persisted.status == JobStatus.running

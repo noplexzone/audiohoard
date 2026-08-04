@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import json
 from datetime import UTC
+from pathlib import Path
 from types import SimpleNamespace
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
 from app.jobs.runner import _fetch_slskd_album_results, _without_blocked_slskd_results
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
-from app.models.import_plan import ImportPlan
+from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.source_candidate_block import SourceCandidateBlock
@@ -868,7 +869,337 @@ async def test_cleanup_dir_prune_oserror_retains_obligation(
     monkeypatch.setattr(acquisition_cleanup, "_mark_cleanup_attempted", fake_mark)
     monkeypatch.setattr(acquisition_cleanup, "_prune_empty_parents", raising_prune)
 
-    await cleanup_imported_sources((ImportedSourceCleanup(42, staged, None),))
+    await cleanup_imported_sources((ImportedSourceCleanup(None, staged, None),))
 
     assert not staged.exists()
     assert completed_flags == [False]
+
+
+async def _pending_cleanup_fixture(
+    db_session: AsyncSession, tmp_path
+) -> tuple[ImportedSourceCleanup, ImportPlan, Track]:
+    staged = tmp_path / "staged.flac"
+    staged.write_bytes(b"old-audio")
+    job = Job(source="slskd", query="cleanup", status=JobStatus.done)
+    release = Release(job=job, source="slskd", title="Album")
+    track = Track(
+        job=job,
+        release=release,
+        source="slskd",
+        source_job_id="old-transfer",
+        staging_path=str(staged),
+        acquisition_provenance_json=json.dumps(
+            {"source": "slskd", "username": "peer", "filename": "song.flac"}
+        ),
+    )
+    plan = ImportPlan(
+        release=release,
+        track=track,
+        source_path=str(staged),
+        staging_path=str(staged),
+        destination_path=str(tmp_path / "library" / "song.flac"),
+        status=ImportWorkflowState.imported,
+    )
+    db_session.add_all([job, release, track, plan])
+    await db_session.commit()
+    pending = await pending_imported_source_cleanups(db_session)
+    assert len(pending) == 1
+    return pending[0], plan, track
+
+
+async def test_stale_cleanup_cannot_unlink_or_clear_reassigned_plan(
+    db_session: AsyncSession, monkeypatch, tmp_path
+) -> None:
+    item, plan, _ = await _pending_cleanup_fixture(db_session, tmp_path)
+    replacement = tmp_path / "replacement.flac"
+    replacement.write_bytes(b"replacement")
+    plan.staging_path = str(replacement)
+    await db_session.commit()
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+
+    await cleanup_imported_sources((item,))
+
+    assert item.staged_path.exists()
+    async with factory() as verify:
+        current = await verify.get(ImportPlan, plan.id)
+        assert current is not None
+        assert current.staging_path == str(replacement)
+        assert current.cleanup_attempted_at is None
+
+
+async def test_stale_cleanup_cannot_cancel_reassigned_transfer(
+    db_session: AsyncSession, monkeypatch, tmp_path
+) -> None:
+    item, _, track = await _pending_cleanup_fixture(db_session, tmp_path)
+    track.source_job_id = "replacement-transfer"
+    await db_session.commit()
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+    calls: list[str | None] = []
+
+    class FakeSlskdAdapter:
+        def __init__(self, url: str, api_key: str) -> None:
+            pass
+
+        async def cancel(self, username: str, filename: str, transfer_id: str | None = None):
+            calls.append(transfer_id)
+
+    async def fake_effective_settings(db, settings):  # noqa: ANN001
+        return SimpleNamespace(slskd_url="", slskd_api_key="")
+
+    monkeypatch.setattr(acquisition_cleanup, "SlskdAdapter", FakeSlskdAdapter)
+    monkeypatch.setattr(acquisition_cleanup, "build_effective_settings", fake_effective_settings)
+
+    await cleanup_imported_sources((item,))
+
+    assert calls == []
+    assert item.staged_path.exists()
+
+
+async def test_cleanup_refuses_changed_filesystem_identity(
+    db_session: AsyncSession, monkeypatch, tmp_path
+) -> None:
+    item, plan, _ = await _pending_cleanup_fixture(db_session, tmp_path)
+    item.staged_path.unlink()
+    item.staged_path.write_bytes(b"replacement-audio")
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+
+    await cleanup_imported_sources((item,))
+
+    assert item.staged_path.read_bytes() == b"replacement-audio"
+    async with factory() as verify:
+        current = await verify.get(ImportPlan, plan.id)
+        assert current is not None
+        assert current.staging_path == str(item.staged_path)
+
+
+async def test_stale_cleanup_cannot_unlink_active_destination_owner(
+    db_session: AsyncSession, monkeypatch, tmp_path
+) -> None:
+    item, stale_plan, _ = await _pending_cleanup_fixture(db_session, tmp_path)
+    stale_plan.destination_path = str(item.staged_path)
+    active_track = Track(job=stale_plan.release.job, release=stale_plan.release, source="slskd")
+    active_plan = ImportPlan(
+        release=stale_plan.release,
+        track=active_track,
+        source_path=str(tmp_path / "other-source.flac"),
+        destination_path=str(item.staged_path),
+        status=ImportWorkflowState.importing,
+        file_state=LibraryFileState.unknown,
+    )
+    db_session.add_all([active_track, active_plan])
+    await db_session.commit()
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+
+    await cleanup_imported_sources((item,))
+
+    assert item.staged_path.exists()
+    async with factory() as verify:
+        current = await verify.get(ImportPlan, stale_plan.id)
+        assert current is not None
+        assert current.staging_path == str(item.staged_path)
+
+
+async def test_stale_cleanup_cannot_unlink_when_track_staging_path_changes(
+    db_session: AsyncSession, monkeypatch, tmp_path
+) -> None:
+    item, plan, track = await _pending_cleanup_fixture(db_session, tmp_path)
+    track.staging_path = str(tmp_path / "new-track-stage.flac")
+    await db_session.commit()
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+
+    await cleanup_imported_sources((item,))
+
+    assert item.staged_path.exists()
+    async with factory() as verify:
+        current = await verify.get(ImportPlan, plan.id)
+        assert current is not None
+        assert current.staging_path == str(item.staged_path)
+        assert current.cleanup_attempted_at is None
+
+
+async def test_cleanup_marker_retry_refetches_and_clears_current_obligation(
+    db_session: AsyncSession, monkeypatch, tmp_path
+) -> None:
+    item, plan, _ = await _pending_cleanup_fixture(db_session, tmp_path)
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+    original_commit = AsyncSession.commit
+    attempts = 0
+
+    async def lock_once(session: AsyncSession) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            from sqlalchemy.exc import OperationalError
+
+            raise OperationalError("UPDATE import_plans", {}, Exception("database is locked"))
+        await original_commit(session)
+
+    async def no_sleep(delay: float) -> None:
+        assert delay == 0.25
+
+    monkeypatch.setattr(AsyncSession, "commit", lock_once)
+    monkeypatch.setattr(acquisition_cleanup.asyncio, "sleep", no_sleep)
+
+    await acquisition_cleanup._mark_cleanup_attempted(item, completed=True)
+
+    assert attempts == 2
+    async with factory() as verify:
+        current = await verify.get(ImportPlan, plan.id)
+        assert current is not None
+        assert current.staging_path is None
+        assert current.cleanup_attempted_at is not None
+
+
+async def test_quarantine_cleanup_preserves_replacement_at_original_path(
+    db_session: AsyncSession, monkeypatch, tmp_path
+) -> None:
+    item, plan, track = await _pending_cleanup_fixture(db_session, tmp_path)
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+
+    class ReplacingAdapter:
+        def __init__(self, url: str, api_key: str) -> None:
+            pass
+
+        async def cancel(
+            self, username: str, filename: str, transfer_id: str | None = None
+        ) -> bool:
+            item.staged_path.write_bytes(b"replacement")
+            return True
+
+    async def fake_effective_settings(db, settings):  # noqa: ANN001
+        return SimpleNamespace(slskd_url="", slskd_api_key="")
+
+    monkeypatch.setattr(acquisition_cleanup, "SlskdAdapter", ReplacingAdapter)
+    monkeypatch.setattr(acquisition_cleanup, "build_effective_settings", fake_effective_settings)
+
+    await cleanup_imported_sources((item,))
+
+    assert item.staged_path.read_bytes() == b"replacement"
+    assert list(tmp_path.glob(".*.audiohoard-cleanup-*")) == []
+    async with factory() as verify:
+        persisted_plan = await verify.get(ImportPlan, plan.id)
+        persisted_track = await verify.get(Track, track.id)
+        assert persisted_plan is not None and persisted_plan.staging_path is None
+        assert persisted_track is not None and persisted_track.staging_path is None
+
+
+async def test_crash_before_quarantine_commit_recovers_owned_inode_and_preserves_replacement(
+    db_session: AsyncSession, monkeypatch, tmp_path
+) -> None:
+    item, plan, track = await _pending_cleanup_fixture(db_session, tmp_path)
+    assert item.expected_device is not None and item.expected_inode is not None
+    assert item.expected_mtime_ns is not None and item.expected_size is not None
+    quarantine = acquisition_cleanup._cleanup_quarantine_path(
+        item.staged_path,
+        plan.id,
+        item.expected_device,
+        item.expected_inode,
+        item.expected_mtime_ns,
+        item.expected_size,
+        acquisition_cleanup._file_sha256(item.staged_path),
+    )
+    item.staged_path.replace(quarantine)
+    item.staged_path.write_bytes(b"replacement")
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+
+    class Adapter:
+        def __init__(self, url: str, api_key: str) -> None:
+            pass
+
+        async def cancel(
+            self, username: str, filename: str, transfer_id: str | None = None
+        ) -> bool:
+            return True
+
+    async def fake_effective_settings(db, settings):  # noqa: ANN001
+        return SimpleNamespace(slskd_url="", slskd_api_key="")
+
+    monkeypatch.setattr(acquisition_cleanup, "SlskdAdapter", Adapter)
+    monkeypatch.setattr(acquisition_cleanup, "build_effective_settings", fake_effective_settings)
+    async with factory() as load:
+        recovered = await pending_imported_source_cleanups(load)
+    assert len(recovered) == 1 and recovered[0].staged_path == quarantine
+
+    await cleanup_imported_sources(recovered)
+
+    assert item.staged_path.read_bytes() == b"replacement"
+    assert not quarantine.exists()
+    async with factory() as verify:
+        persisted_plan = await verify.get(ImportPlan, plan.id)
+        persisted_track = await verify.get(Track, track.id)
+        assert persisted_plan is not None and persisted_plan.staging_path is None
+        assert persisted_track is not None and persisted_track.staging_path is None
+
+
+async def test_provider_failure_retains_quarantined_cleanup_obligation(
+    db_session: AsyncSession, monkeypatch, tmp_path
+) -> None:
+    item, plan, _ = await _pending_cleanup_fixture(db_session, tmp_path)
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+
+    class FailingAdapter:
+        def __init__(self, url: str, api_key: str) -> None:
+            pass
+
+        async def cancel(
+            self, username: str, filename: str, transfer_id: str | None = None
+        ) -> bool:
+            return False
+
+    async def fake_effective_settings(db, settings):  # noqa: ANN001
+        return SimpleNamespace(slskd_url="", slskd_api_key="")
+
+    monkeypatch.setattr(acquisition_cleanup, "SlskdAdapter", FailingAdapter)
+    monkeypatch.setattr(acquisition_cleanup, "build_effective_settings", fake_effective_settings)
+
+    await cleanup_imported_sources((item,))
+
+    async with factory() as verify:
+        persisted = await verify.get(ImportPlan, plan.id)
+        assert persisted is not None and persisted.staging_path is not None
+        retained_bytes = await acquisition_cleanup.asyncio.to_thread(
+            Path(persisted.staging_path).read_bytes
+        )
+        assert retained_bytes == b"old-audio"
+        pending = await pending_imported_source_cleanups(verify)
+        assert len(pending) == 1
+
+
+async def test_persisted_quarantine_with_replaced_inode_is_rejected(
+    db_session: AsyncSession, tmp_path
+) -> None:
+    item, plan, track = await _pending_cleanup_fixture(db_session, tmp_path)
+    assert item.expected_device is not None and item.expected_inode is not None
+    assert item.expected_mtime_ns is not None and item.expected_size is not None
+    quarantine = acquisition_cleanup._cleanup_quarantine_path(
+        item.staged_path,
+        plan.id,
+        item.expected_device,
+        item.expected_inode,
+        item.expected_mtime_ns,
+        item.expected_size,
+        acquisition_cleanup._file_sha256(item.staged_path),
+    )
+    await acquisition_cleanup.asyncio.to_thread(item.staged_path.replace, quarantine)
+    plan.staging_path = str(quarantine)
+    track.staging_path = str(quarantine)
+    await db_session.commit()
+    await acquisition_cleanup.asyncio.to_thread(quarantine.unlink)
+    await acquisition_cleanup.asyncio.to_thread(quarantine.write_bytes, b"replacement")
+
+    pending = await pending_imported_source_cleanups(db_session)
+
+    assert pending == ()
+    replacement = await acquisition_cleanup.asyncio.to_thread(quarantine.read_bytes)
+    assert replacement == b"replacement"
+    await db_session.refresh(plan)
+    assert plan.staging_path == str(quarantine)

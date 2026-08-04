@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from sqlalchemy import case, select
+from sqlalchemy import and_, case, or_, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.config import get_settings
 from app.database import get_session_factory
@@ -30,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 _SOURCE_CLEANUP_COMPLETED_AT = "source_cleanup_completed_at"
 _TERMINAL_CLEANUP_LOCK = asyncio.Lock()
+_IMPORTED_SOURCE_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
 
 
 def _provenance(provenance_json: str | None) -> dict[str, object]:
@@ -50,6 +54,35 @@ class ImportedSourceCleanup:
     staged_path: Path
     provenance_json: str | None
     source_job_id: str | None = None
+    track_id: int | None = None
+    expected_device: int | None = None
+    expected_inode: int | None = None
+    expected_mtime_ns: int | None = None
+    expected_size: int | None = None
+    expected_digest: str | None = None
+    session_factory: async_sessionmaker[AsyncSession] | None = field(
+        default=None, compare=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        if all(
+            value is not None
+            for value in (
+                self.expected_device,
+                self.expected_inode,
+                self.expected_mtime_ns,
+                self.expected_size,
+            )
+        ):
+            return
+        try:
+            stat_result = self.staged_path.stat()
+        except OSError:
+            return
+        object.__setattr__(self, "expected_device", stat_result.st_dev)
+        object.__setattr__(self, "expected_inode", stat_result.st_ino)
+        object.__setattr__(self, "expected_mtime_ns", stat_result.st_mtime_ns)
+        object.__setattr__(self, "expected_size", stat_result.st_size)
 
 
 class SlskdCleanupAdapter(Protocol):
@@ -70,7 +103,7 @@ def _slskd_identity(provenance_json: str | None) -> tuple[str, str] | None:
     return None
 
 
-async def hide_completed_and_timed_out_jobs(
+async def _hide_completed_and_timed_out_jobs_once(
     session_factory: async_sessionmaker[AsyncSession],
     job_ids: set[int] | None = None,
 ) -> list[int]:
@@ -147,10 +180,29 @@ async def hide_completed_and_timed_out_jobs(
         return sorted(hidden)
 
 
+async def hide_completed_and_timed_out_jobs(
+    session_factory: async_sessionmaker[AsyncSession],
+    job_ids: set[int] | None = None,
+    *,
+    max_attempts: int = 3,
+) -> list[int]:
+    """Hide terminal jobs in a fresh rollback-safe transaction on each attempt."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await _hide_completed_and_timed_out_jobs_once(session_factory, job_ids)
+        except Exception as exc:
+            if attempt == max_attempts or not _transient_cleanup_error(exc):
+                raise
+            await _cleanup_retry_delay(attempt)
+    raise RuntimeError("cleanup retry loop exited unexpectedly")
+
+
 async def cleanup_durable_slskd_transfers(
     session_factory: async_sessionmaker[AsyncSession],
     adapter: SlskdCleanupAdapter,
     job_ids: set[int] | None = None,
+    *,
+    max_attempts: int = 3,
 ) -> int:
     """Remove durable completed/timeout transfers with no DB transaction held during I/O."""
     async with session_factory() as db:
@@ -226,24 +278,9 @@ async def cleanup_durable_slskd_transfers(
             )
 
     if cleaned_track_identities:
-        async with session_factory() as db:
-            cleaned_tracks = list(
-                (
-                    await db.scalars(select(Track).where(Track.id.in_(cleaned_track_identities)))
-                ).all()
-            )
-            completed_at = datetime.now(UTC).isoformat()
-            for track in cleaned_tracks:
-                expected_identity, expected_source_job_id = cleaned_track_identities[track.id]
-                if (
-                    track.source_job_id != expected_source_job_id
-                    or _slskd_identity(track.acquisition_provenance_json) != expected_identity
-                ):
-                    continue
-                provenance = _provenance(track.acquisition_provenance_json)
-                provenance[_SOURCE_CLEANUP_COMPLETED_AT] = completed_at
-                track.acquisition_provenance_json = json.dumps(provenance, sort_keys=True)
-            await db.commit()
+        await _mark_durable_source_cleanups(
+            session_factory, cleaned_track_identities, max_attempts=max_attempts
+        )
     return completed
 
 
@@ -255,6 +292,48 @@ def _transient_cleanup_error(exc: BaseException) -> bool:
     )
 
 
+async def _cleanup_retry_delay(attempt: int) -> None:
+    delay = 0.25 * (2 ** (attempt - 1))
+    logger.warning("Cleanup database contention; retrying in %.2fs", delay)
+    await asyncio.sleep(delay)
+
+
+async def _mark_durable_source_cleanups(
+    session_factory: async_sessionmaker[AsyncSession],
+    cleaned_track_identities: dict[int, tuple[tuple[str, str], str]],
+    *,
+    max_attempts: int,
+) -> None:
+    for attempt in range(1, max_attempts + 1):
+        async with session_factory() as db:
+            try:
+                cleaned_tracks = list(
+                    (
+                        await db.scalars(
+                            select(Track).where(Track.id.in_(cleaned_track_identities))
+                        )
+                    ).all()
+                )
+                completed_at = datetime.now(UTC).isoformat()
+                for track in cleaned_tracks:
+                    expected_identity, expected_source_job_id = cleaned_track_identities[track.id]
+                    if (
+                        track.source_job_id != expected_source_job_id
+                        or _slskd_identity(track.acquisition_provenance_json) != expected_identity
+                    ):
+                        continue
+                    provenance = _provenance(track.acquisition_provenance_json)
+                    provenance[_SOURCE_CLEANUP_COMPLETED_AT] = completed_at
+                    track.acquisition_provenance_json = json.dumps(provenance, sort_keys=True)
+                await db.commit()
+                return
+            except Exception as exc:
+                await db.rollback()
+                if attempt == max_attempts or not _transient_cleanup_error(exc):
+                    raise
+        await _cleanup_retry_delay(attempt)
+
+
 async def cleanup_terminal_acquisitions(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -263,24 +342,18 @@ async def cleanup_terminal_acquisitions(
     job_ids: set[int] | None = None,
     max_attempts: int = 3,
 ) -> tuple[list[int], int]:
-    """Serialize and retry idempotent terminal cleanup after transient contention."""
+    """Serialize cleanup while retrying only short database transitions."""
     async with _TERMINAL_CLEANUP_LOCK:
-        for attempt in range(1, max_attempts + 1):
-            try:
-                hidden = await hide_completed_and_timed_out_jobs(session_factory, job_ids)
-                removed = await cleanup_durable_slskd_transfers(
-                    session_factory,
-                    SlskdAdapter(slskd_url, slskd_api_key),
-                    job_ids,
-                )
-                return hidden, removed
-            except Exception as exc:
-                if attempt == max_attempts or not _transient_cleanup_error(exc):
-                    raise
-                delay = 0.25 * (2 ** (attempt - 1))
-                logger.warning("Terminal acquisition cleanup contention; retrying in %.2fs", delay)
-                await asyncio.sleep(delay)
-    raise RuntimeError("terminal cleanup retry loop exited unexpectedly")
+        hidden = await hide_completed_and_timed_out_jobs(
+            session_factory, job_ids, max_attempts=max_attempts
+        )
+        removed = await cleanup_durable_slskd_transfers(
+            session_factory,
+            SlskdAdapter(slskd_url, slskd_api_key),
+            job_ids,
+            max_attempts=max_attempts,
+        )
+        return hidden, removed
 
 
 @dataclass(frozen=True)
@@ -400,6 +473,84 @@ async def prune_orphaned_terminal_records(
     return OrphanPruneResult(removed_tracks, removed_releases, removed_jobs)
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _cleanup_quarantine_path(
+    path: Path,
+    plan_id: int,
+    device: int,
+    inode: int,
+    mtime_ns: int,
+    size: int,
+    digest: str,
+) -> Path:
+    marker = f".audiohoard-cleanup-{plan_id}-{device}-{inode}-{mtime_ns}-{size}-{digest}"
+    if path.name.endswith(marker):
+        return path
+    return path.with_name(f".{path.name}{marker}")
+
+
+def _claimed_identity(path: Path, marker: str) -> tuple[int, int, int, int, str] | None:
+    if marker not in path.name:
+        return None
+    try:
+        values = path.name.rsplit(marker, 1)[1].split("-", 4)
+        if len(values) != 5 or len(values[4]) != 64:
+            return None
+        return int(values[0]), int(values[1]), int(values[2]), int(values[3]), values[4]
+    except ValueError:
+        return None
+
+
+def _current_identity(path: Path) -> tuple[int, int, int, int, str] | None:
+    try:
+        current = path.stat(follow_symlinks=False)
+        digest = _file_sha256(path)
+    except OSError:
+        return None
+    return current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size, digest
+
+
+def _quarantine_claim_matches(path: Path, configured: Path, plan_id: int) -> bool:
+    marker = f".{configured.name}.audiohoard-cleanup-{plan_id}-"
+    return _claimed_identity(path, marker) == _current_identity(path)
+
+
+def _persisted_quarantine_claim_matches(path: Path, plan_id: int) -> bool:
+    marker = f".audiohoard-cleanup-{plan_id}-"
+    return _claimed_identity(path, marker) == _current_identity(path)
+
+
+def _pending_cleanup_path_sync(plan: ImportPlan) -> Path | None:
+    configured = Path(plan.staging_path or plan.source_path)
+    if f".audiohoard-cleanup-{plan.id}-" in configured.name:
+        if _persisted_quarantine_claim_matches(configured, plan.id):
+            return configured
+        logger.error(
+            "refusing persisted cleanup quarantine with mismatched identity: plan=%s path=%s",
+            plan.id,
+            configured,
+        )
+        return None
+    pattern = f".{configured.name}.audiohoard-cleanup-{plan.id}-*"
+    candidates = [
+        candidate
+        for candidate in configured.parent.glob(pattern)
+        if _quarantine_claim_matches(candidate, configured, plan.id)
+    ]
+    return candidates[0] if len(candidates) == 1 else configured
+
+
+async def _pending_cleanup_path(plan: ImportPlan) -> Path | None:
+    return await asyncio.to_thread(_pending_cleanup_path_sync, plan)
+
+
 async def pending_imported_source_cleanups(
     db: AsyncSession, *, limit: int = 500
 ) -> tuple[ImportedSourceCleanup, ...]:
@@ -423,31 +574,278 @@ async def pending_imported_source_cleanups(
             )
         ).all()
     )
-    return tuple(
-        ImportedSourceCleanup(
-            plan.id,
-            Path(plan.staging_path or plan.source_path),
-            plan.track.acquisition_provenance_json if plan.track else None,
-            plan.track.source_job_id if plan.track else None,
+    items: list[ImportedSourceCleanup] = []
+    for plan in plans:
+        cleanup_path = await _pending_cleanup_path(plan)
+        if cleanup_path is None:
+            continue
+        items.append(
+            ImportedSourceCleanup(
+                plan.id,
+                cleanup_path,
+                plan.track.acquisition_provenance_json if plan.track else None,
+                plan.track.source_job_id if plan.track else None,
+                plan.track_id,
+                session_factory=async_sessionmaker(db.bind, expire_on_commit=False)
+                if db.bind is not None
+                else None,
+            )
         )
-        for plan in plans
+    return tuple(items)
+
+
+def _active_destination_owner_condition() -> ColumnElement[bool]:
+    return or_(
+        and_(
+            ImportPlan.status.in_({ImportWorkflowState.ready, ImportWorkflowState.importing}),
+            ImportPlan.file_state != LibraryFileState.removed,
+        ),
+        and_(
+            ImportPlan.status == ImportWorkflowState.imported,
+            ImportPlan.file_state == LibraryFileState.present,
+        ),
     )
 
 
-async def _mark_cleanup_attempted(plan_id: int | None, *, completed: bool) -> None:
-    if plan_id is None:
+async def _cleanup_obligation_is_current(
+    db: AsyncSession, item: ImportedSourceCleanup, *, protect_destination: bool
+) -> bool:
+    if item.plan_id is None:
+        return True
+    plan = await db.get(ImportPlan, item.plan_id, options=(selectinload(ImportPlan.track),))
+    if (
+        plan is None
+        or plan.status != ImportWorkflowState.imported
+        or plan.track_id != item.track_id
+    ):
+        return False
+    configured_path = Path(plan.staging_path or plan.source_path)
+    accepted_paths = {str(configured_path)}
+    claim_matches = await asyncio.to_thread(
+        _quarantine_claim_matches, item.staged_path, configured_path, plan.id
+    )
+    if claim_matches:
+        accepted_paths.add(str(item.staged_path))
+    if str(item.staged_path) not in accepted_paths:
+        return False
+    track = plan.track
+    if item.track_id is not None and (
+        track is None
+        or track.id != item.track_id
+        or track.staging_path not in accepted_paths
+        or track.source_job_id != item.source_job_id
+        or _slskd_identity(track.acquisition_provenance_json)
+        != _slskd_identity(item.provenance_json)
+    ):
+        return False
+    if protect_destination:
+        owner = await db.scalar(
+            select(ImportPlan.id)
+            .where(
+                ImportPlan.destination_path.in_(accepted_paths),
+                _active_destination_owner_condition(),
+            )
+            .limit(1)
+        )
+        if owner is not None:
+            return False
+    return True
+
+
+async def _revalidate_cleanup_obligation(
+    item: ImportedSourceCleanup, *, protect_destination: bool = True
+) -> bool:
+    if item.plan_id is None:
+        return True
+    session_factory = item.session_factory or get_session_factory()
+    async with session_factory() as db:
+        return await _cleanup_obligation_is_current(
+            db, item, protect_destination=protect_destination
+        )
+
+
+async def _claim_cleanup_quarantine(item: ImportedSourceCleanup) -> ImportedSourceCleanup | None:
+    """Durably claim an owned inode at a deterministic crash-recoverable path."""
+    if item.plan_id is None or item.track_id is None:
+        return None
+    factory = item.session_factory or get_session_factory()
+    current_item = item
+    for attempt in range(1, 4):
+        async with factory() as db:
+            try:
+                await db.execute(text("BEGIN IMMEDIATE"))
+                if not await _cleanup_obligation_is_current(
+                    db, current_item, protect_destination=True
+                ):
+                    await db.rollback()
+                    return None
+                plan = await db.get(ImportPlan, current_item.plan_id)
+                track = await db.get(Track, current_item.track_id)
+                if plan is None or track is None:
+                    await db.rollback()
+                    return None
+                configured = Path(plan.staging_path or plan.source_path)
+                if any(
+                    value is None
+                    for value in (
+                        current_item.expected_device,
+                        current_item.expected_inode,
+                        current_item.expected_mtime_ns,
+                        current_item.expected_size,
+                    )
+                ):
+                    # The old artifact is already absent. Preserve any later file at
+                    # the configured name and finish provider cleanup only.
+                    await db.rollback()
+                    return current_item
+                expected_device = current_item.expected_device
+                expected_inode = current_item.expected_inode
+                expected_mtime_ns = current_item.expected_mtime_ns
+                expected_size = current_item.expected_size
+                assert expected_device is not None
+                assert expected_inode is not None
+                assert expected_mtime_ns is not None
+                assert expected_size is not None
+                expected_digest = current_item.expected_digest
+                if expected_digest is None:
+                    expected_digest = await asyncio.to_thread(
+                        _file_sha256, current_item.staged_path
+                    )
+                    current_item = replace(current_item, expected_digest=expected_digest)
+                quarantine = _cleanup_quarantine_path(
+                    configured,
+                    plan.id,
+                    expected_device,
+                    expected_inode,
+                    expected_mtime_ns,
+                    expected_size,
+                    expected_digest,
+                )
+                if current_item.staged_path != quarantine:
+                    if quarantine.exists():
+                        await db.rollback()
+                        return None
+                    await asyncio.to_thread(os.replace, current_item.staged_path, quarantine)
+                    current_item = replace(current_item, staged_path=quarantine)
+                current = await asyncio.to_thread(quarantine.stat, follow_symlinks=False)
+                current_digest = await asyncio.to_thread(_file_sha256, quarantine)
+                if (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_mtime_ns,
+                    current.st_size,
+                    current_digest,
+                ) != (
+                    current_item.expected_device,
+                    current_item.expected_inode,
+                    current_item.expected_mtime_ns,
+                    current_item.expected_size,
+                    current_item.expected_digest,
+                ):
+                    configured_exists = await asyncio.to_thread(configured.exists)
+                    if not configured_exists:
+                        await asyncio.to_thread(os.replace, quarantine, configured)
+                    await db.rollback()
+                    return None
+                plan.staging_path = str(quarantine)
+                track.staging_path = str(quarantine)
+                await db.commit()
+                return current_item
+            except Exception as exc:
+                await db.rollback()
+                if attempt == 3 or not _transient_cleanup_error(exc):
+                    raise
+        await _cleanup_retry_delay(attempt)
+    return None
+
+
+def _unlink_if_identity_matches(item: ImportedSourceCleanup) -> bool:
+    if any(
+        value is None
+        for value in (
+            item.expected_device,
+            item.expected_inode,
+            item.expected_mtime_ns,
+            item.expected_size,
+        )
+    ):
+        return False
+    try:
+        current = item.staged_path.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    try:
+        current_digest = _file_sha256(item.staged_path)
+    except OSError:
+        return False
+    if (
+        current.st_dev,
+        current.st_ino,
+        current.st_mtime_ns,
+        current.st_size,
+        current_digest,
+    ) != (
+        item.expected_device,
+        item.expected_inode,
+        item.expected_mtime_ns,
+        item.expected_size,
+        item.expected_digest,
+    ):
+        return False
+    try:
+        item.staged_path.unlink()
+    except OSError:
+        return False
+    return True
+
+
+async def _mark_cleanup_attempted(
+    item: ImportedSourceCleanup, *, completed: bool, max_attempts: int = 3
+) -> None:
+    if item.plan_id is None:
         return
-    async with get_session_factory()() as db:
-        plan = await db.get(ImportPlan, plan_id)
-        if plan is not None and plan.status == ImportWorkflowState.imported:
-            plan.cleanup_attempted_at = datetime.now(UTC)
-            if completed:
-                plan.staging_path = None
-            await db.commit()
+    session_factory = item.session_factory or get_session_factory()
+    for attempt in range(1, max_attempts + 1):
+        async with session_factory() as db:
+            try:
+                if not await _cleanup_obligation_is_current(db, item, protect_destination=False):
+                    return
+                plan = await db.get(ImportPlan, item.plan_id)
+                if plan is None:
+                    return
+                plan.cleanup_attempted_at = datetime.now(UTC)
+                if completed:
+                    plan.staging_path = None
+                    if item.track_id is not None:
+                        track = await db.get(Track, item.track_id)
+                        if track is not None and track.staging_path == str(item.staged_path):
+                            track.staging_path = None
+                await db.commit()
+                return
+            except Exception as exc:
+                await db.rollback()
+                if attempt == max_attempts or not _transient_cleanup_error(exc):
+                    raise
+        await _cleanup_retry_delay(attempt)
+
+
+async def _provider_cleanup_completed_current(item: ImportedSourceCleanup) -> bool:
+    if item.track_id is None:
+        return _source_cleanup_completed(item.provenance_json)
+    factory = item.session_factory or get_session_factory()
+    async with factory() as db:
+        track = await db.get(Track, item.track_id)
+        return bool(
+            track is not None
+            and track.source_job_id == item.source_job_id
+            and _slskd_identity(track.acquisition_provenance_json)
+            == _slskd_identity(item.provenance_json)
+            and _source_cleanup_completed(track.acquisition_provenance_json)
+        )
 
 
 async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> None:
-    """Idempotently finish durable cleanup obligations after an import commit."""
+    """Idempotently finish currently-owned cleanup obligations after import commit."""
     staging_root = get_settings().staging_root
     adapter = None
     if any(_slskd_identity(item.provenance_json) for item in items):
@@ -458,10 +856,35 @@ async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> 
         except Exception:
             logger.exception("post-import slskd cleanup setup failed")
 
-    for item in items:
+    for original_item in items:
+        item = (
+            await _claim_cleanup_quarantine(original_item)
+            if original_item.plan_id is not None
+            else original_item
+        )
+        if item is None:
+            continue
         failed = False
+        has_local_identity = all(
+            value is not None
+            for value in (
+                item.expected_device,
+                item.expected_inode,
+                item.expected_mtime_ns,
+                item.expected_size,
+            )
+        )
+        if has_local_identity and item.expected_digest is None:
+            try:
+                item = replace(
+                    item,
+                    expected_digest=await asyncio.to_thread(_file_sha256, item.staged_path),
+                )
+            except OSError:
+                failed = True
         identity = _slskd_identity(item.provenance_json)
-        if identity is not None:
+        provider_cleanup_completed = await _provider_cleanup_completed_current(item)
+        if identity is not None and not provider_cleanup_completed:
             if adapter is None:
                 failed = True
             else:
@@ -471,28 +894,71 @@ async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> 
                     cleanup_result = await adapter.cancel(*identity, item.source_job_id)
                     if cleanup_result is False:
                         failed = True
+                    elif item.track_id is not None:
+                        factory = item.session_factory or get_session_factory()
+                        await _mark_durable_source_cleanups(
+                            factory,
+                            {item.track_id: (identity, item.source_job_id)},
+                            max_attempts=3,
+                        )
                 except Exception:
                     failed = True
                     logger.exception("post-import slskd transfer cleanup failed")
-        try:
-            await asyncio.to_thread(item.staged_path.unlink, missing_ok=True)
-        except OSError:
-            failed = True
-            logger.exception("post-import staging cleanup failed for %s", item.staged_path)
-        else:
-            try:
-                await asyncio.to_thread(_prune_empty_parents, item.staged_path, staging_root)
-            except Exception:
+        if not await _revalidate_cleanup_obligation(item):
+            continue
+        if not failed:
+            artifact_was_present = has_local_identity
+            unlinked = (
+                await asyncio.to_thread(_unlink_if_identity_matches, item)
+                if artifact_was_present
+                else True
+            )
+            if not unlinked:
                 failed = True
-                logger.warning("post-import directory prune failed for %s", item.staged_path)
+                logger.warning(
+                    "post-import staging cleanup refused changed artifact %s",
+                    item.staged_path,
+                )
+            elif artifact_was_present:
+                try:
+                    await asyncio.to_thread(_prune_empty_parents, item.staged_path, staging_root)
+                except Exception:
+                    failed = True
+                    logger.warning("post-import directory prune failed for %s", item.staged_path)
         try:
-            await _mark_cleanup_attempted(item.plan_id, completed=not failed)
+            await _mark_cleanup_attempted(item, completed=not failed)
         except Exception:
             logger.exception("failed to record post-import cleanup attempt")
 
 
-def schedule_imported_source_cleanup(items: tuple[ImportedSourceCleanup, ...]) -> None:
-    if not items:
+def _finish_imported_source_cleanup(task: asyncio.Task[None]) -> None:
+    _IMPORTED_SOURCE_CLEANUP_TASKS.discard(task)
+    if task.cancelled():
         return
+    try:
+        task.result()
+    except Exception:
+        logger.exception("detached post-import source cleanup failed")
+
+
+def schedule_imported_source_cleanup(
+    items: tuple[ImportedSourceCleanup, ...],
+) -> asyncio.Task[None] | None:
+    if not items:
+        return None
     task = asyncio.get_running_loop().create_task(cleanup_imported_sources(items))
-    task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+    _IMPORTED_SOURCE_CLEANUP_TASKS.add(task)
+    task.add_done_callback(_finish_imported_source_cleanup)
+    return task
+
+
+async def wait_for_imported_source_cleanups(*, raise_errors: bool = True) -> None:
+    """Drain source-cleanup tasks so tests and shutdown do not abandon obligations."""
+    tasks = tuple(_IMPORTED_SOURCE_CLEANUP_TASKS)
+    if not tasks:
+        return
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    if raise_errors:
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result

@@ -245,8 +245,8 @@ async def test_slskd_success_waits_for_completed_state(staging_root: Path) -> No
     assert result == (staged.resolve(), "t1")
 
 
-async def test_slskd_queued_transfer_yields_and_reacquires_dispatch_slot(
-    staging_root: Path, monkeypatch: pytest.MonkeyPatch
+async def test_slskd_queued_transfer_stays_under_dispatcher_job_permit(
+    staging_root: Path,
 ) -> None:
     staged = staging_root / "song.flac"
     staged.write_bytes(b"flacdata")
@@ -257,18 +257,6 @@ async def test_slskd_queued_transfer_yields_and_reacquires_dispatch_slot(
             CapabilityState(True, "Completed"),
         ]
     )
-    events: list[str] = []
-
-    async def release_slot() -> bool:
-        events.append("release")
-        return True
-
-    async def reacquire_slot() -> bool:
-        events.append("reacquire")
-        return True
-
-    monkeypatch.setattr(runner, "release_current_acquisition_slot", release_slot)
-    monkeypatch.setattr(runner, "reacquire_current_acquisition_slot", reacquire_slot)
 
     result = await runner._poll_slskd_transfer(
         transfer_id="t1",
@@ -281,28 +269,12 @@ async def test_slskd_queued_transfer_yields_and_reacquires_dispatch_slot(
     )
 
     assert result[0] == staged
-    assert events == ["release", "reacquire"]
 
 
-async def test_slskd_queued_timeout_reacquires_dispatcher_slot_before_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    events: list[str] = []
-
-    async def release_slot() -> bool:
-        events.append("release")
-        return True
-
-    async def reacquire_slot() -> bool:
-        events.append("reacquire")
-        return True
-
+async def test_slskd_queued_timeout_is_retryable(tmp_path: Path) -> None:
     class QueuedAdapter:
         async def status(self, _transfer_id: str) -> CapabilityState:
             return CapabilityState(available=True, reason="Queued")
-
-    monkeypatch.setattr(runner, "release_current_acquisition_slot", release_slot)
-    monkeypatch.setattr(runner, "reacquire_current_acquisition_slot", reacquire_slot)
 
     with pytest.raises(ProviderError) as exc_info:
         await runner._poll_slskd_transfer(
@@ -316,7 +288,7 @@ async def test_slskd_queued_timeout_reacquires_dispatcher_slot_before_error(
         )
 
     assert exc_info.value.code == "transfer_timeout"
-    assert events == ["release", "reacquire"]
+    assert exc_info.value.retryable is True
 
 
 async def test_slskd_success_finds_nested_completed_file(staging_root: Path) -> None:
