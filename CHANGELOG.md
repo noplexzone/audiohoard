@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-08-04
+
 ### Fixed
 
 - Keep each configured acquisition permit for the complete provider queue and polling lifecycle, preserving truthful runtime increase and decrease bounds.
