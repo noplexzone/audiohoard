@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import TYPE_CHECKING, Literal, TypedDict
 
 from app.metadata.deezer import DeezerClient
@@ -29,7 +30,17 @@ def _stored_preview(
     preview_url = getattr(catalog_track, "preview_url", None)
     if preview_source == source and isinstance(preview_url, str) and preview_url.strip():
         return preview_url.strip()
-    return None
+
+    album = getattr(catalog_track, "album", None)
+    try:
+        provenance = json.loads(getattr(album, "provenance_json", None) or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    previews = provenance.get("track_previews") if isinstance(provenance, dict) else None
+    source_previews = previews.get(source) if isinstance(previews, dict) else None
+    key = f"{getattr(catalog_track, 'disc', 1)}:{getattr(catalog_track, 'position', 0)}"
+    stored_url = source_previews.get(key) if isinstance(source_previews, dict) else None
+    return stored_url.strip() if isinstance(stored_url, str) and stored_url.strip() else None
 
 
 async def resolve_reference_audio(
