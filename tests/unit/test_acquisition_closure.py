@@ -1165,3 +1165,27 @@ async def test_provider_failure_retains_quarantined_cleanup_obligation(
         assert retained_bytes == b"old-audio"
         pending = await pending_imported_source_cleanups(verify)
         assert len(pending) == 1
+
+
+async def test_persisted_quarantine_with_replaced_inode_is_rejected(
+    db_session: AsyncSession, tmp_path
+) -> None:
+    item, plan, track = await _pending_cleanup_fixture(db_session, tmp_path)
+    assert item.expected_device is not None and item.expected_inode is not None
+    quarantine = acquisition_cleanup._cleanup_quarantine_path(
+        item.staged_path, plan.id, item.expected_device, item.expected_inode
+    )
+    await acquisition_cleanup.asyncio.to_thread(item.staged_path.replace, quarantine)
+    plan.staging_path = str(quarantine)
+    track.staging_path = str(quarantine)
+    await db_session.commit()
+    await acquisition_cleanup.asyncio.to_thread(quarantine.unlink)
+    await acquisition_cleanup.asyncio.to_thread(quarantine.write_bytes, b"replacement")
+
+    pending = await pending_imported_source_cleanups(db_session)
+
+    assert pending == ()
+    replacement = await acquisition_cleanup.asyncio.to_thread(quarantine.read_bytes)
+    assert replacement == b"replacement"
+    await db_session.refresh(plan)
+    assert plan.staging_path == str(quarantine)

@@ -478,10 +478,29 @@ def _quarantine_claim_matches(path: Path, configured: Path, plan_id: int) -> boo
         return False
 
 
-def _pending_cleanup_path(plan: ImportPlan) -> Path:
+def _persisted_quarantine_claim_matches(path: Path, plan_id: int) -> bool:
+    marker = f".audiohoard-cleanup-{plan_id}-"
+    if marker not in path.name:
+        return False
+    try:
+        device_text, inode_text = path.name.rsplit(marker, 1)[1].split("-", 1)
+        current = path.stat(follow_symlinks=False)
+        return (current.st_dev, current.st_ino) == (int(device_text), int(inode_text))
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _pending_cleanup_path(plan: ImportPlan) -> Path | None:
     configured = Path(plan.staging_path or plan.source_path)
     if f".audiohoard-cleanup-{plan.id}-" in configured.name:
-        return configured
+        if _persisted_quarantine_claim_matches(configured, plan.id):
+            return configured
+        logger.error(
+            "refusing persisted cleanup quarantine with mismatched identity: plan=%s path=%s",
+            plan.id,
+            configured,
+        )
+        return None
     pattern = f".{configured.name}.audiohoard-cleanup-{plan.id}-*"
     candidates = [
         candidate
@@ -514,19 +533,24 @@ async def pending_imported_source_cleanups(
             )
         ).all()
     )
-    return tuple(
-        ImportedSourceCleanup(
-            plan.id,
-            _pending_cleanup_path(plan),
-            plan.track.acquisition_provenance_json if plan.track else None,
-            plan.track.source_job_id if plan.track else None,
-            plan.track_id,
-            session_factory=async_sessionmaker(db.bind, expire_on_commit=False)
-            if db.bind is not None
-            else None,
+    items: list[ImportedSourceCleanup] = []
+    for plan in plans:
+        cleanup_path = _pending_cleanup_path(plan)
+        if cleanup_path is None:
+            continue
+        items.append(
+            ImportedSourceCleanup(
+                plan.id,
+                cleanup_path,
+                plan.track.acquisition_provenance_json if plan.track else None,
+                plan.track.source_job_id if plan.track else None,
+                plan.track_id,
+                session_factory=async_sessionmaker(db.bind, expire_on_commit=False)
+                if db.bind is not None
+                else None,
+            )
         )
-        for plan in plans
-    )
+    return tuple(items)
 
 
 def _active_destination_owner_condition() -> ColumnElement[bool]:
