@@ -427,7 +427,19 @@ async def test_deny_clears_review_with_unsafe_stale_staging_path(
 async def test_review_page_has_only_approve_and_deny_actions(
     client: AsyncClient, test_settings: Settings
 ) -> None:
-    item_id, _, staged_path = await _review_fixture(test_settings, "reason")
+    item_id, track_id, staged_path = await _review_fixture(test_settings, "reason")
+    factory = get_session_factory()
+    async with factory() as db:
+        track = await db.get(Track, track_id)
+        assert track is not None
+        track.acquisition_provenance_json = json.dumps(
+            {
+                "source": "slskd",
+                "username": "review-peer",
+                "filename": r"Remote Album\07 Original Track.flac",
+            }
+        )
+        await db.commit()
 
     page = await client.get("/downloads")
     assert page.status_code == 200
@@ -436,6 +448,8 @@ async def test_review_page_has_only_approve_and_deny_actions(
     assert f"/staging/review/{item_id}/approve" in page.text
     assert f"/staging/review/{item_id}/deny" in page.text
     assert ">Deny — remove<" in page.text
+    assert "<dt>Source</dt><dd>Soulseek (slskd)</dd>" in page.text
+    assert "<dt>Original filename</dt><dd><code>07 Original Track.flac</code></dd>" in page.text
     assert "/dismiss" not in page.text
 
     dismissed = await client.post(f"/staging/review/{item_id}/dismiss", follow_redirects=False)
