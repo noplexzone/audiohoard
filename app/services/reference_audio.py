@@ -56,6 +56,9 @@ async def resolve_reference_audio(
     stored_deezer = _stored_preview(catalog_track, "deezer")
     if stored_deezer:
         return {"url": stored_deezer, "source": "deezer"}
+    stored_itunes = _stored_preview(catalog_track, "itunes")
+    if stored_itunes:
+        return {"url": stored_itunes, "source": "itunes"}
 
     title = str(getattr(catalog_track, "title", None) or track.title or "").strip()
     deezer = deezer_client or DeezerClient(settings.deezer_api_url)
@@ -73,10 +76,6 @@ async def resolve_reference_audio(
                 return {"url": candidate.preview_url, "source": "deezer"}
     except Exception:
         pass
-
-    stored_itunes = _stored_preview(catalog_track, "itunes")
-    if stored_itunes:
-        return {"url": stored_itunes, "source": "itunes"}
 
     if not title:
         return None

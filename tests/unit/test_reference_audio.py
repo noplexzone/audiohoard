@@ -62,3 +62,47 @@ async def test_resolver_reuses_persisted_catalog_track_preview() -> None:
         "url": "https://cdn.example/preview.mp3",
         "source": "deezer",
     }
+
+
+class _CountingProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def get_track(self, *args, **kwargs):
+        self.calls += 1
+        return None
+
+    async def search_track(self, *args, **kwargs):
+        self.calls += 1
+        return []
+
+
+async def test_resolver_prefers_stored_itunes_preview_over_live_lookup() -> None:
+    album = CatalogAlbum(
+        title="Album",
+        provenance_json=json.dumps(
+            {
+                "track_previews": {
+                    "itunes": {"1:3": "https://cdn.example/preview.m4a"},
+                }
+            }
+        ),
+    )
+    catalog_track = CatalogAlbumTrack(position=3, disc=1, title="Track", album=album)
+    track = SimpleNamespace(title="Track", deezer_id=None)
+    provider = _CountingProvider()
+
+    reference = await resolve_reference_audio(
+        track,
+        catalog_track,
+        artist_name="Artist",
+        settings=SimpleNamespace(deezer_api_url="https://api.deezer.com"),
+        deezer_client=provider,
+        itunes_client=provider,
+    )
+
+    assert reference == {
+        "url": "https://cdn.example/preview.m4a",
+        "source": "itunes",
+    }
+    assert provider.calls == 0
