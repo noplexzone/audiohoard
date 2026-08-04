@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-08-04
+
+### Fixed
+
+- Default import-review audio previews to maximum volume and remember the browser's selected volume across subsequent review items.
+
 ## [0.17.1] - 2026-08-04
 
 ### Fixed
