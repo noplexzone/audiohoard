@@ -314,3 +314,18 @@ async def test_destination_identity_without_byte_equality_remains_for_review(
     assert report.destination_candidates == ()
     assert report.destinations_closed == 0
     assert plan.status == ImportWorkflowState.needs_review
+
+
+async def test_surviving_plan_source_blocks_stale_projection_dismissal(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    rows = await _fixture(db_session, tmp_path)
+    plan = rows["stale_plan"]
+    assert isinstance(plan, ImportPlan)
+    await asyncio.to_thread(Path(plan.source_path).write_bytes, b"surviving source")
+
+    report = await reconcile_import_backlog(db_session, acceptance_threshold=0.90, apply=True)
+
+    assert report.stale_projection_candidates == ()
+    assert report.stale_projections_normalized == 0
+    assert plan.release.review_dismissed_at is None

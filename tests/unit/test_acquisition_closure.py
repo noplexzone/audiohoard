@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC
+from pathlib import Path
 from types import SimpleNamespace
 
 from sqlalchemy import select
@@ -1087,3 +1088,80 @@ async def test_quarantine_cleanup_preserves_replacement_at_original_path(
         persisted_track = await verify.get(Track, track.id)
         assert persisted_plan is not None and persisted_plan.staging_path is None
         assert persisted_track is not None and persisted_track.staging_path is None
+
+
+async def test_crash_before_quarantine_commit_recovers_owned_inode_and_preserves_replacement(
+    db_session: AsyncSession, monkeypatch, tmp_path
+) -> None:
+    item, plan, track = await _pending_cleanup_fixture(db_session, tmp_path)
+    assert item.expected_device is not None and item.expected_inode is not None
+    quarantine = acquisition_cleanup._cleanup_quarantine_path(
+        item.staged_path, plan.id, item.expected_device, item.expected_inode
+    )
+    item.staged_path.replace(quarantine)
+    item.staged_path.write_bytes(b"replacement")
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+
+    class Adapter:
+        def __init__(self, url: str, api_key: str) -> None:
+            pass
+
+        async def cancel(
+            self, username: str, filename: str, transfer_id: str | None = None
+        ) -> bool:
+            return True
+
+    async def fake_effective_settings(db, settings):  # noqa: ANN001
+        return SimpleNamespace(slskd_url="", slskd_api_key="")
+
+    monkeypatch.setattr(acquisition_cleanup, "SlskdAdapter", Adapter)
+    monkeypatch.setattr(acquisition_cleanup, "build_effective_settings", fake_effective_settings)
+    async with factory() as load:
+        recovered = await pending_imported_source_cleanups(load)
+    assert len(recovered) == 1 and recovered[0].staged_path == quarantine
+
+    await cleanup_imported_sources(recovered)
+
+    assert item.staged_path.read_bytes() == b"replacement"
+    assert not quarantine.exists()
+    async with factory() as verify:
+        persisted_plan = await verify.get(ImportPlan, plan.id)
+        persisted_track = await verify.get(Track, track.id)
+        assert persisted_plan is not None and persisted_plan.staging_path is None
+        assert persisted_track is not None and persisted_track.staging_path is None
+
+
+async def test_provider_failure_retains_quarantined_cleanup_obligation(
+    db_session: AsyncSession, monkeypatch, tmp_path
+) -> None:
+    item, plan, _ = await _pending_cleanup_fixture(db_session, tmp_path)
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+
+    class FailingAdapter:
+        def __init__(self, url: str, api_key: str) -> None:
+            pass
+
+        async def cancel(
+            self, username: str, filename: str, transfer_id: str | None = None
+        ) -> bool:
+            return False
+
+    async def fake_effective_settings(db, settings):  # noqa: ANN001
+        return SimpleNamespace(slskd_url="", slskd_api_key="")
+
+    monkeypatch.setattr(acquisition_cleanup, "SlskdAdapter", FailingAdapter)
+    monkeypatch.setattr(acquisition_cleanup, "build_effective_settings", fake_effective_settings)
+
+    await cleanup_imported_sources((item,))
+
+    async with factory() as verify:
+        persisted = await verify.get(ImportPlan, plan.id)
+        assert persisted is not None and persisted.staging_path is not None
+        retained_bytes = await acquisition_cleanup.asyncio.to_thread(
+            Path(persisted.staging_path).read_bytes
+        )
+        assert retained_bytes == b"old-audio"
+        pending = await pending_imported_source_cleanups(verify)
+        assert len(pending) == 1

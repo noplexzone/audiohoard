@@ -59,9 +59,11 @@ def _path_is_file(raw: str) -> bool:
     return Path(raw).is_file()
 
 
-def _source_exists(track: Track) -> bool:
-    raw = track.staging_path or track.source_path
-    return bool(raw and _path_is_file(raw))
+def _source_exists(track: Track, plan: ImportPlan | None = None) -> bool:
+    paths = [track.staging_path, track.source_path]
+    if plan is not None:
+        paths.extend([plan.staging_path, plan.source_path])
+    return any(raw and _path_is_file(raw) for raw in paths)
 
 
 def _file_sha256(raw: str) -> str | None:
@@ -235,7 +237,7 @@ async def reconcile_import_backlog(
             latest.status == ImportWorkflowState.rolled_back
             and latest.collision_state == CollisionState.duplicate
             and "duplicate" in (latest.rollback_detail or "").casefold()
-            and not _source_exists(track)
+            and not _source_exists(track, latest)
             and latest.release.review_dismissed_at is None
             and latest.release_id not in pending_review_release_ids
             and all(

@@ -5,7 +5,6 @@ import contextlib
 import json
 import logging
 import os
-import uuid
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -460,6 +459,38 @@ async def prune_orphaned_terminal_records(
     return OrphanPruneResult(removed_tracks, removed_releases, removed_jobs)
 
 
+def _cleanup_quarantine_path(path: Path, plan_id: int, device: int, inode: int) -> Path:
+    marker = f".audiohoard-cleanup-{plan_id}-{device}-{inode}"
+    if path.name.endswith(marker):
+        return path
+    return path.with_name(f".{path.name}{marker}")
+
+
+def _quarantine_claim_matches(path: Path, configured: Path, plan_id: int) -> bool:
+    prefix = f".{configured.name}.audiohoard-cleanup-{plan_id}-"
+    if not path.name.startswith(prefix):
+        return False
+    try:
+        device_text, inode_text = path.name.removeprefix(prefix).split("-", 1)
+        current = path.stat(follow_symlinks=False)
+        return (current.st_dev, current.st_ino) == (int(device_text), int(inode_text))
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _pending_cleanup_path(plan: ImportPlan) -> Path:
+    configured = Path(plan.staging_path or plan.source_path)
+    if f".audiohoard-cleanup-{plan.id}-" in configured.name:
+        return configured
+    pattern = f".{configured.name}.audiohoard-cleanup-{plan.id}-*"
+    candidates = [
+        candidate
+        for candidate in configured.parent.glob(pattern)
+        if _quarantine_claim_matches(candidate, configured, plan.id)
+    ]
+    return candidates[0] if len(candidates) == 1 else configured
+
+
 async def pending_imported_source_cleanups(
     db: AsyncSession, *, limit: int = 500
 ) -> tuple[ImportedSourceCleanup, ...]:
@@ -486,7 +517,7 @@ async def pending_imported_source_cleanups(
     return tuple(
         ImportedSourceCleanup(
             plan.id,
-            Path(plan.staging_path or plan.source_path),
+            _pending_cleanup_path(plan),
             plan.track.acquisition_provenance_json if plan.track else None,
             plan.track.source_job_id if plan.track else None,
             plan.track_id,
@@ -520,15 +551,20 @@ async def _cleanup_obligation_is_current(
     if (
         plan is None
         or plan.status != ImportWorkflowState.imported
-        or plan.staging_path != str(item.staged_path)
         or plan.track_id != item.track_id
     ):
+        return False
+    configured_path = Path(plan.staging_path or plan.source_path)
+    accepted_paths = {str(configured_path)}
+    if _quarantine_claim_matches(item.staged_path, configured_path, plan.id):
+        accepted_paths.add(str(item.staged_path))
+    if str(item.staged_path) not in accepted_paths:
         return False
     track = plan.track
     if item.track_id is not None and (
         track is None
         or track.id != item.track_id
-        or track.staging_path != str(item.staged_path)
+        or track.staging_path not in accepted_paths
         or track.source_job_id != item.source_job_id
         or _slskd_identity(track.acquisition_provenance_json)
         != _slskd_identity(item.provenance_json)
@@ -538,7 +574,7 @@ async def _cleanup_obligation_is_current(
         owner = await db.scalar(
             select(ImportPlan.id)
             .where(
-                ImportPlan.destination_path == str(item.staged_path),
+                ImportPlan.destination_path.in_(accepted_paths),
                 _active_destination_owner_condition(),
             )
             .limit(1)
@@ -561,53 +597,59 @@ async def _revalidate_cleanup_obligation(
 
 
 async def _claim_cleanup_quarantine(item: ImportedSourceCleanup) -> ImportedSourceCleanup | None:
-    """Move the exact owned inode to a durable unique path under a SQLite writer claim."""
+    """Durably claim an owned inode at a deterministic crash-recoverable path."""
     if item.plan_id is None or item.track_id is None:
         return None
     factory = item.session_factory or get_session_factory()
+    current_item = item
     for attempt in range(1, 4):
-        quarantine: Path | None = None
-        moved = False
         async with factory() as db:
             try:
                 await db.execute(text("BEGIN IMMEDIATE"))
-                if not await _cleanup_obligation_is_current(db, item, protect_destination=True):
+                if not await _cleanup_obligation_is_current(
+                    db, current_item, protect_destination=True
+                ):
                     await db.rollback()
                     return None
-                quarantine = item.staged_path.with_name(
-                    f".{item.staged_path.name}.audiohoard-cleanup-{uuid.uuid4().hex}"
+                plan = await db.get(ImportPlan, current_item.plan_id)
+                track = await db.get(Track, current_item.track_id)
+                if plan is None or track is None:
+                    await db.rollback()
+                    return None
+                configured = Path(plan.staging_path or plan.source_path)
+                if current_item.expected_device is None or current_item.expected_inode is None:
+                    # The old artifact is already absent. Preserve any later file at
+                    # the configured name and finish provider cleanup only.
+                    await db.rollback()
+                    return current_item
+                quarantine = _cleanup_quarantine_path(
+                    configured,
+                    plan.id,
+                    current_item.expected_device,
+                    current_item.expected_inode,
                 )
-                await asyncio.to_thread(os.replace, item.staged_path, quarantine)
-                moved = True
+                if current_item.staged_path != quarantine:
+                    if quarantine.exists():
+                        await db.rollback()
+                        return None
+                    await asyncio.to_thread(os.replace, current_item.staged_path, quarantine)
+                    current_item = replace(current_item, staged_path=quarantine)
                 current = await asyncio.to_thread(quarantine.stat, follow_symlinks=False)
                 if (current.st_dev, current.st_ino) != (
-                    item.expected_device,
-                    item.expected_inode,
+                    current_item.expected_device,
+                    current_item.expected_inode,
                 ):
-                    if not item.staged_path.exists():
-                        await asyncio.to_thread(os.replace, quarantine, item.staged_path)
-                    await db.rollback()
-                    return None
-                plan = await db.get(ImportPlan, item.plan_id)
-                track = await db.get(Track, item.track_id)
-                if plan is None or track is None:
-                    await asyncio.to_thread(os.replace, quarantine, item.staged_path)
+                    configured_exists = await asyncio.to_thread(configured.exists)
+                    if not configured_exists:
+                        await asyncio.to_thread(os.replace, quarantine, configured)
                     await db.rollback()
                     return None
                 plan.staging_path = str(quarantine)
                 track.staging_path = str(quarantine)
                 await db.commit()
-                return replace(item, staged_path=quarantine)
+                return current_item
             except Exception as exc:
                 await db.rollback()
-                if (
-                    moved
-                    and quarantine is not None
-                    and quarantine.exists()
-                    and not item.staged_path.exists()
-                ):
-                    with contextlib.suppress(OSError):
-                        await asyncio.to_thread(os.replace, quarantine, item.staged_path)
                 if attempt == 3 or not _transient_cleanup_error(exc):
                     raise
         await _cleanup_retry_delay(attempt)
@@ -660,6 +702,21 @@ async def _mark_cleanup_attempted(
         await _cleanup_retry_delay(attempt)
 
 
+async def _provider_cleanup_completed_current(item: ImportedSourceCleanup) -> bool:
+    if item.track_id is None:
+        return _source_cleanup_completed(item.provenance_json)
+    factory = item.session_factory or get_session_factory()
+    async with factory() as db:
+        track = await db.get(Track, item.track_id)
+        return bool(
+            track is not None
+            and track.source_job_id == item.source_job_id
+            and _slskd_identity(track.acquisition_provenance_json)
+            == _slskd_identity(item.provenance_json)
+            and _source_cleanup_completed(track.acquisition_provenance_json)
+        )
+
+
 async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> None:
     """Idempotently finish currently-owned cleanup obligations after import commit."""
     staging_root = get_settings().staging_root
@@ -682,7 +739,8 @@ async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> 
             continue
         failed = False
         identity = _slskd_identity(item.provenance_json)
-        if identity is not None and not _source_cleanup_completed(item.provenance_json):
+        provider_cleanup_completed = await _provider_cleanup_completed_current(item)
+        if identity is not None and not provider_cleanup_completed:
             if adapter is None:
                 failed = True
             else:
@@ -704,19 +762,27 @@ async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> 
                     logger.exception("post-import slskd transfer cleanup failed")
         if not await _revalidate_cleanup_obligation(item):
             continue
-        unlinked = await asyncio.to_thread(_unlink_if_identity_matches, item)
-        if not unlinked:
-            failed = True
-            logger.warning(
-                "post-import staging cleanup refused changed or missing artifact %s",
-                item.staged_path,
+        if not failed:
+            artifact_was_present = (
+                item.expected_device is not None and item.expected_inode is not None
             )
-        else:
-            try:
-                await asyncio.to_thread(_prune_empty_parents, item.staged_path, staging_root)
-            except Exception:
+            unlinked = (
+                await asyncio.to_thread(_unlink_if_identity_matches, item)
+                if artifact_was_present
+                else True
+            )
+            if not unlinked:
                 failed = True
-                logger.warning("post-import directory prune failed for %s", item.staged_path)
+                logger.warning(
+                    "post-import staging cleanup refused changed artifact %s",
+                    item.staged_path,
+                )
+            elif artifact_was_present:
+                try:
+                    await asyncio.to_thread(_prune_empty_parents, item.staged_path, staging_root)
+                except Exception:
+                    failed = True
+                    logger.warning("post-import directory prune failed for %s", item.staged_path)
         try:
             await _mark_cleanup_attempted(item, completed=not failed)
         except Exception:
