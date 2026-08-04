@@ -21,6 +21,46 @@
   var currentTime = player.querySelector('[data-player-current-time]');
   var duration = player.querySelector('[data-player-duration]');
   var status = player.querySelector('[data-player-status]');
+  var reviewVolumeStorageKey = 'audiohoard.importReview.volume';
+
+  function preferredReviewVolume() {
+    try {
+      var stored = window.localStorage.getItem(reviewVolumeStorageKey);
+      if (stored === null) return 1;
+      var parsed = Number(stored);
+      if (!Number.isFinite(parsed)) return 1;
+      return Math.min(1, Math.max(0, parsed));
+    } catch (_error) {
+      return 1;
+    }
+  }
+
+  function persistReviewVolume(value) {
+    try {
+      window.localStorage.setItem(reviewVolumeStorageKey, String(value));
+    } catch (_error) {
+      // Storage can be unavailable in privacy-restricted browser contexts.
+    }
+  }
+
+  function synchronizeReviewVolume(value, source) {
+    Array.from(document.querySelectorAll('.review-audio')).forEach(function (reviewAudio) {
+      if (reviewAudio !== source && reviewAudio.volume !== value) reviewAudio.volume = value;
+    });
+  }
+
+  function bindReviewAudioVolumes(root) {
+    var scope = root && root.querySelectorAll ? root : document;
+    Array.from(scope.querySelectorAll('.review-audio')).forEach(function (reviewAudio) {
+      if (reviewAudio.hasAttribute('data-review-volume-bound')) return;
+      reviewAudio.setAttribute('data-review-volume-bound', 'true');
+      reviewAudio.volume = preferredReviewVolume();
+      reviewAudio.addEventListener('volumechange', function () {
+        persistReviewVolume(reviewAudio.volume);
+        synchronizeReviewVolume(reviewAudio.volume, reviewAudio);
+      }, { signal: listeners.signal });
+    });
+  }
 
   function formatTime(value) {
     if (!Number.isFinite(value) || value < 0) return '0:00';
@@ -209,5 +249,9 @@
   document.addEventListener('audiohoard:page-dispose', function () {
     // The player is global: only transient page hooks are discarded by navigation.
   }, { signal: listeners.signal });
+  document.addEventListener('audiohoard:page-init', function (event) {
+    bindReviewAudioVolumes(event.detail && event.detail.region);
+  }, { signal: listeners.signal });
+  bindReviewAudioVolumes(document);
   updateButtons();
 }());
