@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings, get_settings
-from app.database import get_session_factory
+from app.database import get_session_factory, run_with_sqlite_lock_retry
 from app.fingerprint.acoustid import fingerprint_file
 from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS, is_importable_audio
 from app.metadata.deezer import DeezerClient
@@ -288,6 +288,56 @@ async def _poll_sab_job(
         await asyncio.sleep(min(poll_interval, max(0.01, remaining)))
 
 
+async def _persist_job_envelope(
+    db: AsyncSession,
+    job_id: int,
+    *,
+    expected_statuses: set[JobStatus],
+    status: JobStatus,
+    result_json: str | None = None,
+    cancel_active_tracks: bool = False,
+) -> bool:
+    """Persist one short job-envelope transition with rollback-safe retries."""
+    transitioned = False
+
+    async def operation() -> None:
+        nonlocal transitioned
+        transitioned = False
+        job = await db.get(Job, job_id, populate_existing=True)
+        if job is None or job.status not in expected_statuses:
+            return
+        job.status = status
+        if result_json is not None:
+            job.result_json = result_json
+        job.updated_at = _now()
+        if cancel_active_tracks:
+            tracks = (
+                await db.scalars(
+                    select(Track).where(
+                        Track.job_id == job_id,
+                        Track.acquisition_state.in_(
+                            {
+                                AcquisitionState.queued,
+                                AcquisitionState.searching,
+                                AcquisitionState.acquiring,
+                            }
+                        ),
+                    )
+                )
+            ).all()
+            for track in tracks:
+                track.acquisition_state = AcquisitionState.cancelled
+        await db.commit()
+        transitioned = True
+
+    await run_with_sqlite_lock_retry(db, operation)
+    return transitioned
+
+
+def _job_error_result(code: str, operation: str, *, retryable: bool) -> str:
+    return json.dumps({"error": {"code": code, "operation": operation, "retryable": retryable}})
+
+
 async def run_job(
     job_id: int, db: AsyncSession | None = None, settings: Settings | None = None
 ) -> None:
@@ -301,111 +351,111 @@ async def run_job(
 
     # Phase 1: guarded initial lookup and effective-settings load.
     cfg_built: Settings | None = None
-    _phase1_error: str | None = None
+    phase1_error: str | None = None
     try:
-        async with factory() as s:
+        async with factory() as session:
             try:
-                job = await s.get(Job, job_id)
+                job = await session.get(Job, job_id)
             except Exception:
-                _phase1_error = "init_error"
+                phase1_error = "init_error"
                 raise
             if job is None:
                 logger.error("Job %d not found", job_id)
                 return
             try:
-                cfg_built = settings or await build_effective_settings(s, get_settings())
+                cfg_built = settings or await build_effective_settings(session, get_settings())
             except Exception:
-                _phase1_error = "settings_error"
+                phase1_error = "settings_error"
                 raise
     except Exception:
         logger.exception("Job %d phase-1 failed", job_id)
-        if _phase1_error is not None:
+        if phase1_error is not None:
             with contextlib.suppress(Exception):
-                async with factory() as s:
-                    j = await s.get(Job, job_id)
-                    if j is not None:
-                        j.status = JobStatus.failed
-                        j.result_json = json.dumps(
-                            {
-                                "error": {
-                                    "code": _phase1_error,
-                                    "operation": "init",
-                                    "retryable": False,
-                                }
-                            }
-                        )
-                        j.updated_at = _now()
-                        await s.commit()
+                async with factory() as session:
+                    await _persist_job_envelope(
+                        session,
+                        job_id,
+                        expected_statuses={JobStatus.pending},
+                        status=JobStatus.failed,
+                        result_json=_job_error_result(phase1_error, "init", retryable=False),
+                    )
         return
 
     cfg = cfg_built
 
     # Phase 2: commit pending->running before any provider work so observers see it.
     try:
-        async with factory() as s:
-            job = await s.get(Job, job_id)
-            if job is None:
-                return
-            job.status = JobStatus.running
-            job.updated_at = _now()
-            await s.commit()
+        async with factory() as session:
+            claimed = await _persist_job_envelope(
+                session,
+                job_id,
+                expected_statuses={JobStatus.pending},
+                status=JobStatus.running,
+            )
+        if not claimed:
+            return
     except asyncio.CancelledError:
         raise
     except Exception:
         logger.exception("Job %d phase-2 running transition failed", job_id)
         with contextlib.suppress(Exception):
-            async with factory() as s:
-                j = await s.get(Job, job_id)
-                if j is not None:
-                    j.status = JobStatus.failed
-                    j.result_json = json.dumps(
-                        {
-                            "error": {
-                                "code": "running_transition_error",
-                                "operation": "init",
-                                "retryable": False,
-                            }
-                        }
-                    )
-                    j.updated_at = _now()
-                    await s.commit()
+            async with factory() as session:
+                await _persist_job_envelope(
+                    session,
+                    job_id,
+                    expected_statuses={JobStatus.pending, JobStatus.running},
+                    status=JobStatus.failed,
+                    result_json=_job_error_result(
+                        "running_transition_error", "init", retryable=False
+                    ),
+                )
         return
 
-    # Phase 3: execute with per-result progress commits; terminal state persisted on failure.
+    # Phase 3: provider/filesystem execution occurs once. Only primitive terminal
+    # envelope data crosses into the rollback-safe persistence closure.
     try:
-        async with factory() as s:
-            await _run_job_in_session(job_id, s, cfg, commit_progress=True)
-            await s.commit()
+        async with factory() as session:
+            await _run_job_in_session(job_id, session, cfg, commit_progress=True)
+            current = await session.get(Job, job_id)
+            if current is None:
+                return
+            terminal_status = current.status
+            terminal_result = current.result_json
+            if terminal_status not in {
+                JobStatus.done,
+                JobStatus.partial,
+                JobStatus.failed,
+            }:
+                raise RuntimeError(f"job {job_id} execution did not reach a terminal status")
+            await session.rollback()
+            await _persist_job_envelope(
+                session,
+                job_id,
+                expected_statuses={JobStatus.running},
+                status=terminal_status,
+                result_json=terminal_result,
+            )
     except asyncio.CancelledError:
-        async with factory() as s:
-            job = await s.get(Job, job_id)
-            if job is not None:
-                job.status = JobStatus.cancelled
-                tracks = (await s.execute(select(Track).where(Track.job_id == job_id))).scalars()
-                for track in tracks:
-                    if track.acquisition_state in {
-                        AcquisitionState.queued,
-                        AcquisitionState.searching,
-                        AcquisitionState.acquiring,
-                    }:
-                        track.acquisition_state = AcquisitionState.cancelled
-                job.result_json = json.dumps(
-                    {"error": {"code": "cancelled", "operation": "job", "retryable": True}}
-                )
-                job.updated_at = _now()
-                await s.commit()
+        async with factory() as session:
+            await _persist_job_envelope(
+                session,
+                job_id,
+                expected_statuses={JobStatus.pending, JobStatus.running},
+                status=JobStatus.cancelled,
+                result_json=_job_error_result("cancelled", "job", retryable=True),
+                cancel_active_tracks=True,
+            )
         raise
     except Exception:
         logger.exception("Job %d failed", job_id)
-        async with factory() as s:
-            job = await s.get(Job, job_id)
-            if job is not None:
-                job.status = JobStatus.failed
-                job.result_json = json.dumps(
-                    {"error": {"code": "job_failed", "operation": "job", "retryable": True}}
-                )
-                job.updated_at = _now()
-                await s.commit()
+        async with factory() as session:
+            await _persist_job_envelope(
+                session,
+                job_id,
+                expected_statuses={JobStatus.pending, JobStatus.running},
+                status=JobStatus.failed,
+                result_json=_job_error_result("job_failed", "job", retryable=True),
+            )
     finally:
         try:
             from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
