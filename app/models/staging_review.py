@@ -53,3 +53,43 @@ class StagingReviewItem(Base):
             return []
         loaded = json.loads(self.observed_acoustid_mbids_json)
         return [str(m) for m in loaded] if isinstance(loaded, list) else []
+
+    @property
+    def source_label(self) -> str | None:
+        source = str(self.track.source or "").strip().casefold()
+        if not source:
+            provenance = self._acquisition_provenance
+            source = (
+                str(provenance.get("source") or provenance.get("provider") or "")
+                .strip()
+                .casefold()
+            )
+        labels = {
+            "slskd": "Soulseek (slskd)",
+            "prowlarr": "Prowlarr / SABnzbd",
+            "sabnzbd": "Prowlarr / SABnzbd",
+            "tidal": "TIDAL",
+            "youtube": "YouTube",
+        }
+        return labels.get(source, source or None)
+
+    @property
+    def original_filename(self) -> str | None:
+        provenance = self._acquisition_provenance
+        raw_name = provenance.get("original_filename") or provenance.get("filename")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raw_name = self.track.source_path or self.track.staging_path
+        if not raw_name:
+            return None
+        normalized = str(raw_name).strip().replace("\\", "/").rstrip("/")
+        return normalized.rsplit("/", 1)[-1] or None
+
+    @property
+    def _acquisition_provenance(self) -> dict[str, object]:
+        if not self.track.acquisition_provenance_json:
+            return {}
+        try:
+            loaded = json.loads(self.track.acquisition_provenance_json)
+        except (TypeError, ValueError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}

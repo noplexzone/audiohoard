@@ -25,6 +25,8 @@
         <details class="review-details">
           <summary>Match details</summary>
           <dl class="review-details-grid">
+            <dt>Source</dt><dd>{{ item.source_label or "—" }}</dd>
+            <dt>Original filename</dt><dd><code>{{ item.original_filename or "—" }}</code></dd>
             <dt>Expected MBID</dt><dd><code>{{ item.expected_recording_mbid or "—" }}</code></dd>
             <dt>Observed MBIDs</dt><dd>{% if item.observed_acoustid_mbids %}{% for m in item.observed_acoustid_mbids %}<code>{{ m }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% else %}—{% endif %}</dd>
             <dt>AcoustID score</dt><dd>{{ "%.3f"|format(item.acoustid_score) if item.acoustid_score is not none else "—" }}</dd>
