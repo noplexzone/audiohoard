@@ -130,6 +130,23 @@ def test_player_source_handles_queue_transcode_media_and_keyboard_safely() -> No
     assert "isContentEditable" in source
 
 
+def test_import_review_audio_volume_defaults_to_max_and_persists_user_changes() -> None:
+    source = _read(STATIC / "js" / "player.js")
+
+    for contract in (
+        "audiohoard.importReview.volume",
+        "window.localStorage.getItem",
+        "window.localStorage.setItem",
+        "querySelectorAll('.review-audio')",
+        "audiohoard:page-init",
+        "data-review-volume-bound",
+    ):
+        assert contract in source
+
+    assert "return 1;" in source
+    assert "Math.min(1, Math.max(0, parsed))" in source
+
+
 def test_player_layout_respects_touch_safe_areas_navigation_and_reduced_motion() -> None:
     css = _read(STATIC / "css" / "components.css") + _read(STATIC / "css" / "base.css")
 
