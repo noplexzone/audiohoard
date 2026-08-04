@@ -1095,8 +1095,15 @@ async def test_crash_before_quarantine_commit_recovers_owned_inode_and_preserves
 ) -> None:
     item, plan, track = await _pending_cleanup_fixture(db_session, tmp_path)
     assert item.expected_device is not None and item.expected_inode is not None
+    assert item.expected_mtime_ns is not None and item.expected_size is not None
     quarantine = acquisition_cleanup._cleanup_quarantine_path(
-        item.staged_path, plan.id, item.expected_device, item.expected_inode
+        item.staged_path,
+        plan.id,
+        item.expected_device,
+        item.expected_inode,
+        item.expected_mtime_ns,
+        item.expected_size,
+        acquisition_cleanup._file_sha256(item.staged_path),
     )
     item.staged_path.replace(quarantine)
     item.staged_path.write_bytes(b"replacement")
@@ -1172,8 +1179,15 @@ async def test_persisted_quarantine_with_replaced_inode_is_rejected(
 ) -> None:
     item, plan, track = await _pending_cleanup_fixture(db_session, tmp_path)
     assert item.expected_device is not None and item.expected_inode is not None
+    assert item.expected_mtime_ns is not None and item.expected_size is not None
     quarantine = acquisition_cleanup._cleanup_quarantine_path(
-        item.staged_path, plan.id, item.expected_device, item.expected_inode
+        item.staged_path,
+        plan.id,
+        item.expected_device,
+        item.expected_inode,
+        item.expected_mtime_ns,
+        item.expected_size,
+        acquisition_cleanup._file_sha256(item.staged_path),
     )
     await acquisition_cleanup.asyncio.to_thread(item.staged_path.replace, quarantine)
     plan.staging_path = str(quarantine)

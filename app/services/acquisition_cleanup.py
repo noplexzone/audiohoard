@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -56,12 +57,23 @@ class ImportedSourceCleanup:
     track_id: int | None = None
     expected_device: int | None = None
     expected_inode: int | None = None
+    expected_mtime_ns: int | None = None
+    expected_size: int | None = None
+    expected_digest: str | None = None
     session_factory: async_sessionmaker[AsyncSession] | None = field(
         default=None, compare=False, repr=False
     )
 
     def __post_init__(self) -> None:
-        if self.expected_device is not None or self.expected_inode is not None:
+        if all(
+            value is not None
+            for value in (
+                self.expected_device,
+                self.expected_inode,
+                self.expected_mtime_ns,
+                self.expected_size,
+            )
+        ):
             return
         try:
             stat_result = self.staged_path.stat()
@@ -69,6 +81,8 @@ class ImportedSourceCleanup:
             return
         object.__setattr__(self, "expected_device", stat_result.st_dev)
         object.__setattr__(self, "expected_inode", stat_result.st_ino)
+        object.__setattr__(self, "expected_mtime_ns", stat_result.st_mtime_ns)
+        object.__setattr__(self, "expected_size", stat_result.st_size)
 
 
 class SlskdCleanupAdapter(Protocol):
@@ -459,38 +473,61 @@ async def prune_orphaned_terminal_records(
     return OrphanPruneResult(removed_tracks, removed_releases, removed_jobs)
 
 
-def _cleanup_quarantine_path(path: Path, plan_id: int, device: int, inode: int) -> Path:
-    marker = f".audiohoard-cleanup-{plan_id}-{device}-{inode}"
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _cleanup_quarantine_path(
+    path: Path,
+    plan_id: int,
+    device: int,
+    inode: int,
+    mtime_ns: int,
+    size: int,
+    digest: str,
+) -> Path:
+    marker = f".audiohoard-cleanup-{plan_id}-{device}-{inode}-{mtime_ns}-{size}-{digest}"
     if path.name.endswith(marker):
         return path
     return path.with_name(f".{path.name}{marker}")
 
 
-def _quarantine_claim_matches(path: Path, configured: Path, plan_id: int) -> bool:
-    prefix = f".{configured.name}.audiohoard-cleanup-{plan_id}-"
-    if not path.name.startswith(prefix):
-        return False
+def _claimed_identity(path: Path, marker: str) -> tuple[int, int, int, int, str] | None:
+    if marker not in path.name:
+        return None
     try:
-        device_text, inode_text = path.name.removeprefix(prefix).split("-", 1)
+        values = path.name.rsplit(marker, 1)[1].split("-", 4)
+        if len(values) != 5 or len(values[4]) != 64:
+            return None
+        return int(values[0]), int(values[1]), int(values[2]), int(values[3]), values[4]
+    except ValueError:
+        return None
+
+
+def _current_identity(path: Path) -> tuple[int, int, int, int, str] | None:
+    try:
         current = path.stat(follow_symlinks=False)
-        return (current.st_dev, current.st_ino) == (int(device_text), int(inode_text))
-    except (OSError, TypeError, ValueError):
-        return False
+        digest = _file_sha256(path)
+    except OSError:
+        return None
+    return current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size, digest
+
+
+def _quarantine_claim_matches(path: Path, configured: Path, plan_id: int) -> bool:
+    marker = f".{configured.name}.audiohoard-cleanup-{plan_id}-"
+    return _claimed_identity(path, marker) == _current_identity(path)
 
 
 def _persisted_quarantine_claim_matches(path: Path, plan_id: int) -> bool:
     marker = f".audiohoard-cleanup-{plan_id}-"
-    if marker not in path.name:
-        return False
-    try:
-        device_text, inode_text = path.name.rsplit(marker, 1)[1].split("-", 1)
-        current = path.stat(follow_symlinks=False)
-        return (current.st_dev, current.st_ino) == (int(device_text), int(inode_text))
-    except (OSError, TypeError, ValueError):
-        return False
+    return _claimed_identity(path, marker) == _current_identity(path)
 
 
-def _pending_cleanup_path(plan: ImportPlan) -> Path | None:
+def _pending_cleanup_path_sync(plan: ImportPlan) -> Path | None:
     configured = Path(plan.staging_path or plan.source_path)
     if f".audiohoard-cleanup-{plan.id}-" in configured.name:
         if _persisted_quarantine_claim_matches(configured, plan.id):
@@ -508,6 +545,10 @@ def _pending_cleanup_path(plan: ImportPlan) -> Path | None:
         if _quarantine_claim_matches(candidate, configured, plan.id)
     ]
     return candidates[0] if len(candidates) == 1 else configured
+
+
+async def _pending_cleanup_path(plan: ImportPlan) -> Path | None:
+    return await asyncio.to_thread(_pending_cleanup_path_sync, plan)
 
 
 async def pending_imported_source_cleanups(
@@ -535,7 +576,7 @@ async def pending_imported_source_cleanups(
     )
     items: list[ImportedSourceCleanup] = []
     for plan in plans:
-        cleanup_path = _pending_cleanup_path(plan)
+        cleanup_path = await _pending_cleanup_path(plan)
         if cleanup_path is None:
             continue
         items.append(
@@ -580,7 +621,10 @@ async def _cleanup_obligation_is_current(
         return False
     configured_path = Path(plan.staging_path or plan.source_path)
     accepted_paths = {str(configured_path)}
-    if _quarantine_claim_matches(item.staged_path, configured_path, plan.id):
+    claim_matches = await asyncio.to_thread(
+        _quarantine_claim_matches, item.staged_path, configured_path, plan.id
+    )
+    if claim_matches:
         accepted_paths.add(str(item.staged_path))
     if str(item.staged_path) not in accepted_paths:
         return False
@@ -641,16 +685,41 @@ async def _claim_cleanup_quarantine(item: ImportedSourceCleanup) -> ImportedSour
                     await db.rollback()
                     return None
                 configured = Path(plan.staging_path or plan.source_path)
-                if current_item.expected_device is None or current_item.expected_inode is None:
+                if any(
+                    value is None
+                    for value in (
+                        current_item.expected_device,
+                        current_item.expected_inode,
+                        current_item.expected_mtime_ns,
+                        current_item.expected_size,
+                    )
+                ):
                     # The old artifact is already absent. Preserve any later file at
                     # the configured name and finish provider cleanup only.
                     await db.rollback()
                     return current_item
+                expected_device = current_item.expected_device
+                expected_inode = current_item.expected_inode
+                expected_mtime_ns = current_item.expected_mtime_ns
+                expected_size = current_item.expected_size
+                assert expected_device is not None
+                assert expected_inode is not None
+                assert expected_mtime_ns is not None
+                assert expected_size is not None
+                expected_digest = current_item.expected_digest
+                if expected_digest is None:
+                    expected_digest = await asyncio.to_thread(
+                        _file_sha256, current_item.staged_path
+                    )
+                    current_item = replace(current_item, expected_digest=expected_digest)
                 quarantine = _cleanup_quarantine_path(
                     configured,
                     plan.id,
-                    current_item.expected_device,
-                    current_item.expected_inode,
+                    expected_device,
+                    expected_inode,
+                    expected_mtime_ns,
+                    expected_size,
+                    expected_digest,
                 )
                 if current_item.staged_path != quarantine:
                     if quarantine.exists():
@@ -659,9 +728,19 @@ async def _claim_cleanup_quarantine(item: ImportedSourceCleanup) -> ImportedSour
                     await asyncio.to_thread(os.replace, current_item.staged_path, quarantine)
                     current_item = replace(current_item, staged_path=quarantine)
                 current = await asyncio.to_thread(quarantine.stat, follow_symlinks=False)
-                if (current.st_dev, current.st_ino) != (
+                current_digest = await asyncio.to_thread(_file_sha256, quarantine)
+                if (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_mtime_ns,
+                    current.st_size,
+                    current_digest,
+                ) != (
                     current_item.expected_device,
                     current_item.expected_inode,
+                    current_item.expected_mtime_ns,
+                    current_item.expected_size,
+                    current_item.expected_digest,
                 ):
                     configured_exists = await asyncio.to_thread(configured.exists)
                     if not configured_exists:
@@ -681,13 +760,37 @@ async def _claim_cleanup_quarantine(item: ImportedSourceCleanup) -> ImportedSour
 
 
 def _unlink_if_identity_matches(item: ImportedSourceCleanup) -> bool:
-    if item.expected_device is None or item.expected_inode is None:
+    if any(
+        value is None
+        for value in (
+            item.expected_device,
+            item.expected_inode,
+            item.expected_mtime_ns,
+            item.expected_size,
+        )
+    ):
         return False
     try:
         current = item.staged_path.stat(follow_symlinks=False)
     except OSError:
         return False
-    if (current.st_dev, current.st_ino) != (item.expected_device, item.expected_inode):
+    try:
+        current_digest = _file_sha256(item.staged_path)
+    except OSError:
+        return False
+    if (
+        current.st_dev,
+        current.st_ino,
+        current.st_mtime_ns,
+        current.st_size,
+        current_digest,
+    ) != (
+        item.expected_device,
+        item.expected_inode,
+        item.expected_mtime_ns,
+        item.expected_size,
+        item.expected_digest,
+    ):
         return False
     try:
         item.staged_path.unlink()
@@ -762,6 +865,23 @@ async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> 
         if item is None:
             continue
         failed = False
+        has_local_identity = all(
+            value is not None
+            for value in (
+                item.expected_device,
+                item.expected_inode,
+                item.expected_mtime_ns,
+                item.expected_size,
+            )
+        )
+        if has_local_identity and item.expected_digest is None:
+            try:
+                item = replace(
+                    item,
+                    expected_digest=await asyncio.to_thread(_file_sha256, item.staged_path),
+                )
+            except OSError:
+                failed = True
         identity = _slskd_identity(item.provenance_json)
         provider_cleanup_completed = await _provider_cleanup_completed_current(item)
         if identity is not None and not provider_cleanup_completed:
@@ -787,9 +907,7 @@ async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> 
         if not await _revalidate_cleanup_obligation(item):
             continue
         if not failed:
-            artifact_was_present = (
-                item.expected_device is not None and item.expected_inode is not None
-            )
+            artifact_was_present = has_local_identity
             unlinked = (
                 await asyncio.to_thread(_unlink_if_identity_matches, item)
                 if artifact_was_present
