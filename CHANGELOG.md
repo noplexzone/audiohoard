@@ -10,6 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Keep each configured acquisition permit for the complete provider queue and polling lifecycle, preserving truthful runtime increase and decrease bounds.
 - Coalesce concurrent slskd download polling into short-lived endpoint- and credential-isolated snapshots, with bounded jittered backoff and sanitized retryable failures for HTTP 429 responses.
+- Retry startup and watchdog job recovery as complete rollback-safe SQLite transactions, using conditional stale-state claims so concurrent heartbeats or terminal updates cannot be overwritten or dispatched twice.
 
 ## [0.17.0] - 2026-08-03
 

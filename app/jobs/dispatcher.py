@@ -8,10 +8,11 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.database import get_session_factory
+from app.database import get_session_factory, run_with_sqlite_lock_retry
 from app.models.job import Job, JobStatus
 
 logger = logging.getLogger(__name__)
@@ -216,16 +217,44 @@ class JobDispatcher:
             )
         except Exception:
             logger.exception("Startup terminal acquisition cleanup failed")
+        recovered_ids: list[int] = []
         async with factory() as db:
-            result = await db.execute(
-                select(Job).where(Job.status.in_([JobStatus.pending, JobStatus.running]))
-            )
-            jobs = list(result.scalars().all())
-            for job in jobs:
-                if job.status == JobStatus.running:
-                    job.status = JobStatus.pending
+
+            async def recover_jobs() -> None:
+                attempt_ids: list[int] = []
+                rows = (
+                    await db.execute(
+                        select(
+                            Job.id,
+                            Job.status,
+                            Job.result_json,
+                            Job.updated_at,
+                        ).where(Job.status.in_([JobStatus.pending, JobStatus.running]))
+                    )
+                ).all()
+                for job_id, status, result_json, updated_at in rows:
+                    result_match = (
+                        Job.result_json.is_(None)
+                        if result_json is None
+                        else Job.result_json == result_json
+                    )
+                    if status == JobStatus.pending:
+                        result = await db.execute(
+                            update(Job)
+                            .where(
+                                Job.id == job_id,
+                                Job.status == JobStatus.pending,
+                                func.julianday(Job.updated_at) == func.julianday(updated_at),
+                                result_match,
+                            )
+                            .values(updated_at=datetime.now(UTC))
+                            .execution_options(synchronize_session=False)
+                        )
+                        if isinstance(result, CursorResult) and result.rowcount == 1:
+                            attempt_ids.append(job_id)
+                        continue
                     try:
-                        payload = json.loads(job.result_json) if job.result_json else {}
+                        payload = json.loads(result_json) if result_json else {}
                     except (json.JSONDecodeError, TypeError):
                         payload = {}
                     if not isinstance(payload, dict):
@@ -234,62 +263,109 @@ class JobDispatcher:
                         "code": "interrupted_by_restart",
                         "retryable": True,
                     }
-                    job.result_json = json.dumps(payload)
-                    job.updated_at = datetime.now(UTC)
-            await db.commit()
-        for job in jobs:
-            await self.dispatch(job.id)
-        return [job.id for job in jobs]
+                    result = await db.execute(
+                        update(Job)
+                        .where(
+                            Job.id == job_id,
+                            Job.status == JobStatus.running,
+                            func.julianday(Job.updated_at) == func.julianday(updated_at),
+                        )
+                        .values(
+                            status=JobStatus.pending,
+                            result_json=json.dumps(payload),
+                            updated_at=datetime.now(UTC),
+                        )
+                        .execution_options(synchronize_session=False)
+                    )
+                    if isinstance(result, CursorResult) and result.rowcount == 1:
+                        attempt_ids.append(job_id)
+                await db.commit()
+                recovered_ids[:] = attempt_ids
+
+            await run_with_sqlite_lock_retry(db, recover_jobs)
+        for job_id in recovered_ids:
+            await self.dispatch(job_id)
+        return recovered_ids
 
     async def _watchdog_tick(self, threshold_seconds: int) -> None:
         threshold_dt = datetime.now(UTC) - timedelta(seconds=threshold_seconds)
-        to_dispatch: list[int] = []
+        committed_actions: list[tuple[int, bool]] = []
         async with self._factory()() as db:
-            result = await db.execute(
-                select(Job).where(
-                    Job.status.in_([JobStatus.pending, JobStatus.running]),
-                    Job.updated_at < threshold_dt,
-                )
-            )
-            jobs = list(result.scalars().all())
-            for job in jobs:
-                live = self._tasks.get(job.id)
-                if live is not None and not live.done():
-                    continue
-                try:
-                    current: dict[str, Any] = (
-                        json.loads(job.result_json) if job.result_json else {}
+
+            async def claim_stale_jobs() -> None:
+                attempt_actions: list[tuple[int, bool]] = []
+                rows = (
+                    await db.execute(
+                        select(
+                            Job.id,
+                            Job.status,
+                            Job.result_json,
+                            Job.updated_at,
+                        ).where(
+                            Job.status.in_([JobStatus.pending, JobStatus.running]),
+                            Job.updated_at < threshold_dt,
+                        )
                     )
-                except (json.JSONDecodeError, TypeError):
-                    current = {}
-                if "watchdog_recovery" in current:
-                    job.status = JobStatus.failed
-                    job.result_json = json.dumps(
-                        {
-                            "error": {
-                                "code": "dispatch_lost",
-                                "operation": "watchdog",
-                                "retryable": False,
+                ).all()
+                for job_id, status, result_json, updated_at in rows:
+                    live = self._tasks.get(job_id)
+                    if live is not None and not live.done():
+                        continue
+                    try:
+                        current: dict[str, Any] = json.loads(result_json) if result_json else {}
+                    except (json.JSONDecodeError, TypeError):
+                        current = {}
+                    recurrent = "watchdog_recovery" in current
+                    if recurrent:
+                        next_status = JobStatus.failed
+                        next_result = json.dumps(
+                            {
+                                "error": {
+                                    "code": "dispatch_lost",
+                                    "operation": "watchdog",
+                                    "retryable": False,
+                                }
                             }
-                        }
+                        )
+                    else:
+                        next_status = JobStatus.pending if status == JobStatus.running else status
+                        current["watchdog_recovery"] = {"attempt": 1}
+                        next_result = json.dumps(current)
+                    result_match = (
+                        Job.result_json.is_(None)
+                        if result_json is None
+                        else Job.result_json == result_json
                     )
-                    job.updated_at = datetime.now(UTC)
-                    logger.error(
-                        "Job %d lost after watchdog recovery attempt; marking dispatch_lost",
-                        job.id,
+                    result = await db.execute(
+                        update(Job)
+                        .where(
+                            Job.id == job_id,
+                            Job.status == status,
+                            func.julianday(Job.updated_at) == func.julianday(updated_at),
+                            Job.updated_at < threshold_dt,
+                            result_match,
+                        )
+                        .values(
+                            status=next_status,
+                            result_json=next_result,
+                            updated_at=datetime.now(UTC),
+                        )
+                        .execution_options(synchronize_session=False)
                     )
-                else:
-                    if job.status == JobStatus.running:
-                        job.status = JobStatus.pending
-                    current["watchdog_recovery"] = {"attempt": 1}
-                    job.result_json = json.dumps(current)
-                    job.updated_at = datetime.now(UTC)
-                    to_dispatch.append(job.id)
-                    logger.warning(
-                        "Job %d stale with no live task; dispatching watchdog recovery", job.id
-                    )
-            await db.commit()
-        for job_id in to_dispatch:
+                    if isinstance(result, CursorResult) and result.rowcount == 1:
+                        attempt_actions.append((job_id, recurrent))
+                await db.commit()
+                committed_actions[:] = attempt_actions
+
+            await run_with_sqlite_lock_retry(db, claim_stale_jobs)
+        for job_id, recurrent in committed_actions:
+            if recurrent:
+                logger.error(
+                    "Job %d lost after watchdog recovery attempt; marking dispatch_lost",
+                    job_id,
+                )
+                continue
+            logger.warning("Job %d stale with no live task; dispatching watchdog recovery", job_id)
             await self.dispatch(job_id)
 
     async def _watchdog_loop(self, threshold_seconds: int, interval_seconds: int) -> None:
