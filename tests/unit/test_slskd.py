@@ -283,6 +283,48 @@ class TestSlskdTransfers:
         assert result is True
         assert [request.method for request in httpx_mock.get_requests()] == ["GET"]
 
+    async def test_cleanup_cancel_refreshes_stale_snapshot_before_matching_transfer(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        adapter = SlskdAdapter("http://slskd.local", "key123")
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer1",
+                    "files": [
+                        {
+                            "id": "old-transfer",
+                            "filename": "Music\\same.flac",
+                            "state": "Completed, Succeeded",
+                        }
+                    ],
+                }
+            ],
+        )
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer1",
+                    "files": [
+                        {
+                            "id": "replacement-transfer",
+                            "filename": "Music\\same.flac",
+                            "state": "InProgress",
+                        }
+                    ],
+                }
+            ],
+        )
+
+        assert (await adapter.status("old-transfer")).available is True
+        result = await adapter.cancel("peer1", "Music\\same.flac", "old-transfer")
+
+        assert result is True
+        requests = httpx_mock.get_requests()
+        assert [request.method for request in requests] == ["GET", "GET"]
+
     async def test_cleanup_cancel_keeps_fallback_identity_pending_when_ambiguous(
         self, httpx_mock: HTTPXMock
     ) -> None:

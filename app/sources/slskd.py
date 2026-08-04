@@ -349,11 +349,17 @@ class SlskdAdapter:
                 )
         raise RuntimeError("slskd download polling exhausted without a response")
 
-    async def downloads(self) -> list[dict[str, object]]:
-        """Return a short-lived, configuration-isolated downloads snapshot."""
+    def _download_snapshot_key(self) -> tuple[str, bytes]:
         credential_key = hashlib.sha256(self._api_key.encode()).digest()
-        key = (self._base_url, credential_key)
-        snapshot = _download_snapshots.setdefault(key, _DownloadSnapshot())
+        return self._base_url, credential_key
+
+    async def downloads(self, *, force_refresh: bool = False) -> list[dict[str, object]]:
+        """Return a short-lived, configuration-isolated downloads snapshot."""
+        key = self._download_snapshot_key()
+        snapshot = _download_snapshots.get(key)
+        if snapshot is None or (force_refresh and snapshot.in_flight is None):
+            snapshot = _DownloadSnapshot()
+            _download_snapshots[key] = snapshot
         if snapshot.downloads is not None and _monotonic() < snapshot.expires_at:
             return snapshot.downloads
 
@@ -388,7 +394,7 @@ class SlskdAdapter:
         expected_filename = filename.replace("\\", "/")
         resolved_transfer_id: str | None = None
         matched_identity = False
-        for item in await self.downloads():
+        for item in await self.downloads(force_refresh=True):
             item_username = str(item.get("username") or "")
             item_filename = str(item.get("filename") or "").replace("\\", "/")
             provider_id = item.get("id") or item.get("transferId")
@@ -422,4 +428,5 @@ class SlskdAdapter:
             )
             if resp.status_code != 404:
                 resp.raise_for_status()
+        _download_snapshots.pop(self._download_snapshot_key(), None)
         return True
