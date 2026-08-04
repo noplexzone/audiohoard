@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-03
+
 ### Added
 
 - Add region-selectable discovery with bounded popular artist, genre, new-release, and trending feeds, dedicated paginated pages, global-fallback labels, and stale cache recovery.
