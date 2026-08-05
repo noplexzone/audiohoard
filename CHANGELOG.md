@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-08-04
+
 ### Added
 
 - Show persisted slskd username and remote-folder provenance in import review, and add mobile swipe-right approval and swipe-left denial with destructive confirmation preserved.
