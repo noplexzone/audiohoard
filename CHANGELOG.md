@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-08-05
+
+### Added
+
+- Align Deezer reference previews to the equivalent passage in downloaded import-review files with bounded transient Chromaprint analysis, confidence reporting, A/B switching, and manual timing nudges.
+
+### Changed
+
+- Replace the inaccurate generic midpoint assumption with an explicitly labelled centered-preview estimate when exact acoustic alignment is unavailable; iTunes fallback previews remain independent and are never fetched for synchronization.
+
 ## [0.19.2] - 2026-08-04
 
 ### Fixed

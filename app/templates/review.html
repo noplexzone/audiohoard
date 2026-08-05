@@ -12,7 +12,9 @@
 </header>
 
 {% if review %}
-<article class="review-deck-card" data-review-deck data-swipe-surface>
+<article class="review-deck-card" data-review-deck data-swipe-surface
+  data-alignment-url="/staging/review/{{ review.item.id }}/alignment"
+  {% if review.reference %}data-reference-source="{{ review.reference.source }}" data-reference-url="{{ review.reference.url }}"{% endif %}>
   <header class="review-deck-heading">
     {% if review.artwork_url %}
     <img class="review-deck-art" src="/artwork?url={{ review.artwork_url | urlencode }}" width="112" height="112" alt="">
@@ -44,9 +46,24 @@
       <audio class="review-deck-audio" controls data-reference-audio aria-disabled="true"></audio>
       <p class="hint">No reference available</p>
       {% endif %}
-      <p class="hint">The reference is an approximately 30-second mid-track clip. Players remain independent.</p>
+      <p class="hint">The reference is approximately 30 seconds. Audiohoard can attempt to locate the same passage in the downloaded file.</p>
     </div>
   </section>
+  {% if review.reference %}
+  <section class="review-alignment-controls" aria-label="Reference alignment">
+    <div class="review-alignment-primary">
+      <button class="btn secondary" type="button" data-match-section>Match section</button>
+      <button class="btn secondary" type="button" data-ab-toggle disabled>A/B switch</button>
+    </div>
+    <div class="review-alignment-nudges" aria-label="Adjust matched position">
+      <button type="button" data-alignment-nudge="-5" disabled>−5s</button>
+      <button type="button" data-alignment-nudge="-1" disabled>−1s</button>
+      <button type="button" data-alignment-nudge="1" disabled>+1s</button>
+      <button type="button" data-alignment-nudge="5" disabled>+5s</button>
+    </div>
+    <p class="hint review-alignment-status" data-alignment-status aria-live="polite">Players are independent until a section is matched.</p>
+  </section>
+  {% endif %}
 
   <div class="review-deck-actions">
     <form method="post" action="/staging/review/{{ review.item.id }}/deny" data-review-action data-confirm="Remove this review item and delete its staged file?">
