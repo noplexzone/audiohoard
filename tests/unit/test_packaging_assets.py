@@ -127,7 +127,7 @@ def test_favicon_ico_uses_the_requested_artwork_at_every_size() -> None:
 
 def test_dockerfile_version_and_healthcheck_match_current_runtime_contract() -> None:
     dockerfile = Path("docker/Dockerfile").read_text(encoding="utf-8")
-    assert 'org.opencontainers.image.version="0.20.0"' in dockerfile
+    assert 'org.opencontainers.image.version="0.21.0"' in dockerfile
     assert "http://localhost:8000/health/ready" in dockerfile
 
 
@@ -209,6 +209,7 @@ def test_review_deck_alignment_switches_one_player_at_equivalent_times() -> None
     assert "searchParams.set('reference_url'" in script
     assert "fetch(alignmentUrl" in script
     assert "signal: signal" in script
+    assert "      matchReferenceSection(true);" in script
     assert "downloaded.currentTime - alignmentOffset" in script
     assert "reference.currentTime + alignmentOffset" in script
     assert "downloaded.pause();" in script
@@ -216,6 +217,8 @@ def test_review_deck_alignment_switches_one_player_at_equivalent_times() -> None
     assert "alignmentOffset + Number(button.dataset.alignmentNudge" in script
     assert "downloaded.addEventListener('play'" in script
     assert "reference.addEventListener('play'" in script
+    assert "playbackStarted = true" in script
+    assert "!automatic || !playbackStarted" in script
     assert "target.closest(INTERACTIVE_SELECTOR)" in script
     cleanup = script.split("return function () {", 1)[1]
     assert "downloaded.pause()" in cleanup
