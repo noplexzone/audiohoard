@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -17,12 +18,13 @@ import httpx
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user, require_mutation
 from app.config import Settings
-from app.database import get_db, run_with_sqlite_lock_retry
+from app.database import get_db, is_sqlite_database_locked, run_with_sqlite_lock_retry
 from app.jobs.dispatcher import job_dispatcher
 from app.media_formats import IMPORTABLE_AUDIO_SUFFIXES
 from app.models.import_plan import ImportPlan
@@ -39,6 +41,8 @@ from app.models.workflow import (
 )
 from app.services.audio_alignment import align_deezer_preview, estimate_centered_offset
 from app.settings_service import effective_settings_dep, get_runtime_settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/staging", dependencies=[Depends(get_current_user)])
 
@@ -364,26 +368,55 @@ async def approve_review_item(
             _review_result_location(return_to, "already_reviewed"), status_code=303
         )
 
-    item.review_state = ReviewDecision.approved
-    item.reviewed_at = datetime.now(UTC)
+    release_id = item.release_id
+    approved = False
 
-    track = await db.get(Track, item.track_id)
-    if track is not None:
-        track.acoustid_verification_state = AcoustIDVerificationState.approved
+    async def persist_approval() -> None:
+        nonlocal approved
+        current_item = await db.get(StagingReviewItem, item_id)
+        if current_item is None:
+            raise HTTPException(status_code=404, detail="Review item not found")
+        if current_item.review_state != ReviewDecision.pending:
+            return
 
-    release = await db.get(Release, item.release_id)
-    if release is not None:
-        await db.flush()
-        from app.services.auto_import import try_auto_import_release
+        # Load related rows before dirtying the session. A query after mutation
+        # triggers autoflush and turns a transient writer lock into a raw 500.
+        track = await db.get(Track, current_item.track_id)
+        current_item.review_state = ReviewDecision.approved
+        current_item.reviewed_at = datetime.now(UTC)
+        if track is not None:
+            track.acoustid_verification_state = AcoustIDVerificationState.approved
+        await db.commit()
+        approved = True
 
-        await try_auto_import_release(
-            db,
-            release,
-            library_root=settings.library_root,
-            naming_template=settings.naming_template,
+    await run_with_sqlite_lock_retry(db, persist_approval, attempts=6, delay_seconds=0.2)
+    if not approved:
+        return RedirectResponse(
+            _review_result_location(return_to, "already_reviewed"), status_code=303
         )
 
-    await db.commit()
+    try:
+        release = await db.get(Release, release_id)
+        if release is not None:
+            from app.services.auto_import import try_auto_import_release
+
+            await try_auto_import_release(
+                db,
+                release,
+                library_root=settings.library_root,
+                naming_template=settings.naming_template,
+            )
+            await db.commit()
+    except OperationalError as exc:
+        if not is_sqlite_database_locked(exc):
+            raise
+        await db.rollback()
+        logger.warning(
+            "Approval for review item %d was saved, but auto-import hit a SQLite lock; "
+            "recovery will retry it",
+            item_id,
+        )
+
     return RedirectResponse(_review_result_location(return_to, "approved"), status_code=303)
 
 

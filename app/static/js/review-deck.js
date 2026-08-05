@@ -24,6 +24,7 @@
     var nudgeButtons = Array.from(deck.querySelectorAll('[data-alignment-nudge]'));
     var alignmentOffset = null;
     var matching = false;
+    var playbackStarted = false;
     var working = false;
     var swipe = null;
     var touchIdentifier = null;
@@ -52,11 +53,11 @@
       else player.addEventListener('loadedmetadata', apply, { once: true, signal: signal });
     }
 
-    function setAlignmentState(payload) {
+    function setAlignmentState(payload, seekDownloaded) {
       var offset = Number(payload.downloaded_offset_sec);
       if (!Number.isFinite(offset) || offset < 0) throw new Error('Invalid alignment response');
       alignmentOffset = offset;
-      seekPlayer(downloaded, alignmentOffset);
+      if (seekDownloaded !== false) seekPlayer(downloaded, alignmentOffset);
       var linkedPlayback = payload.linked_playback === true;
       if (abToggle) abToggle.disabled = !linkedPlayback;
       nudgeButtons.forEach(function (button) { button.disabled = !linkedPlayback; });
@@ -65,7 +66,7 @@
       alignmentStatus.dataset.alignmentState = payload.status;
     }
 
-    function matchReferenceSection() {
+    function matchReferenceSection(automatic) {
       if (matching || !matchSection || !deck.dataset.alignmentUrl) return;
       matching = true;
       matchSection.disabled = true;
@@ -81,9 +82,11 @@
         })
         .then(function (payload) {
           if (payload.status === 'unavailable') throw new Error(payload.message || 'No reliable match was found');
-          setAlignmentState(payload);
-          downloaded.pause();
-          reference.pause();
+          setAlignmentState(payload, !automatic || !playbackStarted);
+          if (!automatic) {
+            downloaded.pause();
+            reference.pause();
+          }
         })
         .catch(function (error) {
           alignmentStatus.textContent = error.message || 'The reference could not be matched.';
@@ -226,11 +229,17 @@
     deck.addEventListener('pointercancel', clearSwipe, { signal: signal });
 
     if (downloaded && reference) {
-      downloaded.addEventListener('play', function () { reference.pause(); }, { signal: signal });
-      reference.addEventListener('play', function () { downloaded.pause(); }, { signal: signal });
+      downloaded.addEventListener('play', function () {
+        playbackStarted = true;
+        reference.pause();
+      }, { signal: signal });
+      reference.addEventListener('play', function () {
+        playbackStarted = true;
+        downloaded.pause();
+      }, { signal: signal });
     }
 
-    if (matchSection) matchSection.addEventListener('click', matchReferenceSection, { signal: signal });
+    if (matchSection) matchSection.addEventListener('click', function () { matchReferenceSection(false); }, { signal: signal });
     if (abToggle) abToggle.addEventListener('click', switchAB, { signal: signal });
     nudgeButtons.forEach(function (button) {
       button.addEventListener('click', function () {
@@ -260,6 +269,10 @@
         if (active) active.textContent = 'Working…';
       }, { signal: signal });
     });
+
+    if (matchSection && deck.dataset.alignmentUrl) {
+      matchReferenceSection(true);
+    }
 
     document.addEventListener('keydown', function (event) {
       var target = event.target;

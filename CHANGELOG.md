@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-05
+
+### Changed
+
+- Automatically align and seek the idle downloaded player to the matched or explicitly estimated reference passage when each import-review card opens, without autoplay or interrupting playback started before analysis completes.
+
+### Fixed
+
+- Retry import-review approval state writes during transient SQLite contention, avoid premature query-triggered autoflush, and preserve a successful approval when follow-up auto-import encounters a separate writer lock.
+
 ## [0.20.0] - 2026-08-05
 
 ### Added
