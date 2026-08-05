@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -493,7 +494,7 @@ def _cleanup_quarantine_path(
     marker = f".audiohoard-cleanup-{plan_id}-{device}-{inode}-{mtime_ns}-{size}-{digest}"
     if path.name.endswith(marker):
         return path
-    return path.with_name(f".{path.name}{marker}")
+    return path.with_name(marker)
 
 
 def _claimed_identity(path: Path, marker: str) -> tuple[int, int, int, int, str] | None:
@@ -511,6 +512,11 @@ def _claimed_identity(path: Path, marker: str) -> tuple[int, int, int, int, str]
 def _current_identity(path: Path) -> tuple[int, int, int, int, str] | None:
     try:
         current = path.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(current.st_mode):
+        return None
+    try:
         digest = _file_sha256(path)
     except OSError:
         return None
@@ -518,13 +524,26 @@ def _current_identity(path: Path) -> tuple[int, int, int, int, str] | None:
 
 
 def _quarantine_claim_matches(path: Path, configured: Path, plan_id: int) -> bool:
-    marker = f".{configured.name}.audiohoard-cleanup-{plan_id}-"
-    return _claimed_identity(path, marker) == _current_identity(path)
+    markers = (
+        f".audiohoard-cleanup-{plan_id}-",
+        f".{configured.name}.audiohoard-cleanup-{plan_id}-",
+    )
+    claimed_identities = {
+        claimed for marker in markers if (claimed := _claimed_identity(path, marker)) is not None
+    }
+    if not claimed_identities:
+        return False
+    current_identity = _current_identity(path)
+    return current_identity is not None and current_identity in claimed_identities
 
 
 def _persisted_quarantine_claim_matches(path: Path, plan_id: int) -> bool:
     marker = f".audiohoard-cleanup-{plan_id}-"
-    return _claimed_identity(path, marker) == _current_identity(path)
+    claimed_identity = _claimed_identity(path, marker)
+    if claimed_identity is None:
+        return False
+    current_identity = _current_identity(path)
+    return current_identity is not None and claimed_identity == current_identity
 
 
 def _pending_cleanup_path_sync(plan: ImportPlan) -> Path | None:
@@ -538,9 +557,13 @@ def _pending_cleanup_path_sync(plan: ImportPlan) -> Path | None:
             configured,
         )
         return None
-    pattern = f".{configured.name}.audiohoard-cleanup-{plan.id}-*"
+    patterns = (
+        f".audiohoard-cleanup-{plan.id}-*",
+        f".*.audiohoard-cleanup-{plan.id}-*",
+    )
     candidates = [
         candidate
+        for pattern in patterns
         for candidate in configured.parent.glob(pattern)
         if _quarantine_claim_matches(candidate, configured, plan.id)
     ]
