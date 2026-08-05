@@ -43,7 +43,7 @@ from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
-from app.database import register_transaction_callbacks
+from app.database import register_transaction_callbacks, run_with_sqlite_lock_retry
 from app.http import stream_with_retry
 from app.media_formats import is_importable_audio, supported_audio_formats_display
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
@@ -1440,6 +1440,12 @@ async def execute_release_import(
     plans = list(plans_result.scalars().all())
     if not plans:
         raise ImportExecutionError("release import plans are not ready")
+    release_id = release.id
+    if release_id is None or any(plan.id is None for plan in plans):
+        raise ImportExecutionError("release import plans are not persisted")
+    execution_statuses = {
+        plan.id: ImportWorkflowState.importing for plan in plans if plan.id is not None
+    }
 
     catalog_album_id = next(
         (
@@ -1513,6 +1519,8 @@ async def execute_release_import(
             if ext and len(ext) <= 16 and ext.isalnum():
                 track.file_format = ext
             plan.status = ImportWorkflowState.imported
+            if plan.id is not None:
+                execution_statuses[plan.id] = ImportWorkflowState.imported
             plan.file_state = LibraryFileState.present
             plan.file_checked_at = datetime.now(UTC)
             plan.file_removed_at = None
@@ -1626,25 +1634,45 @@ async def execute_release_import(
         )
         return plans
     except Exception as exc:
+        detail = str(exc)
         try:
             _rollback_pinned_filesystem(temp_paths, created_destinations, backup_paths)
         finally:
             _close_pinned_destinations(pinned_destinations)
-        detail = str(exc)
-        release.import_state = ImportWorkflowState.rolled_back
-        release.rollback_detail = detail
-        for plan in plans:
-            if plan.status == ImportWorkflowState.imported:
-                plan.status = ImportWorkflowState.rolled_back
-                plan.rollback_detail = detail
-            elif plan.status == ImportWorkflowState.importing:
-                plan.status = ImportWorkflowState.failed
-                plan.error_detail = detail
-            plan.destination_temp_path = None
-        for plan in plans:
-            if plan.track is not None and plan.track.import_state == ImportWorkflowState.imported:
-                plan.track.import_state = ImportWorkflowState.rolled_back
-        await db.flush()
+
+        # A failed flush leaves SQLAlchemy's transaction rollback-only. Never
+        # inspect expired ORM attributes until that failed transaction is cleared;
+        # doing so raises PendingRollbackError and masks the original failure.
+        await db.rollback()
+
+        async def record_failure_state() -> None:
+            failed_release = await db.get(Release, release_id)
+            failed_plans = list(
+                (
+                    await db.scalars(
+                        select(ImportPlan)
+                        .where(ImportPlan.id.in_(execution_statuses))
+                        .options(selectinload(ImportPlan.track))
+                    )
+                ).all()
+            )
+            if failed_release is not None:
+                failed_release.import_state = ImportWorkflowState.rolled_back
+                failed_release.rollback_detail = detail
+            for failed_plan in failed_plans:
+                prior_status = execution_statuses.get(failed_plan.id)
+                if prior_status == ImportWorkflowState.imported:
+                    failed_plan.status = ImportWorkflowState.rolled_back
+                    failed_plan.rollback_detail = detail
+                    if failed_plan.track is not None:
+                        failed_plan.track.import_state = ImportWorkflowState.rolled_back
+                elif prior_status == ImportWorkflowState.importing:
+                    failed_plan.status = ImportWorkflowState.failed
+                    failed_plan.error_detail = detail
+                failed_plan.destination_temp_path = None
+            await db.flush()
+
+        await run_with_sqlite_lock_retry(db, record_failure_state)
         if isinstance(exc, ImportExecutionError):
             raise
         raise ImportExecutionError(detail) from exc

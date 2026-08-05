@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 from mutagen.id3 import ID3, TXXX
-from sqlalchemy import select
+from sqlalchemy import event, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.media_formats import IMPORTABLE_AUDIO_EXTENSIONS, is_importable_audio
@@ -247,6 +248,46 @@ async def test_execute_import_releases_sqlite_writer_lock_before_filesystem_work
     )
 
     assert writer_checks == 1
+
+
+async def test_execute_import_rolls_back_failed_session_before_recording_lock_failure(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    release, _tracks = await _release_with_staged_tracks(db_session, tmp_path)
+    library = tmp_path / "library"
+    plans = await plan_release_import(db_session, release, library_root=library)
+    injected_lock = False
+
+    def fail_after_importing_flush(_session, _flush_context) -> None:
+        nonlocal injected_lock
+        if not injected_lock and release.import_state == ImportWorkflowState.importing:
+            injected_lock = True
+            raise OperationalError(
+                "UPDATE releases SET import_state='importing'",
+                {},
+                sqlite3.OperationalError("database is locked"),
+            )
+
+    event.listen(db_session.sync_session, "after_flush_postexec", fail_after_importing_flush)
+    try:
+        with pytest.raises(ImportExecutionError, match="database is locked"):
+            await execute_release_import(
+                db_session,
+                release,
+                library_root=library,
+                tag_writer=MutagenTagWriter(),
+            )
+    finally:
+        event.remove(db_session.sync_session, "after_flush_postexec", fail_after_importing_flush)
+
+    assert injected_lock is True
+    assert db_session.is_active is True
+    assert release.import_state == ImportWorkflowState.rolled_back
+    assert plans[0].status == ImportWorkflowState.rolled_back
+    assert not list(library.rglob("*.mp3"))
+
+    # The recovered session must remain usable by the approving request.
+    await db_session.execute(select(Release).where(Release.id == release.id))
 
 
 async def test_execute_import_rejects_source_symlink_swap_after_planning(
@@ -746,6 +787,7 @@ async def test_failed_import_does_not_change_catalog_ownership(
             tag_writer=FailingSecondTagWriter(),
         )
 
+    await db_session.refresh(album)
     assert album.in_library is False
 
 

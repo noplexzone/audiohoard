@@ -2399,29 +2399,53 @@ a.metric-card:hover {
   margin-bottom: var(--space-4);
 }
 
-.tag-diff-table {
-  width: 100%;
-  border-collapse: collapse;
+.tag-comparison-list {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
 }
 
-.tag-diff-table th,
-.tag-diff-table td {
-  padding: var(--space-2) var(--space-3);
+.tag-comparison-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(7rem, .7fr) minmax(0, 1fr) minmax(0, 1fr);
   border-bottom: 1px solid var(--border);
-  text-align: left;
+}
+
+.tag-comparison-row:last-child {
+  border-bottom: 0;
+}
+
+.tag-comparison-row > div {
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
   overflow-wrap: anywhere;
 }
 
-.tag-diff-table tbody th {
-  color: var(--muted);
-  font-weight: 600;
+.tag-comparison-row > div + div {
+  border-left: 1px solid var(--border-soft);
 }
 
-.tag-diff-table tr.tag-mismatch {
+.tag-comparison-field {
+  color: var(--muted);
+}
+
+.tag-comparison-label {
+  display: block;
+  margin-bottom: .15rem;
+  color: var(--faint);
+  font-size: .7rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.tag-comparison-row.tag-mismatch {
   background: color-mix(in srgb, var(--warn) 12%, transparent);
 }
 
-.tag-diff-table tr.tag-mismatch th {
+.tag-comparison-row.tag-mismatch .tag-comparison-field {
   color: var(--warn);
 }
 
@@ -2599,6 +2623,19 @@ a.metric-card:hover {
 
   .review-secondary-details > summary {
     padding: .45rem .65rem;
+  }
+
+  .tag-comparison-row {
+    grid-template-columns: 1fr;
+  }
+
+  .tag-comparison-row > div {
+    padding: .5rem .65rem;
+  }
+
+  .tag-comparison-row > div + div {
+    border-top: 1px solid var(--border-soft);
+    border-left: 0;
   }
 }
 

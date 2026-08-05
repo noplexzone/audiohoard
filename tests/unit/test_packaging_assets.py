@@ -127,7 +127,7 @@ def test_favicon_ico_uses_the_requested_artwork_at_every_size() -> None:
 
 def test_dockerfile_version_and_healthcheck_match_current_runtime_contract() -> None:
     dockerfile = Path("docker/Dockerfile").read_text(encoding="utf-8")
-    assert 'org.opencontainers.image.version="0.19.1"' in dockerfile
+    assert 'org.opencontainers.image.version="0.19.2"' in dockerfile
     assert "http://localhost:8000/health/ready" in dockerfile
 
 
@@ -166,6 +166,21 @@ def test_review_deck_registers_deliberate_ios_touch_swipes() -> None:
     assert "visibility: visible" in css
     assert ".review-secondary-details > summary::after" in css
     assert 'content: "+"' in css and 'content: "−"' in css
+
+
+def test_review_tag_comparison_does_not_require_horizontal_scrolling() -> None:
+    template = Path("app/templates/review.html").read_text(encoding="utf-8")
+    css = Path("app/static/css/pages.css").read_text(encoding="utf-8")
+
+    assert 'class="tag-comparison-list"' in template
+    assert 'class="tag-comparison-row' in template
+    assert 'class="tag-comparison-value"' in template
+    assert 'class="tag-diff-table"' not in template
+    assert '<div class="table-wrap">' not in template
+    assert ".tag-comparison-row" in css
+    assert "grid-template-columns: minmax(7rem, .7fr) minmax(0, 1fr) minmax(0, 1fr)" in css
+    assert "overflow-wrap: anywhere" in css
+    assert "grid-template-columns: 1fr" in css
 
 
 def test_templates_are_compatible_with_the_html_content_security_policy() -> None:

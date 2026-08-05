@@ -67,19 +67,23 @@
     <summary>Tags &amp; file details</summary>
     <section class="review-tag-diff" aria-labelledby="tag-diff-heading">
     <h3 id="tag-diff-heading">Tag comparison</h3>
-    <div class="table-wrap">
-      <table class="tag-diff-table">
-        <thead><tr><th scope="col">Field</th><th scope="col">As tagged in file</th><th scope="col">Should be (catalog)</th></tr></thead>
-        <tbody>
-          {% for field, label in tag_fields %}
-          <tr{% if review.diff[field] %} class="tag-mismatch"{% endif %}>
-            <th scope="row">{{ label }}</th>
-            <td>{{ review.as_tagged[field] if review.as_tagged[field] is not none else "—" }}</td>
-            <td>{{ review.should_be[field] if review.should_be[field] is not none else "—" }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+    <div class="tag-comparison-list">
+      {% for field, label in tag_fields %}
+      <div class="tag-comparison-row{% if review.diff[field] %} tag-mismatch{% endif %}">
+        <div class="tag-comparison-field">
+          <span class="tag-comparison-label">Field</span>
+          <strong>{{ label }}</strong>
+        </div>
+        <div class="tag-comparison-value">
+          <span class="tag-comparison-label">As tagged</span>
+          <span>{{ review.as_tagged[field] if review.as_tagged[field] is not none else "—" }}</span>
+        </div>
+        <div class="tag-comparison-value">
+          <span class="tag-comparison-label">Catalog</span>
+          <span>{{ review.should_be[field] if review.should_be[field] is not none else "—" }}</span>
+        </div>
+      </div>
+      {% endfor %}
     </div>
   </section>
 
