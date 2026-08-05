@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-05
+
+### Added
+
+- Add non-destructive Skip navigation to the import-review deck, including wraparound queue traversal and an `N` keyboard shortcut.
+
+### Changed
+
+- Remember independent browser-local volume levels for downloaded and reference review audio across approve, deny, skip, progressive navigation, and page reloads.
+
 ## [0.21.0] - 2026-08-05
 
 ### Changed

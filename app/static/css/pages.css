@@ -2459,6 +2459,10 @@ a.metric-card:hover {
   gap: var(--space-3);
 }
 
+.review-deck-actions.has-skip {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .review-deck-actions form,
 .review-deck-actions .btn {
   width: 100%;

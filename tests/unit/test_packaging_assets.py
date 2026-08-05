@@ -127,7 +127,7 @@ def test_favicon_ico_uses_the_requested_artwork_at_every_size() -> None:
 
 def test_dockerfile_version_and_healthcheck_match_current_runtime_contract() -> None:
     dockerfile = Path("docker/Dockerfile").read_text(encoding="utf-8")
-    assert 'org.opencontainers.image.version="0.21.0"' in dockerfile
+    assert 'org.opencontainers.image.version="0.22.0"' in dockerfile
     assert "http://localhost:8000/health/ready" in dockerfile
 
 
@@ -199,6 +199,19 @@ def test_api_docs_link_is_about_only_not_sidebar() -> None:
 
     assert "/api/docs" not in base
     assert '<a class="btn secondary" href="/api/docs">API docs</a>' in settings
+
+
+def test_review_deck_persists_downloaded_and_reference_volumes_separately() -> None:
+    script = Path("app/static/js/review-deck.js").read_text(encoding="utf-8")
+
+    assert "audiohoard.importReview.downloadedVolume" in script
+    assert "audiohoard.importReview.referenceVolume" in script
+    assert "window.localStorage.getItem" in script
+    assert "window.localStorage.setItem" in script
+    assert "volumechange" in script
+    assert "Math.min(1, Math.max(0, parsed))" in script
+    assert "bindVolumePreference(downloaded" in script
+    assert "bindVolumePreference(reference" in script
 
 
 def test_review_deck_alignment_switches_one_player_at_equivalent_times() -> None:

@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from httpx import AsyncClient
@@ -117,6 +118,8 @@ async def test_review_renders_front_card_audio_and_tag_diff(
     assert "Original filename" in response.text
     assert "01 Original Name.flac" in response.text
     assert "data-swipe-surface" in response.text
+    assert "data-skip-button" not in response.text
+    assert "N next" not in response.text
     assert "Swipe right to approve · Swipe left to deny" in response.text
     assert "Jump downloaded file to midpoint" not in response.text
     assert "data-jump-midpoint" not in response.text
@@ -128,6 +131,59 @@ async def test_review_renders_front_card_audio_and_tag_diff(
     assert response.text.index("review-deck-actions") < response.text.index(
         "review-secondary-details"
     )
+
+
+async def test_review_skip_advances_without_deciding_and_wraps(
+    client: AsyncClient, test_settings, monkeypatch
+) -> None:
+    first_id = await _seed_review(test_settings.staging_root)
+    second_id = await _seed_review(test_settings.staging_root)
+
+    async def no_reference(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("app.services.staging.resolve_reference_audio", no_reference)
+
+    # Queue traversal deliberately follows stable insertion IDs, even if timestamps diverge.
+    factory = get_session_factory()
+    async with factory() as db:
+        first = await db.get(StagingReviewItem, first_id)
+        second_item = await db.get(StagingReviewItem, second_id)
+        assert first is not None and second_item is not None
+        first.created_at = datetime.now(UTC) + timedelta(days=1)
+        second_item.created_at = datetime.now(UTC)
+        await db.commit()
+
+    first_page = await client.get("/review")
+    assert f'src="/staging/audio/{first_id}"' in first_page.text
+    second = await client.get(f"/review?after={first_id}")
+    assert second.status_code == 200
+    assert f'src="/staging/audio/{second_id}"' in second.text
+    assert f'href="/review?after={second_id}"' in second.text
+    assert "data-skip-button" in second.text
+    assert "N next" in second.text
+
+    wrapped = await client.get(f"/review?after={second_id}")
+    assert wrapped.status_code == 200
+    assert f'src="/staging/audio/{first_id}"' in wrapped.text
+
+    factory = get_session_factory()
+    async with factory() as db:
+        first = await db.get(StagingReviewItem, first_id)
+        second_item = await db.get(StagingReviewItem, second_id)
+        assert first is not None and second_item is not None
+        assert first.review_state == ReviewDecision.pending
+        assert second_item.review_state == ReviewDecision.pending
+
+
+async def test_review_skip_cursor_rejects_values_outside_sqlite_integer_range(
+    client: AsyncClient, test_settings
+) -> None:
+    await _seed_review(test_settings.staging_root)
+
+    response = await client.get("/review?after=9223372036854775808")
+
+    assert response.status_code == 422
 
 
 async def test_review_reference_badge_reflects_resolver_source(
