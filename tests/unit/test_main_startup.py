@@ -58,6 +58,7 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
     monkeypatch.setattr(main, "recover_deletion_operations", recover_deletions)
     monkeypatch.setattr(main, "prune_orphaned_terminal_records", prune)
     monkeypatch.setattr(main, "reconcile_duplicate_catalog_artists", AsyncMock(return_value=0))
+    monkeypatch.setattr(main, "reconcile_deezer_release_snapshots", AsyncMock(return_value=0))
     monkeypatch.setattr(
         main,
         "build_effective_settings",

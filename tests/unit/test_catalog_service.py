@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import perf_counter
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -381,6 +382,48 @@ async def test_library_artist_card_uses_explicit_primary_provider_regardless_of_
 
     assert row.primary_metadata_provider == "deezer"
     assert row.release_count == 1
+
+
+async def test_library_artist_page_scales_to_production_sized_catalog(
+    db_session: AsyncSession,
+) -> None:
+    for artist_index in range(40):
+        artist = CatalogArtist(name=f"Scale Artist {artist_index:02d}", monitored=True)
+        identity = CatalogArtistIdentity(
+            provider="deezer",
+            provider_artist_id=f"scale-{artist_index}",
+            name=artist.name,
+        )
+        artist.identities.append(identity)
+        for release_index in range(100):
+            album = CatalogAlbum(
+                artist=artist,
+                title=f"Release {release_index:03d}",
+                year="2026",
+                release_type="album",
+                track_count=10,
+            )
+            identity.releases.append(
+                CatalogAlbumProvider(
+                    provider_album_id=f"{artist_index}-{release_index}",
+                    title=album.title,
+                    year="2026",
+                    track_count=10,
+                    release_kind="album",
+                    catalog_album=album,
+                )
+            )
+        db_session.add(artist)
+    await db_session.flush()
+
+    started = perf_counter()
+    page = await get_library_artists_page(db_session, per_page=50)
+    elapsed = perf_counter() - started
+
+    assert page.total == 40
+    assert len(page.items) == 40
+    assert all(row.release_count == 100 for row in page.items)
+    assert elapsed < 5.0, f"grouped library query took {elapsed:.2f}s"
 
 
 async def test_release_progress_uses_hydrated_manifest_as_denominator(

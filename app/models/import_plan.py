@@ -63,7 +63,7 @@ class ImportPlan(Base):
         ForeignKey("releases.id", ondelete="CASCADE"), nullable=False
     )
     track_id: Mapped[int | None] = mapped_column(
-        ForeignKey("tracks.id", ondelete="CASCADE"), nullable=True
+        ForeignKey("tracks.id", ondelete="CASCADE"), nullable=True, index=True
     )
     source_path: Mapped[str] = mapped_column(Text, nullable=False)
     staging_path: Mapped[str | None] = mapped_column(Text, nullable=True)
