@@ -928,16 +928,24 @@ def test_cleanup_quarantine_path_is_bounded_for_long_source_name(tmp_path: Path)
     assert not quarantine.exists()
 
 
-def test_cleanup_quarantine_rejects_malformed_unreadable_claim(tmp_path: Path) -> None:
+def test_cleanup_quarantine_rejects_malformed_claim_before_identity_read(
+    tmp_path: Path, monkeypatch
+) -> None:
     configured = tmp_path / "staged.flac"
     malformed = tmp_path / ".audiohoard-cleanup-42-invalid"
     malformed.mkdir()
 
+    def unexpected_identity(path: Path):
+        raise AssertionError(f"identity read for malformed claim: {path}")
+
+    monkeypatch.setattr(acquisition_cleanup, "_current_identity", unexpected_identity)
+
     assert not acquisition_cleanup._quarantine_claim_matches(malformed, configured, 42)
+    assert not acquisition_cleanup._persisted_quarantine_claim_matches(malformed, 42)
 
 
 def test_pending_cleanup_finds_legacy_quarantine_name(tmp_path: Path) -> None:
-    configured = tmp_path / "staged.flac"
+    configured = tmp_path / "[track].flac"
     configured.write_bytes(b"old-audio")
     current = configured.stat()
     digest = acquisition_cleanup._file_sha256(configured)
@@ -950,6 +958,22 @@ def test_pending_cleanup_finds_legacy_quarantine_name(tmp_path: Path) -> None:
     plan = SimpleNamespace(id=42, staging_path=str(configured), source_path=str(configured))
 
     assert acquisition_cleanup._pending_cleanup_path_sync(plan) == legacy
+
+
+def test_cleanup_quarantine_rejects_non_regular_claim_before_hash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    configured = tmp_path / "staged.flac"
+    digest = "0" * 64
+    candidate = tmp_path / f".audiohoard-cleanup-42-1-2-3-4-{digest}"
+    candidate.mkdir()
+
+    def unexpected_hash(path: Path):
+        raise AssertionError(f"hash attempted for non-regular claim: {path}")
+
+    monkeypatch.setattr(acquisition_cleanup, "_file_sha256", unexpected_hash)
+
+    assert not acquisition_cleanup._quarantine_claim_matches(candidate, configured, 42)
 
 
 async def test_stale_cleanup_cannot_unlink_or_clear_reassigned_plan(
