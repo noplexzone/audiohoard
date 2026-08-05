@@ -366,7 +366,10 @@ async def fetch_and_store_discography(
     if provider is None:
         return []
     albums = await provider.get_discography(identity.provider_artist_id)
+    albums = _compact_provider_discography(provider_name, albums)
     releases = [await upsert_provider_release(db, artist, identity, hit) for hit in albums]
+    if provider_name == "deezer":
+        await reconcile_deezer_release_snapshots(db, artist.id)
     identity.last_discography_at = datetime.now(tz=UTC)
     await db.flush()
     return releases
@@ -378,6 +381,56 @@ def normalize_release_kind(hit: AlbumHit | AlbumDetail) -> str:
     raw = hit.release_type_raw or hit.release_type
     bucket = release_bucket(raw)
     return {"album": "album", "single_ep": "single", "compilation": "compilation"}[bucket]
+
+
+def _provider_release_family_key(hit: Any) -> tuple[str, str | None, str, str, str]:
+    """Identify provider snapshots of one artist-intended release.
+
+    The title remains part of the key, so named Deluxe/Remaster/etc. editions stay
+    distinct. Ratings are exact rather than merely compatible so clean, explicit,
+    and unknown provider rows cannot absorb one another.
+    """
+    release_kind = getattr(hit, "release_kind", None)
+    if release_kind not in {"album", "single", "ep", "compilation", "other"}:
+        raw_kind = getattr(hit, "release_type_raw", None) or getattr(hit, "release_type", None)
+        if raw_kind:
+            release_kind = {
+                "album": "album",
+                "single_ep": "single",
+                "compilation": "compilation",
+            }.get(release_bucket(raw_kind), "other")
+        else:
+            release_kind = "unknown"
+    title = str(getattr(hit, "title", ""))
+    return (
+        _norm_title(title),
+        getattr(hit, "year", None),
+        _edition_marker(title),
+        release_kind,
+        normalize_content_rating(getattr(hit, "content_rating", None)),
+    )
+
+
+def _compact_provider_discography(provider_name: str, hits: list[AlbumHit]) -> list[AlbumHit]:
+    """Keep the richest Deezer snapshot for each exact release family."""
+    if provider_name != "deezer":
+        return hits
+    grouped: dict[tuple[str, str | None, str, str, str], list[AlbumHit]] = {}
+    for hit in hits:
+        key = _provider_release_family_key(hit)
+        grouped.setdefault(key, []).append(hit)
+    compacted: list[AlbumHit] = []
+    for group in grouped.values():
+        known_counts = {hit.track_count for hit in group if hit.track_count is not None}
+        if len(known_counts) < 2:
+            compacted.extend(group)
+            continue
+        richest_count = max(known_counts)
+        richest = [hit for hit in group if hit.track_count == richest_count]
+        unknown = [hit for hit in group if hit.track_count is None]
+        compacted.extend(richest)
+        compacted.extend(unknown)
+    return compacted
 
 
 async def upsert_provider_release(
@@ -1235,8 +1288,10 @@ async def enrich_catalog_artist(
                     artist.artwork_url = detail.artwork_url
                     provenance["artwork_url"] = provider_name
                 identity = await upsert_artist_identity(db, artist, detail)
-                for album_hit in discography:
+                for album_hit in _compact_provider_discography(provider_name, discography):
                     await upsert_provider_release(db, artist, identity, album_hit)
+                if provider_name == "deezer":
+                    await reconcile_deezer_release_snapshots(db, artist.id)
                 identity.last_discography_at = datetime.now(tz=UTC)
             outcomes[provider_name] = "ok"
         except Exception as exc:
@@ -1280,6 +1335,53 @@ async def enrich_catalog_artist(
     if ambiguities:
         result["candidates"] = ambiguities
     return result
+
+
+async def reconcile_deezer_release_snapshots(
+    db: AsyncSession, artist_id: int | None = None
+) -> int:
+    """Hide superseded Deezer snapshots while preserving canonical catalog state.
+
+    Only provider rows with different known track counts are condensed. Canonical
+    albums, manifests, jobs, imported tracks, and non-Deezer provider ownership
+    remain untouched; the richer Deezer row is the sole selected-provider card.
+    """
+    stmt = (
+        select(CatalogAlbumProvider)
+        .join(CatalogArtistIdentity)
+        .where(CatalogArtistIdentity.provider == "deezer")
+        .order_by(CatalogAlbumProvider.artist_identity_id, CatalogAlbumProvider.id)
+    )
+    if artist_id is not None:
+        stmt = stmt.where(CatalogArtistIdentity.artist_id == artist_id)
+    releases = list((await db.scalars(stmt)).unique().all())
+    groups: dict[tuple[int, str, str | None, str, str, str], list[CatalogAlbumProvider]] = {}
+    for release in releases:
+        family = _provider_release_family_key(release)
+        groups.setdefault((release.artist_identity_id, *family), []).append(release)
+
+    condensed = 0
+    for group in groups.values():
+        known_counts = {
+            release.track_count for release in group if release.track_count is not None
+        }
+        if len(known_counts) < 2:
+            continue
+        richest_count = max(known_counts)
+        richest = [release for release in group if release.track_count == richest_count]
+        if len(richest) != 1 or richest[0].catalog_album_id is None:
+            continue
+        winner = richest[0]
+        for loser in group:
+            if loser.id == winner.id or loser.track_count in {None, richest_count}:
+                continue
+            winner.monitored = bool(winner.monitored or loser.monitored)
+            winner.artwork_url = winner.artwork_url or loser.artwork_url
+            winner.upc = winner.upc or loser.upc
+            await db.delete(loser)
+            condensed += 1
+    await db.flush()
+    return condensed
 
 
 async def reconcile_duplicate_catalog_albums(

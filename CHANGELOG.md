@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-05
+
+### Fixed
+
+- Replace repeated correlated Library artist-card scans with grouped catalog aggregates and query-aligned indexes, removing multi-second navigation stalls on production-sized libraries.
+- Condense same-release Deezer discography snapshots to the richer track list while preserving distinct editions, years, release kinds, providers, and content ratings; reconcile existing duplicates without losing linked library state.
+
 ## [0.22.0] - 2026-08-05
 
 ### Added

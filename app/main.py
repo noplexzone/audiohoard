@@ -52,7 +52,10 @@ from app.services.acquisition_cleanup import (
 )
 from app.services.acquisition_recovery import recover_approved_downloads
 from app.services.artist_monitoring import DiscographyRefreshScheduler
-from app.services.catalog_metadata import reconcile_duplicate_catalog_artists
+from app.services.catalog_metadata import (
+    reconcile_deezer_release_snapshots,
+    reconcile_duplicate_catalog_artists,
+)
 from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
 from app.services.dashboard import get_dashboard_data
 from app.services.health_status import get_health_status_service
@@ -134,9 +137,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 pruned.jobs,
             )
         n = await reconcile_duplicate_catalog_artists(db)
+        release_snapshots = await reconcile_deezer_release_snapshots(db)
         await db.commit()
         if n:
             logger.info("Reconciled %d duplicate catalog artist(s) at startup", n)
+        if release_snapshots:
+            logger.info(
+                "Reconciled %d superseded Deezer release snapshot(s) at startup",
+                release_snapshots,
+            )
         repaired = await recover_approved_downloads(db, effective_settings)
         await db.commit()
         if repaired:

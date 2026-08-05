@@ -84,7 +84,7 @@ class CatalogAlbum(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     artist_id: Mapped[int] = mapped_column(
-        ForeignKey("catalog_artists.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("catalog_artists.id", ondelete="CASCADE"), nullable=False, index=True
     )
     title: Mapped[str] = mapped_column(Text, nullable=False)
     year: Mapped[str | None] = mapped_column(String(4), nullable=True)
@@ -222,7 +222,7 @@ class CatalogAlbumTrack(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     album_id: Mapped[int] = mapped_column(
-        ForeignKey("catalog_albums.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("catalog_albums.id", ondelete="CASCADE"), nullable=False, index=True
     )
     position: Mapped[int] = mapped_column(Integer, nullable=False)
     disc: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")

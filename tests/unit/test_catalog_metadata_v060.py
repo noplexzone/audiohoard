@@ -23,9 +23,11 @@ from app.models.track import Track
 from app.services import catalog_metadata
 from app.services.catalog_metadata import (
     _album_keys_match,
+    _compact_provider_discography,
     _norm_title,
     enrich_catalog_artist,
     fetch_and_store_discography,
+    reconcile_deezer_release_snapshots,
     reconcile_duplicate_catalog_albums,
     reconcile_duplicate_catalog_artists,
     search_catalog_artists,
@@ -436,6 +438,345 @@ async def test_reconcile_duplicate_catalog_albums_merges_legacy_curly_apostrophe
     assert (await db_session.scalars(select(Job.catalog_album_id))).one() == kept.id
     assert (await db_session.scalars(select(Track.catalog_album_id))).one() == kept.id
     assert await reconcile_duplicate_catalog_albums(db_session, artist.id) == 0
+
+
+def test_compact_deezer_discography_keeps_richest_snapshot_and_real_editions() -> None:
+    hits = [
+        AlbumHit(
+            provider="deezer",
+            provider_id="338552127",
+            deezer_id="338552127",
+            title="RED & WHITE",
+            year="2022",
+            release_type="EP",
+            release_kind="ep",
+            track_count=5,
+            content_rating="explicit",
+        ),
+        AlbumHit(
+            provider="deezer",
+            provider_id="339525867",
+            deezer_id="339525867",
+            title="RED & WHITE",
+            year="2022",
+            release_type="EP",
+            release_kind="ep",
+            track_count=9,
+            content_rating="explicit",
+        ),
+        AlbumHit(
+            provider="deezer",
+            provider_id="deluxe",
+            deezer_id="deluxe",
+            title="RED & WHITE (Deluxe Edition)",
+            year="2022",
+            release_type="EP",
+            release_kind="ep",
+            track_count=12,
+            content_rating="explicit",
+        ),
+        AlbumHit(
+            provider="deezer",
+            provider_id="clean",
+            deezer_id="clean",
+            title="RED & WHITE",
+            year="2022",
+            release_type="EP",
+            release_kind="ep",
+            track_count=9,
+            content_rating="clean",
+        ),
+        AlbumHit(
+            provider="deezer",
+            provider_id="928878",
+            deezer_id="928878",
+            title="VICES & VIRTUES",
+            year="2011",
+            release_type="album",
+            release_kind="album",
+            track_count=10,
+            content_rating="unknown",
+        ),
+        AlbumHit(
+            provider="deezer",
+            provider_id="809473311",
+            deezer_id="809473311",
+            title="Vices & Virtues",
+            year="2011",
+            release_type="album",
+            release_kind="album",
+            track_count=12,
+            content_rating="unknown",
+        ),
+    ]
+
+    compacted = _compact_provider_discography("deezer", hits)
+
+    assert [hit.provider_id for hit in compacted] == [
+        "339525867",
+        "deluxe",
+        "clean",
+        "809473311",
+    ]
+    assert _compact_provider_discography("itunes", hits) == hits
+    equal_snapshots = [
+        AlbumHit(
+            provider="deezer",
+            provider_id="equal-a",
+            title="Equal Single",
+            year="2026",
+            release_kind="single",
+            track_count=1,
+        ),
+        AlbumHit(
+            provider="deezer",
+            provider_id="equal-b",
+            title="Equal Single",
+            year="2026",
+            release_kind="single",
+            track_count=1,
+        ),
+    ]
+    assert _compact_provider_discography("deezer", equal_snapshots) == equal_snapshots
+
+
+async def test_reconcile_deezer_snapshots_preserves_equal_count_releases(
+    db_session: AsyncSession,
+) -> None:
+    artist = CatalogArtist(name="Equal Count Artist")
+    identity = CatalogArtistIdentity(
+        provider="deezer", provider_artist_id="equal", name=artist.name
+    )
+    artist.identities.append(identity)
+    identity.releases.extend(
+        [
+            CatalogAlbumProvider(
+                provider_album_id="equal-a",
+                title="Equal Single",
+                year="2026",
+                track_count=1,
+                release_kind="single",
+                content_rating="unknown",
+            ),
+            CatalogAlbumProvider(
+                provider_album_id="equal-b",
+                title="Equal Single",
+                year="2026",
+                track_count=1,
+                release_kind="single",
+                content_rating="unknown",
+            ),
+        ]
+    )
+    db_session.add(artist)
+    await db_session.flush()
+
+    assert await reconcile_deezer_release_snapshots(db_session, artist.id) == 0
+    assert len(list((await db_session.scalars(select(CatalogAlbumProvider))).all())) == 2
+
+
+async def test_reconcile_deezer_snapshots_keeps_larger_provider_and_preserves_canonical_state(
+    db_session: AsyncSession,
+) -> None:
+    artist = CatalogArtist(name="Lil Uzi Vert")
+    deezer_identity = CatalogArtistIdentity(
+        provider="deezer", provider_artist_id="13", name=artist.name
+    )
+    musicbrainz_identity = CatalogArtistIdentity(
+        provider="musicbrainz", provider_artist_id="uzi-mbid", name=artist.name
+    )
+    artist.identities.extend([deezer_identity, musicbrainz_identity])
+    smaller = CatalogAlbum(
+        artist=artist,
+        title="RED & WHITE",
+        year="2022",
+        release_type="EP",
+        mbid="red-white-mbid",
+        deezer_id="338552127",
+        track_count=5,
+        content_rating="explicit",
+        monitored=True,
+    )
+    larger = CatalogAlbum(
+        artist=artist,
+        title="RED & WHITE",
+        year="2022",
+        release_type="EP",
+        deezer_id="339525867",
+        track_count=9,
+        content_rating="explicit",
+    )
+    deluxe = CatalogAlbum(
+        artist=artist,
+        title="RED & WHITE (Deluxe Edition)",
+        year="2022",
+        release_type="EP",
+        deezer_id="deluxe",
+        track_count=12,
+        content_rating="explicit",
+    )
+    for album, count in ((smaller, 5), (larger, 9), (deluxe, 12)):
+        album.tracks.extend(
+            CatalogAlbumTrack(position=position, disc=1, title=f"Song {position}")
+            for position in range(1, count + 1)
+        )
+    deezer_identity.releases.extend(
+        [
+            CatalogAlbumProvider(
+                catalog_album=smaller,
+                provider_album_id="338552127",
+                title=smaller.title,
+                year="2022",
+                track_count=5,
+                release_kind="ep",
+                content_rating="explicit",
+                monitored=True,
+            ),
+            CatalogAlbumProvider(
+                catalog_album=larger,
+                provider_album_id="339525867",
+                title=larger.title,
+                year="2022",
+                track_count=9,
+                release_kind="ep",
+                content_rating="explicit",
+            ),
+            CatalogAlbumProvider(
+                catalog_album=deluxe,
+                provider_album_id="deluxe",
+                title=deluxe.title,
+                year="2022",
+                track_count=12,
+                release_kind="ep",
+                content_rating="explicit",
+            ),
+        ]
+    )
+    musicbrainz_identity.releases.append(
+        CatalogAlbumProvider(
+            catalog_album=smaller,
+            provider_album_id="red-white-mbid",
+            title=smaller.title,
+            year="2022",
+            track_count=5,
+            release_kind="ep",
+            content_rating="explicit",
+        )
+    )
+    db_session.add(artist)
+    await db_session.flush()
+    job = Job(
+        source="priority",
+        query="Lil Uzi Vert RED & WHITE",
+        status=JobStatus.pending,
+        catalog_album_id=smaller.id,
+        catalog_track_id=smaller.tracks[0].id,
+    )
+    db_session.add(job)
+    await db_session.flush()
+    db_session.add(
+        Track(
+            job_id=job.id,
+            source="test",
+            title="Song 1",
+            catalog_album_id=smaller.id,
+            catalog_track_id=smaller.tracks[0].id,
+        )
+    )
+    await db_session.flush()
+
+    assert await reconcile_deezer_release_snapshots(db_session, artist.id) == 1
+    await db_session.flush()
+
+    releases = list((await db_session.scalars(select(CatalogAlbumProvider))).all())
+    assert {release.provider_album_id for release in releases} == {
+        "339525867",
+        "deluxe",
+        "red-white-mbid",
+    }
+    winner = next(release for release in releases if release.provider_album_id == "339525867")
+    assert winner.track_count == 9
+    assert winner.monitored is True
+    albums = list((await db_session.scalars(select(CatalogAlbum))).all())
+    assert {album.id for album in albums} == {smaller.id, larger.id, deluxe.id}
+    assert len(smaller.tracks) == 5
+    assert len(larger.tracks) == 9
+    assert (await db_session.scalars(select(Job.catalog_album_id))).one() == smaller.id
+    assert (await db_session.scalars(select(Job.catalog_track_id))).one() == smaller.tracks[0].id
+    assert (await db_session.scalars(select(Track.catalog_album_id))).one() == smaller.id
+    assert (await db_session.scalars(select(Track.catalog_track_id))).one() == smaller.tracks[0].id
+    assert await reconcile_deezer_release_snapshots(db_session, artist.id) == 0
+
+
+async def test_reconcile_deezer_snapshots_handles_unknown_release_kind(
+    db_session: AsyncSession,
+) -> None:
+    artist = CatalogArtist(name="Legacy Deezer Artist")
+    identity = CatalogArtistIdentity(
+        provider="deezer", provider_artist_id="legacy", name=artist.name
+    )
+    artist.identities.append(identity)
+    smaller = CatalogAlbum(artist=artist, title="Legacy Release", track_count=5)
+    larger = CatalogAlbum(artist=artist, title="Legacy Release", track_count=9)
+    identity.releases.extend(
+        [
+            CatalogAlbumProvider(
+                catalog_album=smaller,
+                provider_album_id="legacy-small",
+                title="Legacy Release",
+                track_count=5,
+                release_kind="unknown",
+                release_type_raw=None,
+            ),
+            CatalogAlbumProvider(
+                catalog_album=larger,
+                provider_album_id="legacy-large",
+                title="Legacy Release",
+                track_count=9,
+                release_kind="unknown",
+                release_type_raw=None,
+            ),
+        ]
+    )
+    db_session.add(artist)
+    await db_session.flush()
+
+    assert await reconcile_deezer_release_snapshots(db_session, artist.id) == 1
+    releases = list((await db_session.scalars(select(CatalogAlbumProvider))).all())
+    assert [release.provider_album_id for release in releases] == ["legacy-large"]
+
+
+async def test_reconcile_deezer_snapshots_skips_unlinked_richest_release(
+    db_session: AsyncSession,
+) -> None:
+    artist = CatalogArtist(name="Unlinked Deezer Artist")
+    identity = CatalogArtistIdentity(
+        provider="deezer", provider_artist_id="unlinked", name=artist.name
+    )
+    artist.identities.append(identity)
+    smaller = CatalogAlbum(artist=artist, title="Unlinked Release", track_count=5)
+    identity.releases.extend(
+        [
+            CatalogAlbumProvider(
+                catalog_album=smaller,
+                provider_album_id="linked-small",
+                title="Unlinked Release",
+                track_count=5,
+                release_kind="album",
+            ),
+            CatalogAlbumProvider(
+                provider_album_id="unlinked-large",
+                title="Unlinked Release",
+                track_count=9,
+                release_kind="album",
+            ),
+        ]
+    )
+    db_session.add(artist)
+    await db_session.flush()
+
+    assert await reconcile_deezer_release_snapshots(db_session, artist.id) == 0
+    assert len(list((await db_session.scalars(select(CatalogAlbumProvider))).all())) == 2
 
 
 async def test_fetch_and_store_album_prefers_deezer_identity_for_hybrid_catalog_album(
@@ -911,6 +1252,61 @@ async def test_fetch_discography_uses_explicit_provider_and_tags_membership(
     ).one()
     assert albums[0].artist_identity_id == identity.id
     assert albums[0].release_kind == "album"
+
+
+async def test_deezer_refresh_does_not_persist_smaller_same_release_snapshot(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: Settings,
+) -> None:
+    artist = CatalogArtist(name="Panic! At the Disco", deezer_id="1")
+    db_session.add(artist)
+    await db_session.flush()
+
+    class UpdatedReleaseProvider:
+        async def get_discography(self, id: str) -> list[AlbumHit]:
+            assert id == "1"
+            return [
+                AlbumHit(
+                    provider="deezer",
+                    provider_id="928878",
+                    deezer_id="928878",
+                    title="VICES & VIRTUES",
+                    year="2011",
+                    release_type="album",
+                    release_kind="album",
+                    track_count=10,
+                    content_rating="unknown",
+                ),
+                AlbumHit(
+                    provider="deezer",
+                    provider_id="809473311",
+                    deezer_id="809473311",
+                    title="Vices & Virtues",
+                    year="2011",
+                    release_type="album",
+                    release_kind="album",
+                    track_count=12,
+                    content_rating="unknown",
+                ),
+            ]
+
+    monkeypatch.setattr(
+        catalog_metadata,
+        "build_metadata_provider",
+        lambda name, settings: UpdatedReleaseProvider(),
+    )
+
+    releases = await fetch_and_store_discography(
+        db_session, test_settings, artist, provider_name="deezer"
+    )
+
+    assert len(releases) == 1
+    assert releases[0].provider_album_id == "809473311"
+    assert releases[0].track_count == 12
+    assert (await db_session.scalars(select(CatalogAlbumProvider))).one().provider_album_id == (
+        "809473311"
+    )
 
 
 async def test_enrichment_attempts_known_provider_and_isolates_provider_failure(
