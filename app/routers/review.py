@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
@@ -54,6 +54,7 @@ async def review_page(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(effective_settings_dep)],
+    after: Annotated[int | None, Query(ge=1, le=9_223_372_036_854_775_807)] = None,
 ) -> HTMLResponse:
     pending_filter = (
         StagingReviewItem.review_state == ReviewDecision.pending,
@@ -62,7 +63,7 @@ async def review_page(
     pending_count = int(
         await db.scalar(select(func.count(StagingReviewItem.id)).where(*pending_filter)) or 0
     )
-    item = await db.scalar(
+    review_query = (
         select(StagingReviewItem)
         .where(*pending_filter)
         .options(
@@ -75,9 +76,14 @@ async def review_page(
             .selectinload(Track.catalog_album)
             .selectinload(CatalogAlbum.artist),
         )
-        .order_by(StagingReviewItem.created_at.asc(), StagingReviewItem.id.asc())
+        .order_by(StagingReviewItem.id.asc())
         .limit(1)
     )
+    item = None
+    if after is not None:
+        item = await db.scalar(review_query.where(StagingReviewItem.id > after))
+    if item is None:
+        item = await db.scalar(review_query)
     review = await build_review_item(item, settings) if item is not None else None
     release_recovery = None
     if item is None:

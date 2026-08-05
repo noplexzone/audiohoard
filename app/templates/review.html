@@ -65,19 +65,22 @@
   </section>
   {% endif %}
 
-  <div class="review-deck-actions">
+  <div class="review-deck-actions{% if pending_count > 1 %} has-skip{% endif %}">
     <form method="post" action="/staging/review/{{ review.item.id }}/deny" data-review-action data-confirm="Remove this review item and delete its staged file?">
       <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
       <input type="hidden" name="return_to" value="/review">
       <button class="btn secondary" type="submit" data-deny-button>Deny <span aria-hidden="true">←</span></button>
     </form>
+    {% if pending_count > 1 %}
+    <a class="btn secondary" href="/review?after={{ review.item.id }}" data-skip-button>Skip <span aria-hidden="true">⇥</span></a>
+    {% endif %}
     <form method="post" action="/staging/review/{{ review.item.id }}/approve" data-review-action>
       <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
       <input type="hidden" name="return_to" value="/review">
       <button class="btn" type="submit" data-approve-button>Approve <span aria-hidden="true">→</span></button>
     </form>
   </div>
-  <p class="review-shortcuts hint">Keyboard: ← deny · → approve · Space downloaded · R reference</p>
+  <p class="review-shortcuts hint">Keyboard: ← deny · → approve{% if pending_count > 1 %} · N next{% endif %} · Space downloaded · R reference</p>
   <p class="review-swipe-hint hint">Swipe right to approve · Swipe left to deny</p>
 
   <details class="review-secondary-details">

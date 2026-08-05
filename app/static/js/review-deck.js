@@ -6,6 +6,8 @@
   var SWIPE_DIRECTION_THRESHOLD = 18;
   var SWIPE_HORIZONTAL_INTENT_RATIO = 1.5;
   var INTERACTIVE_SELECTOR = 'a, button, input, select, textarea, audio, video, label, summary, [contenteditable="true"]';
+  var DOWNLOADED_VOLUME_KEY = 'audiohoard.importReview.downloadedVolume';
+  var REFERENCE_VOLUME_KEY = 'audiohoard.importReview.referenceVolume';
 
   function initializeReviewDeck(root) {
     var deck = root.querySelector('[data-review-deck]');
@@ -17,6 +19,7 @@
     var reference = deck.querySelector('[data-reference-audio]');
     var approve = deck.querySelector('[data-approve-button]');
     var deny = deck.querySelector('[data-deny-button]');
+    var skip = deck.querySelector('[data-skip-button]');
     var forms = Array.from(deck.querySelectorAll('[data-review-action]'));
     var matchSection = deck.querySelector('[data-match-section]');
     var abToggle = deck.querySelector('[data-ab-toggle]');
@@ -28,6 +31,34 @@
     var working = false;
     var swipe = null;
     var touchIdentifier = null;
+
+    function preferredVolume(storageKey) {
+      try {
+        var stored = window.localStorage.getItem(storageKey);
+        if (stored === null) return 1;
+        var parsed = Number(stored);
+        if (!Number.isFinite(parsed)) return 1;
+        return Math.min(1, Math.max(0, parsed));
+      } catch (_error) {
+        return 1;
+      }
+    }
+
+    function persistVolume(storageKey, value) {
+      try {
+        window.localStorage.setItem(storageKey, String(value));
+      } catch (_error) {
+        // Storage can be unavailable in privacy-restricted browser contexts.
+      }
+    }
+
+    function bindVolumePreference(player, storageKey) {
+      if (!player) return;
+      player.volume = preferredVolume(storageKey);
+      player.addEventListener('volumechange', function () {
+        persistVolume(storageKey, player.volume);
+      }, { signal: signal });
+    }
 
     function toggle(player) {
       if (!player || player.getAttribute('aria-disabled') === 'true') return;
@@ -228,6 +259,9 @@
 
     deck.addEventListener('pointercancel', clearSwipe, { signal: signal });
 
+    bindVolumePreference(downloaded, DOWNLOADED_VOLUME_KEY);
+    bindVolumePreference(reference, REFERENCE_VOLUME_KEY);
+
     if (downloaded && reference) {
       downloaded.addEventListener('play', function () {
         playbackStarted = true;
@@ -236,6 +270,13 @@
       reference.addEventListener('play', function () {
         playbackStarted = true;
         downloaded.pause();
+      }, { signal: signal });
+    }
+
+    if (skip) {
+      skip.addEventListener('click', function () {
+        if (downloaded) downloaded.pause();
+        if (reference) reference.pause();
       }, { signal: signal });
     }
 
@@ -285,6 +326,9 @@
       } else if (event.key === 'ArrowLeft') {
         event.preventDefault();
         submit(deny);
+      } else if (event.key.toLowerCase() === 'n' && skip) {
+        event.preventDefault();
+        skip.click();
       } else if (event.key === ' ') {
         event.preventDefault();
         toggle(downloaded);
