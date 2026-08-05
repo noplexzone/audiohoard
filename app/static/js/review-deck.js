@@ -1,6 +1,11 @@
 'use strict';
 
 (function () {
+  var SWIPE_THRESHOLD = 84;
+  var SWIPE_INTENT_THRESHOLD = 12;
+  var SWIPE_DIRECTION_THRESHOLD = 18;
+  var INTERACTIVE_SELECTOR = 'a, button, input, select, textarea, audio, video, label, summary, [contenteditable="true"]';
+
   function initializeReviewDeck(root) {
     var deck = root.querySelector('[data-review-deck]');
     if (!deck) return;
@@ -13,6 +18,7 @@
     var deny = deck.querySelector('[data-deny-button]');
     var forms = Array.from(deck.querySelectorAll('[data-review-action]'));
     var working = false;
+    var swipe = null;
 
     function toggle(player) {
       if (!player || player.getAttribute('aria-disabled') === 'true') return;
@@ -26,8 +32,74 @@
     function submit(button) {
       if (working || !button) return;
       var form = button.closest('form');
-      if (form) form.requestSubmit();
+      if (form) form.requestSubmit(button);
     }
+
+    function clearSwipe() {
+      swipe = null;
+      deck.classList.remove('is-swiping', 'swipe-approve', 'swipe-deny');
+    }
+
+    function ignoresSwipe(target) {
+      return target instanceof Element && Boolean(target.closest(INTERACTIVE_SELECTOR));
+    }
+
+    deck.addEventListener('pointerdown', function (event) {
+      if (working || !event.isPrimary || event.pointerType === 'mouse' || ignoresSwipe(event.target)) return;
+      swipe = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        deltaX: 0,
+        horizontal: false
+      };
+    }, { signal: signal });
+
+    deck.addEventListener('pointermove', function (event) {
+      if (!swipe || event.pointerId !== swipe.pointerId) return;
+      var deltaX = event.clientX - swipe.startX;
+      var deltaY = event.clientY - swipe.startY;
+      var absoluteX = Math.abs(deltaX);
+      var absoluteY = Math.abs(deltaY);
+
+      if (!swipe.horizontal) {
+        if (Math.max(absoluteX, absoluteY) < SWIPE_INTENT_THRESHOLD) return;
+        if (absoluteY >= absoluteX) {
+          clearSwipe();
+          return;
+        }
+        swipe.horizontal = true;
+        deck.classList.add('is-swiping');
+        try {
+          deck.setPointerCapture(event.pointerId);
+        } catch (error) {
+          // Pointer capture can fail if the browser already cancelled the gesture.
+        }
+      }
+
+      swipe.deltaX = deltaX;
+      event.preventDefault();
+      deck.classList.toggle('swipe-approve', deltaX >= SWIPE_DIRECTION_THRESHOLD);
+      deck.classList.toggle('swipe-deny', deltaX <= -SWIPE_DIRECTION_THRESHOLD);
+    }, { signal: signal });
+
+    deck.addEventListener('pointerup', function (event) {
+      if (!swipe || event.pointerId !== swipe.pointerId) return;
+      var deltaX = swipe.deltaX;
+      var horizontal = swipe.horizontal;
+      clearSwipe();
+      if (!horizontal) return;
+      if (deltaX >= SWIPE_THRESHOLD) {
+        submit(approve);
+      } else if (deltaX <= -SWIPE_THRESHOLD) {
+        submit(deny);
+      }
+    }, { signal: signal });
+
+    deck.addEventListener('pointercancel', clearSwipe, { signal: signal });
+    deck.addEventListener('lostpointercapture', function () {
+      if (swipe && swipe.horizontal) clearSwipe();
+    }, { signal: signal });
 
     var midpoint = deck.querySelector('[data-jump-midpoint]');
     if (midpoint) {
@@ -49,6 +121,7 @@
           return;
         }
         working = true;
+        clearSwipe();
         [approve, deny].forEach(function (button) {
           if (button) button.disabled = true;
         });

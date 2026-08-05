@@ -1170,7 +1170,7 @@ a.metric-card:hover {
 
 @media (hover: none) {
   .album-download {
-    opacity: 1;
+    visibility: visible;
     transform: none;
   }
 
@@ -2256,12 +2256,60 @@ a.metric-card:hover {
 }
 
 .review-deck-card {
+  position: relative;
   max-width: 1120px;
   margin: 0 auto;
   padding: var(--space-5);
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);
+  touch-action: pan-y;
+  transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.review-deck-card::before,
+.review-deck-card::after {
+  position: absolute;
+  z-index: 2;
+  top: var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid currentcolor;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: .82rem;
+  font-weight: 800;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.review-deck-card::before {
+  right: var(--space-4);
+  color: var(--ok);
+  content: "Approve →";
+}
+
+.review-deck-card::after {
+  left: var(--space-4);
+  color: var(--danger);
+  content: "← Deny";
+}
+
+.review-deck-card.is-swiping.swipe-approve {
+  border-color: color-mix(in srgb, var(--ok) 70%, var(--border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 18%, transparent);
+  transform: translateX(24px) rotate(.25deg);
+}
+
+.review-deck-card.is-swiping.swipe-deny {
+  border-color: color-mix(in srgb, var(--danger) 70%, var(--border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 18%, transparent);
+  transform: translateX(-24px) rotate(-.25deg);
+}
+
+.review-deck-card.swipe-approve::before,
+.review-deck-card.swipe-deny::after {
+  opacity: 1;
 }
 
 .review-deck-heading {
@@ -2391,9 +2439,14 @@ a.metric-card:hover {
   width: 100%;
 }
 
-.review-shortcuts {
+.review-shortcuts,
+.review-swipe-hint {
   margin: var(--space-3) 0 0;
   text-align: center;
+}
+
+.review-swipe-hint {
+  display: none;
 }
 
 .review-empty-state {
@@ -2423,5 +2476,20 @@ a.metric-card:hover {
 
   .review-shortcuts {
     display: none;
+  }
+
+  .review-swipe-hint {
+    display: block;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .review-deck-card {
+    transition: none;
+  }
+
+  .review-deck-card.is-swiping.swipe-approve,
+  .review-deck-card.is-swiping.swipe-deny {
+    transform: none;
   }
 }

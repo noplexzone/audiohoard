@@ -147,6 +147,8 @@ async def build_review_item(
         "diff": build_tag_diff(as_tagged, should_be),
         "reference": reference,
         "source_label": item.source_label,
+        "source_username": getattr(item, "source_username", None),
+        "source_folder": getattr(item, "source_folder", None),
         "original_filename": item.original_filename,
         "acoustid_score": item.acoustid_score,
         "expected_recording_mbid": expected_mbid,
