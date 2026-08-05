@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-05
+
 ### Fixed
 
 - Replace repeated correlated Library artist-card scans with grouped catalog aggregates and query-aligned indexes, removing multi-second navigation stalls on production-sized libraries.
