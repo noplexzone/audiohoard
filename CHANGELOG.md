@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Refresh expired signed Deezer reference previews before rendering import review so comparison audio and alignment remain usable.
+
 ## [0.23.0] - 2026-08-05
 
 ### Fixed
