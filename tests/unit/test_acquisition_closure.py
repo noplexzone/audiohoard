@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC
 from pathlib import Path
 from types import SimpleNamespace
@@ -905,6 +906,50 @@ async def _pending_cleanup_fixture(
     pending = await pending_imported_source_cleanups(db_session)
     assert len(pending) == 1
     return pending[0], plan, track
+
+
+def test_cleanup_quarantine_path_is_bounded_for_long_source_name(tmp_path: Path) -> None:
+    staged = tmp_path / (
+        "Panic! at the Disco_A Fever You Can’t Sweat Out_02_"
+        "The Only Difference Between Martyrdom and Suicide Is Press Coverage.flac"
+    )
+    staged.write_bytes(b"old-audio")
+    quarantine = acquisition_cleanup._cleanup_quarantine_path(
+        staged,
+        2405,
+        44,
+        650207209087006807,
+        1785800562000715084,
+        69911789,
+        acquisition_cleanup._file_sha256(staged),
+    )
+
+    assert len(os.fsencode(quarantine.name)) <= os.pathconf(tmp_path, "PC_NAME_MAX")
+    assert not quarantine.exists()
+
+
+def test_cleanup_quarantine_rejects_malformed_unreadable_claim(tmp_path: Path) -> None:
+    configured = tmp_path / "staged.flac"
+    malformed = tmp_path / ".audiohoard-cleanup-42-invalid"
+    malformed.mkdir()
+
+    assert not acquisition_cleanup._quarantine_claim_matches(malformed, configured, 42)
+
+
+def test_pending_cleanup_finds_legacy_quarantine_name(tmp_path: Path) -> None:
+    configured = tmp_path / "staged.flac"
+    configured.write_bytes(b"old-audio")
+    current = configured.stat()
+    digest = acquisition_cleanup._file_sha256(configured)
+    marker = (
+        f".audiohoard-cleanup-42-{current.st_dev}-{current.st_ino}-"
+        f"{current.st_mtime_ns}-{current.st_size}-{digest}"
+    )
+    legacy = configured.with_name(f".{configured.name}{marker}")
+    configured.replace(legacy)
+    plan = SimpleNamespace(id=42, staging_path=str(configured), source_path=str(configured))
+
+    assert acquisition_cleanup._pending_cleanup_path_sync(plan) == legacy
 
 
 async def test_stale_cleanup_cannot_unlink_or_clear_reassigned_plan(

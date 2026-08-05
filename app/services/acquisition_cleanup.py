@@ -493,7 +493,7 @@ def _cleanup_quarantine_path(
     marker = f".audiohoard-cleanup-{plan_id}-{device}-{inode}-{mtime_ns}-{size}-{digest}"
     if path.name.endswith(marker):
         return path
-    return path.with_name(f".{path.name}{marker}")
+    return path.with_name(marker)
 
 
 def _claimed_identity(path: Path, marker: str) -> tuple[int, int, int, int, str] | None:
@@ -518,8 +518,14 @@ def _current_identity(path: Path) -> tuple[int, int, int, int, str] | None:
 
 
 def _quarantine_claim_matches(path: Path, configured: Path, plan_id: int) -> bool:
-    marker = f".{configured.name}.audiohoard-cleanup-{plan_id}-"
-    return _claimed_identity(path, marker) == _current_identity(path)
+    current_identity = _current_identity(path)
+    if current_identity is None:
+        return False
+    markers = (
+        f".audiohoard-cleanup-{plan_id}-",
+        f".{configured.name}.audiohoard-cleanup-{plan_id}-",
+    )
+    return any(_claimed_identity(path, marker) == current_identity for marker in markers)
 
 
 def _persisted_quarantine_claim_matches(path: Path, plan_id: int) -> bool:
@@ -538,9 +544,13 @@ def _pending_cleanup_path_sync(plan: ImportPlan) -> Path | None:
             configured,
         )
         return None
-    pattern = f".{configured.name}.audiohoard-cleanup-{plan.id}-*"
+    patterns = (
+        f".audiohoard-cleanup-{plan.id}-*",
+        f".{configured.name}.audiohoard-cleanup-{plan.id}-*",
+    )
     candidates = [
         candidate
+        for pattern in patterns
         for candidate in configured.parent.glob(pattern)
         if _quarantine_claim_matches(candidate, configured, plan.id)
     ]
