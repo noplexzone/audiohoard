@@ -12,7 +12,7 @@
 </header>
 
 {% if review %}
-<article class="review-deck-card" data-review-deck>
+<article class="review-deck-card" data-review-deck data-swipe-surface>
   <header class="review-deck-heading">
     {% if review.artwork_url %}
     <img class="review-deck-art" src="/artwork?url={{ review.artwork_url | urlencode }}" width="112" height="112" alt="">
@@ -70,6 +70,8 @@
   <section class="review-verification-strip" aria-label="Verification details">
     <dl class="review-details-grid">
       <dt>Acquisition source</dt><dd>{{ review.source_label or "—" }}</dd>
+      <dt>Username</dt><dd><code>{{ review.source_username or "—" }}</code></dd>
+      <dt>Remote folder</dt><dd><code>{{ review.source_folder or "—" }}</code></dd>
       <dt>Original filename</dt><dd><code>{{ review.original_filename or "—" }}</code></dd>
       <dt>AcoustID score</dt><dd>{{ "%.3f"|format(review.acoustid_score) if review.acoustid_score is not none else "—" }}</dd>
       <dt>MBID match</dt><dd>{{ "Yes" if review.mbid_match else "No" }}</dd>
@@ -93,6 +95,7 @@
     </form>
   </div>
   <p class="review-shortcuts hint">Keyboard: ← deny · → approve · Space downloaded · R reference</p>
+  <p class="review-swipe-hint hint">Swipe right to approve · Swipe left to deny</p>
 </article>
 {% elif release_recovery %}
 <article class="review-deck-card review-recovery-card">

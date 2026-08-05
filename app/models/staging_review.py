@@ -74,6 +74,26 @@ class StagingReviewItem(Base):
         return labels.get(source, source or None)
 
     @property
+    def source_username(self) -> str | None:
+        raw_username = self._acquisition_provenance.get("username")
+        if not isinstance(raw_username, str):
+            return None
+        username = raw_username.strip()
+        return username or None
+
+    @property
+    def source_folder(self) -> str | None:
+        raw_name = self._acquisition_provenance.get("filename")
+        if not isinstance(raw_name, str):
+            return None
+        remote_path = raw_name.strip().rstrip("/\\")
+        separator = max(remote_path.rfind("/"), remote_path.rfind("\\"))
+        if separator <= 0:
+            return None
+        folder = remote_path[:separator].rstrip("/\\").strip()
+        return folder or None
+
+    @property
     def original_filename(self) -> str | None:
         provenance = self._acquisition_provenance
         raw_name = provenance.get("original_filename") or provenance.get("filename")

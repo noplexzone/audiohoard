@@ -58,7 +58,8 @@ async def _seed_review(staging_root: Path) -> int:
             source_path=str(staged),
             acquisition_state=AcquisitionState.downloaded,
             acquisition_provenance_json=(
-                '{"source":"slskd","filename":"Remote/01 Original Name.flac"}'
+                '{"source":"slskd","username":"allbren",'
+                '"filename":"downloads\\\\LISA\\\\Alter Ego\\\\01 Original Name.flac"}'
             ),
         )
         item = StagingReviewItem(
@@ -94,8 +95,14 @@ async def test_review_renders_front_card_audio_and_tag_diff(
     assert 'data-page-module="review-deck"' in response.text
     assert "Acquisition source" in response.text
     assert "Soulseek (slskd)" in response.text
+    assert "Username" in response.text
+    assert "allbren" in response.text
+    assert "Remote folder" in response.text
+    assert r"downloads\LISA\Alter Ego" in response.text
     assert "Original filename" in response.text
     assert "01 Original Name.flac" in response.text
+    assert "data-swipe-surface" in response.text
+    assert "Swipe right to approve · Swipe left to deny" in response.text
 
 
 async def test_review_reference_badge_reflects_resolver_source(

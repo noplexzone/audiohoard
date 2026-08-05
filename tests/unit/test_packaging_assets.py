@@ -137,6 +137,17 @@ def test_manual_develop_publish_is_restricted_to_main() -> None:
     assert "if: github.event_name == 'push' || github.ref == 'refs/heads/main'" in workflow
 
 
+def test_review_deck_registers_deliberate_pointer_swipes() -> None:
+    script = Path("app/static/js/review-deck.js").read_text(encoding="utf-8")
+
+    assert "pointerdown" in script
+    assert "pointermove" in script
+    assert "pointerup" in script
+    assert "pointercancel" in script
+    assert "SWIPE_THRESHOLD" in script
+    assert "data-swipe-surface" in Path("app/templates/review.html").read_text(encoding="utf-8")
+
+
 def test_templates_are_compatible_with_the_html_content_security_policy() -> None:
     templates = Path("app/templates")
     for template in templates.rglob("*.html"):
