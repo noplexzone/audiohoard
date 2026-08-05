@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-08-04
+
+### Fixed
+
+- Recover import-review execution from transient SQLite writer contention without reusing a rollback-only session, repeating filesystem work, or surfacing an internal server error.
+- Replace the horizontally scrolling tag-comparison table with responsive field comparisons that remain readable inside the mobile swipe card.
+
 ## [0.19.1] - 2026-08-04
 
 ### Fixed

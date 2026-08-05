@@ -91,7 +91,13 @@ async def test_review_renders_front_card_audio_and_tag_diff(
     assert response.status_code == 200
     assert f'src="/staging/audio/{item_id}"' in response.text
     assert 'src="https://cdn.example.test/reference.mp3"' in response.text
-    assert 'class="tag-diff-table"' in response.text
+    assert 'class="tag-comparison-list"' in response.text
+    assert 'class="tag-comparison-row tag-mismatch"' in response.text
+    assert 'class="tag-comparison-value"' in response.text
+    assert 'class="tag-diff-table"' not in response.text
+    assert 'class="table-wrap"' not in response.text
+    assert "As tagged" in response.text
+    assert "Catalog" in response.text
     assert 'data-page-module="review-deck"' in response.text
     assert "Acquisition source" in response.text
     assert "Soulseek (slskd)" in response.text
