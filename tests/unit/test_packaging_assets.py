@@ -127,7 +127,7 @@ def test_favicon_ico_uses_the_requested_artwork_at_every_size() -> None:
 
 def test_dockerfile_version_and_healthcheck_match_current_runtime_contract() -> None:
     dockerfile = Path("docker/Dockerfile").read_text(encoding="utf-8")
-    assert 'org.opencontainers.image.version="0.19.0"' in dockerfile
+    assert 'org.opencontainers.image.version="0.19.1"' in dockerfile
     assert "http://localhost:8000/health/ready" in dockerfile
 
 
@@ -153,6 +153,10 @@ def test_review_deck_registers_deliberate_ios_touch_swipes() -> None:
         "pointermove",
         "pointerup",
         "SWIPE_THRESHOLD",
+        "SWIPE_HORIZONTAL_INTENT_RATIO",
+        "absoluteX < absoluteY * SWIPE_HORIZONTAL_INTENT_RATIO",
+        "absoluteY >= absoluteX",
+        "clientY",
         "event.preventDefault()",
     ):
         assert contract in script

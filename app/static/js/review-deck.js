@@ -4,6 +4,7 @@
   var SWIPE_THRESHOLD = 72;
   var SWIPE_INTENT_THRESHOLD = 10;
   var SWIPE_DIRECTION_THRESHOLD = 18;
+  var SWIPE_HORIZONTAL_INTENT_RATIO = 1.5;
   var INTERACTIVE_SELECTOR = 'a, button, input, select, textarea, audio, video, label, summary, [contenteditable="true"]';
 
   function initializeReviewDeck(root) {
@@ -50,6 +51,7 @@
         startX: clientX,
         startY: clientY,
         deltaX: 0,
+        deltaY: 0,
         horizontal: false
       };
       return true;
@@ -68,23 +70,30 @@
           clearSwipe();
           return;
         }
+        if (absoluteX < absoluteY * SWIPE_HORIZONTAL_INTENT_RATIO) return;
         swipe.horizontal = true;
         deck.classList.add('is-swiping');
+      } else if (absoluteY >= absoluteX) {
+        clearSwipe();
+        return;
       }
 
       swipe.deltaX = deltaX;
+      swipe.deltaY = deltaY;
       event.preventDefault();
       deck.classList.toggle('swipe-approve', deltaX >= SWIPE_DIRECTION_THRESHOLD);
       deck.classList.toggle('swipe-deny', deltaX <= -SWIPE_DIRECTION_THRESHOLD);
     }
 
-    function finishSwipe(identifier, clientX) {
+    function finishSwipe(identifier, clientX, clientY) {
       if (!swipe || identifier !== swipe.identifier) return;
       if (Number.isFinite(clientX)) swipe.deltaX = clientX - swipe.startX;
+      if (Number.isFinite(clientY)) swipe.deltaY = clientY - swipe.startY;
       var deltaX = swipe.deltaX;
+      var deltaY = swipe.deltaY;
       var horizontal = swipe.horizontal;
       clearSwipe();
-      if (!horizontal) return;
+      if (!horizontal || Math.abs(deltaY) >= Math.abs(deltaX)) return;
       if (deltaX >= SWIPE_THRESHOLD) submit(approve);
       else if (deltaX <= -SWIPE_THRESHOLD) submit(deny);
     }
@@ -115,7 +124,7 @@
     deck.addEventListener('touchend', function (event) {
       if (touchIdentifier === null) return;
       var touch = findTouch(event.changedTouches, touchIdentifier);
-      if (touch) finishSwipe(touchIdentifier, touch.clientX);
+      if (touch) finishSwipe(touchIdentifier, touch.clientX, touch.clientY);
     }, { signal: signal, passive: true });
 
     deck.addEventListener('touchcancel', clearSwipe, { signal: signal, passive: true });
@@ -132,7 +141,7 @@
 
     deck.addEventListener('pointerup', function (event) {
       if (event.pointerType !== 'pen') return;
-      finishSwipe(event.pointerId, event.clientX);
+      finishSwipe(event.pointerId, event.clientX, event.clientY);
     }, { signal: signal });
 
     deck.addEventListener('pointercancel', clearSwipe, { signal: signal });
