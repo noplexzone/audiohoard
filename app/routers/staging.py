@@ -9,14 +9,16 @@ import subprocess
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import uuid4
 from weakref import WeakValueDictionary
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
+import httpx
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user, require_mutation
 from app.config import Settings
@@ -35,6 +37,7 @@ from app.models.workflow import (
     ImportWorkflowState,
     ReviewDecision,
 )
+from app.services.audio_alignment import align_deezer_preview, estimate_centered_offset
 from app.settings_service import effective_settings_dep, get_runtime_settings
 
 router = APIRouter(prefix="/staging", dependencies=[Depends(get_current_user)])
@@ -251,6 +254,91 @@ async def serve_staged_audio(
             "Content-Type": mime,
         }
         return StreamingResponse(iterfile(), status_code=200, headers=headers, media_type=mime)
+
+
+@router.get("/review/{item_id}/alignment", include_in_schema=False)
+async def align_review_audio(
+    item_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    reference_source: Annotated[Literal["deezer", "itunes"] | None, Query()] = None,
+    reference_url: Annotated[str | None, Query(max_length=2048)] = None,
+) -> dict[str, object]:
+    """Align the exact reference already rendered in the browser to its staged file."""
+    item = await db.scalar(
+        select(StagingReviewItem)
+        .where(
+            StagingReviewItem.id == item_id,
+            StagingReviewItem.review_state == ReviewDecision.pending,
+        )
+        .options(
+            selectinload(StagingReviewItem.release),
+            selectinload(StagingReviewItem.track),
+        )
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="Pending review item not found")
+    track = item.track
+    if not track.staging_path:
+        raise HTTPException(status_code=404, detail="Staged track path not available")
+    source_path = await asyncio.to_thread(
+        _validate_audio_path, track.staging_path, settings.staging_root
+    )
+    if reference_source is None:
+        return {
+            "status": "unavailable",
+            "downloaded_offset_sec": None,
+            "confidence": None,
+            "method": None,
+            "message": "No reference preview is available.",
+            "linked_playback": False,
+        }
+
+    downloaded_duration = item.fingerprint_duration_sec or track.duration_sec
+    deezer_reference_valid = reference_source == "deezer" and bool(reference_url)
+    if deezer_reference_valid and reference_url is not None:
+        try:
+            async with asyncio.timeout(65):
+                result = await align_deezer_preview(source_path, reference_url)
+        except ValueError:
+            deezer_reference_valid = False
+            result = None
+        except (OSError, RuntimeError, httpx.HTTPError):
+            result = None
+        if result is not None:
+            return {
+                "status": "matched",
+                "downloaded_offset_sec": result.offset_seconds,
+                "confidence": result.confidence,
+                "method": "chromaprint",
+                "message": "Reference located in the downloaded file.",
+                "linked_playback": True,
+            }
+
+    estimate = estimate_centered_offset(downloaded_duration, 30.0)
+    if estimate is not None:
+        linked_playback = bool(deezer_reference_valid)
+        message = (
+            "Exact alignment was unavailable; using an estimated preview start."
+            if linked_playback
+            else "Using an estimated downloaded start; the reference player remains independent."
+        )
+        return {
+            "status": "estimated",
+            "downloaded_offset_sec": estimate,
+            "confidence": "estimated",
+            "method": "centered-preview-estimate",
+            "message": message,
+            "linked_playback": linked_playback,
+        }
+    return {
+        "status": "unavailable",
+        "downloaded_offset_sec": None,
+        "confidence": None,
+        "method": None,
+        "message": "The reference could not be aligned to this file.",
+        "linked_playback": False,
+    }
 
 
 def _review_result_location(return_to: str | None, notice: str) -> str:

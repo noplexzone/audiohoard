@@ -99,6 +99,15 @@ async def test_review_renders_front_card_audio_and_tag_diff(
     assert "As tagged" in response.text
     assert "Catalog" in response.text
     assert 'data-page-module="review-deck"' in response.text
+    assert f'data-alignment-url="/staging/review/{item_id}/alignment"' in response.text
+    assert 'data-reference-source="deezer"' in response.text
+    assert 'data-reference-url="https://cdn.example.test/reference.mp3"' in response.text
+    assert "data-match-section" in response.text
+    assert "data-ab-toggle" in response.text
+    assert "data-alignment-status" in response.text
+    assert 'data-alignment-nudge="-5"' in response.text
+    assert 'data-alignment-nudge="1"' in response.text
+    assert "approximately 30-second mid-track clip" not in response.text
     assert "Acquisition source" in response.text
     assert "Soulseek (slskd)" in response.text
     assert "Username" in response.text

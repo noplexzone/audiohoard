@@ -724,3 +724,88 @@ async def test_pending_review_count_nav_badge_appears_only_when_needed(
 
     assert pending.status_code == 200
     assert pending.text.count('class="nav-badge">1</span>') == 2
+
+
+async def test_review_alignment_matches_deezer_preview(
+    client: AsyncClient, test_settings: Settings, monkeypatch
+) -> None:
+    from app.services.audio_alignment import AlignmentResult
+
+    item_id, _, _ = await _review_fixture(test_settings, "alignment-deezer")
+
+    async def align(path, url):
+        assert path.name == "alignment-deezer.mp3"
+        assert url.startswith("https://cdnt-preview.dzcdn.net/")
+        return AlignmentResult(offset_seconds=74.25, score=0.03, confidence="high")
+
+    monkeypatch.setattr("app.routers.staging.align_deezer_preview", align)
+
+    response = await client.get(
+        f"/staging/review/{item_id}/alignment",
+        params={
+            "reference_source": "deezer",
+            "reference_url": "https://cdnt-preview.dzcdn.net/reference.mp3",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "matched",
+        "downloaded_offset_sec": 74.25,
+        "confidence": "high",
+        "method": "chromaprint",
+        "message": "Reference located in the downloaded file.",
+        "linked_playback": True,
+    }
+
+
+async def test_review_alignment_estimates_itunes_without_fetching(
+    client: AsyncClient, test_settings: Settings, monkeypatch
+) -> None:
+    item_id, _, _ = await _review_fixture(test_settings, "alignment-itunes")
+    factory = get_session_factory()
+    async with factory() as db:
+        item = await db.get(StagingReviewItem, item_id)
+        assert item is not None
+        item.fingerprint_duration_sec = 240
+        await db.commit()
+
+    async def forbidden_align(*args, **kwargs):
+        raise AssertionError("iTunes preview must not be downloaded or synchronized")
+
+    monkeypatch.setattr("app.routers.staging.align_deezer_preview", forbidden_align)
+
+    response = await client.get(
+        f"/staging/review/{item_id}/alignment",
+        params={
+            "reference_source": "itunes",
+            "reference_url": "https://audio-ssl.itunes.apple.com/reference.m4a",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "estimated"
+    assert response.json()["downloaded_offset_sec"] == 105.0
+    assert response.json()["method"] == "centered-preview-estimate"
+    assert response.json()["linked_playback"] is False
+
+
+async def test_review_alignment_degrades_without_reference_or_match(
+    client: AsyncClient, test_settings: Settings, monkeypatch
+) -> None:
+    item_id, _, _ = await _review_fixture(test_settings, "alignment-none")
+
+    missing = await client.get(f"/staging/review/{item_id}/alignment")
+    unknown = await client.get("/staging/review/999999/alignment")
+
+    assert missing.status_code == 200
+    assert missing.json()["status"] == "unavailable"
+    assert unknown.status_code == 404
+
+
+async def test_review_alignment_requires_auth(unauthenticated_client: AsyncClient) -> None:
+    response = await unauthenticated_client.get(
+        "/staging/review/1/alignment", follow_redirects=False
+    )
+
+    assert response.status_code in (401, 302, 307)

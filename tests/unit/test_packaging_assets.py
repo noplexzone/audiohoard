@@ -127,7 +127,7 @@ def test_favicon_ico_uses_the_requested_artwork_at_every_size() -> None:
 
 def test_dockerfile_version_and_healthcheck_match_current_runtime_contract() -> None:
     dockerfile = Path("docker/Dockerfile").read_text(encoding="utf-8")
-    assert 'org.opencontainers.image.version="0.19.2"' in dockerfile
+    assert 'org.opencontainers.image.version="0.20.0"' in dockerfile
     assert "http://localhost:8000/health/ready" in dockerfile
 
 
@@ -199,3 +199,25 @@ def test_api_docs_link_is_about_only_not_sidebar() -> None:
 
     assert "/api/docs" not in base
     assert '<a class="btn secondary" href="/api/docs">API docs</a>' in settings
+
+
+def test_review_deck_alignment_switches_one_player_at_equivalent_times() -> None:
+    script = Path("app/static/js/review-deck.js").read_text(encoding="utf-8")
+
+    assert "new URL(deck.dataset.alignmentUrl" in script
+    assert "searchParams.set('reference_source'" in script
+    assert "searchParams.set('reference_url'" in script
+    assert "fetch(alignmentUrl" in script
+    assert "signal: signal" in script
+    assert "downloaded.currentTime - alignmentOffset" in script
+    assert "reference.currentTime + alignmentOffset" in script
+    assert "downloaded.pause();" in script
+    assert "reference.pause();" in script
+    assert "alignmentOffset + Number(button.dataset.alignmentNudge" in script
+    assert "downloaded.addEventListener('play'" in script
+    assert "reference.addEventListener('play'" in script
+    assert "target.closest(INTERACTIVE_SELECTOR)" in script
+    cleanup = script.split("return function () {", 1)[1]
+    assert "downloaded.pause()" in cleanup
+    assert "reference.pause()" in cleanup
+    assert cleanup.index("downloaded.pause()") < cleanup.index("controller.abort()")

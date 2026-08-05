@@ -2649,3 +2649,63 @@ a.metric-card:hover {
     transform: none;
   }
 }
+
+
+.review-alignment-controls {
+  display: grid;
+  gap: var(--space-3);
+  margin: calc(-1 * var(--space-2)) 0 var(--space-5);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.review-alignment-primary,
+.review-alignment-nudges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.review-alignment-nudges button {
+  min-width: 3.25rem;
+  padding: .45rem .65rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  background: var(--surface-1);
+  cursor: pointer;
+}
+
+.review-alignment-nudges button:disabled {
+  cursor: not-allowed;
+  opacity: .45;
+}
+
+.review-alignment-status {
+  margin: 0;
+}
+
+.review-alignment-status[data-alignment-state="matched"] {
+  color: var(--ok);
+}
+
+.review-alignment-status[data-alignment-state="estimated"] {
+  color: var(--warn);
+}
+
+.review-alignment-status[data-alignment-state="unavailable"] {
+  color: var(--danger);
+}
+
+@media (max-width: 640px) {
+  .review-alignment-controls {
+    margin-bottom: var(--space-3);
+    padding: var(--space-3);
+  }
+
+  .review-alignment-primary .btn {
+    flex: 1 1 8rem;
+  }
+}
