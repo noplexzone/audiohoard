@@ -70,11 +70,11 @@
     {% block content %}{% endblock %}
   </main>
   {% if not auth_view %}
-  <section class="global-player" id="global-player" aria-label="Audio player" data-player-state="idle">
+  <section class="global-player" id="global-player" aria-label="Audio player" aria-hidden="true" data-player-state="idle" hidden>
     <div class="player-art" data-player-art aria-hidden="true"><span>♪</span></div>
     <div class="player-track-copy">
-      <strong data-player-title>Nothing playing</strong>
-      <span data-player-artist>Choose a track from your library</span>
+      <strong data-player-title></strong>
+      <span data-player-artist></span>
     </div>
     <div class="player-transport">
       <button type="button" class="player-icon" data-player-previous aria-label="Previous track" disabled>⏮</button>

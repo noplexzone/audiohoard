@@ -1,8 +1,8 @@
 'use strict';
 
 (function () {
-  var SWIPE_THRESHOLD = 84;
-  var SWIPE_INTENT_THRESHOLD = 12;
+  var SWIPE_THRESHOLD = 72;
+  var SWIPE_INTENT_THRESHOLD = 10;
   var SWIPE_DIRECTION_THRESHOLD = 18;
   var INTERACTIVE_SELECTOR = 'a, button, input, select, textarea, audio, video, label, summary, [contenteditable="true"]';
 
@@ -19,14 +19,12 @@
     var forms = Array.from(deck.querySelectorAll('[data-review-action]'));
     var working = false;
     var swipe = null;
+    var touchIdentifier = null;
 
     function toggle(player) {
       if (!player || player.getAttribute('aria-disabled') === 'true') return;
-      if (player.paused) {
-        void player.play();
-      } else {
-        player.pause();
-      }
+      if (player.paused) void player.play();
+      else player.pause();
     }
 
     function submit(button) {
@@ -37,6 +35,7 @@
 
     function clearSwipe() {
       swipe = null;
+      touchIdentifier = null;
       deck.classList.remove('is-swiping', 'swipe-approve', 'swipe-deny');
     }
 
@@ -44,21 +43,22 @@
       return target instanceof Element && Boolean(target.closest(INTERACTIVE_SELECTOR));
     }
 
-    deck.addEventListener('pointerdown', function (event) {
-      if (working || !event.isPrimary || event.pointerType === 'mouse' || ignoresSwipe(event.target)) return;
+    function beginSwipe(identifier, clientX, clientY, target) {
+      if (working || ignoresSwipe(target)) return false;
       swipe = {
-        pointerId: event.pointerId,
-        startX: event.clientX,
-        startY: event.clientY,
+        identifier: identifier,
+        startX: clientX,
+        startY: clientY,
         deltaX: 0,
         horizontal: false
       };
-    }, { signal: signal });
+      return true;
+    }
 
-    deck.addEventListener('pointermove', function (event) {
-      if (!swipe || event.pointerId !== swipe.pointerId) return;
-      var deltaX = event.clientX - swipe.startX;
-      var deltaY = event.clientY - swipe.startY;
+    function moveSwipe(identifier, clientX, clientY, event) {
+      if (!swipe || identifier !== swipe.identifier) return;
+      var deltaX = clientX - swipe.startX;
+      var deltaY = clientY - swipe.startY;
       var absoluteX = Math.abs(deltaX);
       var absoluteY = Math.abs(deltaY);
 
@@ -70,45 +70,72 @@
         }
         swipe.horizontal = true;
         deck.classList.add('is-swiping');
-        try {
-          deck.setPointerCapture(event.pointerId);
-        } catch (error) {
-          // Pointer capture can fail if the browser already cancelled the gesture.
-        }
       }
 
       swipe.deltaX = deltaX;
       event.preventDefault();
       deck.classList.toggle('swipe-approve', deltaX >= SWIPE_DIRECTION_THRESHOLD);
       deck.classList.toggle('swipe-deny', deltaX <= -SWIPE_DIRECTION_THRESHOLD);
-    }, { signal: signal });
+    }
 
-    deck.addEventListener('pointerup', function (event) {
-      if (!swipe || event.pointerId !== swipe.pointerId) return;
+    function finishSwipe(identifier, clientX) {
+      if (!swipe || identifier !== swipe.identifier) return;
+      if (Number.isFinite(clientX)) swipe.deltaX = clientX - swipe.startX;
       var deltaX = swipe.deltaX;
       var horizontal = swipe.horizontal;
       clearSwipe();
       if (!horizontal) return;
-      if (deltaX >= SWIPE_THRESHOLD) {
-        submit(approve);
-      } else if (deltaX <= -SWIPE_THRESHOLD) {
-        submit(deny);
+      if (deltaX >= SWIPE_THRESHOLD) submit(approve);
+      else if (deltaX <= -SWIPE_THRESHOLD) submit(deny);
+    }
+
+    function findTouch(touchList, identifier) {
+      return Array.from(touchList).find(function (touch) {
+        return touch.identifier === identifier;
+      });
+    }
+
+    deck.addEventListener('touchstart', function (event) {
+      if (event.touches.length !== 1) {
+        clearSwipe();
+        return;
       }
+      var touch = event.changedTouches[0];
+      if (touch && beginSwipe(touch.identifier, touch.clientX, touch.clientY, event.target)) {
+        touchIdentifier = touch.identifier;
+      }
+    }, { signal: signal, passive: true });
+
+    deck.addEventListener('touchmove', function (event) {
+      if (touchIdentifier === null) return;
+      var touch = findTouch(event.touches, touchIdentifier);
+      if (touch) moveSwipe(touchIdentifier, touch.clientX, touch.clientY, event);
+    }, { signal: signal, passive: false });
+
+    deck.addEventListener('touchend', function (event) {
+      if (touchIdentifier === null) return;
+      var touch = findTouch(event.changedTouches, touchIdentifier);
+      if (touch) finishSwipe(touchIdentifier, touch.clientX);
+    }, { signal: signal, passive: true });
+
+    deck.addEventListener('touchcancel', clearSwipe, { signal: signal, passive: true });
+
+    deck.addEventListener('pointerdown', function (event) {
+      if (event.pointerType !== 'pen' || !event.isPrimary) return;
+      beginSwipe(event.pointerId, event.clientX, event.clientY, event.target);
+    }, { signal: signal });
+
+    deck.addEventListener('pointermove', function (event) {
+      if (event.pointerType !== 'pen') return;
+      moveSwipe(event.pointerId, event.clientX, event.clientY, event);
+    }, { signal: signal });
+
+    deck.addEventListener('pointerup', function (event) {
+      if (event.pointerType !== 'pen') return;
+      finishSwipe(event.pointerId, event.clientX);
     }, { signal: signal });
 
     deck.addEventListener('pointercancel', clearSwipe, { signal: signal });
-    deck.addEventListener('lostpointercapture', function () {
-      if (swipe && swipe.horizontal) clearSwipe();
-    }, { signal: signal });
-
-    var midpoint = deck.querySelector('[data-jump-midpoint]');
-    if (midpoint) {
-      midpoint.addEventListener('click', function () {
-        if (downloaded && Number.isFinite(downloaded.duration) && downloaded.duration > 0) {
-          downloaded.currentTime = downloaded.duration / 2;
-        }
-      }, { signal: signal });
-    }
 
     forms.forEach(function (form) {
       form.addEventListener('submit', function (event) {

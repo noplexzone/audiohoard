@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Compact import review on mobile so track identity, both audio players, deny/approve actions, swipe guidance, and a collapsed tag/file-details disclosure fit within one phone viewport.
+- Keep all mobile navigation destinations in one safe-area-aware row and reserve global-player space only after a library track is selected.
+
+### Fixed
+
+- Handle iOS touch gestures directly for reliable swipe-right approval and swipe-left denial while preserving vertical scrolling, native audio controls, and the existing destructive confirmation.
+- Show visible directional swipe feedback instead of leaving its approval and denial labels hidden.
+
+### Removed
+
+- Remove the unused downloaded-file midpoint control and its JavaScript behavior.
+
 ## [0.19.0] - 2026-08-04
 
 ### Added
