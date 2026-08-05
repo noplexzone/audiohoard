@@ -77,6 +77,92 @@ class _CountingProvider:
         return []
 
 
+class _FreshDeezerProvider:
+    def __init__(self) -> None:
+        self.track_ids: list[str] = []
+
+    async def get_track(self, track_id: str):
+        self.track_ids.append(track_id)
+        return SimpleNamespace(preview_url="https://cdn.example/fresh-preview.mp3")
+
+    async def search_track(self, *args, **kwargs):
+        raise AssertionError("exact Deezer track lookup should be used")
+
+
+async def test_resolver_refreshes_expired_stored_deezer_preview() -> None:
+    album = CatalogAlbum(
+        title="Album",
+        provenance_json=json.dumps(
+            {
+                "track_previews": {
+                    "deezer": {
+                        "1:3": "https://cdnt-preview.dzcdn.net/preview.mp3?hdnea=exp=1~acl=/*"
+                    },
+                    "itunes": {"1:3": "https://cdn.example/fallback-preview.m4a"},
+                }
+            }
+        ),
+    )
+    catalog_track = CatalogAlbumTrack(position=3, disc=1, title="Track", album=album)
+    track = SimpleNamespace(title="Track", deezer_id="42")
+    provider = _FreshDeezerProvider()
+
+    reference = await resolve_reference_audio(
+        track,
+        catalog_track,
+        artist_name="Artist",
+        settings=SimpleNamespace(deezer_api_url="https://api.deezer.com"),
+        deezer_client=provider,
+        itunes_client=_UnexpectedProvider(),
+    )
+
+    assert reference == {
+        "url": "https://cdn.example/fresh-preview.mp3",
+        "source": "deezer",
+    }
+    assert provider.track_ids == ["42"]
+
+
+class _FuzzyDeezerProvider:
+    async def get_track(self, *args, **kwargs):
+        raise AssertionError("exact Deezer track lookup was not expected")
+
+    async def search_track(self, *args, **kwargs):
+        return [SimpleNamespace(preview_url="https://cdn.example/fuzzy-preview.mp3")]
+
+
+async def test_expired_deezer_without_exact_id_preserves_stored_itunes_fallback() -> None:
+    album = CatalogAlbum(
+        title="Album",
+        provenance_json=json.dumps(
+            {
+                "track_previews": {
+                    "deezer": {
+                        "1:3": "https://cdnt-preview.dzcdn.net/preview.mp3?hdnea=exp=1~acl=/*"
+                    },
+                    "itunes": {"1:3": "https://cdn.example/fallback-preview.m4a"},
+                }
+            }
+        ),
+    )
+    catalog_track = CatalogAlbumTrack(position=3, disc=1, title="Track", album=album)
+    track = SimpleNamespace(title="Track", deezer_id=None)
+
+    reference = await resolve_reference_audio(
+        track,
+        catalog_track,
+        artist_name="Artist",
+        settings=SimpleNamespace(deezer_api_url="https://api.deezer.com"),
+        deezer_client=_FuzzyDeezerProvider(),
+        itunes_client=_UnexpectedProvider(),
+    )
+
+    assert reference == {
+        "url": "https://cdn.example/fallback-preview.m4a",
+        "source": "itunes",
+    }
+
+
 async def test_resolver_prefers_stored_itunes_preview_over_live_lookup() -> None:
     album = CatalogAlbum(
         title="Album",

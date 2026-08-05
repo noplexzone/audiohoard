@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import TYPE_CHECKING, Literal, TypedDict
+from urllib.parse import parse_qs, urlsplit
 
 from app.metadata.deezer import DeezerClient
 from app.metadata.itunes import ITunesClient
@@ -16,6 +18,24 @@ if TYPE_CHECKING:
 class ReferenceAudio(TypedDict):
     url: str
     source: Literal["deezer", "itunes"]
+
+
+_DEEZER_PREVIEW_MINIMUM_VALIDITY_SECONDS = 120
+
+
+def _deezer_preview_is_usable(url: str, *, now: float | None = None) -> bool:
+    """Reject signed Deezer previews that will expire before review analysis can finish."""
+    try:
+        signature = parse_qs(urlsplit(url).query).get("hdnea", [])
+        expiry = next(
+            int(part.removeprefix("exp="))
+            for part in signature[0].split("~")
+            if part.startswith("exp=")
+        )
+    except (IndexError, StopIteration, TypeError, ValueError):
+        return True
+    current_time = time.time() if now is None else now
+    return expiry > current_time + _DEEZER_PREVIEW_MINIMUM_VALIDITY_SECONDS
 
 
 def _stored_preview(
@@ -54,10 +74,12 @@ async def resolve_reference_audio(
 ) -> ReferenceAudio | None:
     """Resolve a comparison preview, keeping provider identity separate from acquisition."""
     stored_deezer = _stored_preview(catalog_track, "deezer")
-    if stored_deezer:
+    expired_deezer = bool(stored_deezer and not _deezer_preview_is_usable(stored_deezer))
+    if stored_deezer and not expired_deezer:
         return {"url": stored_deezer, "source": "deezer"}
     stored_itunes = _stored_preview(catalog_track, "itunes")
-    if stored_itunes:
+    exact_deezer_refresh = expired_deezer and bool(track.deezer_id)
+    if stored_itunes and not exact_deezer_refresh:
         return {"url": stored_itunes, "source": "itunes"}
 
     title = str(getattr(catalog_track, "title", None) or track.title or "").strip()
@@ -72,11 +94,13 @@ async def resolve_reference_audio(
             elif title:
                 candidates = await deezer.search_track(title, artist_name)
         for candidate in candidates:
-            if candidate.preview_url:
+            if candidate.preview_url and _deezer_preview_is_usable(candidate.preview_url):
                 return {"url": candidate.preview_url, "source": "deezer"}
     except Exception:
         pass
 
+    if stored_itunes:
+        return {"url": stored_itunes, "source": "itunes"}
     if not title:
         return None
     itunes = itunes_client or ITunesClient()
