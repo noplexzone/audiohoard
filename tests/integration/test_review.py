@@ -103,6 +103,16 @@ async def test_review_renders_front_card_audio_and_tag_diff(
     assert "01 Original Name.flac" in response.text
     assert "data-swipe-surface" in response.text
     assert "Swipe right to approve · Swipe left to deny" in response.text
+    assert "Jump downloaded file to midpoint" not in response.text
+    assert "data-jump-midpoint" not in response.text
+    assert '<details class="review-secondary-details">' in response.text
+    assert "Tags &amp; file details" in response.text
+    assert response.text.index("review-audio-comparison") < response.text.index(
+        "review-deck-actions"
+    )
+    assert response.text.index("review-deck-actions") < response.text.index(
+        "review-secondary-details"
+    )
 
 
 async def test_review_reference_badge_reflects_resolver_source(

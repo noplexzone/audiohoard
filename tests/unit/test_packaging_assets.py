@@ -127,7 +127,7 @@ def test_favicon_ico_uses_the_requested_artwork_at_every_size() -> None:
 
 def test_dockerfile_version_and_healthcheck_match_current_runtime_contract() -> None:
     dockerfile = Path("docker/Dockerfile").read_text(encoding="utf-8")
-    assert 'org.opencontainers.image.version="0.19.0"' in dockerfile
+    assert 'org.opencontainers.image.version="0.19.1"' in dockerfile
     assert "http://localhost:8000/health/ready" in dockerfile
 
 
@@ -137,15 +137,35 @@ def test_manual_develop_publish_is_restricted_to_main() -> None:
     assert "if: github.event_name == 'push' || github.ref == 'refs/heads/main'" in workflow
 
 
-def test_review_deck_registers_deliberate_pointer_swipes() -> None:
+def test_review_deck_registers_deliberate_ios_touch_swipes() -> None:
     script = Path("app/static/js/review-deck.js").read_text(encoding="utf-8")
+    template = Path("app/templates/review.html").read_text(encoding="utf-8")
+    css = Path("app/static/css/pages.css").read_text(encoding="utf-8")
 
-    assert "pointerdown" in script
-    assert "pointermove" in script
-    assert "pointerup" in script
-    assert "pointercancel" in script
-    assert "SWIPE_THRESHOLD" in script
-    assert "data-swipe-surface" in Path("app/templates/review.html").read_text(encoding="utf-8")
+    for contract in (
+        "touchstart",
+        "touchmove",
+        "touchend",
+        "touchcancel",
+        "changedTouches",
+        "touchIdentifier",
+        "pointerdown",
+        "pointermove",
+        "pointerup",
+        "SWIPE_THRESHOLD",
+        "SWIPE_HORIZONTAL_INTENT_RATIO",
+        "absoluteX < absoluteY * SWIPE_HORIZONTAL_INTENT_RATIO",
+        "absoluteY >= absoluteX",
+        "clientY",
+        "event.preventDefault()",
+    ):
+        assert contract in script
+    assert "data-swipe-surface" in template
+    assert "data-jump-midpoint" not in template
+    assert "downloaded.duration / 2" not in script
+    assert "visibility: visible" in css
+    assert ".review-secondary-details > summary::after" in css
+    assert 'content: "+"' in css and 'content: "−"' in css
 
 
 def test_templates_are_compatible_with_the_html_content_security_policy() -> None:

@@ -21,6 +21,15 @@ def test_authenticated_shell_keeps_one_global_audio_outside_page_region() -> Non
     assert 'id="global-audio"' in base
     assert base.index("data-page-region") < base.index('id="global-player"')
     assert base.index('id="global-player"') < base.index('id="global-audio"')
+    player_tag = base[
+        base.index('<section class="global-player"') : base.index(
+            ">", base.index('<section class="global-player"')
+        )
+    ]
+    assert " hidden" in player_tag
+    assert 'aria-hidden="true"' in player_tag
+    assert "Nothing playing" not in base
+    assert "Choose a track from your library" not in base
     assert "/static/js/player.js?v={{ app_version }}" in base
     assert "/static/js/navigation.js?v={{ app_version }}" in base
     assert not re.search(r"<script(?![^>]*\bsrc=)[^>]*>\s*\S", base, re.IGNORECASE)
@@ -128,6 +137,8 @@ def test_player_source_handles_queue_transcode_media_and_keyboard_safely() -> No
         assert contract in source
     assert "INPUT" in source and "TEXTAREA" in source and "SELECT" in source
     assert "isContentEditable" in source
+    assert "player.hidden = false" in source
+    assert "player-visible" in source
 
 
 def test_import_review_audio_volume_defaults_to_max_and_persists_user_changes() -> None:
@@ -155,3 +166,8 @@ def test_player_layout_respects_touch_safe_areas_navigation_and_reduced_motion()
     assert "var(--mobile-nav-height)" in css
     assert "min-height: 44px" in css
     assert "prefers-reduced-motion: reduce" in css
+    assert ".mobile-nav {" in css
+    assert "display: flex" in css
+    assert "flex: 1 1 0" in css
+    assert "grid-template-columns: repeat(5, 1fr)" not in css
+    assert ".player-visible" in css

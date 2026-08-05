@@ -21,6 +21,7 @@
   var currentTime = player.querySelector('[data-player-current-time]');
   var duration = player.querySelector('[data-player-duration]');
   var status = player.querySelector('[data-player-status]');
+  var shell = player.closest('.app-shell');
   var reviewVolumeStorageKey = 'audiohoard.importReview.volume';
 
   function preferredReviewVolume() {
@@ -129,8 +130,15 @@
     updateMediaSession(item);
   }
 
+  function revealPlayer() {
+    player.hidden = false;
+    player.setAttribute('aria-hidden', 'false');
+    if (shell) shell.classList.add('player-visible');
+  }
+
   function playAt(nextIndex) {
     if (nextIndex < 0 || nextIndex >= queue.length) return;
+    revealPlayer();
     index = nextIndex;
     retriedTranscode = false;
     var item = queue[index];

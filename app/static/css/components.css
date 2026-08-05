@@ -579,6 +579,10 @@ button.small {
   box-shadow: 0 -12px 34px rgba(0, 0, 0, .28);
 }
 
+.global-player[hidden] {
+  display: none;
+}
+
 .player-art {
   display: grid;
   width: 52px;

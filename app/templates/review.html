@@ -30,7 +30,6 @@
     <div class="review-audio-panel">
       <div class="review-player-heading"><h3>Downloaded file</h3><span class="review-source-badge acquisition">Full file</span></div>
       <audio class="review-deck-audio" controls preload="metadata" data-downloaded-audio src="/staging/audio/{{ review.item.id }}">Your browser does not support audio playback.</audio>
-      <button class="btn secondary compact" type="button" data-jump-midpoint>Jump downloaded file to midpoint</button>
     </div>
     <div class="review-audio-panel{% if not review.reference %} unavailable{% endif %}">
       <div class="review-player-heading">
@@ -49,7 +48,24 @@
     </div>
   </section>
 
-  <section class="review-tag-diff" aria-labelledby="tag-diff-heading">
+  <div class="review-deck-actions">
+    <form method="post" action="/staging/review/{{ review.item.id }}/deny" data-review-action data-confirm="Remove this review item and delete its staged file?">
+      <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+      <input type="hidden" name="return_to" value="/review">
+      <button class="btn secondary" type="submit" data-deny-button>Deny <span aria-hidden="true">←</span></button>
+    </form>
+    <form method="post" action="/staging/review/{{ review.item.id }}/approve" data-review-action>
+      <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
+      <input type="hidden" name="return_to" value="/review">
+      <button class="btn" type="submit" data-approve-button>Approve <span aria-hidden="true">→</span></button>
+    </form>
+  </div>
+  <p class="review-shortcuts hint">Keyboard: ← deny · → approve · Space downloaded · R reference</p>
+  <p class="review-swipe-hint hint">Swipe right to approve · Swipe left to deny</p>
+
+  <details class="review-secondary-details">
+    <summary>Tags &amp; file details</summary>
+    <section class="review-tag-diff" aria-labelledby="tag-diff-heading">
     <h3 id="tag-diff-heading">Tag comparison</h3>
     <div class="table-wrap">
       <table class="tag-diff-table">
@@ -82,20 +98,7 @@
     </dl>
   </section>
 
-  <div class="review-deck-actions">
-    <form method="post" action="/staging/review/{{ review.item.id }}/deny" data-review-action data-confirm="Remove this review item and delete its staged file?">
-      <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
-      <input type="hidden" name="return_to" value="/review">
-      <button class="btn secondary" type="submit" data-deny-button>Deny <span aria-hidden="true">←</span></button>
-    </form>
-    <form method="post" action="/staging/review/{{ review.item.id }}/approve" data-review-action>
-      <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
-      <input type="hidden" name="return_to" value="/review">
-      <button class="btn" type="submit" data-approve-button>Approve <span aria-hidden="true">→</span></button>
-    </form>
-  </div>
-  <p class="review-shortcuts hint">Keyboard: ← deny · → approve · Space downloaded · R reference</p>
-  <p class="review-swipe-hint hint">Swipe right to approve · Swipe left to deny</p>
+  </details>
 </article>
 {% elif release_recovery %}
 <article class="review-deck-card review-recovery-card">
