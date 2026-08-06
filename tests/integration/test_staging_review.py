@@ -928,16 +928,39 @@ async def test_review_alignment_matches_deezer_preview(
     }
 
 
-async def test_review_alignment_estimates_itunes_without_fetching(
+async def test_review_alignment_defaults_deezer_to_common_preview_offset_when_match_fails(
+    client: AsyncClient, test_settings: Settings, monkeypatch
+) -> None:
+    item_id, _, _ = await _review_fixture(test_settings, "alignment-deezer-default")
+
+    async def no_match(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("app.routers.staging.align_deezer_preview", no_match)
+
+    response = await client.get(
+        f"/staging/review/{item_id}/alignment",
+        params={
+            "reference_source": "deezer",
+            "reference_url": "https://cdnt-preview.dzcdn.net/reference.mp3",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "defaulted",
+        "downloaded_offset_sec": 47.926,
+        "confidence": "defaulted",
+        "method": "common-preview-offset",
+        "message": ("Exact alignment was unavailable; using the common 47.926s preview start."),
+        "linked_playback": True,
+    }
+
+
+async def test_review_alignment_defaults_itunes_to_common_preview_offset_without_fetching(
     client: AsyncClient, test_settings: Settings, monkeypatch
 ) -> None:
     item_id, _, _ = await _review_fixture(test_settings, "alignment-itunes")
-    factory = get_session_factory()
-    async with factory() as db:
-        item = await db.get(StagingReviewItem, item_id)
-        assert item is not None
-        item.fingerprint_duration_sec = 240
-        await db.commit()
 
     async def forbidden_align(*args, **kwargs):
         raise AssertionError("iTunes preview must not be downloaded or synchronized")
@@ -953,9 +976,12 @@ async def test_review_alignment_estimates_itunes_without_fetching(
     )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "estimated"
-    assert response.json()["downloaded_offset_sec"] == 105.0
-    assert response.json()["method"] == "centered-preview-estimate"
+    assert response.json()["status"] == "defaulted"
+    assert response.json()["downloaded_offset_sec"] == 47.926
+    assert response.json()["method"] == "common-preview-offset"
+    assert response.json()["message"] == (
+        "Using the common 47.926s preview start; the reference player remains independent."
+    )
     assert response.json()["linked_playback"] is False
 
 

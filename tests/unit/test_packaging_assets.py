@@ -221,6 +221,7 @@ def test_review_deck_alignment_switches_one_player_at_equivalent_times() -> None
     assert "searchParams.set('reference_source'" in script
     assert "searchParams.set('reference_url'" in script
     assert "fetch(alignmentUrl" in script
+    assert "payload.status === 'defaulted' ? 'Defaulted'" in script
     assert "signal: signal" in script
     assert "      matchReferenceSection(true);" in script
     assert "downloaded.currentTime - alignmentOffset" in script

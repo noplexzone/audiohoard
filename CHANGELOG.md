@@ -12,6 +12,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Persist and retry approved auto-import dispatches with bounded backoff and duplicate-dispatch claims so transient failures recover without an application restart.
 - Record strict AcoustID-only consensus decisions in shadow mode so future automation can be evaluated without allowing confidence score alone to authorize an import.
 
+### Changed
+
+- Default import-review preview alignment to the common 47.926-second source offset when an exact acoustic match is unavailable.
+
 ### Fixed
 
 - Refresh expired signed Deezer reference previews before rendering import review so comparison audio and alignment remain usable.
