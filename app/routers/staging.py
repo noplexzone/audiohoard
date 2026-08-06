@@ -66,7 +66,7 @@ _PREVIEW_ITEM_LOCKS: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionar
 
 
 def _browser_preview_path(source: Path, item_id: int, cache_root: Path) -> Path:
-    """Return a cached MP3 preview for MP4-family audio without changing the source."""
+    """Return a cached MP3 browser preview without changing the source."""
     source_stat = source.stat()
     cache_key = hashlib.sha256(
         f"{source.resolve()}:{source_stat.st_size}:{source_stat.st_mtime_ns}".encode()
@@ -185,6 +185,16 @@ def _parse_range(range_header: str | None, file_size: int) -> tuple[int, int]:
     return start, end
 
 
+def _needs_browser_preview(suffix: str, user_agent: str | None) -> bool:
+    """Use stable MP3 review audio where the native format cannot seek reliably."""
+    if suffix in {".m4a", ".mp4"}:
+        return True
+    if suffix != ".flac" or not user_agent:
+        return False
+    normalized = user_agent.casefold()
+    return any(marker in normalized for marker in ("mobile", "android", "iphone", "ipad", "ipod"))
+
+
 @router.get("/audio/{item_id}", include_in_schema=False)
 async def serve_staged_audio(
     item_id: int,
@@ -209,7 +219,8 @@ async def serve_staged_audio(
         _validate_audio_path, track.staging_path, settings.staging_root
     )
     suffix = resolved.suffix.casefold()
-    if suffix in {".m4a", ".mp4"}:
+    vary_user_agent = suffix == ".flac"
+    if _needs_browser_preview(suffix, request.headers.get("user-agent")):
         try:
             item_lock = _PREVIEW_ITEM_LOCKS.setdefault(item_id, asyncio.Lock())
             async with item_lock, _PREVIEW_TRANSCODE_LIMIT:
@@ -250,6 +261,8 @@ async def serve_staged_audio(
             "Content-Length": str(chunk_size),
             "Content-Type": mime,
         }
+        if vary_user_agent:
+            headers["Vary"] = "User-Agent"
         return StreamingResponse(iterfile(), status_code=206, headers=headers, media_type=mime)
     else:
         headers = {
@@ -257,6 +270,8 @@ async def serve_staged_audio(
             "Content-Length": str(file_size),
             "Content-Type": mime,
         }
+        if vary_user_agent:
+            headers["Vary"] = "User-Agent"
         return StreamingResponse(iterfile(), status_code=200, headers=headers, media_type=mime)
 
 
