@@ -9,6 +9,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - Refresh expired signed Deezer reference previews before rendering import review so comparison audio and alignment remain usable.
+- Serve cached MP3 review audio for FLAC files on mobile browsers so matched timestamps seek to the correct audible passage without changing the downloaded source.
 
 ## [0.23.0] - 2026-08-05
 

@@ -27,9 +27,11 @@ from app.models.workflow import (
 from app.settings_service import DEFAULT_MAX_PARTIAL_ATTEMPTS
 
 
-async def _review_fixture(settings: Settings, name: str) -> tuple[int, int, Path]:
+async def _review_fixture(
+    settings: Settings, name: str, *, suffix: str = ".mp3"
+) -> tuple[int, int, Path]:
     settings.staging_root.mkdir(parents=True, exist_ok=True)
-    audio = settings.staging_root / f"{name}.mp3"
+    audio = settings.staging_root / f"{name}{suffix}"
     audio.write_bytes(b"0123456789abcdef")  # noqa: ASYNC240
     factory = get_session_factory()
     async with factory() as db:
@@ -138,6 +140,73 @@ async def test_staged_m4a_is_transcoded_to_seekable_browser_preview(
     assert ranged.status_code == 206
     assert ranged.headers["accept-ranges"] == "bytes"
     assert len(ranged.content) == 19
+
+
+@pytest.mark.parametrize(
+    "user_agent",
+    [
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X)",
+        "Mozilla/5.0 (Linux; Android 16; Pixel 10 Pro) AppleWebKit/537.36 Mobile",
+        "Mozilla/5.0 (iPad; CPU OS 18_6 like Mac OS X)",
+    ],
+)
+async def test_staged_flac_is_transcoded_for_mobile_only(
+    client: AsyncClient, test_settings: Settings, monkeypatch, user_agent: str
+) -> None:
+    item_id, _, _ = await _review_fixture(test_settings, "iphone-flac", suffix=".flac")
+    preview = test_settings.artwork_cache_root.parent / "review-audio" / "iphone.mp3"
+    preview.parent.mkdir(parents=True, exist_ok=True)
+    preview.write_bytes(b"browser-compatible-preview")
+    preview_calls: list[int] = []
+
+    def fake_preview(source: Path, review_item_id: int, cache_root: Path) -> Path:
+        del source, cache_root
+        preview_calls.append(review_item_id)
+        return preview
+
+    monkeypatch.setattr("app.routers.staging._browser_preview_path", fake_preview)
+
+    response = await client.get(
+        f"/staging/audio/{item_id}",
+        headers={"User-Agent": user_agent},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("audio/mpeg")
+    assert response.content == b"browser-compatible-preview"
+    assert response.headers["vary"] == "User-Agent"
+
+    ranged = await client.get(
+        f"/staging/audio/{item_id}",
+        headers={"User-Agent": user_agent, "Range": "bytes=2-7"},
+    )
+    assert ranged.status_code == 206
+    assert ranged.content == b"owser-"
+    assert ranged.headers["content-range"] == "bytes 2-7/26"
+    assert ranged.headers["vary"] == "User-Agent"
+    assert preview_calls == [item_id, item_id]
+
+
+async def test_staged_flac_remains_direct_for_desktop_browser(
+    client: AsyncClient, test_settings: Settings, monkeypatch
+) -> None:
+    item_id, _, _ = await _review_fixture(test_settings, "desktop-flac", suffix=".flac")
+
+    def forbidden_preview(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("desktop FLAC must remain direct")
+
+    monkeypatch.setattr("app.routers.staging._browser_preview_path", forbidden_preview)
+
+    response = await client.get(
+        f"/staging/audio/{item_id}",
+        headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0 Safari/537.36"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("audio/flac")
+    assert response.headers["vary"] == "User-Agent"
+    assert response.content == b"0123456789abcdef"
 
 
 async def test_review_approve_resumes_import_and_deny_removes_staged_item(
