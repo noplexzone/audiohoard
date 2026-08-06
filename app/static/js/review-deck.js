@@ -92,7 +92,7 @@
       var linkedPlayback = payload.linked_playback === true;
       if (abToggle) abToggle.disabled = !linkedPlayback;
       nudgeButtons.forEach(function (button) { button.disabled = !linkedPlayback; });
-      var label = payload.status === 'matched' ? 'Matched' : 'Estimated';
+      var label = payload.status === 'matched' ? 'Matched' : payload.status === 'defaulted' ? 'Defaulted' : 'Estimated';
       alignmentStatus.textContent = label + ' downloaded start at ' + alignmentOffset.toFixed(1) + 's. ' + payload.message;
       alignmentStatus.dataset.alignmentState = payload.status;
     }

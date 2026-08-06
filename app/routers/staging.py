@@ -37,7 +37,7 @@ from app.models.workflow import (
     ImportWorkflowState,
     ReviewDecision,
 )
-from app.services.audio_alignment import align_deezer_preview, estimate_centered_offset
+from app.services.audio_alignment import COMMON_PREVIEW_OFFSET_SECONDS, align_deezer_preview
 from app.services.review_automation import _source_identity
 from app.settings_service import effective_settings_dep, get_runtime_settings
 
@@ -310,7 +310,6 @@ async def align_review_audio(
             "linked_playback": False,
         }
 
-    downloaded_duration = item.fingerprint_duration_sec or track.duration_sec
     deezer_reference_valid = reference_source == "deezer" and bool(reference_url)
     if deezer_reference_valid and reference_url is not None:
         try:
@@ -331,29 +330,19 @@ async def align_review_audio(
                 "linked_playback": True,
             }
 
-    estimate = estimate_centered_offset(downloaded_duration, 30.0)
-    if estimate is not None:
-        linked_playback = bool(deezer_reference_valid)
-        message = (
-            "Exact alignment was unavailable; using an estimated preview start."
-            if linked_playback
-            else "Using an estimated downloaded start; the reference player remains independent."
-        )
-        return {
-            "status": "estimated",
-            "downloaded_offset_sec": estimate,
-            "confidence": "estimated",
-            "method": "centered-preview-estimate",
-            "message": message,
-            "linked_playback": linked_playback,
-        }
+    linked_playback = bool(deezer_reference_valid)
+    message = (
+        "Exact alignment was unavailable; using the common 47.926s preview start."
+        if linked_playback
+        else "Using the common 47.926s preview start; the reference player remains independent."
+    )
     return {
-        "status": "unavailable",
-        "downloaded_offset_sec": None,
-        "confidence": None,
-        "method": None,
-        "message": "The reference could not be aligned to this file.",
-        "linked_playback": False,
+        "status": "defaulted",
+        "downloaded_offset_sec": COMMON_PREVIEW_OFFSET_SECONDS,
+        "confidence": "defaulted",
+        "method": "common-preview-offset",
+        "message": message,
+        "linked_playback": linked_playback,
     }
 
 

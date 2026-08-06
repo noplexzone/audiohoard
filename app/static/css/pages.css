@@ -2695,7 +2695,7 @@ a.metric-card:hover {
   color: var(--ok);
 }
 
-.review-alignment-status[data-alignment-state="estimated"] {
+.review-alignment-status[data-alignment-state="defaulted"] {
   color: var(--warn);
 }
 

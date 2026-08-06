@@ -21,6 +21,7 @@ _MAX_REFERENCE_SECONDS = 90
 _FINGERPRINT_FRAME_RATE = 11025.0 * 3.0 / 4096.0
 _ALIGNMENT_LIMIT = asyncio.Semaphore(2)
 _ALLOWED_REFERENCE_SUFFIXES = ("deezer.com", "dzcdn.net")
+COMMON_PREVIEW_OFFSET_SECONDS = 47.926
 
 
 @dataclass(frozen=True)
@@ -34,21 +35,6 @@ class AlignmentResult:
 class FingerprintData:
     values: tuple[int, ...]
     duration_seconds: float
-
-
-def estimate_centered_offset(
-    downloaded_duration: float | int | None, reference_duration: float | int | None = 30.0
-) -> float | None:
-    if downloaded_duration is None or reference_duration is None:
-        return None
-    try:
-        downloaded = float(downloaded_duration)
-        reference = float(reference_duration)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(downloaded) or not math.isfinite(reference) or downloaded <= 0:
-        return None
-    return round(max(0.0, (downloaded - max(0.0, reference)) / 2.0), 3)
 
 
 def _window_distance(

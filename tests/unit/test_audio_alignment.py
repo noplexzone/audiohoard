@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from app.services.audio_alignment import estimate_centered_offset, find_fingerprint_alignment
+from app.services.audio_alignment import find_fingerprint_alignment
 
 
 def test_fingerprint_alignment_finds_exact_embedded_window() -> None:
@@ -49,12 +49,6 @@ def test_fingerprint_alignment_rejects_unrelated_or_short_inputs() -> None:
     assert find_fingerprint_alignment([0xFFFFFFFF] * 8, reference, frame_rate=2.0) is None
     assert find_fingerprint_alignment([0, 0], reference, frame_rate=2.0) is None
     assert find_fingerprint_alignment([0] * 8, [], frame_rate=2.0) is None
-
-
-def test_centered_offset_uses_preview_start_not_track_midpoint() -> None:
-    assert estimate_centered_offset(240.0, 30.0) == 105.0
-    assert estimate_centered_offset(20.0, 30.0) == 0.0
-    assert estimate_centered_offset(None, 30.0) is None
 
 
 async def test_deezer_download_validates_every_redirect(httpx_mock, tmp_path) -> None:
