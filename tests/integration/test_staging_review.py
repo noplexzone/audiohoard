@@ -209,37 +209,36 @@ async def test_staged_flac_remains_direct_for_desktop_browser(
     assert response.content == b"0123456789abcdef"
 
 
-async def test_review_approve_resumes_import_and_deny_removes_staged_item(
+async def test_review_approve_queues_import_and_deny_removes_staged_item(
     client: AsyncClient, test_settings: Settings, monkeypatch
 ) -> None:
-    from app.services import auto_import
-
+    del monkeypatch
     approved_item, approved_track, _ = await _review_fixture(test_settings, "approve")
     denied_item, denied_track, denied_path = await _review_fixture(test_settings, "deny")
-    imported: list[int] = []
 
-    async def fake_auto_import(db, release, **kwargs):
-        del db, kwargs
-        imported.append(release.id)
-        return True
-
-    monkeypatch.setattr(auto_import, "try_auto_import_release", fake_auto_import)
     approved = await client.post(
         f"/staging/review/{approved_item}/approve", follow_redirects=False
     )
     denied = await client.post(f"/staging/review/{denied_item}/deny", follow_redirects=False)
     assert approved.status_code == 303
     assert denied.status_code == 303
-    assert imported
     assert not denied_path.exists()
 
     factory = get_session_factory()
     async with factory() as db:
         approved_row = await db.get(Track, approved_track)
+        approved_review = await db.get(StagingReviewItem, approved_item)
         denied_row = await db.get(Track, denied_track)
         assert approved_row is not None
+        assert approved_review is not None
         assert denied_row is not None
         assert approved_row.acoustid_verification_state == AcoustIDVerificationState.approved
+        assert approved_review.import_dispatch_state == "pending"
+        decision = approved_review.automation_decision
+        assert decision["source_path"] == approved_row.staging_path
+        assert isinstance(decision["source_sha256"], str)
+        assert decision["source_size"] > 0
+        assert decision["source_mtime_ns"] > 0
         assert denied_row.acoustid_verification_state == AcoustIDVerificationState.denied
         assert denied_row.acquisition_state == AcquisitionState.failed
         assert denied_row.staging_path is None
@@ -247,18 +246,15 @@ async def test_review_approve_resumes_import_and_deny_removes_staged_item(
         assert await db.get(StagingReviewItem, denied_item) is None
 
 
-async def test_review_approve_retries_sqlite_lock_before_import(
+async def test_review_approve_retries_sqlite_lock_before_queueing_import(
     client: AsyncClient, test_settings: Settings, monkeypatch
 ) -> None:
     from sqlalchemy.exc import OperationalError
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from app.services import auto_import
-
     item_id, track_id, _ = await _review_fixture(test_settings, "approve-lock")
     original_commit = AsyncSession.commit
     attempts = 0
-    imported: list[int] = []
 
     async def lock_then_commit(self) -> None:
         nonlocal attempts
@@ -269,30 +265,24 @@ async def test_review_approve_retries_sqlite_lock_before_import(
             )
         await original_commit(self)
 
-    async def fake_auto_import(db, release, **kwargs):
-        del db, kwargs
-        imported.append(release.id)
-        return True
-
     monkeypatch.setattr(AsyncSession, "commit", lock_then_commit)
-    monkeypatch.setattr(auto_import, "try_auto_import_release", fake_auto_import)
 
     response = await client.post(f"/staging/review/{item_id}/approve", follow_redirects=False)
 
     assert response.status_code == 303
     assert response.headers["location"] == "/downloads?notice=approved"
     assert attempts >= 2
-    assert imported
     factory = get_session_factory()
     async with factory() as db:
         item = await db.get(StagingReviewItem, item_id)
         track = await db.get(Track, track_id)
         assert item is not None and track is not None
         assert item.review_state == ReviewDecision.approved
+        assert item.import_dispatch_state == "pending"
         assert track.acoustid_verification_state == AcoustIDVerificationState.approved
 
 
-async def test_review_approve_stays_successful_when_release_reload_is_locked(
+async def test_review_approve_does_not_reload_release_before_dispatch(
     client: AsyncClient, test_settings: Settings, monkeypatch
 ) -> None:
     from sqlalchemy.exc import OperationalError
@@ -315,7 +305,7 @@ async def test_review_approve_stays_successful_when_release_reload_is_locked(
 
     assert response.status_code == 303
     assert response.headers["location"] == "/downloads?notice=approved"
-    assert locked
+    assert not locked
     factory = get_session_factory()
     async with factory() as db:
         item = await db.get(StagingReviewItem, item_id)
@@ -333,8 +323,11 @@ async def test_review_approve_stays_successful_when_auto_import_is_locked(
     from app.services import auto_import
 
     item_id, track_id, _ = await _review_fixture(test_settings, "approve-import-lock")
+    called = False
 
     async def locked_auto_import(*args, **kwargs):
+        nonlocal called
+        called = True
         del args, kwargs
         raise OperationalError("UPDATE releases", {}, Exception("database is locked"))
 
@@ -344,6 +337,7 @@ async def test_review_approve_stays_successful_when_auto_import_is_locked(
 
     assert response.status_code == 303
     assert response.headers["location"] == "/downloads?notice=approved"
+    assert not called
     factory = get_session_factory()
     async with factory() as db:
         item = await db.get(StagingReviewItem, item_id)

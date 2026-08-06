@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, TypedDict
 from urllib.parse import parse_qs, urlsplit
 
@@ -20,7 +21,94 @@ class ReferenceAudio(TypedDict):
     source: Literal["deezer", "itunes"]
 
 
+@dataclass(frozen=True)
+class ExactDeezerReference:
+    provider_track_id: str
+    title: str
+    duration_sec: int | None
+    preview_url: str
+    album_title: str
+    artist_name: str
+    track_artist_name: str = ""
+    track_content_rating: str = "unknown"
+    album_content_rating: str = "unknown"
+
+
 _DEEZER_PREVIEW_MINIMUM_VALIDITY_SECONDS = 120
+
+
+async def resolve_exact_deezer_position_reference(
+    *,
+    album_deezer_id: str | None,
+    disc: int,
+    position: int,
+    settings: Settings,
+    deezer_client: DeezerClient | None = None,
+) -> ExactDeezerReference | None:
+    """Resolve one current Deezer preview from exact album and manifest position.
+
+    The album endpoint is the authority for disc/position.  This deliberately has
+    no title-search or track-enrichment fallback.
+    """
+    exact_album_id = str(album_deezer_id or "").strip()
+    if not exact_album_id or disc < 1 or position < 1:
+        return None
+    client = deezer_client or DeezerClient(settings.deezer_api_url)
+    async with asyncio.timeout(12):
+        album = await client.get_album(exact_album_id)
+    if str(album.deezer_id or album.provider_id or "").strip() != exact_album_id:
+        return None
+    matches = [
+        track for track in album.tracks if track.disc == disc and track.position == position
+    ]
+    if len(matches) != 1:
+        return None
+    selected = matches[0]
+    provider_track_id = str(selected.provider_track_id or "").strip()
+    title = str(selected.title or "").strip()
+    preview_url = str(selected.preview_url or "").strip()
+    album_title = str(album.title or "").strip()
+    artist_name = str(album.artist_name or "").strip()
+    track_artist_name = str(selected.artist_name or "").strip()
+    if (
+        not provider_track_id
+        or not title
+        or not preview_url
+        or not album_title
+        or not artist_name
+        or not track_artist_name
+    ):
+        return None
+    if not _deezer_preview_is_usable(preview_url):
+        return None
+    return ExactDeezerReference(
+        provider_track_id=provider_track_id,
+        title=title,
+        duration_sec=selected.duration_sec,
+        preview_url=preview_url,
+        album_title=album_title,
+        artist_name=artist_name,
+        track_artist_name=track_artist_name,
+        track_content_rating=selected.content_rating,
+        album_content_rating=album.content_rating,
+    )
+
+
+async def resolve_exact_deezer_catalog_reference(
+    catalog_track: CatalogAlbumTrack | object,
+    *,
+    settings: Settings,
+    deezer_client: DeezerClient | None = None,
+) -> ExactDeezerReference | None:
+    """Resolve exact preview evidence using only catalog album identity/position."""
+    album = getattr(catalog_track, "album", None)
+    return await resolve_exact_deezer_position_reference(
+        album_deezer_id=getattr(album, "deezer_id", None),
+        disc=int(getattr(catalog_track, "disc", 0) or 0),
+        position=int(getattr(catalog_track, "position", 0) or 0),
+        settings=settings,
+        deezer_client=deezer_client,
+    )
 
 
 def _deezer_preview_is_usable(url: str, *, now: float | None = None) -> bool:

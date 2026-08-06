@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Automatically approve import-review mismatches only when the exact catalog-position Deezer preview produces a high-confidence acoustic match, with per-MBID score evidence, source/catalog revalidation, operator-precedence fencing, append-only audit attempts, and safe track-level MBID overrides.
+- Persist and retry approved auto-import dispatches with bounded backoff and duplicate-dispatch claims so transient failures recover without an application restart.
+- Record strict AcoustID-only consensus decisions in shadow mode so future automation can be evaluated without allowing confidence score alone to authorize an import.
+
 ### Fixed
 
 - Refresh expired signed Deezer reference previews before rendering import review so comparison audio and alignment remain usable.

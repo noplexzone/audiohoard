@@ -21,6 +21,10 @@ from app.models.workflow import (
     ImportWorkflowState,
     ReviewDecision,
 )
+from app.services.acoustid_evidence import (
+    canonical_recording_mbid,
+    parse_consistent_acoustid_evidence,
+)
 
 
 @dataclass(frozen=True)
@@ -126,12 +130,17 @@ async def reconcile_import_backlog(
             and not _source_exists(track)
         ):
             continue
-        observed = tuple(
-            dict.fromkeys(value.strip() for value in item.observed_acoustid_mbids if value.strip())
+        expected_mbid = canonical_recording_mbid(catalog_track.recording_mbid)
+        consistent = parse_consistent_acoustid_evidence(
+            item.observed_acoustid_mbids_json,
+            item.observed_acoustid_evidence_json,
         )
-        if observed != (catalog_track.recording_mbid,):
+        if expected_mbid is None or consistent is None:
             continue
-        if (item.acoustid_score or 0.0) <= acceptance_threshold:
+        observed, scores_by_mbid = consistent
+        if observed != (expected_mbid,):
+            continue
+        if scores_by_mbid.get(expected_mbid, 0.0) <= acceptance_threshold:
             continue
         if _normalized_title(item.expected_title or track.title) != _normalized_title(
             catalog_track.title

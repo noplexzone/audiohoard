@@ -25,7 +25,10 @@ from app.models.workflow import (
 )
 from app.schemas.search import SearchRequest, SearchResult
 from app.services import acquisition_cleanup, acquisition_recovery
-from app.services.acoustid_verification import run_acoustid_verification
+from app.services.acoustid_verification import (
+    reconcile_matching_acoustid_reviews,
+    run_acoustid_verification,
+)
 from app.services.acquisition_cleanup import (
     ImportedSourceCleanup,
     cleanup_imported_sources,
@@ -70,6 +73,105 @@ async def test_acoustid_strict_threshold_and_mismatch(db_session: AsyncSession) 
     assert above == AcoustIDVerificationState.verified
     assert mismatch == AcoustIDVerificationState.mismatch
     assert len(list((await db_session.scalars(select(StagingReviewItem))).all())) == 2
+
+
+async def test_acoustid_evidence_persists_sanitized_per_recording_details(
+    db_session: AsyncSession,
+) -> None:
+    job = Job(source="slskd", query="x", status=JobStatus.running)
+    release = Release(job=job, source="slskd", title="Album")
+    track = Track(
+        job=job,
+        release=release,
+        source="slskd",
+        title="Song",
+        catalog_track_id=1,
+        mbid="11111111-1111-1111-1111-111111111111",
+        identity_state=IdentityResolutionState.resolved,
+        acquisition_state=AcquisitionState.downloaded,
+    )
+    db_session.add_all([job, release, track])
+    await db_session.flush()
+
+    await run_acoustid_verification(
+        track,
+        acoustid_raw_results=[
+            {
+                "id": "raw-result-id-must-not-be-copied",
+                "score": 0.98,
+                "recordings": [
+                    {
+                        "id": "22222222-2222-2222-2222-222222222222",
+                        "title": "Song",
+                        "artists": [{"id": "artist-id", "name": "Artist"}],
+                        "releasegroups": [{"title": "must not be copied"}],
+                    }
+                ],
+            }
+        ],
+        fingerprint_duration_sec=180,
+        db=db_session,
+        acceptance_threshold=0.90,
+    )
+
+    evidence = json.loads(track.acoustid_evidence_json or "{}")
+    assert evidence["recordings"] == [
+        {
+            "artist": "Artist",
+            "mbid": "22222222-2222-2222-2222-222222222222",
+            "score": 0.98,
+            "title": "Song",
+        }
+    ]
+    assert "raw-result-id-must-not-be-copied" not in track.acoustid_evidence_json
+    assert "releasegroups" not in track.acoustid_evidence_json
+
+
+async def test_reconciliation_uses_expected_mbids_own_strict_score(
+    db_session: AsyncSession,
+) -> None:
+    expected = "11111111-1111-1111-1111-111111111111"
+    unrelated = "22222222-2222-2222-2222-222222222222"
+    job = Job(source="slskd", query="x", status=JobStatus.running)
+    release = Release(job=job, source="slskd", title="Album")
+    track = Track(
+        job=job,
+        release=release,
+        source="slskd",
+        title="Song",
+        catalog_track_id=1,
+        mbid=expected,
+        identity_state=IdentityResolutionState.resolved,
+        acquisition_state=AcquisitionState.downloaded,
+    )
+    db_session.add_all([job, release, track])
+    await db_session.flush()
+    await run_acoustid_verification(
+        track,
+        acoustid_raw_results=[
+            {"score": 0.99, "recordings": [{"id": unrelated}]},
+            {"score": 0.90, "recordings": [{"id": expected}]},
+        ],
+        fingerprint_duration_sec=180,
+        db=db_session,
+        acceptance_threshold=0.90,
+    )
+    assert await reconcile_matching_acoustid_reviews(db_session, acceptance_threshold=0.90) == 0
+    assert (
+        await db_session.scalar(
+            select(StagingReviewItem).where(StagingReviewItem.track_id == track.id)
+        )
+        is not None
+    )
+
+
+async def test_non_finite_and_boolean_acoustid_scores_fail_closed(
+    db_session: AsyncSession,
+) -> None:
+    expected = "11111111-1111-1111-1111-111111111111"
+    for invalid in (float("inf"), float("nan"), True):
+        state = await _verify(db_session, invalid, expected, expected)
+        assert state != AcoustIDVerificationState.verified
 
 
 async def test_runtime_threshold_and_timeout_defaults_persist(db_session: AsyncSession) -> None:
@@ -636,6 +738,12 @@ async def test_recovery_promotes_matching_review_and_imports_partial_release(
         observed_acoustid_mbids_json=json.dumps(
             [expected, "22222222-2222-2222-2222-222222222222"]
         ),
+        observed_acoustid_evidence_json=json.dumps(
+            [
+                {"mbid": expected, "score": 0.99},
+                {"mbid": "22222222-2222-2222-2222-222222222222", "score": 0.98},
+            ]
+        ),
         acoustid_score=0.99,
         fingerprint_duration_sec=180,
         verification_reason="ambiguous",
@@ -653,6 +761,21 @@ async def test_recovery_promotes_matching_review_and_imports_partial_release(
     monkeypatch.setattr(acquisition_recovery, "try_auto_import_release", fake_import)
     settings = get_settings().model_copy(
         update={"library_root": tmp_path / "music", "staging_root": tmp_path}
+    )
+
+    review.observed_acoustid_evidence_json = json.dumps([{"mbid": expected, "score": 0.99}])
+    assert await recover_approved_downloads(db_session, settings) == 0
+    assert await db_session.get(StagingReviewItem, review.id) is review
+    review.observed_acoustid_evidence_json = json.dumps(
+        [{"mbid": expected, "score": 0.10}, {"mbid": expected, "score": 0.99}]
+    )
+    assert await recover_approved_downloads(db_session, settings) == 0
+    assert await db_session.get(StagingReviewItem, review.id) is review
+    review.observed_acoustid_evidence_json = json.dumps(
+        [
+            {"mbid": expected, "score": 0.99},
+            {"mbid": "22222222-2222-2222-2222-222222222222", "score": 0.98},
+        ]
     )
 
     assert await recover_approved_downloads(db_session, settings) == 1

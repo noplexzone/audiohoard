@@ -27,6 +27,7 @@ async def try_auto_import_release(
     *,
     library_root: Path,
     naming_template: str,
+    source_artifacts: dict[int, tuple[Path, str]] | None = None,
 ) -> bool:
     """Import every verified file-backed track without waiting for album closure."""
     from app.models.workflow import AcquisitionState
@@ -44,6 +45,7 @@ async def try_auto_import_release(
         and track.acoustid_verification_state
         in {AcoustIDVerificationState.verified, AcoustIDVerificationState.approved}
         and bool(track.staging_path or track.source_path)
+        and (source_artifacts is None or track.id in source_artifacts)
     ]
     if not eligible:
         unresolved = [
@@ -77,6 +79,7 @@ async def try_auto_import_release(
             release,
             library_root=library_root,
             naming_template=naming_template,
+            source_artifacts=source_artifacts,
             track_ids={track.id for track in eligible if track.id is not None},
         )
     except (ImportPlanningError, OSError) as exc:

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 import os
 import shutil
 import subprocess
@@ -17,21 +16,20 @@ from weakref import WeakValueDictionary
 import httpx
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
-from sqlalchemy import delete, func, select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user, require_mutation
 from app.config import Settings
-from app.database import get_db, is_sqlite_database_locked, run_with_sqlite_lock_retry
+from app.database import get_db, run_with_sqlite_lock_retry
 from app.jobs.dispatcher import job_dispatcher
 from app.media_formats import IMPORTABLE_AUDIO_SUFFIXES
 from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.source_candidate_block import SourceCandidateBlock
-from app.models.staging_review import StagingReviewItem
+from app.models.staging_review import ReviewAutomationAttempt, StagingReviewItem
 from app.models.track import Track
 from app.models.workflow import (
     AcoustIDVerificationState,
@@ -40,9 +38,8 @@ from app.models.workflow import (
     ReviewDecision,
 )
 from app.services.audio_alignment import align_deezer_preview, estimate_centered_offset
+from app.services.review_automation import _source_identity
 from app.settings_service import effective_settings_dep, get_runtime_settings
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/staging", dependencies=[Depends(get_current_user)])
 
@@ -375,30 +372,83 @@ async def approve_review_item(
     return_to: Annotated[str | None, Form()] = None,
 ) -> RedirectResponse:
     """Approve a staged track for import despite a verification flag."""
-    item = await db.get(StagingReviewItem, item_id)
-    if item is None:
+    await db.rollback()
+    pending_item = await db.get(StagingReviewItem, item_id)
+    if pending_item is None:
         raise HTTPException(status_code=404, detail="Review item not found")
-    if item.review_state != ReviewDecision.pending:
-        return RedirectResponse(
-            _review_result_location(return_to, "already_reviewed"), status_code=303
+    pending_track = await db.get(Track, pending_item.track_id)
+    manual_source_value = str(
+        (pending_track.staging_path or pending_track.source_path or "")
+        if pending_track is not None
+        else ""
+    ).strip()
+    manual_source_path = Path(manual_source_value) if manual_source_value else None
+    manual_source_identity = (
+        await asyncio.to_thread(
+            _source_identity,
+            manual_source_path,
+            Path(settings.staging_root),
         )
-
-    release_id = item.release_id
+        if manual_source_path is not None
+        else None
+    )
+    if manual_source_path is None or manual_source_identity is None:
+        raise HTTPException(status_code=409, detail="Approved source is missing or changed")
     approved = False
 
     async def persist_approval() -> None:
         nonlocal approved
+        await db.rollback()
+        await db.execute(text("BEGIN IMMEDIATE"))
         current_item = await db.get(StagingReviewItem, item_id)
         if current_item is None:
             raise HTTPException(status_code=404, detail="Review item not found")
         if current_item.review_state != ReviewDecision.pending:
+            await db.rollback()
             return
 
-        # Load related rows before dirtying the session. A query after mutation
-        # triggers autoflush and turns a transient writer lock into a raw 500.
         track = await db.get(Track, current_item.track_id)
+        current_source = str(
+            (track.staging_path or track.source_path or "") if track is not None else ""
+        ).strip()
+        if current_source != str(manual_source_path):
+            await db.rollback()
+            raise HTTPException(status_code=409, detail="Approved source path changed")
+        now = datetime.now(UTC)
+        if current_item.automation_claim_token:
+            attempt = await db.scalar(
+                select(ReviewAutomationAttempt).where(
+                    ReviewAutomationAttempt.claim_token == current_item.automation_claim_token
+                )
+            )
+            if attempt is not None and attempt.state == "claimed":
+                attempt.state = "abandoned"
+                attempt.completed_at = now
+                attempt.decision_json = json.dumps(
+                    {"decision": "manual_approval", "reason": "manual_decision_precedence"},
+                    sort_keys=True,
+                )
         current_item.review_state = ReviewDecision.approved
-        current_item.reviewed_at = datetime.now(UTC)
+        current_item.reviewed_at = now
+        current_item.automation_state = "manual_approved"
+        current_item.automation_claim_token = None
+        current_item.automation_claimed_at = None
+        current_item.automation_next_attempt_at = None
+        current_item.automation_decision_json = json.dumps(
+            {
+                "decision": "manual_approval",
+                "reason": "operator_approved",
+                "source_path": str(manual_source_path),
+                "source_sha256": manual_source_identity[0],
+                "source_size": manual_source_identity[1],
+                "source_mtime_ns": manual_source_identity[2],
+            },
+            sort_keys=True,
+        )
+        current_item.import_dispatch_state = "pending"
+        current_item.import_dispatch_claim_token = None
+        current_item.import_dispatch_claimed_at = None
+        current_item.import_dispatch_next_attempt_at = now
         if track is not None:
             track.acoustid_verification_state = AcoustIDVerificationState.approved
         await db.commit()
@@ -408,28 +458,6 @@ async def approve_review_item(
     if not approved:
         return RedirectResponse(
             _review_result_location(return_to, "already_reviewed"), status_code=303
-        )
-
-    try:
-        release = await db.get(Release, release_id)
-        if release is not None:
-            from app.services.auto_import import try_auto_import_release
-
-            await try_auto_import_release(
-                db,
-                release,
-                library_root=settings.library_root,
-                naming_template=settings.naming_template,
-            )
-            await db.commit()
-    except OperationalError as exc:
-        if not is_sqlite_database_locked(exc):
-            raise
-        await db.rollback()
-        logger.warning(
-            "Approval for review item %d was saved, but auto-import hit a SQLite lock; "
-            "recovery will retry it",
-            item_id,
         )
 
     return RedirectResponse(_review_result_location(return_to, "approved"), status_code=303)
@@ -477,13 +505,30 @@ async def deny_review_item(
     return_to: Annotated[str | None, Form()] = None,
 ) -> RedirectResponse:
     """Deny and remove a staged track, then schedule bounded reacquisition."""
+    await db.rollback()
+    await db.execute(text("BEGIN IMMEDIATE"))
     item = await db.get(StagingReviewItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Review item not found")
     if item.review_state != ReviewDecision.pending:
+        await db.rollback()
         return RedirectResponse(
             _review_result_location(return_to, "already_reviewed"), status_code=303
         )
+
+    if item.automation_claim_token:
+        attempt = await db.scalar(
+            select(ReviewAutomationAttempt).where(
+                ReviewAutomationAttempt.claim_token == item.automation_claim_token
+            )
+        )
+        if attempt is not None and attempt.state == "claimed":
+            attempt.state = "abandoned"
+            attempt.completed_at = datetime.now(UTC)
+            attempt.decision_json = json.dumps(
+                {"decision": "manual_denial", "reason": "manual_decision_precedence"},
+                sort_keys=True,
+            )
 
     track = await db.get(Track, item.track_id)
     continuation_id: int | None = None
