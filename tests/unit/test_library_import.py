@@ -220,6 +220,36 @@ async def test_execute_import_copies_to_destination_temp_writes_verified_tags_an
     assert destination.exists()  # noqa: ASYNC240
 
 
+async def test_execute_import_cancellation_rolls_back_published_files(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    from app.services import library_import
+
+    release, _tracks = await _release_with_staged_tracks(db_session, tmp_path, count=1)
+    library = tmp_path / "library"
+    plans = await plan_release_import(db_session, release, library_root=library)
+    destination = Path(plans[0].destination_path)
+
+    async def cancel_after_publish(*_args, **_kwargs) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        library_import,
+        "_reconcile_catalog_ownership",
+        cancel_after_publish,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await execute_release_import(
+            db_session,
+            release,
+            library_root=library,
+            tag_writer=MutagenTagWriter(),
+        )
+
+    assert not destination.exists()  # noqa: ASYNC240
+    assert not list(destination.parent.glob(".*.audiohoard-*"))  # noqa: ASYNC240
+
+
 async def test_execute_import_releases_sqlite_writer_lock_before_filesystem_work(
     db_session: AsyncSession, tmp_path: Path
 ) -> None:

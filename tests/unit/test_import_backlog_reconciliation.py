@@ -74,6 +74,9 @@ async def _fixture(db: AsyncSession, tmp_path: Path) -> dict[str, object]:
         release_id=release.id,
         expected_title="Song 1",
         observed_acoustid_mbids_json=json.dumps([catalog[0].recording_mbid]),
+        observed_acoustid_evidence_json=json.dumps(
+            [{"mbid": catalog[0].recording_mbid, "score": 0.99}]
+        ),
         fingerprint_duration_sec=catalog[0].duration_sec,
         acoustid_score=0.99,
         verification_reason="no_expected_mbid",
@@ -298,6 +301,60 @@ async def test_reconciliation_apply_is_idempotent_and_leaves_ambiguous_rows(
     assert second.stale_projections_normalized == 0
     remaining = list((await db_session.scalars(select(StagingReviewItem))).all())
     assert remaining == [rows["ambiguous_review"]]
+
+
+async def test_identity_recovery_rejects_unrelated_aggregate_acoustid_score(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    rows = await _fixture(db_session, tmp_path)
+    review = rows["identity_review"]
+    assert isinstance(review, StagingReviewItem)
+    mbid = json.loads(review.observed_acoustid_mbids_json or "[]")[0]
+    review.acoustid_score = 0.999
+    review.observed_acoustid_evidence_json = json.dumps(
+        [
+            {"mbid": "ffffffff-ffff-ffff-ffff-ffffffffffff", "score": 0.999},
+            {"mbid": mbid, "score": 0.89},
+        ]
+    )
+
+    report = await reconcile_import_backlog(db_session, acceptance_threshold=0.90, apply=True)
+
+    assert report.identity_candidates == ()
+    assert report.identity_repaired == 0
+    assert await db_session.get(StagingReviewItem, review.id) is review
+
+
+async def test_identity_recovery_requires_one_strictly_qualified_exact_mbid_score(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    rows = await _fixture(db_session, tmp_path)
+    review = rows["identity_review"]
+    assert isinstance(review, StagingReviewItem)
+    mbid = json.loads(review.observed_acoustid_mbids_json or "[]")[0]
+
+    for evidence in (
+        [{"mbid": mbid, "score": 0.90}],
+        [{"mbid": mbid, "score": True}],
+        [{"mbid": mbid, "score": float("nan")}],
+        [{"mbid": mbid, "score": 0.99}, {"mbid": mbid, "score": 0.89}],
+        [{"mbid": mbid, "score": 0.99}, "malformed"],
+        [
+            {"mbid": mbid, "score": 0.99},
+            {"mbid": "not-an-mbid", "score": 0.99},
+        ],
+        [
+            {"mbid": mbid, "score": 0.99},
+            {"mbid": "22222222-2222-2222-2222-222222222222", "score": 0.99},
+        ],
+    ):
+        review.observed_acoustid_evidence_json = json.dumps(evidence)
+        report = await reconcile_import_backlog(
+            db_session,
+            acceptance_threshold=0.90,
+            apply=False,
+        )
+        assert report.identity_candidates == ()
 
 
 async def test_destination_identity_without_byte_equality_remains_for_review(

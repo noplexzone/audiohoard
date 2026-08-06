@@ -1633,6 +1633,13 @@ async def execute_release_import(
             after_rollback=rollback_filesystem_commit,
         )
         return plans
+    except asyncio.CancelledError:
+        try:
+            _rollback_pinned_filesystem(temp_paths, created_destinations, backup_paths)
+        finally:
+            _close_pinned_destinations(pinned_destinations)
+        await db.rollback()
+        raise
     except Exception as exc:
         detail = str(exc)
         try:

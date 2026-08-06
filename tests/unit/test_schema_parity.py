@@ -36,6 +36,7 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "provider_settings",
         "release_candidates",
         "releases",
+        "review_automation_attempts",
         "source_candidate_blocks",
         "staging_review_items",
         "tracks",

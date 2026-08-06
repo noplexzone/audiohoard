@@ -359,12 +359,21 @@ async def test_auto_import_starts_with_first_verified_track_of_partial_release(
         acquisition_state=AcquisitionState.downloaded,
         acoustid_verification_state=AcoustIDVerificationState.verified,
     )
-    db_session.add_all([job, release, first])
+    sibling = Track(
+        job=job,
+        release=release,
+        source="slskd",
+        catalog_track_id=2,
+        source_path=str(tmp_path / "two.flac"),
+        acquisition_state=AcquisitionState.downloaded,
+        acoustid_verification_state=AcoustIDVerificationState.verified,
+    )
+    db_session.add_all([job, release, first, sibling])
     await db_session.flush()
     calls: list[object] = []
 
     async def fake_plan(*args, **kwargs):
-        calls.append(("plan", kwargs["track_ids"]))
+        calls.append(("plan", kwargs["track_ids"], kwargs["source_artifacts"]))
         first.title = "Persisted before execution"
         await db_session.flush()
         return [SimpleNamespace(id=1, status=auto_import.ImportWorkflowState.ready)]
@@ -378,10 +387,15 @@ async def test_auto_import_starts_with_first_verified_track_of_partial_release(
     monkeypatch.setattr(auto_import, "plan_release_import", fake_plan)
     monkeypatch.setattr(auto_import, "execute_release_import", fake_execute)
 
+    artifact = {first.id: (tmp_path / "one.flac", "approved-hash")}
     assert await try_auto_import_release(
-        db_session, release, library_root=tmp_path, naming_template="{title}.{ext}"
+        db_session,
+        release,
+        library_root=tmp_path,
+        naming_template="{title}.{ext}",
+        source_artifacts=artifact,
     )
-    assert calls == [("plan", {first.id}), ("execute", False)]
+    assert calls == [("plan", {first.id}, artifact), ("execute", False)]
     assert release.import_state != ImportWorkflowState.imported
 
 

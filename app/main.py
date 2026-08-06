@@ -65,6 +65,7 @@ from app.services.library_removal import recover_deletion_operations
 from app.services.maintenance_scheduler import MaintenanceScheduler
 from app.services.maintenance_state import empty_maintenance_state
 from app.services.monitoring import MonitoringScheduler, QualityUpgradeCycleScheduler
+from app.services.review_automation import ReviewAutomationScheduler, ReviewAutomationService
 from app.settings_service import (
     build_effective_settings,
     effective_settings_dep,
@@ -113,6 +114,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         runtime = await get_runtime_settings(db)
         await job_dispatcher.set_max_concurrent_jobs(runtime.max_parallel_acquisitions)
         effective_settings = await build_effective_settings(db, get_settings())
+
+    async def review_automation_settings() -> tuple[Settings, float]:
+        async with get_session_factory()() as db:
+            current_runtime = await get_runtime_settings(db)
+            current_effective = await build_effective_settings(db, get_settings())
+        return current_effective, current_runtime.acoustid_acceptance_threshold
+
+    review_automation_scheduler = ReviewAutomationScheduler(
+        ReviewAutomationService(
+            get_session_factory(),
+            effective_settings,
+            acceptance_threshold=runtime.acoustid_acceptance_threshold,
+            settings_provider=review_automation_settings,
+        )
+    )
+    app.state.review_automation_scheduler = review_automation_scheduler
     library_adoption_runner = LibraryAdoptionRunner(get_session_factory())
     app.state.library_adoption_runner = library_adoption_runner
     await recover_deletion_operations(
@@ -169,11 +186,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await library_adoption_runner.start()
     await maintenance_scheduler.start()
     await quality_upgrade_scheduler.start()
+    await review_automation_scheduler.start()
     await health_status.start()
     await library_reconciliation.start()
     try:
         yield
     finally:
+        await review_automation_scheduler.stop()
         await library_adoption_runner.stop()
         await library_reconciliation.stop()
         if not ownership_task.done():

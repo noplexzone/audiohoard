@@ -23,7 +23,7 @@ from app.models.release import Release
 from app.models.release_candidate import MatchReviewState, ReleaseCandidate
 from app.models.settings import AppSetting, ProviderSetting
 from app.models.source_candidate_block import SourceCandidateBlock
-from app.models.staging_review import StagingReviewItem
+from app.models.staging_review import ReviewAutomationAttempt, StagingReviewItem
 from app.models.track import Track
 
 __all__ = [
@@ -48,6 +48,7 @@ __all__ = [
     "Release",
     "MatchReviewState",
     "ReleaseCandidate",
+    "ReviewAutomationAttempt",
     "StagingReviewItem",
     "SourceCandidateBlock",
     "Track",

@@ -44,7 +44,12 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
     monkeypatch.setattr(
         main,
         "get_runtime_settings",
-        AsyncMock(return_value=SimpleNamespace(max_parallel_acquisitions=1)),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                max_parallel_acquisitions=1,
+                acoustid_acceptance_threshold=0.91,
+            )
+        ),
     )
     monkeypatch.setattr(main, "pending_imported_source_cleanups", AsyncMock(return_value=[]))
 
@@ -71,6 +76,7 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
     monkeypatch.setattr(main, "MaintenanceScheduler", _Service)
     monkeypatch.setattr(main, "MonitoringScheduler", _Service)
     monkeypatch.setattr(main, "QualityUpgradeCycleScheduler", _Service)
+    monkeypatch.setattr(main, "ReviewAutomationScheduler", _Service)
     monkeypatch.setattr(main, "LibraryReconciliationService", _Reconciliation)
     monkeypatch.setattr(main, "get_health_status_service", lambda: _Service())
     monkeypatch.setattr(main.job_dispatcher, "set_max_concurrent_jobs", AsyncMock())

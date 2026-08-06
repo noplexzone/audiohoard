@@ -1,10 +1,13 @@
 import json
 from types import SimpleNamespace
 
-from app.metadata.base import AlbumTrack
+from app.metadata.base import AlbumDetail, AlbumTrack
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
 from app.services.catalog_metadata import _store_track_previews
-from app.services.reference_audio import resolve_reference_audio
+from app.services.reference_audio import (
+    resolve_exact_deezer_catalog_reference,
+    resolve_reference_audio,
+)
 
 
 class _UnexpectedProvider:
@@ -192,3 +195,97 @@ async def test_resolver_prefers_stored_itunes_preview_over_live_lookup() -> None
         "source": "itunes",
     }
     assert provider.calls == 0
+
+
+class _ExactAlbumProvider:
+    def __init__(self) -> None:
+        self.album_ids: list[str] = []
+
+    async def get_album(self, album_id: str) -> AlbumDetail:
+        self.album_ids.append(album_id)
+        return AlbumDetail(
+            provider="deezer",
+            provider_id=album_id,
+            deezer_id=album_id,
+            title="Album",
+            artist_name="Artist",
+            tracks=[
+                AlbumTrack(
+                    provider_track_id="101",
+                    position=1,
+                    disc=1,
+                    title="Song",
+                    artist_name="Artist",
+                    duration_sec=181,
+                    preview_url="https://cdnt-preview.dzcdn.net/preview.mp3?hdnea=signed",
+                ),
+                AlbumTrack(
+                    provider_track_id="202",
+                    position=1,
+                    disc=2,
+                    title="Song (Live)",
+                    artist_name="Artist",
+                    duration_sec=220,
+                    preview_url="https://cdnt-preview.dzcdn.net/live.mp3?hdnea=signed",
+                ),
+            ],
+        )
+
+
+async def test_exact_catalog_deezer_resolver_uses_album_disc_and_position() -> None:
+    album = CatalogAlbum(title="Album", deezer_id="55")
+    catalog_track = CatalogAlbumTrack(position=1, disc=2, title="Song (Live)", album=album)
+    provider = _ExactAlbumProvider()
+
+    reference = await resolve_exact_deezer_catalog_reference(
+        catalog_track,
+        settings=SimpleNamespace(deezer_api_url="https://api.deezer.com"),
+        deezer_client=provider,
+    )
+
+    assert reference is not None
+    assert reference.provider_track_id == "202"
+    assert reference.title == "Song (Live)"
+    assert reference.duration_sec == 220
+    assert reference.album_title == "Album"
+    assert reference.artist_name == "Artist"
+    assert reference.track_artist_name == "Artist"
+    assert reference.preview_url.startswith("https://cdnt-preview.dzcdn.net/live.mp3")
+    assert provider.album_ids == ["55"]
+
+
+async def test_exact_catalog_deezer_resolver_never_uses_fuzzy_track_deezer_id() -> None:
+    album = CatalogAlbum(title="Album", deezer_id=None)
+    catalog_track = CatalogAlbumTrack(position=1, disc=1, title="Song", album=album)
+    provider = _UnexpectedProvider()
+
+    reference = await resolve_exact_deezer_catalog_reference(
+        catalog_track,
+        settings=SimpleNamespace(deezer_api_url="https://api.deezer.com"),
+        deezer_client=provider,
+    )
+
+    assert reference is None
+
+
+async def test_exact_catalog_deezer_resolver_rejects_duplicate_position() -> None:
+    album = CatalogAlbum(title="Album", deezer_id="55")
+    catalog_track = CatalogAlbumTrack(position=1, disc=1, title="Song", album=album)
+    provider = _ExactAlbumProvider()
+    original_get_album = provider.get_album
+
+    async def duplicate_album(album_id: str) -> AlbumDetail:
+        detail = await original_get_album(album_id)
+        detail.tracks.append(detail.tracks[0])
+        return detail
+
+    provider.get_album = duplicate_album  # type: ignore[method-assign]
+
+    assert (
+        await resolve_exact_deezer_catalog_reference(
+            catalog_track,
+            settings=SimpleNamespace(deezer_api_url="https://api.deezer.com"),
+            deezer_client=provider,
+        )
+        is None
+    )
