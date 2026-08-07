@@ -1929,9 +1929,24 @@ async def test_family_route_rejects_cross_family_artist_and_provider_ids_and_get
         f"/artists/catalog/{artist_id}/release-families/{ids['foreign']}",
         data={"csrf_token": csrf, "family_provider": "deezer", "action": "save"},
     )
+    oversized_id = await client.post(
+        url,
+        data={
+            "csrf_token": csrf,
+            "family_provider": "deezer",
+            "action": "save",
+            "edition": "9" * 5000,
+        },
+    )
 
     assert get_response.status_code == 405
-    assert foreign.status_code == wrong_provider.status_code == wrong_artist.status_code == 400
+    assert (
+        foreign.status_code
+        == wrong_provider.status_code
+        == wrong_artist.status_code
+        == oversized_id.status_code
+        == 400
+    )
     async with factory() as db:
         explicit = await db.get(CatalogAlbumProvider, ids["explicit"])
     assert explicit is not None and explicit.monitor_override is None

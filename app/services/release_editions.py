@@ -105,7 +105,7 @@ def _normalized_title(value: object) -> str:
     while title != previous:
         previous = title
         title = _RATING_LABEL.sub("", title).strip(" -_()[]")
-    return _normalize_text(title)
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", title).casefold()).strip()
 
 
 def _edition_descriptor(value: object) -> str:

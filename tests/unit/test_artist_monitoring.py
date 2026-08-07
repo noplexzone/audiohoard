@@ -19,6 +19,8 @@ from app.models.catalog_entities import (
     CatalogArtistIdentity,
 )
 from app.models.job import Job, JobStatus
+from app.models.monitoring import MonitoringRecord, MonitoringStatus
+from app.models.release import Release
 from app.services import artist_monitoring, upgrade_monitoring
 from app.services.artist_monitoring import (
     DiscographyRefreshScheduler,
@@ -545,6 +547,27 @@ async def test_upgrade_monitoring_uses_or_projection_for_shared_canonical_album(
 
     sync.assert_awaited_once()
     assert sync.await_args.args[1:] == (42, True)
+
+
+async def test_reenabling_upgrade_monitoring_preserves_history(
+    monitoring_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with monitoring_factory() as db:
+        job = Job(source="test", query="upgrade history", status=JobStatus.done)
+        release = Release(job=job, source="test", title="Imported Album")
+        record = MonitoringRecord(
+            release=release,
+            status=MonitoringStatus.active,
+            desired_quality_json="{}",
+            history_json='[{"outcome":"candidate_discovered"}]',
+        )
+        db.add(record)
+        await db.flush()
+
+        await upgrade_monitoring._set_release_upgrade_monitoring(db, release.id, True)
+
+        assert record.status == MonitoringStatus.active
+        assert record.history_json == '[{"outcome":"candidate_discovered"}]'
 
 
 async def test_refresh_invokes_upgrade_projection_after_monitor_policy(

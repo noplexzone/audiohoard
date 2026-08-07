@@ -66,6 +66,7 @@ def test_discography_uses_native_family_scoped_edition_controls() -> None:
     assert 'name="edition"' in template
     assert 'name="action" value="defaults"' in template
     assert "Use defaults" in template
+    assert "edition ·" in template
     assert "Explicit preferred" in template
     assert "Unknown only when Explicit is unavailable" in template
     assert "album_monitored" not in template

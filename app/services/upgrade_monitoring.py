@@ -57,9 +57,9 @@ async def _set_release_upgrade_monitoring(
         )
     else:
         record.status = MonitoringStatus.active
-        record.desired_quality_json = profile.to_json()
-        record.history_json = history
-        record.candidate_id = None
+        desired_quality_json = profile.to_json()
+        if record.desired_quality_json != desired_quality_json:
+            record.desired_quality_json = desired_quality_json
 
 
 async def sync_album_upgrade_monitoring(db: AsyncSession, album_id: int, enabled: bool) -> None:

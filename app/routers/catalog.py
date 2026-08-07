@@ -1311,7 +1311,7 @@ async def set_catalog_release_family_editions(
             release.monitor_override = None
     elif action == "save":
         raw_ids = [str(value) for value in form.getlist("edition")]
-        if any(not value.isdigit() for value in raw_ids):
+        if any(not value.isdigit() or len(value) > 19 for value in raw_ids):
             raise HTTPException(status_code=400, detail="Release edition is invalid")
         selected_ids = {int(value) for value in raw_ids}
         representative_ids = {

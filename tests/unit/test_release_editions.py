@@ -171,6 +171,17 @@ def test_release_family_projection_strips_delimited_rating_labels() -> None:
     assert len(project_release_families(releases)) == 1
 
 
+def test_release_family_projection_preserves_punctuation_and_diacritic_identity() -> None:
+    releases = [
+        _release(1, title="AC/DC", rating="explicit"),
+        _release(2, title="AC DC", rating="clean"),
+        _release(3, title="Beyoncé", rating="explicit"),
+        _release(4, title="Beyonce", rating="clean"),
+    ]
+
+    assert len(project_release_families(releases)) == 4
+
+
 def test_policy_selects_one_deterministic_explicit_then_unknown_and_never_clean() -> None:
     explicit_plain = _release(1, rating="explicit")
     explicit_rich = _release(2, rating="explicit", artwork="cover")

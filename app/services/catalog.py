@@ -219,9 +219,18 @@ async def _provider_family_counts(
     releases_by_identity: dict[int, list[CatalogAlbumProvider]] = {}
     for release in releases:
         releases_by_identity.setdefault(release.artist_identity_id, []).append(release)
+    album_ids = {release.catalog_album_id for release in releases if release.catalog_album_id}
     progress_by_album = {
         int(row["album_id"]): (int(row["manifest_count"]), int(row["present_count"]))
-        for row in (await db.execute(select(album_progress))).mappings()
+        for row in (
+            (
+                await db.execute(
+                    select(album_progress).where(album_progress.c.album_id.in_(album_ids))
+                )
+            ).mappings()
+            if album_ids
+            else []
+        )
     }
     result: dict[int, _ProviderFamilyCounts] = {}
     for identity_id in identity_ids:
@@ -1378,6 +1387,8 @@ async def get_library_artists_page(
         )
     else:
         stmt = stmt.order_by(combined.c.name, combined.c.catalog_id)
+    if valid_sort != "wanted":
+        stmt = stmt.offset(_page_offset(page, per_page)).limit(per_page)
     rows = [dict(row) for row in (await db.execute(stmt)).mappings()]
     identity_ids = {int(row["identity_id"]) for row in rows if row["identity_id"] is not None}
     family_counts = await _provider_family_counts(db, identity_ids, album_progress)
@@ -1411,7 +1422,8 @@ async def get_library_artists_page(
         )
     else:
         rows.sort(key=lambda row: (str(row["name"]), int(row["catalog_id"] or 0)))
-    rows = rows[_page_offset(page, per_page) : _page_offset(page, per_page) + per_page]
+    if valid_sort == "wanted":
+        rows = rows[_page_offset(page, per_page) : _page_offset(page, per_page) + per_page]
 
     items: list[LibraryArtistRow] = []
     for row in rows:
