@@ -15,6 +15,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Hide the redundant Unknown badge and edition chooser on release cards that have no explicit or clean edition choice.
 - Group compatible provider release editions into one artist-discography card with native family-scoped Explicit, Clean, Not explicit, and Unknown controls plus a per-family reset to defaults.
 - Apply monitoring after complete discography refreshes, preserve edition choices across outer watchlist gates, and prevent stale sibling editions from creating duplicate acquisition or quality-upgrade work.
 - Count compatible rating editions once in local library, watchlist, and provider-state release totals while keeping ownership and progress tied to each exact canonical edition.

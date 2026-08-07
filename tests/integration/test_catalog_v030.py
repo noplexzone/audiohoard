@@ -1829,6 +1829,54 @@ async def test_artist_discography_groups_editions_and_uses_family_display_choice
     assert "Defaults: Explicit preferred; Unknown only when Explicit is unavailable" in page.text
 
 
+async def test_unknown_only_release_card_hides_unknown_label_and_edition_chooser(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Unknown Edition Artist",
+            monitored=True,
+            watchlist_provider="deezer",
+        )
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="deezer",
+            provider_artist_id="unknown-edition-artist",
+            name=artist.name,
+        )
+        CatalogAlbumProvider(
+            artist_identity=identity,
+            catalog_album=CatalogAlbum(
+                artist=artist,
+                title="Unlabelled Release",
+                release_type="album",
+                content_rating="unknown",
+                track_count=8,
+            ),
+            provider_album_id="unknown-only-release",
+            title="Unlabelled Release",
+            year="2026",
+            release_kind="album",
+            release_type_raw="Album",
+            content_rating="unknown",
+            track_count=8,
+            monitored=True,
+        )
+        db.add(artist)
+        await db.commit()
+        artist_id = artist.id
+
+    page = await client.get(f"/artists/catalog/{artist_id}?provider=deezer&release_type=Album")
+
+    assert page.status_code == 200
+    assert page.text.count('class="album-card"') == 1
+    assert "Unknown edition" not in page.text
+    assert 'aria-label="Available editions"' not in page.text
+    assert 'class="edition-chooser"' not in page.text
+    assert 'name="edition"' not in page.text
+
+
 async def test_family_post_supports_clean_multiple_none_and_defaults(client: AsyncClient) -> None:
     artist_id, ids = await _seed_edition_family()
     url = f"/artists/catalog/{artist_id}/release-families/{ids['explicit']}"
