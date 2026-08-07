@@ -28,6 +28,7 @@ from app.models.job import Job, JobStatus
 from app.models.track import Track
 from app.models.workflow import AcquisitionState, ImportWorkflowState
 from app.naming.convention import _sanitize_segment
+from app.services.release_editions import project_release_families
 from app.settings_service import QualityProfile, get_runtime_settings
 
 UNKNOWN = "Unknown"
@@ -187,6 +188,69 @@ class LibraryArtistRow:
     partial_release_count: int = 0
     unknown_release_count: int = 0
     local_release_count: int = 0
+
+
+@dataclass(frozen=True)
+class _ProviderFamilyCounts:
+    release_count: int = 0
+    complete_count: int = 0
+    partial_count: int = 0
+    unknown_count: int = 0
+    local_count: int = 0
+
+
+async def _provider_family_counts(
+    db: AsyncSession,
+    identity_ids: set[int],
+    album_progress: Any,
+) -> dict[int, _ProviderFamilyCounts]:
+    """Aggregate exact-edition progress over centralized provider release families."""
+    if not identity_ids:
+        return {}
+    releases = list(
+        (
+            await db.scalars(
+                select(CatalogAlbumProvider)
+                .where(CatalogAlbumProvider.artist_identity_id.in_(identity_ids))
+                .options(selectinload(CatalogAlbumProvider.artist_identity))
+            )
+        ).all()
+    )
+    releases_by_identity: dict[int, list[CatalogAlbumProvider]] = {}
+    for release in releases:
+        releases_by_identity.setdefault(release.artist_identity_id, []).append(release)
+    progress_by_album = {
+        int(row["album_id"]): (int(row["manifest_count"]), int(row["present_count"]))
+        for row in (await db.execute(select(album_progress))).mappings()
+    }
+    result: dict[int, _ProviderFamilyCounts] = {}
+    for identity_id in identity_ids:
+        complete = partial = unknown = local = 0
+        families = project_release_families(releases_by_identity.get(identity_id, []))
+        for family in families:
+            # Progress belongs to the displayed canonical edition only. A compatible
+            # sibling may collapse the count, but can never contribute its files.
+            album_id = family.display_release.catalog_album_id
+            if album_id is None:
+                unknown += 1
+                continue
+            manifest, present = progress_by_album.get(album_id, (0, 0))
+            if manifest == 0:
+                unknown += 1
+            elif present >= manifest:
+                complete += 1
+            elif present > 0:
+                partial += 1
+            if present > 0:
+                local += 1
+        result[identity_id] = _ProviderFamilyCounts(
+            release_count=len(families),
+            complete_count=complete,
+            partial_count=partial,
+            unknown_count=unknown,
+            local_count=local,
+        )
+    return result
 
 
 @dataclass
@@ -1224,6 +1288,7 @@ async def get_library_artists_page(
             CatalogArtist.name.label("name"),
             CatalogArtist.artwork_url.label("artwork_url"),
             CatalogArtist.monitored.label("monitored"),
+            canonical_identities.c.identity_id.label("identity_id"),
             canonical_identities.c.provider.label("primary_metadata_provider"),
             release_count.label("release_count"),
             downloaded_count.label("downloaded_file_count"),
@@ -1286,6 +1351,7 @@ async def get_library_artists_page(
         legacy_projection.c.name,
         literal(None).label("artwork_url"),
         literal(False).label("monitored"),
+        literal(None).label("identity_id"),
         literal(None).label("primary_metadata_provider"),
         literal(0).label("release_count"),
         legacy_projection.c.downloaded_file_count,
@@ -1312,7 +1378,40 @@ async def get_library_artists_page(
         )
     else:
         stmt = stmt.order_by(combined.c.name, combined.c.catalog_id)
-    rows = (await db.execute(stmt.offset(_page_offset(page, per_page)).limit(per_page))).mappings()
+    rows = [dict(row) for row in (await db.execute(stmt)).mappings()]
+    identity_ids = {int(row["identity_id"]) for row in rows if row["identity_id"] is not None}
+    family_counts = await _provider_family_counts(db, identity_ids, album_progress)
+    for row in rows:
+        identity_id = row["identity_id"]
+        if identity_id is None:
+            continue
+        counts = family_counts[int(identity_id)]
+        row["release_count"] = counts.release_count
+        row["complete_release_count"] = counts.complete_count
+        row["partial_release_count"] = counts.partial_count
+        row["unknown_release_count"] = counts.unknown_count
+        row["local_release_count"] = counts.local_count
+        row["wanted_release_count"] = counts.release_count - counts.complete_count
+
+    if valid_sort == "downloaded":
+        rows.sort(
+            key=lambda row: (
+                -int(row["downloaded_file_count"] or 0),
+                str(row["name"]),
+                int(row["catalog_id"] or 0),
+            )
+        )
+    elif valid_sort == "wanted":
+        rows.sort(
+            key=lambda row: (
+                -int(row["wanted_release_count"] or 0),
+                str(row["name"]),
+                int(row["catalog_id"] or 0),
+            )
+        )
+    else:
+        rows.sort(key=lambda row: (str(row["name"]), int(row["catalog_id"] or 0)))
+    rows = rows[_page_offset(page, per_page) : _page_offset(page, per_page) + per_page]
 
     items: list[LibraryArtistRow] = []
     for row in rows:
@@ -1436,7 +1535,10 @@ async def get_watchlisted_artists_page(
     stmt = (
         select(CatalogArtist)
         .where(CatalogArtist.monitored.is_(True))
-        .options(selectinload(CatalogArtist.albums))
+        .options(
+            selectinload(CatalogArtist.albums),
+            selectinload(CatalogArtist.identities).selectinload(CatalogArtistIdentity.releases),
+        )
     )
     if q:
         stmt = stmt.where(CatalogArtist.name.ilike(f"%{q}%"))
@@ -1444,8 +1546,24 @@ async def get_watchlisted_artists_page(
     items: list[WatchlistedArtistRow] = []
     for artist in catalog_artists:
         albums = singles_eps = compilations = 0
-        for release in artist.albums:
-            release_type = (release.release_type or "album").casefold()
+        identity = next(
+            (
+                item
+                for item in artist.identities
+                if item.provider == artist.watchlist_provider and item.releases
+            ),
+            None,
+        )
+        if identity is not None:
+            release_types = [
+                family.key.release_kind
+                for family in project_release_families(list(identity.releases))
+            ]
+        else:
+            release_types = [
+                (release.release_type or "album").casefold() for release in artist.albums
+            ]
+        for release_type in release_types:
             if release_type in {"single", "ep"}:
                 singles_eps += 1
             elif "compilation" in release_type:

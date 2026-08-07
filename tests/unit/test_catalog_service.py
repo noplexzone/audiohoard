@@ -32,6 +32,7 @@ from app.services.catalog import (
     get_library_artists_page,
     get_library_stats,
     get_release_progress,
+    get_watchlisted_artists_page,
     list_distinct_formats,
     list_library_tracks,
     track_meets_quality,
@@ -384,6 +385,173 @@ async def test_library_artist_card_uses_explicit_primary_provider_regardless_of_
     assert row.release_count == 1
 
 
+async def test_library_artist_card_counts_primary_provider_release_families(
+    db_session: AsyncSession,
+) -> None:
+    artist = CatalogArtist(
+        name="Edition Family Artist",
+        monitored=True,
+        primary_metadata_provider="deezer",
+    )
+    deezer = CatalogArtistIdentity(
+        provider="deezer", provider_artist_id="family-deezer", name=artist.name
+    )
+    musicbrainz = CatalogArtistIdentity(
+        provider="musicbrainz", provider_artist_id="family-mb", name=artist.name
+    )
+    artist.identities.extend([deezer, musicbrainz])
+    for provider_id, title, year, kind, track_count, rating in (
+        ("explicit", "Same Release (Explicit)", "2024", "album", 10, "explicit"),
+        ("clean", "Same Release (Clean)", "2024", "album", 10, "clean"),
+        ("year", "Same Release", "2025", "album", 10, "unknown"),
+        ("kind", "Same Release", "2024", "single", 10, "unknown"),
+        ("tracks", "Same Release", "2024", "album", 9, "unknown"),
+        ("version", "Same Release (Deluxe)", "2024", "album", 10, "unknown"),
+        ("missing-explicit", "Missing Count (Explicit)", "2024", "album", 10, "explicit"),
+        ("missing-clean", "Missing Count (Clean)", "2024", "album", None, "clean"),
+    ):
+        deezer.releases.append(
+            CatalogAlbumProvider(
+                provider_album_id=provider_id,
+                title=title,
+                year=year,
+                release_kind=kind,
+                track_count=track_count,
+                content_rating=rating,
+            )
+        )
+    musicbrainz.releases.extend(
+        CatalogAlbumProvider(
+            provider_album_id=f"mb-{index}",
+            title="Same Release",
+            year="2024",
+            release_kind="album",
+            track_count=10,
+        )
+        for index in range(3)
+    )
+    db_session.add(artist)
+    await db_session.flush()
+
+    row = (await get_library_artists_page(db_session)).items[0]
+
+    assert row.primary_metadata_provider == "deezer"
+    assert row.release_count == 6
+    assert row.unknown_release_count == 6
+
+
+async def test_library_artist_family_progress_does_not_cross_credit_owned_sibling(
+    db_session: AsyncSession, job: Job
+) -> None:
+    artist = CatalogArtist(
+        name="Ownership Boundary Artist",
+        monitored=True,
+        primary_metadata_provider="deezer",
+    )
+    identity = CatalogArtistIdentity(
+        provider="deezer", provider_artist_id="ownership-boundary", name=artist.name
+    )
+    clean = CatalogAlbum(
+        artist=artist, title="Boundary", year="2024", track_count=1, content_rating="clean"
+    )
+    explicit = CatalogAlbum(
+        artist=artist,
+        title="Boundary",
+        year="2024",
+        track_count=1,
+        content_rating="explicit",
+    )
+    clean.tracks.append(CatalogAlbumTrack(position=1, disc=1, title="Clean Track"))
+    explicit.tracks.append(CatalogAlbumTrack(position=1, disc=1, title="Explicit Track"))
+    identity.releases.extend(
+        [
+            CatalogAlbumProvider(
+                provider_album_id="boundary-clean",
+                title="Boundary (Clean)",
+                year="2024",
+                track_count=1,
+                release_kind="album",
+                content_rating="clean",
+                catalog_album=clean,
+            ),
+            CatalogAlbumProvider(
+                provider_album_id="boundary-explicit",
+                title="Boundary (Explicit)",
+                year="2024",
+                track_count=1,
+                release_kind="album",
+                content_rating="explicit",
+                catalog_album=explicit,
+            ),
+        ]
+    )
+    artist.identities.append(identity)
+    db_session.add(artist)
+    await db_session.flush()
+    imported = _make_track(job.id, title="Clean Track", artist=artist.name)
+    imported.catalog_album_id = clean.id
+    imported.catalog_track_id = clean.tracks[0].id
+    db_session.add(imported)
+    await db_session.flush()
+
+    row = (await get_library_artists_page(db_session)).items[0]
+
+    assert row.release_count == 1
+    assert row.complete_release_count == 0
+    assert row.partial_release_count == 0
+    assert row.unknown_release_count == 0
+    assert row.local_release_count == 0
+    assert row.wanted_release_count == 1
+    assert row.downloaded_file_count == 1
+
+
+async def test_watchlist_counts_release_families_and_preserves_legacy_fallback(
+    db_session: AsyncSession,
+) -> None:
+    family_artist = CatalogArtist(
+        name="Family Watchlist", monitored=True, watchlist_provider="deezer"
+    )
+    identity = CatalogArtistIdentity(
+        provider="deezer", provider_artist_id="family-watchlist", name=family_artist.name
+    )
+    identity.releases.extend(
+        [
+            CatalogAlbumProvider(
+                provider_album_id="watch-explicit",
+                title="Watch Release (Explicit)",
+                release_kind="album",
+                track_count=8,
+                content_rating="explicit",
+            ),
+            CatalogAlbumProvider(
+                provider_album_id="watch-clean",
+                title="Watch Release (Clean)",
+                release_kind="album",
+                track_count=8,
+                content_rating="clean",
+            ),
+        ]
+    )
+    family_artist.identities.append(identity)
+    legacy_artist = CatalogArtist(name="Legacy Watchlist", monitored=True)
+    legacy_artist.albums.extend(
+        [
+            CatalogAlbum(title="Legacy Album", release_type="album"),
+            CatalogAlbum(title="Legacy EP", release_type="ep"),
+        ]
+    )
+    db_session.add_all([family_artist, legacy_artist])
+    await db_session.flush()
+
+    rows = {row.name: row for row in (await get_watchlisted_artists_page(db_session)).items}
+
+    assert rows[family_artist.name].total_releases == 1
+    assert rows[family_artist.name].album_count == 1
+    assert rows[legacy_artist.name].total_releases == 2
+    assert rows[legacy_artist.name].album_count == 1
+    assert rows[legacy_artist.name].single_ep_count == 1
+
+
 async def test_library_artist_page_scales_to_production_sized_catalog(
     db_session: AsyncSession,
 ) -> None:
@@ -686,7 +854,7 @@ async def test_library_artist_projection_distinguishes_complete_partial_unknown_
     assert row.downloaded_file_count == 3
 
 
-async def test_library_artist_projection_deduplicates_provider_aliases_but_not_canonical_ids(
+async def test_library_artist_projection_groups_compatible_primary_provider_canonical_ids(
     db_session: AsyncSession,
 ) -> None:
     artist = CatalogArtist(name="Alias Artist", monitored=True, watchlist_provider="deezer")
@@ -718,8 +886,8 @@ async def test_library_artist_projection_deduplicates_provider_aliases_but_not_c
 
     row = (await get_library_artists_page(db_session)).items[0]
 
-    assert row.release_count == 2
-    assert row.unknown_release_count == 2
+    assert row.release_count == 1
+    assert row.unknown_release_count == 1
 
 
 async def test_release_progress_requires_present_plan_and_hydrated_manifest(

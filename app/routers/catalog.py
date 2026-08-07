@@ -1366,7 +1366,7 @@ async def catalog_artist_state(
             state = "ready"
         providers[identity.provider] = {
             "state": state,
-            "release_count": len(identity.releases),
+            "release_count": len(project_release_families(list(identity.releases))),
             "error": metadata.get("discography_error") if state == "failed" else None,
         }
     return JSONResponse({"providers": providers})

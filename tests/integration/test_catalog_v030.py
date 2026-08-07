@@ -1289,6 +1289,53 @@ async def test_discography_claim_is_atomic_across_sessions(client: AsyncClient) 
         assert await catalog_router._claim_discography_refresh(second, second_identity) is None
 
 
+async def test_artist_provider_state_counts_release_families(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(name="Provider State Families")
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="deezer",
+            provider_artist_id="provider-state-families",
+            name=artist.name,
+        )
+        identity.releases.extend(
+            [
+                CatalogAlbumProvider(
+                    provider_album_id="state-explicit",
+                    title="State Release (Explicit)",
+                    year="2024",
+                    track_count=10,
+                    release_kind="album",
+                    content_rating="explicit",
+                ),
+                CatalogAlbumProvider(
+                    provider_album_id="state-clean",
+                    title="State Release (Clean)",
+                    year="2024",
+                    track_count=10,
+                    release_kind="album",
+                    content_rating="clean",
+                ),
+                CatalogAlbumProvider(
+                    provider_album_id="state-other-year",
+                    title="State Release",
+                    year="2025",
+                    track_count=10,
+                    release_kind="album",
+                ),
+            ]
+        )
+        db.add(artist)
+        await db.commit()
+        artist_id = artist.id
+
+    response = await client.get(f"/artists/catalog/{artist_id}/state")
+
+    assert response.status_code == 200
+    assert response.json()["providers"]["deezer"]["release_count"] == 2
+
+
 async def test_preclaim_failure_does_not_mutate_discography_state(
     client: AsyncClient, monkeypatch
 ) -> None:
