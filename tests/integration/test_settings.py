@@ -515,6 +515,37 @@ async def test_source_priority_move_control_persists_order(client: AsyncClient) 
 
 
 @pytest.mark.asyncio
+async def test_behavior_slskd_download_timeout_persists(client: AsyncClient) -> None:
+    from app.database import get_session_factory
+    from app.settings_service import get_runtime_settings
+
+    async with get_session_factory()() as db:
+        original_timeout = (await get_runtime_settings(db)).slskd_download_timeout_seconds
+
+    try:
+        response = await client.post(
+            "/settings",
+            data={"section": "behavior", "slskd_download_timeout_seconds": "360"},
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        assert response.headers["location"] == "/settings/behavior?saved=1"
+        async with get_session_factory()() as db:
+            runtime = await get_runtime_settings(db)
+        assert runtime.slskd_download_timeout_seconds == 360
+    finally:
+        await client.post(
+            "/settings",
+            data={
+                "section": "behavior",
+                "slskd_download_timeout_seconds": str(original_timeout),
+            },
+            follow_redirects=False,
+        )
+
+
+@pytest.mark.asyncio
 async def test_invalid_behavior_form_redirects_with_error_instead_of_500(
     client: AsyncClient,
 ) -> None:

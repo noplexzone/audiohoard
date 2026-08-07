@@ -500,9 +500,7 @@ async def save_runtime_settings_page(
                 else current.acoustid_acceptance_threshold
             ),
             slskd_download_timeout_seconds=(
-                slskd_timeout
-                if section == "download-sources"
-                else current.slskd_download_timeout_seconds
+                slskd_timeout if section == "behavior" else current.slskd_download_timeout_seconds
             ),
             max_parallel_acquisitions=(
                 max_parallel if section == "behavior" else current.max_parallel_acquisitions
