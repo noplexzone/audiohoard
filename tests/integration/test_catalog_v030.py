@@ -828,6 +828,7 @@ async def test_switching_watchlist_provider_preserves_target_provider_choices(
             title="MB Release",
             release_kind="album",
             monitored=True,
+            monitor_override=True,
         )
         dz_release = CatalogAlbumProvider(
             artist_identity_id=deezer.id,
@@ -848,6 +849,7 @@ async def test_switching_watchlist_provider_preserves_target_provider_choices(
             "csrf_token": client.cookies.get("csrf", ""),
             "monitored": "true",
             "watchlist_provider": "deezer",
+            "watchlist_release_albums": "true",
             "provider": "musicbrainz",
             "album_monitored": str(mb_release_id),
         },
@@ -861,8 +863,59 @@ async def test_switching_watchlist_provider_preserves_target_provider_choices(
         refreshed_dz = await db.get(CatalogAlbumProvider, dz_release_id)
     assert refreshed_artist is not None
     assert refreshed_artist.watchlist_provider == "deezer"
-    assert refreshed_mb is not None and refreshed_mb.monitored is True
+    assert refreshed_mb is not None and refreshed_mb.monitored is False
+    assert refreshed_mb.monitor_override is True
     assert refreshed_dz is not None and refreshed_dz.monitored is True
+
+
+async def test_bulk_release_type_gates_preserve_edition_overrides(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Override Gate Artist",
+            monitored=True,
+            watchlist_provider="deezer",
+            watchlist_release_albums=True,
+        )
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="deezer",
+            provider_artist_id="override-gate-dz",
+            name=artist.name,
+        )
+        clean = CatalogAlbumProvider(
+            artist_identity=identity,
+            provider_album_id="clean",
+            title="Family",
+            release_kind="album",
+            content_rating="clean",
+            monitor_override=True,
+            monitored=True,
+        )
+        db.add(artist)
+        await db.commit()
+        artist_id = artist.id
+        clean_id = clean.id
+
+    for bulk, expected_monitored in (("none", False), ("all", True)):
+        response = await client.post(
+            f"/artists/catalog/{artist_id}/monitor",
+            data={
+                "csrf_token": client.cookies.get("csrf", ""),
+                "monitored": "true",
+                "watchlist_provider": "deezer",
+                "watchlist_release_albums": "true",
+                "provider": "deezer",
+                "bulk": bulk,
+            },
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        async with factory() as db:
+            refreshed = await db.get(CatalogAlbumProvider, clean_id)
+            assert refreshed is not None
+            assert refreshed.monitor_override is True
+            assert refreshed.monitored is expected_monitored
 
 
 async def test_watchlist_defaults_monitor_all_release_types_and_upgrade_records(

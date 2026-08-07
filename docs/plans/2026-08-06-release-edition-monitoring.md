@@ -12,16 +12,20 @@
 
 - Guest appearances remain in artist discographies.
 - One visible release card represents compatible clean, explicit, not-explicit, and unknown editions from the selected provider.
-- Preserve every concrete provider release and canonical catalog album internally; do not merge clean audio ownership into explicit ownership.
+- Preserve every clean/explicit/unknown provider edition and canonical catalog album internally; do not merge clean audio ownership into explicit ownership. Existing provider-specific safe condensation may continue deleting only proven same-rating superseded snapshots while preserving canonical state.
 - Never group releases with incompatible normalized titles, years, release kinds, concrete track counts, or identity-changing version descriptors.
 - Default monitoring policy everywhere: explicit editions on; unknown editions on only when the family has no explicit edition; clean and not-explicit editions off.
 - If a family contains only clean/not-explicit editions, it remains unmonitored.
 - The artist's album/single/EP watchlist switches remain the outer gate.
 - Users can override edition monitoring per grouped release. Explicit user overrides survive refreshes and new provider rows.
-- Within duplicate provider snapshots of the same rating, monitor at most one deterministic representative; retain the others as alternate provider records.
+- Artist enable/disable, release-type gates, bulk none/all/albums-only, and provider changes alter effective monitoring without erasing edition overrides. Each family exposes a separate reset-to-default action that clears its overrides.
+- When a family has rating overrides, an explicitly selected same-rating representative remains pinned ahead of mutable metadata richness; newly arriving siblings default off until the family is reset or edited.
+- Within duplicate provider snapshots of the same rating, monitor at most one deterministic representative; retain unresolved equal-count siblings, while proven provider-specific subset snapshots may use the existing safe condensation path.
+- When policy moves monitoring from an unknown/clean sibling to explicit, prevent duplicate acquisition across the family: cancel safely cancellable stale pending work and defer rather than double-queue when a sibling is already running.
+- Aggregate quality-upgrade monitoring by canonical album with OR semantics so an unmonitored alternate cannot pause a monitored sibling sharing that album.
 - Existing monitored artists are reconciled on upgrade without provider HTTP and without touching files, imports, ownership, jobs, or running containers.
 - GET routes remain read-only. Provider HTTP remains outside database transactions.
-- Update `CHANGELOG.md` under Unreleased. This is a user-visible feature and will release as the next minor version under `docs/VERSIONING.md`.
+- Update `CHANGELOG.md` under Unreleased. This is a user-visible minor-version feature, but the acceptance build remains untagged until Caleb approves a stable release.
 - Do not restart or modify the production AudioHoard container or live database during development/release verification.
 
 ---
@@ -138,20 +142,15 @@
 6. Obtain independent specification and quality review, remediate findings, and rerun the affected gates.
 7. Commit coherent Conventional Commits and push the feature branch. Open a PR and require CI success before merge.
 
-### Task 7: Release and published-image proof
+### Task 7: Acceptance-build publication and image proof
 
-**Objective:** Publish the exact verified feature through Audiohoard's required release path.
-
-**Files:**
-- Modify: `CHANGELOG.md`
-- Modify: `pyproject.toml`
-- Modify: `docker/Dockerfile`
+**Objective:** Publish the exact verified feature to Audiohoard's approved mutable acceptance channel without creating a premature stable release.
 
 **Steps:**
 1. Re-read `docs/VERSIONING.md`.
-2. Release the next minor version, expected `0.24.0`, because this adds schema and user-visible behavior.
-3. Merge preserving history, create and push annotated `v0.24.0`, and confirm the release workflow is running.
+2. Keep package and Dockerfile versions unchanged while this is under Caleb's acceptance testing; leave notes under Changelog `Unreleased`.
+3. Merge preserving history and manually dispatch the Release workflow on `main`, which publishes only `develop` for a branch dispatch.
 4. Wait for release quality/publish success.
 5. Pull and smoke-test the published image against disposable data; verify migration, readiness, and grouped-edition behavior without touching production.
-6. Verify Docker Hub digest and OCI labels for the exact merge/tag commit.
-7. Report the literal pull line for `noplexzone/audiohoard:develop@sha256:…`; do not change `latest` and do not restart production.
+6. Verify Docker Hub digest and OCI revision labels for the exact merge commit.
+7. Report the literal pull line for `noplexzone/audiohoard:develop@sha256:…`; do not create a semver tag, change `latest`, or restart production before Caleb's acceptance.

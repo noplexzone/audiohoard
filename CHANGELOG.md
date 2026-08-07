@@ -8,12 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Add provider-scoped release-family monitoring with durable per-edition overrides, explicit-first defaults, unknown fallback, clean-off defaults, and startup reconciliation for existing artists.
 - Automatically approve import-review mismatches only when the exact catalog-position Deezer preview produces a high-confidence acoustic match, with per-MBID score evidence, source/catalog revalidation, operator-precedence fencing, append-only audit attempts, and safe track-level MBID overrides.
 - Persist and retry approved auto-import dispatches with bounded backoff and duplicate-dispatch claims so transient failures recover without an application restart.
 - Record strict AcoustID-only consensus decisions in shadow mode so future automation can be evaluated without allowing confidence score alone to authorize an import.
 
 ### Changed
 
+- Apply monitoring after complete discography refreshes, preserve edition choices across outer watchlist gates, and prevent stale sibling editions from creating duplicate acquisition or quality-upgrade work.
 - Default import-review preview alignment to the common 47.926-second source offset when an exact acoustic match is unavailable.
 
 ### Fixed

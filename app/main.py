@@ -65,6 +65,7 @@ from app.services.library_removal import recover_deletion_operations
 from app.services.maintenance_scheduler import MaintenanceScheduler
 from app.services.maintenance_state import empty_maintenance_state
 from app.services.monitoring import MonitoringScheduler, QualityUpgradeCycleScheduler
+from app.services.release_editions import reconcile_release_monitoring
 from app.services.review_automation import ReviewAutomationScheduler, ReviewAutomationService
 from app.settings_service import (
     build_effective_settings,
@@ -155,6 +156,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
         n = await reconcile_duplicate_catalog_artists(db)
         release_snapshots = await reconcile_deezer_release_snapshots(db)
+        release_monitoring = await reconcile_release_monitoring(db)
         await db.commit()
         if n:
             logger.info("Reconciled %d duplicate catalog artist(s) at startup", n)
@@ -162,6 +164,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.info(
                 "Reconciled %d superseded Deezer release snapshot(s) at startup",
                 release_snapshots,
+            )
+        if release_monitoring:
+            logger.info(
+                "Reconciled %d provider release monitoring state(s) at startup",
+                release_monitoring,
             )
         repaired = await recover_approved_downloads(db, effective_settings)
         await db.commit()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from datetime import UTC, datetime
 
@@ -25,6 +26,12 @@ from app.services.catalog_metadata import (
     release_bucket,
 )
 from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
+from app.services.release_editions import (
+    apply_release_monitoring_policy,
+    project_release_families,
+    sync_canonical_monitoring,
+)
+from app.services.upgrade_monitoring import sync_artist_upgrade_monitoring
 from app.settings_service import build_effective_settings, get_runtime_settings
 
 logger = logging.getLogger(__name__)
@@ -35,6 +42,9 @@ def apply_monitor_policy(
     artist: CatalogArtist, releases: list[CatalogAlbumProvider] | list[CatalogAlbum]
 ) -> None:
     """Apply the artist policy to releases from the selected provider only."""
+    if releases and isinstance(releases[0], CatalogAlbumProvider):
+        apply_release_monitoring_policy(artist, releases)
+        return
     if not artist.monitored:
         for release in releases:
             release.monitored = False
@@ -97,13 +107,7 @@ def apply_monitor_policy(
 def _sync_canonical_monitoring(
     artist: CatalogArtist, releases: list[CatalogAlbumProvider]
 ) -> None:
-    for album in artist.albums:
-        album.monitored = False
-    if not artist.monitored:
-        return
-    for release in releases:
-        if release.monitored and release.catalog_album is not None:
-            release.catalog_album.monitored = True
+    sync_canonical_monitoring(artist, releases)
 
 
 def wanted_releases(releases: list[CatalogAlbumProvider]) -> list[CatalogAlbumProvider]:
@@ -147,12 +151,78 @@ async def queue_wanted_artist_releases(db: AsyncSession, artist: CatalogArtist) 
             ).all()
         )
     else:
-        albums = [
-            release.catalog_album
-            for release in wanted_releases(list(identity.releases))
-            if release.catalog_album is not None
-        ]
-    album_ids = [album.id for album in albums]
+        releases = list(identity.releases)
+        apply_release_monitoring_policy(artist, releases)
+        families = project_release_families(releases)
+        family_album_ids = {
+            release.catalog_album_id
+            for family in families
+            for release in family.releases
+            if release.catalog_album_id is not None
+        }
+        active_jobs = (
+            list(
+                (
+                    await db.scalars(
+                        select(Job).where(
+                            Job.catalog_album_id.in_(family_album_ids),
+                            Job.status.in_(_ACTIVE_JOB_STATES),
+                        )
+                    )
+                ).all()
+            )
+            if family_album_ids
+            else []
+        )
+        jobs_by_album: dict[int, list[Job]] = {}
+        for job in active_jobs:
+            if job.catalog_album_id is not None:
+                jobs_by_album.setdefault(job.catalog_album_id, []).append(job)
+
+        albums = []
+        for family in families:
+            selected = [
+                release
+                for release in family.releases
+                if release.monitored
+                and release.catalog_album is not None
+                and not release.catalog_album.in_library
+            ]
+            explicitly_multi_selected = len({release.catalog_album_id for release in selected}) > 1
+            for release in selected:
+                album = release.catalog_album
+                assert album is not None
+                if jobs_by_album.get(album.id):
+                    continue
+                sibling_ids = {
+                    sibling.catalog_album_id
+                    for sibling in family.releases
+                    if sibling.catalog_album_id is not None
+                    and sibling.catalog_album_id != album.id
+                    and not sibling.monitored
+                }
+                sibling_jobs = [
+                    job for sibling_id in sibling_ids for job in jobs_by_album.get(sibling_id, [])
+                ]
+                if not explicitly_multi_selected and any(
+                    job.status == JobStatus.running for job in sibling_jobs
+                ):
+                    continue
+                if not explicitly_multi_selected:
+                    for job in sibling_jobs:
+                        if job.status == JobStatus.pending:
+                            job.status = JobStatus.cancelled
+                            job.result_json = json.dumps(
+                                {
+                                    "status": "cancelled",
+                                    "reason": "superseded_by_preferred_release_edition",
+                                    "preferred_catalog_album_id": album.id,
+                                },
+                                sort_keys=True,
+                            )
+                albums.append(album)
+    unique_albums = {album.id: album for album in albums}
+    album_ids = list(unique_albums)
     active_album_ids: set[int] = set()
     if album_ids:
         active_album_ids = {
@@ -168,7 +238,7 @@ async def queue_wanted_artist_releases(db: AsyncSession, artist: CatalogArtist) 
             if album_id is not None
         }
     job_ids: list[int] = []
-    for album in albums:
+    for album in unique_albums.values():
         if album.id in active_album_ids:
             continue
         job = Job(
@@ -233,8 +303,9 @@ async def refresh_monitored_artist(
         await db.flush()
         return [], job_ids
     new = [release for release in releases if release.id not in before]
-    apply_monitor_policy(artist, new)
+    apply_monitor_policy(artist, releases)
     _sync_canonical_monitoring(artist, releases)
+    await sync_artist_upgrade_monitoring(db, artist, releases)
     artist.last_refreshed_at = datetime.now(tz=UTC)
 
     normalized_job_ids = await queue_wanted_artist_releases(db, artist) if auto_download else []
