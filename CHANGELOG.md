@@ -23,6 +23,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Persist the slskd download timeout when saving the Behavior settings form.
 - Refresh expired signed Deezer reference previews before rendering import review so comparison audio and alignment remain usable.
 - Serve cached MP3 review audio for FLAC files on mobile browsers so matched timestamps seek to the correct audible passage without changing the downloaded source.
 
