@@ -370,6 +370,20 @@ async def fetch_and_store_discography(
     releases = [await upsert_provider_release(db, artist, identity, hit) for hit in albums]
     if provider_name == "deezer":
         await reconcile_deezer_release_snapshots(db, artist.id)
+    await db.flush()
+    if artist.watchlist_provider == provider_name:
+        from app.services.release_editions import apply_release_monitoring_policy
+
+        complete = list(
+            (
+                await db.scalars(
+                    select(CatalogAlbumProvider)
+                    .where(CatalogAlbumProvider.artist_identity_id == identity.id)
+                    .options(selectinload(CatalogAlbumProvider.artist_identity))
+                )
+            ).all()
+        )
+        apply_release_monitoring_policy(artist, complete)
     identity.last_discography_at = datetime.now(tz=UTC)
     await db.flush()
     return releases
@@ -1376,6 +1390,8 @@ async def reconcile_deezer_release_snapshots(
             if loser.id == winner.id or loser.track_count in {None, richest_count}:
                 continue
             winner.monitored = bool(winner.monitored or loser.monitored)
+            if winner.monitor_override is None or loser.monitor_override is True:
+                winner.monitor_override = loser.monitor_override
             winner.artwork_url = winner.artwork_url or loser.artwork_url
             winner.upc = winner.upc or loser.upc
             await db.delete(loser)

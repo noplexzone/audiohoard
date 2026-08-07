@@ -1130,6 +1130,7 @@ async def test_search_page_watchlist_defaults_monitor_all_enriched_release_types
         )
         assert single is not None and identity is not None
         single.monitored = False
+        single.monitor_override = False
         metadata = json.loads(identity.metadata_json or "{}")
         metadata["discography_state"] = "idle"
         metadata.pop("discography_claim_id", None)

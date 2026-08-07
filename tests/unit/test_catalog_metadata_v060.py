@@ -631,6 +631,7 @@ async def test_reconcile_deezer_snapshots_keeps_larger_provider_and_preserves_ca
                 release_kind="ep",
                 content_rating="explicit",
                 monitored=True,
+                monitor_override=True,
             ),
             CatalogAlbumProvider(
                 catalog_album=larger,
@@ -697,6 +698,7 @@ async def test_reconcile_deezer_snapshots_keeps_larger_provider_and_preserves_ca
     winner = next(release for release in releases if release.provider_album_id == "339525867")
     assert winner.track_count == 9
     assert winner.monitored is True
+    assert winner.monitor_override is True
     albums = list((await db_session.scalars(select(CatalogAlbum))).all())
     assert {album.id for album in albums} == {smaller.id, larger.id, deluxe.id}
     assert len(smaller.tracks) == 5

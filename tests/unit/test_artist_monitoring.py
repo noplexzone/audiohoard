@@ -12,12 +12,20 @@ from sqlalchemy.orm import selectinload
 
 from app.config import Settings
 from app.database import Base
-from app.models.catalog_entities import CatalogAlbum, CatalogArtist
+from app.models.catalog_entities import (
+    CatalogAlbum,
+    CatalogAlbumProvider,
+    CatalogArtist,
+    CatalogArtistIdentity,
+)
 from app.models.job import Job, JobStatus
-from app.services import artist_monitoring
+from app.models.monitoring import MonitoringRecord, MonitoringStatus
+from app.models.release import Release
+from app.services import artist_monitoring, upgrade_monitoring
 from app.services.artist_monitoring import (
     DiscographyRefreshScheduler,
     apply_monitor_policy,
+    queue_wanted_artist_releases,
     refresh_monitored_artist,
 )
 
@@ -252,3 +260,330 @@ async def test_refresh_uses_watchlist_provider(monkeypatch: pytest.MonkeyPatch) 
     await refresh_monitored_artist(db, Settings(secret_key="test"), artist)
 
     assert observed == ["deezer"]
+
+
+async def _create_edition_artist(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    manual_clean: bool = False,
+    duplicate_explicit: bool = False,
+) -> int:
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Edition Artist",
+            monitored=True,
+            monitor_policy="all",
+            watchlist_provider="deezer",
+            watchlist_release_albums=True,
+            watchlist_release_singles=False,
+            watchlist_release_eps=False,
+        )
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="deezer",
+            provider_artist_id="edition-dz",
+            name=artist.name,
+        )
+        unknown_album = CatalogAlbum(
+            artist=artist, title="Family Unknown", release_type="album", in_library=False
+        )
+        CatalogAlbumProvider(
+            artist_identity=identity,
+            catalog_album=unknown_album,
+            provider_album_id="unknown",
+            title="Family",
+            year="2024",
+            release_kind="album",
+            content_rating="unknown",
+            track_count=10,
+            monitored=not manual_clean,
+            monitor_override=False if manual_clean else None,
+        )
+        if manual_clean:
+            clean_album = CatalogAlbum(
+                artist=artist, title="Family Clean", release_type="album", in_library=False
+            )
+            CatalogAlbumProvider(
+                artist_identity=identity,
+                catalog_album=clean_album,
+                provider_album_id="clean",
+                title="Family",
+                year="2024",
+                release_kind="album",
+                content_rating="clean",
+                track_count=10,
+                monitor_override=True,
+            )
+        if duplicate_explicit:
+            for index, artwork in ((1, None), (2, "cover")):
+                album = CatalogAlbum(
+                    artist=artist,
+                    title=f"Family Explicit {index}",
+                    release_type="album",
+                    in_library=False,
+                )
+                CatalogAlbumProvider(
+                    artist_identity=identity,
+                    catalog_album=album,
+                    provider_album_id=f"explicit-{index}",
+                    title="Family",
+                    year="2024",
+                    release_kind="album",
+                    content_rating="explicit",
+                    track_count=10,
+                    artwork_url=artwork,
+                )
+        db.add(artist)
+        await db.commit()
+        return artist.id
+
+
+async def _load_edition_artist(db: AsyncSession, artist_id: int) -> CatalogArtist:
+    return (
+        await db.execute(
+            select(CatalogArtist)
+            .where(CatalogArtist.id == artist_id)
+            .options(
+                selectinload(CatalogArtist.albums),
+                selectinload(CatalogArtist.identities)
+                .selectinload(CatalogArtistIdentity.releases)
+                .selectinload(CatalogAlbumProvider.catalog_album),
+            )
+        )
+    ).scalar_one()
+
+
+async def test_refresh_applies_policy_to_complete_family_after_all_upserts(
+    monitoring_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artist_id = await _create_edition_artist(monitoring_factory)
+
+    async def add_explicit(db, settings, artist, provider_name=None):
+        identity = (
+            await db.scalars(
+                select(CatalogArtistIdentity).where(
+                    CatalogArtistIdentity.artist_id == artist.id,
+                    CatalogArtistIdentity.provider == "deezer",
+                )
+            )
+        ).one()
+        album = CatalogAlbum(
+            artist=artist, title="Family Explicit", release_type="album", in_library=False
+        )
+        db.add(
+            CatalogAlbumProvider(
+                artist_identity=identity,
+                catalog_album=album,
+                provider_album_id="explicit-new",
+                title="Family",
+                year="2024",
+                release_kind="album",
+                content_rating="explicit",
+                track_count=10,
+            )
+        )
+        await db.flush()
+        return []
+
+    monkeypatch.setattr(artist_monitoring, "fetch_and_store_discography", add_explicit)
+    async with monitoring_factory() as db:
+        artist = await _load_edition_artist(db, artist_id)
+        await refresh_monitored_artist(db, Settings(secret_key="test"), artist)
+        rows = list(
+            (
+                await db.scalars(select(CatalogAlbumProvider).order_by(CatalogAlbumProvider.id))
+            ).all()
+        )
+    assert [(row.content_rating, row.monitored) for row in rows] == [
+        ("unknown", False),
+        ("explicit", True),
+    ]
+
+
+async def test_refresh_preserves_manual_clean_override(
+    monitoring_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artist_id = await _create_edition_artist(monitoring_factory, manual_clean=True)
+    monkeypatch.setattr(
+        artist_monitoring, "fetch_and_store_discography", AsyncMock(return_value=[])
+    )
+    async with monitoring_factory() as db:
+        artist = await _load_edition_artist(db, artist_id)
+        await refresh_monitored_artist(db, Settings(secret_key="test"), artist)
+        rows = list(
+            (
+                await db.scalars(select(CatalogAlbumProvider).order_by(CatalogAlbumProvider.id))
+            ).all()
+        )
+    assert [(row.content_rating, row.monitored) for row in rows] == [
+        ("unknown", False),
+        ("clean", True),
+    ]
+
+
+async def test_refresh_never_double_monitors_same_rating_duplicates(
+    monitoring_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artist_id = await _create_edition_artist(monitoring_factory, duplicate_explicit=True)
+    monkeypatch.setattr(
+        artist_monitoring, "fetch_and_store_discography", AsyncMock(return_value=[])
+    )
+    async with monitoring_factory() as db:
+        artist = await _load_edition_artist(db, artist_id)
+        await refresh_monitored_artist(db, Settings(secret_key="test"), artist)
+        rows = list((await db.scalars(select(CatalogAlbumProvider))).all())
+    assert sum(row.monitored for row in rows) == 1
+    assert next(row for row in rows if row.monitored).provider_album_id == "explicit-2"
+
+
+async def test_queue_supersedes_pending_unmonitored_sibling(
+    monitoring_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    artist_id = await _create_edition_artist(monitoring_factory, duplicate_explicit=True)
+    async with monitoring_factory() as db:
+        artist = await _load_edition_artist(db, artist_id)
+        unknown = next(
+            row
+            for identity in artist.identities
+            for row in identity.releases
+            if row.content_rating == "unknown"
+        )
+        old_job = Job(
+            source="priority",
+            query="old edition",
+            status=JobStatus.pending,
+            catalog_album_id=unknown.catalog_album_id,
+        )
+        db.add(old_job)
+        await db.flush()
+        job_ids = await queue_wanted_artist_releases(db, artist)
+        await db.flush()
+        await db.refresh(old_job)
+        new_job = await db.get(Job, job_ids[0])
+    assert old_job.status == JobStatus.cancelled
+    assert new_job is not None and new_job.catalog_album_id != unknown.catalog_album_id
+
+
+async def test_queue_defers_preferred_edition_while_sibling_is_running(
+    monitoring_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    artist_id = await _create_edition_artist(monitoring_factory, duplicate_explicit=True)
+    async with monitoring_factory() as db:
+        artist = await _load_edition_artist(db, artist_id)
+        unknown = next(
+            row
+            for identity in artist.identities
+            for row in identity.releases
+            if row.content_rating == "unknown"
+        )
+        db.add(
+            Job(
+                source="priority",
+                query="running old edition",
+                status=JobStatus.running,
+                catalog_album_id=unknown.catalog_album_id,
+            )
+        )
+        await db.flush()
+        assert await queue_wanted_artist_releases(db, artist) == []
+
+
+async def test_queue_respects_explicit_multi_rating_monitoring_choice(
+    monitoring_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    artist_id = await _create_edition_artist(monitoring_factory, manual_clean=True)
+    async with monitoring_factory() as db:
+        artist = await _load_edition_artist(db, artist_id)
+        rows = [row for identity in artist.identities for row in identity.releases]
+        for row in rows:
+            row.monitor_override = True
+        db.add(
+            Job(
+                source="priority",
+                query="first chosen edition",
+                status=JobStatus.pending,
+                catalog_album_id=rows[0].catalog_album_id,
+            )
+        )
+        await db.flush()
+        job_ids = await queue_wanted_artist_releases(db, artist)
+        jobs = list((await db.scalars(select(Job).order_by(Job.id))).all())
+    assert len(job_ids) == 1
+    assert [job.status for job in jobs] == [JobStatus.pending, JobStatus.pending]
+    assert {job.catalog_album_id for job in jobs} == {row.catalog_album_id for row in rows}
+
+
+async def test_upgrade_monitoring_uses_or_projection_for_shared_canonical_album(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artist = CatalogArtist(name="Upgrade OR", monitored=True, watchlist_monitor_upgrades=True)
+    rows = [
+        CatalogAlbumProvider(
+            id=1,
+            artist_identity_id=1,
+            catalog_album_id=42,
+            provider_album_id="monitored",
+            title="Album",
+            release_kind="album",
+            monitored=True,
+        ),
+        CatalogAlbumProvider(
+            id=2,
+            artist_identity_id=1,
+            catalog_album_id=42,
+            provider_album_id="alternate",
+            title="Album",
+            release_kind="album",
+            monitored=False,
+        ),
+    ]
+    sync = AsyncMock()
+    monkeypatch.setattr(upgrade_monitoring, "sync_album_upgrade_monitoring", sync)
+
+    await upgrade_monitoring.sync_artist_upgrade_monitoring(AsyncMock(), artist, rows)
+
+    sync.assert_awaited_once()
+    assert sync.await_args.args[1:] == (42, True)
+
+
+async def test_reenabling_upgrade_monitoring_preserves_history(
+    monitoring_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with monitoring_factory() as db:
+        job = Job(source="test", query="upgrade history", status=JobStatus.done)
+        release = Release(job=job, source="test", title="Imported Album")
+        record = MonitoringRecord(
+            release=release,
+            status=MonitoringStatus.active,
+            desired_quality_json="{}",
+            history_json='[{"outcome":"candidate_discovered"}]',
+        )
+        db.add(record)
+        await db.flush()
+
+        await upgrade_monitoring._set_release_upgrade_monitoring(db, release.id, True)
+
+        assert record.status == MonitoringStatus.active
+        assert record.history_json == '[{"outcome":"candidate_discovered"}]'
+
+
+async def test_refresh_invokes_upgrade_projection_after_monitor_policy(
+    monitoring_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artist_id = await _create_edition_artist(monitoring_factory, duplicate_explicit=True)
+    monkeypatch.setattr(
+        artist_monitoring, "fetch_and_store_discography", AsyncMock(return_value=[])
+    )
+    sync = AsyncMock()
+    monkeypatch.setattr(artist_monitoring, "sync_artist_upgrade_monitoring", sync)
+    async with monitoring_factory() as db:
+        artist = await _load_edition_artist(db, artist_id)
+        await refresh_monitored_artist(db, Settings(secret_key="test"), artist)
+
+    sync.assert_awaited_once()
+    releases = sync.await_args.args[2]
+    assert sum(release.monitored for release in releases) == 1

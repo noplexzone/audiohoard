@@ -828,6 +828,7 @@ async def test_switching_watchlist_provider_preserves_target_provider_choices(
             title="MB Release",
             release_kind="album",
             monitored=True,
+            monitor_override=True,
         )
         dz_release = CatalogAlbumProvider(
             artist_identity_id=deezer.id,
@@ -848,6 +849,7 @@ async def test_switching_watchlist_provider_preserves_target_provider_choices(
             "csrf_token": client.cookies.get("csrf", ""),
             "monitored": "true",
             "watchlist_provider": "deezer",
+            "watchlist_release_albums": "true",
             "provider": "musicbrainz",
             "album_monitored": str(mb_release_id),
         },
@@ -861,8 +863,59 @@ async def test_switching_watchlist_provider_preserves_target_provider_choices(
         refreshed_dz = await db.get(CatalogAlbumProvider, dz_release_id)
     assert refreshed_artist is not None
     assert refreshed_artist.watchlist_provider == "deezer"
-    assert refreshed_mb is not None and refreshed_mb.monitored is True
+    assert refreshed_mb is not None and refreshed_mb.monitored is False
+    assert refreshed_mb.monitor_override is True
     assert refreshed_dz is not None and refreshed_dz.monitored is True
+
+
+async def test_bulk_release_type_gates_preserve_edition_overrides(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Override Gate Artist",
+            monitored=True,
+            watchlist_provider="deezer",
+            watchlist_release_albums=True,
+        )
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="deezer",
+            provider_artist_id="override-gate-dz",
+            name=artist.name,
+        )
+        clean = CatalogAlbumProvider(
+            artist_identity=identity,
+            provider_album_id="clean",
+            title="Family",
+            release_kind="album",
+            content_rating="clean",
+            monitor_override=True,
+            monitored=True,
+        )
+        db.add(artist)
+        await db.commit()
+        artist_id = artist.id
+        clean_id = clean.id
+
+    for bulk, expected_monitored in (("none", False), ("all", True)):
+        response = await client.post(
+            f"/artists/catalog/{artist_id}/monitor",
+            data={
+                "csrf_token": client.cookies.get("csrf", ""),
+                "monitored": "true",
+                "watchlist_provider": "deezer",
+                "watchlist_release_albums": "true",
+                "provider": "deezer",
+                "bulk": bulk,
+            },
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        async with factory() as db:
+            refreshed = await db.get(CatalogAlbumProvider, clean_id)
+            assert refreshed is not None
+            assert refreshed.monitor_override is True
+            assert refreshed.monitored is expected_monitored
 
 
 async def test_watchlist_defaults_monitor_all_release_types_and_upgrade_records(
@@ -1234,6 +1287,53 @@ async def test_discography_claim_is_atomic_across_sessions(client: AsyncClient) 
         first_claim = await catalog_router._claim_discography_refresh(first, first_identity)
         assert isinstance(first_claim, str) and first_claim
         assert await catalog_router._claim_discography_refresh(second, second_identity) is None
+
+
+async def test_artist_provider_state_counts_release_families(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(name="Provider State Families")
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="deezer",
+            provider_artist_id="provider-state-families",
+            name=artist.name,
+        )
+        identity.releases.extend(
+            [
+                CatalogAlbumProvider(
+                    provider_album_id="state-explicit",
+                    title="State Release (Explicit)",
+                    year="2024",
+                    track_count=10,
+                    release_kind="album",
+                    content_rating="explicit",
+                ),
+                CatalogAlbumProvider(
+                    provider_album_id="state-clean",
+                    title="State Release (Clean)",
+                    year="2024",
+                    track_count=10,
+                    release_kind="album",
+                    content_rating="clean",
+                ),
+                CatalogAlbumProvider(
+                    provider_album_id="state-other-year",
+                    title="State Release",
+                    year="2025",
+                    track_count=10,
+                    release_kind="album",
+                ),
+            ]
+        )
+        db.add(artist)
+        await db.commit()
+        artist_id = artist.id
+
+    response = await client.get(f"/artists/catalog/{artist_id}/state")
+
+    assert response.status_code == 200
+    assert response.json()["providers"]["deezer"]["release_count"] == 2
 
 
 async def test_preclaim_failure_does_not_mutate_discography_state(
@@ -1617,3 +1717,262 @@ async def test_artist_page_keeps_section_heading_with_release_type_filter(
 
     assert response.status_code == 200
     assert "<h2>Album</h2>" in response.text
+
+
+async def _seed_edition_family() -> tuple[int, dict[str, int]]:
+    factory = get_session_factory()
+    async with factory() as db:
+        artist = CatalogArtist(
+            name="Edition Artist",
+            monitored=True,
+            watchlist_provider="deezer",
+            watchlist_release_albums=True,
+            watchlist_release_singles=True,
+        )
+        identity = CatalogArtistIdentity(
+            artist=artist,
+            provider="deezer",
+            provider_artist_id="edition-artist",
+            name=artist.name,
+        )
+        releases: dict[str, CatalogAlbumProvider] = {}
+        for rating in ("explicit", "clean", "unknown"):
+            album = CatalogAlbum(
+                artist=artist,
+                title=f"One Family {rating}",
+                release_type="album",
+                content_rating=rating,
+                track_count=10,
+            )
+            releases[rating] = CatalogAlbumProvider(
+                artist_identity=identity,
+                catalog_album=album,
+                provider_album_id=f"family-{rating}",
+                title=f"One Family ({rating.title()})",
+                year="2026",
+                release_kind="album",
+                release_type_raw="Album",
+                content_rating=rating,
+                track_count=10,
+            )
+        alternate = CatalogAlbumProvider(
+            artist_identity=identity,
+            catalog_album=CatalogAlbum(
+                artist=artist,
+                title="One Family clean alternate",
+                release_type="album",
+                content_rating="clean",
+                track_count=10,
+            ),
+            provider_album_id="family-clean-alternate",
+            title="One Family (Clean)",
+            year="2026",
+            release_kind="album",
+            release_type_raw="Album",
+            content_rating="clean",
+            track_count=10,
+        )
+        hidden = CatalogAlbumProvider(
+            artist_identity=identity,
+            catalog_album=CatalogAlbum(
+                artist=artist, title="Hidden Single", release_type="single", track_count=1
+            ),
+            provider_album_id="hidden-single",
+            title="Hidden Single",
+            year="2026",
+            release_kind="single",
+            release_type_raw="Single",
+            content_rating="explicit",
+            track_count=1,
+            monitor_override=True,
+            monitored=True,
+        )
+        other_artist = CatalogArtist(name="Other Edition Artist", monitored=True)
+        other_identity = CatalogArtistIdentity(
+            artist=other_artist,
+            provider="deezer",
+            provider_artist_id="other-edition-artist",
+            name=other_artist.name,
+        )
+        foreign = CatalogAlbumProvider(
+            artist_identity=other_identity,
+            provider_album_id="foreign-release",
+            title="Foreign",
+            release_kind="album",
+            content_rating="clean",
+        )
+        db.add_all([artist, other_artist])
+        await db.commit()
+        return artist.id, {
+            **{rating: release.id for rating, release in releases.items()},
+            "alternate": alternate.id,
+            "hidden": hidden.id,
+            "foreign": foreign.id,
+        }
+
+
+async def test_artist_discography_groups_editions_and_uses_family_display_choice(
+    client: AsyncClient,
+) -> None:
+    artist_id, ids = await _seed_edition_family()
+
+    page = await client.get(f"/artists/catalog/{artist_id}?provider=deezer&release_type=Album")
+
+    assert page.status_code == 200
+    assert page.text.count('class="album-card"') == 1
+    assert page.text.count('name="edition"') == 3
+    assert "Explicit" in page.text and "Clean" in page.text and "Unknown" in page.text
+    assert f'value="{ids["explicit"]}" checked' in page.text
+    assert f'value="{ids["clean"]}" checked' not in page.text
+    assert f'href="/albums/{ids["clean"]}"' not in page.text
+    assert 'class="edition-chooser"' in page.text
+    assert "Defaults: Explicit preferred; Unknown only when Explicit is unavailable" in page.text
+
+
+async def test_family_post_supports_clean_multiple_none_and_defaults(client: AsyncClient) -> None:
+    artist_id, ids = await _seed_edition_family()
+    url = f"/artists/catalog/{artist_id}/release-families/{ids['explicit']}"
+    base = {
+        "csrf_token": client.cookies.get("csrf", ""),
+        "family_provider": "deezer",
+        "provider": "deezer",
+        "release_type": "Album",
+        "sort": "asc",
+    }
+    factory = get_session_factory()
+
+    response = await client.post(
+        url, data={**base, "action": "save", "edition": str(ids["clean"])}, follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert response.headers["location"].endswith(f"#release-family-{ids['explicit']}")
+    async with factory() as db:
+        rows = {
+            key: await db.get(CatalogAlbumProvider, value)
+            for key, value in ids.items()
+            if key != "foreign"
+        }
+    assert rows["clean"] is not None and rows["clean"].monitor_override is True
+    assert rows["clean"].monitored is True
+    assert rows["explicit"] is not None and rows["explicit"].monitor_override is False
+    assert rows["alternate"] is not None and rows["alternate"].monitor_override is False
+
+    page = await client.get(f"/artists/catalog/{artist_id}?provider=deezer&release_type=Album")
+    clean_album_id = rows["clean"].catalog_album_id
+    assert clean_album_id is not None and f'href="/albums/{clean_album_id}"' in page.text
+
+    await client.post(
+        url,
+        data={
+            **base,
+            "action": "save",
+            "edition": [str(ids["explicit"]), str(ids["unknown"])],
+        },
+    )
+    async with factory() as db:
+        explicit = await db.get(CatalogAlbumProvider, ids["explicit"])
+        unknown = await db.get(CatalogAlbumProvider, ids["unknown"])
+    assert explicit is not None and explicit.monitored is True
+    assert unknown is not None and unknown.monitored is True
+
+    await client.post(url, data={**base, "action": "save"})
+    async with factory() as db:
+        family_rows = [
+            await db.get(CatalogAlbumProvider, ids[key])
+            for key in ("explicit", "clean", "unknown", "alternate")
+        ]
+    assert all(
+        row is not None and row.monitor_override is False and not row.monitored
+        for row in family_rows
+    )
+
+    await client.post(url, data={**base, "action": "defaults"})
+    async with factory() as db:
+        explicit = await db.get(CatalogAlbumProvider, ids["explicit"])
+        clean = await db.get(CatalogAlbumProvider, ids["clean"])
+        unknown = await db.get(CatalogAlbumProvider, ids["unknown"])
+    assert (
+        explicit is not None and explicit.monitor_override is None and explicit.monitored is True
+    )
+    assert clean is not None and clean.monitor_override is None and clean.monitored is False
+    assert unknown is not None and unknown.monitor_override is None and unknown.monitored is False
+
+
+async def test_family_route_rejects_cross_family_artist_and_provider_ids_and_get_is_read_only(
+    client: AsyncClient,
+) -> None:
+    artist_id, ids = await _seed_edition_family()
+    url = f"/artists/catalog/{artist_id}/release-families/{ids['explicit']}"
+    csrf = client.cookies.get("csrf", "")
+    factory = get_session_factory()
+
+    get_response = await client.get(url)
+    foreign = await client.post(
+        url,
+        data={
+            "csrf_token": csrf,
+            "family_provider": "deezer",
+            "action": "save",
+            "edition": str(ids["foreign"]),
+        },
+    )
+    wrong_provider = await client.post(
+        url,
+        data={
+            "csrf_token": csrf,
+            "family_provider": "musicbrainz",
+            "action": "save",
+            "edition": str(ids["clean"]),
+        },
+    )
+    wrong_artist = await client.post(
+        f"/artists/catalog/{artist_id}/release-families/{ids['foreign']}",
+        data={"csrf_token": csrf, "family_provider": "deezer", "action": "save"},
+    )
+    oversized_id = await client.post(
+        url,
+        data={
+            "csrf_token": csrf,
+            "family_provider": "deezer",
+            "action": "save",
+            "edition": "9" * 5000,
+        },
+    )
+
+    assert get_response.status_code == 405
+    assert (
+        foreign.status_code
+        == wrong_provider.status_code
+        == wrong_artist.status_code
+        == oversized_id.status_code
+        == 400
+    )
+    async with factory() as db:
+        explicit = await db.get(CatalogAlbumProvider, ids["explicit"])
+    assert explicit is not None and explicit.monitor_override is None
+
+
+async def test_filtered_artist_settings_post_does_not_clear_hidden_family_override(
+    client: AsyncClient,
+) -> None:
+    artist_id, ids = await _seed_edition_family()
+
+    response = await client.post(
+        f"/artists/catalog/{artist_id}/monitor",
+        data={
+            "csrf_token": client.cookies.get("csrf", ""),
+            "monitored": "true",
+            "watchlist_provider": "deezer",
+            "watchlist_release_albums": "true",
+            "watchlist_release_singles": "true",
+            "provider": "deezer",
+            "release_type": "Album",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    factory = get_session_factory()
+    async with factory() as db:
+        hidden = await db.get(CatalogAlbumProvider, ids["hidden"])
+    assert hidden is not None and hidden.monitor_override is True and hidden.monitored is True

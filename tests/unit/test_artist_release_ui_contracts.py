@@ -57,6 +57,26 @@ def test_catalog_artist_watchlist_settings_are_collapsed_and_immediate() -> None
     assert "watchlist-dialog" in css
 
 
+def test_discography_uses_native_family_scoped_edition_controls() -> None:
+    template = _read(TEMPLATES / "partials" / "_discography.html")
+    catalog = _read(TEMPLATES / "catalog_artist.html")
+    css = _read(STATIC / "css" / "pages.css")
+
+    assert '<details class="edition-chooser">' in template
+    assert 'name="edition"' in template
+    assert 'name="action" value="defaults"' in template
+    assert "Use defaults" in template
+    assert "edition ·" in template
+    assert "Explicit preferred" in template
+    assert "Unknown only when Explicit is unavailable" in template
+    assert "album_monitored" not in template
+    assert "album_monitored" not in catalog
+    assert "release-families/{{ family.anchor.id }}" in template
+    assert ".edition-chooser" in css
+    chooser_css = css[css.index(".edition-chooser") : css.index(".library-section")]
+    assert "overflow-x" not in chooser_css
+
+
 def test_release_page_has_compact_actions_autosave_and_safe_file_removal() -> None:
     template = _read(TEMPLATES / "catalog_album.html")
     source = _read(STATIC / "js" / "album.js")

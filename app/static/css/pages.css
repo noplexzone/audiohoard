@@ -1122,6 +1122,59 @@ a.metric-card:hover {
   min-height: 44px;
 }
 
+.edition-chooser {
+  margin: .55rem 0 .7rem;
+  border-top: 1px solid var(--border-soft);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.edition-chooser summary {
+  min-height: 44px;
+  padding: .7rem 0;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: .78rem;
+  font-weight: 700;
+}
+
+.edition-chooser form,
+.edition-chooser fieldset {
+  display: grid;
+  min-width: 0;
+  gap: .45rem;
+}
+
+.edition-chooser fieldset {
+  padding: 0;
+  border: 0;
+}
+
+.edition-choice {
+  min-height: 44px;
+  padding: .45rem .55rem;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.edition-policy {
+  margin: .2rem 0;
+  color: var(--muted);
+  font-size: .7rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.edition-actions {
+  display: flex;
+  gap: .4rem;
+  padding-bottom: .7rem;
+  flex-wrap: wrap;
+}
+
+.edition-actions .btn {
+  min-height: 44px;
+}
+
 .library-section {
   margin-top: 1.2rem;
   padding: 1rem;
