@@ -72,6 +72,7 @@ from app.services.library_removal import (
 from app.services.quality_upgrade import reconcile_album_quality_duplicates
 from app.services.release_editions import (
     apply_release_monitoring_policy,
+    project_release_families,
     set_family_monitor_overrides,
     sync_canonical_monitoring,
 )
@@ -934,6 +935,7 @@ async def catalog_artist_page(
         if selected_identity is not None
         else _legacy_provider_album_rows(artist, selected_provider)
     )
+    release_families = project_release_families(provider_albums)
     if (
         selected_provider == effective_primary_provider
         and not provider_albums
@@ -960,10 +962,15 @@ async def catalog_artist_page(
             ReleaseProgress(wanted_track_count=0, downloaded_track_count=0),
         )
         release_progress[release.id] = projected
-    artist_rollup = aggregate_artist_release_rollup(release_progress.values())
+    artist_rollup = aggregate_artist_release_rollup(
+        release_progress[family.display_release.id] for family in release_families
+    )
     albums = sorted(
-        provider_albums,
-        key=lambda release: (release.year or "0000", release.title.casefold()),
+        release_families,
+        key=lambda family: (
+            family.display_release.year or "0000",
+            family.display_release.title.casefold(),
+        ),
         reverse=sort != "asc",
     )
     requested_kinds = {
@@ -972,34 +979,34 @@ async def catalog_artist_page(
         "Compilation": {"compilation"},
     }.get(release_type)
     if requested_kinds:
-        albums = [release for release in albums if release.release_kind in requested_kinds]
+        albums = [family for family in albums if family.key.release_kind in requested_kinds]
     else:
         release_type = ""
     release_types = sorted(
         {release.release_type_raw for release in provider_albums if release.release_type_raw}
     )
     counts_by_type = {"albums": 0, "singles_eps": 0, "compilations": 0}
-    for release in provider_albums:
-        if release.release_kind in {"single", "ep"}:
+    for family in release_families:
+        if family.key.release_kind in {"single", "ep"}:
             counts_by_type["singles_eps"] += 1
-        elif release.release_kind == "compilation":
+        elif family.key.release_kind == "compilation":
             counts_by_type["compilations"] += 1
         else:
             counts_by_type["albums"] += 1
     grouped_albums = (
         [
-            ("Albums", [release for release in albums if release.release_kind == "album"]),
+            ("Albums", [family for family in albums if family.key.release_kind == "album"]),
             (
                 "Singles & EPs",
-                [release for release in albums if release.release_kind in {"single", "ep"}],
+                [family for family in albums if family.key.release_kind in {"single", "ep"}],
             ),
             (
                 "Compilations",
-                [release for release in albums if release.release_kind == "compilation"],
+                [family for family in albums if family.key.release_kind == "compilation"],
             ),
             (
                 "Other",
-                [release for release in albums if release.release_kind in {"other", "unknown"}],
+                [family for family in albums if family.key.release_kind in {"other", "unknown"}],
             ),
         ]
         if not release_type
@@ -1152,9 +1159,6 @@ async def monitor_catalog_artist_page(
     runtime = await get_runtime_settings(db)
     available = available_artist_providers(artist)
     requested_view_provider = str(form.get("provider", ""))
-    submitted_release_provider = (
-        requested_view_provider if requested_view_provider in available else None
-    )
     view_provider = _selected_provider(
         requested_view_provider,
         available,
@@ -1202,9 +1206,6 @@ async def monitor_catalog_artist_page(
         ),
         None,
     )
-    selected_ids = {
-        int(str(value)) for value in form.getlist("album_monitored") if str(value).isdigit()
-    }
     bulk = "all" if quick and artist.monitored else "none" if quick else str(form.get("bulk", ""))
     if bulk == "all":
         artist.watchlist_release_albums = True
@@ -1221,9 +1222,6 @@ async def monitor_catalog_artist_page(
 
     all_releases = [release for identity in artist.identities for release in identity.releases]
     if selected_identity is not None:
-        selected_releases = list(selected_identity.releases)
-        if submitted_release_provider == artist.watchlist_provider and not quick and not bulk:
-            set_family_monitor_overrides(selected_releases, selected_ids)
         apply_release_monitoring_policy(artist, all_releases)
         sync_canonical_monitoring(artist, all_releases)
     else:
@@ -1248,6 +1246,95 @@ async def monitor_catalog_artist_page(
         _artist_page_url(artist.id, provider=view_provider, release_type=release_type, sort=sort),
         status_code=303,
     )
+
+
+@router.post(
+    "/artists/catalog/{artist_id}/release-families/{anchor_release_id}",
+    include_in_schema=False,
+)
+async def set_catalog_release_family_editions(
+    artist_id: int,
+    anchor_release_id: int,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    load = (
+        selectinload(CatalogArtist.identities)
+        .selectinload(CatalogArtistIdentity.releases)
+        .selectinload(CatalogAlbumProvider.catalog_album)
+    )
+    artist = (
+        await db.execute(
+            select(CatalogArtist)
+            .where(CatalogArtist.id == artist_id)
+            .options(load, selectinload(CatalogArtist.albums))
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if artist is None:
+        raise HTTPException(status_code=404, detail="Catalog artist not found")
+
+    form = await request.form()
+    submitted_watchlist_provider = str(form.get("family_provider", ""))
+    if (
+        not artist.watchlist_provider
+        or submitted_watchlist_provider != artist.watchlist_provider
+        or submitted_watchlist_provider not in VALID_METADATA_PROVIDERS
+    ):
+        raise HTTPException(status_code=400, detail="Release family provider is not selected")
+    identity = next(
+        (
+            item
+            for item in artist.identities
+            if item.provider == artist.watchlist_provider
+            and any(release.id == anchor_release_id for release in item.releases)
+        ),
+        None,
+    )
+    if identity is None:
+        raise HTTPException(status_code=400, detail="Release family anchor is invalid")
+    family = next(
+        (
+            projected
+            for projected in project_release_families(list(identity.releases))
+            if any(release.id == anchor_release_id for release in projected.releases)
+        ),
+        None,
+    )
+    if family is None:
+        raise HTTPException(status_code=400, detail="Release family anchor is invalid")
+
+    action = str(form.get("action", "save"))
+    if action == "defaults":
+        for release in family.releases:
+            release.monitor_override = None
+    elif action == "save":
+        raw_ids = [str(value) for value in form.getlist("edition")]
+        if any(not value.isdigit() for value in raw_ids):
+            raise HTTPException(status_code=400, detail="Release edition is invalid")
+        selected_ids = {int(value) for value in raw_ids}
+        representative_ids = {
+            representative.id for representative in family.representatives.values()
+        }
+        if not selected_ids.issubset(representative_ids):
+            raise HTTPException(status_code=400, detail="Release edition is not in this family")
+        set_family_monitor_overrides(list(family.releases), selected_ids)
+    else:
+        raise HTTPException(status_code=400, detail="Release family action is invalid")
+
+    all_releases = [release for item in artist.identities for release in item.releases]
+    apply_release_monitoring_policy(artist, all_releases)
+    sync_canonical_monitoring(artist, all_releases)
+    await _sync_artist_upgrade_monitoring(db, artist, all_releases)
+    await db.commit()
+    location = _artist_page_url(
+        artist.id,
+        provider=str(form.get("provider", "")),
+        release_type=str(form.get("release_type", "")),
+        sort=str(form.get("sort", "desc")),
+    )
+    return RedirectResponse(f"{location}#release-family-{family.anchor.id}", status_code=303)
 
 
 @router.get("/artists/catalog/{artist_id}/state", include_in_schema=False)

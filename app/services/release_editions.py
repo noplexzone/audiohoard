@@ -18,8 +18,8 @@ from app.models.catalog_entities import (
 )
 
 _RATING_LABEL = re.compile(
-    r"(?:\s*[\[(]\s*(?:clean|explicit|not[\s_-]*explicit)\s*[\])]"
-    r"|\s*(?:-|–|—|:|\|)\s*(?:clean|explicit|not[\s_-]*explicit))\s*$",
+    r"(?:\s*[\[(]\s*(?:clean|explicit|unknown|not[\s_-]*explicit)\s*[\])]"
+    r"|\s*(?:-|–|—|:|\|)\s*(?:clean|explicit|unknown|not[\s_-]*explicit))\s*$",
     re.IGNORECASE,
 )
 _EDITION_WORDS = (
@@ -53,6 +53,45 @@ class ReleaseFamily:
     representatives: dict[str, CatalogAlbumProvider]
     preferred: CatalogAlbumProvider
 
+    @property
+    def anchor(self) -> CatalogAlbumProvider:
+        return min(self.releases, key=lambda release: release.id or 2**31)
+
+    @property
+    def has_overrides(self) -> bool:
+        return any(
+            getattr(release, "monitor_override", None) is not None for release in self.releases
+        )
+
+    @property
+    def selected_representatives(self) -> tuple[CatalogAlbumProvider, ...]:
+        """Return configured rating choices, independent of the artist's outer gate."""
+        if self.has_overrides:
+            selected_ratings = {
+                normalize_content_rating(release.content_rating)
+                for release in self.releases
+                if getattr(release, "monitor_override", None) is True
+            }
+        else:
+            selected_ratings = (
+                {"explicit"}
+                if "explicit" in self.representatives
+                else {"unknown"}
+                if "unknown" in self.representatives
+                else set()
+            )
+        return tuple(
+            self.representatives[rating]
+            for rating in ("explicit", "unknown", "clean", "not_explicit")
+            if rating in selected_ratings and rating in self.representatives
+        )
+
+    @property
+    def display_release(self) -> CatalogAlbumProvider:
+        """Prefer selected ratings before falling back to the available-edition policy."""
+        selected = self.selected_representatives
+        return selected[0] if selected else self.preferred
+
 
 def _normalize_text(value: object) -> str:
     folded = unicodedata.normalize("NFKD", str(value or ""))
@@ -76,7 +115,7 @@ def _edition_descriptor(value: object) -> str:
 
 def _provider_name(release: CatalogAlbumProvider) -> str:
     identity = getattr(release, "artist_identity", None)
-    return str(getattr(identity, "provider", "") or "")
+    return str(getattr(identity, "provider", "") or getattr(release, "provider", "") or "")
 
 
 def _normalized_kind(release: CatalogAlbumProvider) -> str:
@@ -98,7 +137,7 @@ def _normalized_kind(release: CatalogAlbumProvider) -> str:
 def release_family_key(release: CatalogAlbumProvider) -> ReleaseFamilyKey:
     """Return the provider-scoped identity shared by compatible rating editions."""
     return ReleaseFamilyKey(
-        artist_identity_id=release.artist_identity_id,
+        artist_identity_id=getattr(release, "artist_identity_id", 0),
         provider=_provider_name(release),
         normalized_title=_normalized_title(release.title),
         year=str(release.year).strip() if release.year else None,
@@ -109,7 +148,7 @@ def release_family_key(release: CatalogAlbumProvider) -> ReleaseFamilyKey:
 
 def _rank(release: CatalogAlbumProvider) -> tuple[int, int, int, int, str]:
     try:
-        metadata = json.loads(release.metadata_json or "{}")
+        metadata = json.loads(getattr(release, "metadata_json", None) or "{}")
     except (json.JSONDecodeError, TypeError):
         metadata = {}
     metadata_score = len(metadata) if isinstance(metadata, dict) else 0
@@ -119,7 +158,7 @@ def _rank(release: CatalogAlbumProvider) -> tuple[int, int, int, int, str]:
         metadata_score,
         int(bool(release.artwork_url)),
         -stable_id,
-        release.provider_album_id,
+        str(getattr(release, "provider_album_id", release.id)),
     )
 
 
@@ -131,7 +170,10 @@ def _representatives(
         rating = normalize_content_rating(release.content_rating)
         by_rating.setdefault(rating, []).append(release)
     return {
-        rating: max(rows, key=lambda row: (row.monitor_override is True, _rank(row)))
+        rating: max(
+            rows,
+            key=lambda row: (getattr(row, "monitor_override", None) is True, _rank(row)),
+        )
         for rating, rows in by_rating.items()
     }
 

@@ -104,6 +104,50 @@ def test_release_family_projection_ignores_rating_labels_in_title() -> None:
     assert len(families) == 1
 
 
+def test_family_display_prefers_single_configured_rating_then_policy_order() -> None:
+    explicit = _release(1, rating="explicit", override=False)
+    clean = _release(2, rating="clean", override=True)
+    unknown = _release(3, rating="unknown", override=False)
+
+    family = project_release_families([explicit, clean, unknown])[0]
+
+    assert [release.id for release in family.selected_representatives] == [2]
+    assert family.display_release.id == 2
+    assert family.has_overrides is True
+
+    clean.monitor_override = False
+    explicit.monitor_override = True
+    unknown.monitor_override = True
+    family = project_release_families([explicit, clean, unknown])[0]
+    assert {release.id for release in family.selected_representatives} == {1, 3}
+    assert family.display_release.id == 1
+
+
+def test_family_display_does_not_target_an_unselected_explicit_edition() -> None:
+    explicit = _release(1, rating="explicit", override=False)
+    clean = _release(2, rating="clean", override=True)
+    unknown = _release(3, rating="unknown", override=True)
+
+    family = project_release_families([explicit, clean, unknown])[0]
+
+    assert {release.id for release in family.selected_representatives} == {2, 3}
+    assert family.display_release.id == 3
+
+
+def test_family_policy_selection_is_explicit_then_unknown_and_clean_only_is_empty() -> None:
+    explicit = _release(1, rating="explicit")
+    unknown = _release(2, rating="unknown")
+    clean = _release(3, rating="clean")
+
+    family = project_release_families([explicit, unknown, clean])[0]
+    assert [release.id for release in family.selected_representatives] == [1]
+    assert family.display_release.id == 1
+
+    clean_only = project_release_families([_release(4, rating="clean")])[0]
+    assert clean_only.selected_representatives == ()
+    assert clean_only.display_release.id == 4
+
+
 def test_release_family_projection_preserves_bare_rating_words_in_real_titles() -> None:
     releases = [
         _release(1, title="Keep It Explicit", rating="explicit"),

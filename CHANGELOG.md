@@ -15,6 +15,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Group compatible provider release editions into one artist-discography card with native family-scoped Explicit, Clean, Not explicit, and Unknown controls plus a per-family reset to defaults.
 - Apply monitoring after complete discography refreshes, preserve edition choices across outer watchlist gates, and prevent stale sibling editions from creating duplicate acquisition or quality-upgrade work.
 - Default import-review preview alignment to the common 47.926-second source offset when an exact acoustic match is unavailable.
 
