@@ -10,6 +10,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
 if TYPE_CHECKING:
+    from app.models.acquisition_attempt import AcquisitionAttempt
     from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
     from app.models.release import Release
     from app.models.track import Track
@@ -64,6 +65,9 @@ class Job(Base):
         ForeignKey("catalog_album_tracks.id", ondelete="SET NULL"), nullable=True
     )
 
+    acquisition_attempts: Mapped[list[AcquisitionAttempt]] = relationship(
+        "AcquisitionAttempt", back_populates="job", cascade="all, delete-orphan"
+    )
     tracks: Mapped[list[Track]] = relationship(
         "Track", back_populates="job", cascade="all, delete-orphan"
     )
