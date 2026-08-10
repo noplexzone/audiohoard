@@ -132,4 +132,4 @@ async def test_advanced_search_skips_discovery_network(client, monkeypatch) -> N
     response = await client.get("/search?tab=advanced")
 
     assert response.status_code == 200
-    assert "Advanced source search" in response.text
+    assert "Manual search" in response.text

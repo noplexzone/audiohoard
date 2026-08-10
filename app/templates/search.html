@@ -3,7 +3,7 @@
 {% block content %}
 <div class="page-header">
   <h1>Discover</h1>
-  <p>Find artists in configured catalogs, explore releases, and use Manual search when you need exact acquisition-source results.</p>
+  <p>Find artists in configured catalogs, explore releases, and use Manual search—including a direct TIDAL track URL—when you need exact acquisition-source results.</p>
 </div>
 <nav class="tabs search-tabs">
   <a class="btn {{ 'secondary' if tab == 'advanced' else '' }}" href="/search">Discover</a>
@@ -79,7 +79,7 @@
 {% endif %}
 {% else %}
 <section class="card">
-  <h2>Manual search</h2><p class="hint">Search enabled acquisition sources directly. Context from a release, missing track, Wanted item, or failed acquisition is prefilled when available.</p>
+  <h2>Manual search</h2><p class="hint">Search enabled acquisition sources directly, including a direct TIDAL track URL when TIDAL is enabled. Context from a release, missing track, Wanted item, or failed acquisition is prefilled when available.</p>
   <form method="post" action="/search/ui" class="search-form advanced-search-form" role="search" aria-label="Manual source search">
     <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
     <div class="form-row">

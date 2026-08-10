@@ -3,18 +3,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from pydantic import ValidationError
+from sqlalchemy import or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
 from app.config import Settings
 from app.database import get_db
 from app.models.catalog_entities import CatalogArtist, CatalogArtistIdentity
+from app.models.source_candidate_block import SourceCandidateBlock
 from app.schemas.health import SourceStatus
 from app.schemas.search import SearchRequest, SearchResponse, SearchResult
 from app.services.catalog_metadata import search_catalog_artists
@@ -70,14 +74,23 @@ async def _watched_catalog_artists(
     return watched
 
 
-async def _monitored_catalog_artists(db: AsyncSession) -> list[CatalogArtist]:
+@dataclass(frozen=True, slots=True)
+class MonitoredArtistSummary:
+    id: int
+    name: str
+
+
+async def _monitored_catalog_artists(db: AsyncSession) -> list[MonitoredArtistSummary]:
     query = (
-        select(CatalogArtist)
+        select(CatalogArtist.id, CatalogArtist.name)
         .where(CatalogArtist.monitored.is_(True))
         .order_by(CatalogArtist.name)
         .limit(12)
     )
-    return list((await db.scalars(query)).all())
+    return [
+        MonitoredArtistSummary(id=int(row.id), name=str(row.name))
+        for row in (await db.execute(query))
+    ]
 
 
 def _build_adapter(
@@ -182,6 +195,7 @@ async def search(
         all_results.extend(results)
         source_states[name] = state
 
+    await _mark_active_rejected_results(db, all_results)
     ranked = rank_manual_results(all_results, req, requested)
     return SearchResponse(results=[item.result for item in ranked], source_states=source_states)
 
@@ -351,6 +365,46 @@ async def search_ui_get() -> RedirectResponse:
     return RedirectResponse("/search", status_code=307)
 
 
+async def _mark_active_rejected_results(db: AsyncSession, results: list[SearchResult]) -> None:
+    result_identities = {
+        (
+            str(result.metadata.get("username") or ""),
+            str(result.metadata.get("filename") or ""),
+        )
+        for result in results
+        if result.source == "slskd"
+    }
+    result_identities.discard(("", ""))
+    if not result_identities:
+        return
+    identities = {
+        (str(peer), str(filename))
+        for peer, filename in (
+            await db.execute(
+                select(SourceCandidateBlock.peer, SourceCandidateBlock.filename).where(
+                    SourceCandidateBlock.provider == "slskd",
+                    or_(
+                        SourceCandidateBlock.blocked_until.is_(None),
+                        SourceCandidateBlock.blocked_until > datetime.now(UTC),
+                    ),
+                    tuple_(SourceCandidateBlock.peer, SourceCandidateBlock.filename).in_(
+                        result_identities
+                    ),
+                )
+            )
+        ).all()
+    }
+    for result in results:
+        if result.source != "slskd":
+            continue
+        identity = (
+            str(result.metadata.get("username") or ""),
+            str(result.metadata.get("filename") or ""),
+        )
+        if identity in identities:
+            result.metadata["blocked"] = True
+
+
 @router.post("/search/ui", response_class=HTMLResponse)
 async def search_ui(
     request: Request,
@@ -367,11 +421,6 @@ async def search_ui(
     enabled_sources = {source for source in runtime.enabled_sources if source in _VALID_SOURCES}
     sources = [str(value) for value in form.getlist("sources") if str(value) in enabled_sources]
     expected_duration_raw = str(form.get("expected_duration_sec", "")).strip()
-    expected_duration_sec = (
-        int(expected_duration_raw)
-        if expected_duration_raw.isdigit() and int(expected_duration_raw) > 0
-        else None
-    )
     preferred_format = str(form.get("preferred_format", "")).strip()
     await db.rollback()
 
@@ -393,7 +442,7 @@ async def search_ui(
                 "artist": artist,
                 "album": album,
                 "track": track,
-                "expected_duration_sec": expected_duration_sec,
+                "expected_duration_sec": expected_duration_raw,
                 "preferred_format": preferred_format,
                 "enabled_sources": [s for s in runtime.enabled_sources if s in _VALID_SOURCES],
                 "selected_sources": sources,
@@ -401,15 +450,45 @@ async def search_ui(
             },
         )
 
-    req = SearchRequest(
-        query=query_str,
-        artist=artist or None,
-        album=album or None,
-        track=track or None,
-        sources=sources,
-        expected_duration_sec=expected_duration_sec,
-        preferred_format=preferred_format or None,
-    )
+    try:
+        req = SearchRequest.model_validate(
+            {
+                "query": query_str,
+                "artist": artist or None,
+                "album": album or None,
+                "track": track or None,
+                "sources": sources,
+                "expected_duration_sec": expected_duration_raw or None,
+                "preferred_format": preferred_format or None,
+            }
+        )
+    except ValidationError as exc:
+        message = str(exc.errors()[0].get("msg") or "Invalid search value")
+        return templates.TemplateResponse(
+            request,
+            "search.html",
+            {
+                "tab": "advanced",
+                "catalog_query": "",
+                "catalog_provider": "primary",
+                "metadata_providers": runtime.metadata_providers,
+                "catalog_outcomes": [],
+                "metadata_enabled": runtime.enabled_metadata_providers,
+                "results": None,
+                "result_groups": [],
+                "source_states": {},
+                "query": query_str,
+                "artist": artist,
+                "album": album,
+                "track": track,
+                "expected_duration_sec": expected_duration_raw,
+                "preferred_format": preferred_format,
+                "enabled_sources": [s for s in runtime.enabled_sources if s in _VALID_SOURCES],
+                "selected_sources": sources,
+                "error": message,
+            },
+            status_code=422,
+        )
     ordered_sources = sources
     tasks = [
         _search_source(name, settings, req, runtime.source_search_budget_seconds)
@@ -425,6 +504,7 @@ async def search_ui(
         name, results, state = outcome
         all_results.extend(results)
         source_states[name] = state
+    await _mark_active_rejected_results(db, all_results)
     ranked_results = rank_manual_results(all_results, req, ordered_sources)
     result_groups = group_ranked_results(ranked_results)
 
@@ -445,7 +525,7 @@ async def search_ui(
             "artist": artist,
             "album": album,
             "track": track,
-            "expected_duration_sec": expected_duration_sec,
+            "expected_duration_sec": req.expected_duration_sec,
             "preferred_format": preferred_format,
             "enabled_sources": [s for s in runtime.enabled_sources if s in _VALID_SOURCES],
             "selected_sources": sources,

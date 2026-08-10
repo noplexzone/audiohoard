@@ -70,7 +70,7 @@
       </div>
       {% endif %}
       <div class="album-card-actions">
-        <a class="btn secondary" href="/search?tab=sources&amp;q={{ (release.artist_name ~ ' ' ~ release.title) | urlencode }}&amp;artist={{ release.artist_name | urlencode }}&amp;album={{ release.title | urlencode }}">Manual search</a><button type="submit" class="btn secondary album-download" form="wanted-selected-form" formaction="/albums/{{ release.id }}/download">Queue missing</button>
+        <a class="btn secondary" href="/search?tab=advanced&amp;artist={{ release.artist_name | urlencode }}&amp;album={{ release.title | urlencode }}">Manual search</a><button type="submit" class="btn secondary album-download" form="wanted-selected-form" formaction="/albums/{{ release.id }}/download">Queue missing</button>
       </div>
     </div>
   </article>

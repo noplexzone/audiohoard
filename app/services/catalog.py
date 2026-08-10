@@ -25,8 +25,10 @@ from app.models.catalog_entities import (
 )
 from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
+from app.models.release import Release
+from app.models.staging_review import StagingReviewItem
 from app.models.track import Track
-from app.models.workflow import AcquisitionState, ImportWorkflowState
+from app.models.workflow import AcquisitionState, ImportWorkflowState, ReviewDecision
 from app.naming.convention import _sanitize_segment
 from app.services.release_editions import project_release_families
 from app.settings_service import QualityProfile, get_runtime_settings
@@ -1492,25 +1494,42 @@ async def get_missing_releases_page(
     if q:
         pattern = f"%{q}%"
         filters.append(or_(CatalogArtist.name.ilike(pattern), CatalogAlbum.title.ilike(pattern)))
-    active_job = exists(
-        select(Job.id).where(
+    pending_review = exists(
+        select(StagingReviewItem.id)
+        .join(Release, Release.id == StagingReviewItem.release_id)
+        .join(Job, Job.id == Release.job_id)
+        .where(
             Job.catalog_album_id == CatalogAlbum.id,
-            Job.status.in_((JobStatus.pending, JobStatus.running)),
+            StagingReviewItem.review_state == ReviewDecision.pending,
+            Release.review_dismissed_at.is_(None),
         )
     )
-    failed_job = exists(
-        select(Job.id).where(
-            Job.catalog_album_id == CatalogAlbum.id,
-            Job.status.in_((JobStatus.failed, JobStatus.partial)),
-        )
+    latest_job_status = (
+        select(Job.status)
+        .where(Job.catalog_album_id == CatalogAlbum.id)
+        .order_by(Job.updated_at.desc(), Job.id.desc())
+        .limit(1)
+        .correlate(CatalogAlbum)
+        .scalar_subquery()
     )
-    any_job = exists(select(Job.id).where(Job.catalog_album_id == CatalogAlbum.id))
     if status == "active":
-        filters.append(active_job)
+        filters.append(
+            or_(pending_review, latest_job_status.in_((JobStatus.pending, JobStatus.running)))
+        )
     elif status == "failed":
-        filters.append(failed_job)
+        filters.append(
+            and_(
+                ~pending_review,
+                latest_job_status.in_((JobStatus.failed, JobStatus.partial, JobStatus.cancelled)),
+            )
+        )
     elif status == "needs-search":
-        filters.append(~any_job)
+        filters.append(
+            and_(
+                ~pending_review,
+                or_(latest_job_status.is_(None), latest_job_status == JobStatus.done),
+            )
+        )
     rows_query = (
         select(
             CatalogAlbum.id.label("album_id"),

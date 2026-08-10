@@ -908,6 +908,42 @@ async def test_save_and_test_persists_and_refreshes_visible_status(
 
 
 @pytest.mark.asyncio
+async def test_save_and_test_ignores_fields_for_other_sections(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.sources.base import CapabilityState
+    from app.sources.slskd import SlskdAdapter
+
+    async def healthy(self: SlskdAdapter) -> CapabilityState:
+        return CapabilityState(available=True)
+
+    before = (await client.get("/api/settings")).json()["library_root"]["value"]
+    monkeypatch.setattr(SlskdAdapter, "health", healthy)
+    response = await client.post(
+        "/settings/save-and-test",
+        data={
+            "provider": "slskd",
+            "slskd_url": "http://slskd:5030",
+            "slskd_api_key": "secret",
+            "library_root": "/unrelated/crafted/path",
+        },
+        headers={"X-Requested-With": "fetch"},
+    )
+    assert response.status_code == 200
+    after = (await client.get("/api/settings")).json()["library_root"]["value"]
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_provider_urls_reject_link_local_metadata_targets(client: AsyncClient) -> None:
+    response = await client.post(
+        "/api/settings/save",
+        json={"slskd_url": "http://169.254.169.254/latest/meta-data"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_save_and_test_persists_configuration_when_connection_fails(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

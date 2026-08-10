@@ -14,7 +14,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import and_, func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, selectinload
 from tenacity import RetryError
@@ -1458,6 +1458,7 @@ async def _wanted_release_context(
         .where(
             Job.catalog_album_id == CatalogAlbum.id,
             StagingReviewItem.review_state == ReviewDecision.pending,
+            Release.review_dismissed_at.is_(None),
         )
         .correlate(CatalogAlbum)
         .scalar_subquery()
@@ -1473,7 +1474,13 @@ async def _wanted_release_context(
                 AcquisitionAttempt.remote_path == SourceCandidateBlock.filename,
             ),
         )
-        .where(AcquisitionAttempt.catalog_album_id == CatalogAlbum.id)
+        .where(
+            AcquisitionAttempt.catalog_album_id == CatalogAlbum.id,
+            or_(
+                SourceCandidateBlock.blocked_until.is_(None),
+                SourceCandidateBlock.blocked_until > datetime.now(UTC),
+            ),
+        )
         .correlate(CatalogAlbum)
         .scalar_subquery()
     )
@@ -1513,7 +1520,7 @@ async def _wanted_release_context(
             state = "Search scheduled"
         elif row.status == JobStatus.partial:
             state = "Partially downloaded"
-        elif row.status == JobStatus.failed:
+        elif row.status in {JobStatus.failed, JobStatus.cancelled}:
             state = "No usable candidates" if row.rejected_count else "Failed"
         result[int(row.id)] = SimpleNamespace(
             state=state,

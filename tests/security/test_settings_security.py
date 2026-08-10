@@ -156,3 +156,14 @@ async def test_member_cannot_read_settings(unauthenticated_client: AsyncClient) 
     )
     assert (await client.get("/settings/download-sources")).status_code == 403
     assert (await client.get("/api/settings")).status_code == 403
+    for path, data in (
+        ("/settings/save", {"section": "acquisition"}),
+        ("/settings/save-and-test", {"provider": "slskd"}),
+        ("/settings/test-paths", {}),
+        ("/settings/refresh", {"provider": "slskd"}),
+        ("/settings/test", {"provider": "slskd"}),
+    ):
+        response = await client.post(
+            path, data=data, headers={"X-CSRF-Token": client.cookies["csrf"]}
+        )
+        assert response.status_code == 403, path

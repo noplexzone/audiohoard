@@ -112,3 +112,19 @@ async def test_activity_hub_degrades_to_an_accessible_error_state(
     assert 'role="alert"' in response.text
     assert "Activity counts are temporarily unavailable" in response.text
     assert 'aria-label="Activity sections"' in response.text
+
+
+async def test_activity_summary_is_not_queried_before_authentication(
+    unauthenticated_client: AsyncClient, monkeypatch
+) -> None:
+    calls = 0
+
+    async def forbidden_summary(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("unauthenticated navigation must not aggregate activity")
+
+    monkeypatch.setattr("app.main.get_activity_summary", forbidden_summary)
+    response = await unauthenticated_client.get("/activity")
+    assert response.status_code == 401
+    assert calls == 0

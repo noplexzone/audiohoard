@@ -21,8 +21,9 @@ from app.models.catalog_entities import (
 from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
 from app.models.release import Release
+from app.models.staging_review import StagingReviewItem
 from app.models.track import FingerprintState, IdentityResolutionState, Track
-from app.models.workflow import AcquisitionState, ImportWorkflowState
+from app.models.workflow import AcquisitionState, ImportWorkflowState, ReviewDecision
 
 
 def _make_track(
@@ -325,7 +326,7 @@ async def test_wanted_page_shows_partial_release_and_hides_fully_owned_release(
     assert ">Queue all<" not in response.text
     assert 'name="status"' in response.text
     assert "Needs search" in response.text
-    assert "tab=sources" in response.text
+    assert "tab=advanced" in response.text
 
 
 async def test_wanted_failed_filter_uses_persistent_job_state(client: AsyncClient) -> None:
@@ -350,6 +351,73 @@ async def test_wanted_failed_filter_uses_persistent_job_state(client: AsyncClien
     assert "Second Partial Wanted Album" not in response.text
     assert "Failed" in response.text
     assert "No candidates" in response.text
+
+
+async def test_wanted_filters_use_only_latest_persistent_job_state(client: AsyncClient) -> None:
+    ids = await _seed_wanted_view_releases()
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        session.add_all(
+            [
+                Job(
+                    source="slskd",
+                    query="old failed wanted query",
+                    status=JobStatus.failed,
+                    catalog_album_id=ids["partial"],
+                ),
+                Job(
+                    source="slskd",
+                    query="new active wanted query",
+                    status=JobStatus.running,
+                    catalog_album_id=ids["partial"],
+                ),
+            ]
+        )
+        await session.commit()
+
+    failed = await client.get("/wanted?status=failed")
+    active = await client.get("/wanted?status=active")
+    assert f'href="/albums/{ids["partial"]}"' not in failed.text
+    assert f'href="/albums/{ids["partial"]}"' in active.text
+
+
+async def test_wanted_review_state_takes_precedence_in_filters(client: AsyncClient) -> None:
+    ids = await _seed_wanted_view_releases()
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        job = Job(
+            source="slskd",
+            query="completed acquisition awaiting review",
+            status=JobStatus.done,
+            catalog_album_id=ids["partial"],
+        )
+        session.add(job)
+        await session.flush()
+        release = Release(
+            job=job,
+            source="slskd",
+            title="Partial Wanted Album",
+            import_state=ImportWorkflowState.needs_review,
+        )
+        track = _make_track(job.id, title="Review-gated track")
+        track.release = release
+        review = StagingReviewItem(
+            track=track,
+            release=release,
+            expected_title="Review-gated track",
+            review_state=ReviewDecision.pending,
+        )
+        session.add_all([release, track, review])
+        await session.commit()
+
+    needs_search = await client.get("/wanted?status=needs-search")
+    failed = await client.get("/wanted?status=failed")
+    active = await client.get("/wanted?status=active")
+    album_href = f'href="/albums/{ids["partial"]}"'
+    assert album_href not in needs_search.text
+    assert album_href not in failed.text
+    assert album_href in active.text
+    assert "Awaiting review" in active.text
 
 
 async def test_wanted_queue_two_ids_queues_only_missing_tracks(

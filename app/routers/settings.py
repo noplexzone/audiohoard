@@ -12,9 +12,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.datastructures import FormData
 from starlette.responses import Response
 
-from app.auth import require_admin, require_admin_read, require_mutation
+from app.auth import require_admin, require_admin_read
 from app.config import Settings, get_settings
 from app.database import get_db
 from app.jobs.dispatcher import job_dispatcher
@@ -373,7 +374,7 @@ async def settings_section_page(
 async def save_runtime_settings_page(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
-    _user: Annotated[object, Depends(require_mutation)],
+    _user: Annotated[AppUser, Depends(require_admin)],
 ) -> RedirectResponse:
     form = await request.form()
     runtime = await get_runtime_settings(db)
@@ -639,17 +640,37 @@ async def save_runtime_settings_page(
     return RedirectResponse(f"/settings/{redirect_target}?saved=1", status_code=303)
 
 
+_PROVIDER_SAVE_FIELDS: dict[str, frozenset[str]] = {
+    "slskd": frozenset({"slskd_url", "slskd_api_key"}),
+    "prowlarr": frozenset({"prowlarr_url", "prowlarr_api_key"}),
+    "sabnzbd": frozenset({"sabnzbd_url", "sabnzbd_api_key"}),
+    "youtube": frozenset({"ytdlp_cookies_file"}),
+    "tidal": frozenset({"tidal_config_path", "tidal_session_path", "tidal_quality"}),
+}
+_SECTION_SAVE_FIELDS: dict[str, frozenset[str]] = {
+    "acquisition": frozenset().union(*_PROVIDER_SAVE_FIELDS.values()),
+    "download-clients": frozenset().union(*_PROVIDER_SAVE_FIELDS.values()),
+    "metadata": frozenset({"musicbrainz_contact", "acoustid_api_key"}),
+    "library": frozenset({"library_root", "staging_root", "naming_template"}),
+    "naming": frozenset({"library_root", "staging_root", "naming_template"}),
+}
+
+
+def _submitted_settings(form: FormData, allowed: frozenset[str]) -> dict[str, str]:
+    return {str(key): str(value) for key, value in form.items() if str(key) in allowed}
+
+
 @router.post("/settings/save", include_in_schema=False)
 async def save_settings_page(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     env: Annotated[Settings, Depends(get_settings)],
-    _user: Annotated[object, Depends(require_mutation)],
+    _user: Annotated[AppUser, Depends(require_admin)],
 ) -> RedirectResponse:
     form = await request.form()
     section = str(form.get("section", "download-clients"))
-    allowed = set(SettingsSaveRequest.model_fields)
-    updates = {str(key): str(value) for key, value in form.items() if str(key) in allowed}
+    allowed = _SECTION_SAVE_FIELDS.get(section, frozenset())
+    updates = _submitted_settings(form, allowed)
     if "naming_template" in updates:
         preview = _naming_preview(updates["naming_template"])
         if preview.startswith("Template error:"):
@@ -720,12 +741,14 @@ async def save_and_test_provider_page(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     env: Annotated[Settings, Depends(get_settings)],
-    _user: Annotated[object, Depends(require_mutation)],
+    _user: Annotated[AppUser, Depends(require_admin)],
 ) -> Response:
     form = await request.form()
     provider = str(form.get("provider", ""))
-    allowed = set(SettingsSaveRequest.model_fields)
-    updates = {str(key): str(value) for key, value in form.items() if str(key) in allowed}
+    allowed = _PROVIDER_SAVE_FIELDS.get(provider)
+    if allowed is None:
+        raise HTTPException(status_code=422, detail="Unknown provider")
+    updates = _submitted_settings(form, allowed)
     try:
         SettingsSaveRequest.model_validate(updates)
         result = await _save_and_test_result(provider, updates, db, env)
@@ -759,7 +782,7 @@ async def test_configured_paths_page(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     env: Annotated[Settings, Depends(get_settings)],
-    _user: Annotated[object, Depends(require_mutation)],
+    _user: Annotated[AppUser, Depends(require_admin)],
 ) -> RedirectResponse:
     effective = await get_all_effective(db, env)
     # Deliberately ignore form-supplied paths: only effective configured roots are probed.
@@ -776,7 +799,7 @@ async def refresh_provider_status_page(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     env: Annotated[Settings, Depends(get_settings)],
-    _user: Annotated[object, Depends(require_mutation)],
+    _user: Annotated[AppUser, Depends(require_admin)],
 ) -> RedirectResponse:
     form = await request.form()
     provider = str(form.get("provider", ""))
@@ -795,7 +818,7 @@ async def test_provider_page(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     env: Annotated[Settings, Depends(get_settings)],
-    _user: Annotated[object, Depends(require_mutation)],
+    _user: Annotated[AppUser, Depends(require_admin)],
 ) -> RedirectResponse:
     form = await request.form()
     provider = str(form.get("provider", ""))

@@ -139,3 +139,129 @@ async def test_manual_search_requires_visible_source_selection(client: AsyncClie
     assert response.status_code == 200
     assert "Select at least one enabled source" in response.text
     assert 'value="Massive Attack"' in response.text
+
+
+async def test_manual_search_marks_only_active_exact_rejections(client: AsyncClient) -> None:
+    del client
+    from datetime import UTC, datetime, timedelta
+
+    import app.database as db_module
+    from app.models.source_candidate_block import SourceCandidateBlock
+    from app.routers.search import _mark_active_rejected_results
+    from app.schemas.search import SearchResult
+
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        block = SourceCandidateBlock(
+            provider="slskd", peer="peer", filename="Artist/track.flac", reason="denied"
+        )
+        session.add(block)
+        await session.commit()
+        active = SearchResult(
+            source="slskd",
+            metadata={"username": "peer", "filename": "Artist/track.flac"},
+        )
+        await _mark_active_rejected_results(session, [active])
+        assert active.metadata["blocked"] is True
+
+        block.blocked_until = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+        expired = SearchResult(
+            source="slskd",
+            metadata={"username": "peer", "filename": "Artist/track.flac"},
+        )
+        await _mark_active_rejected_results(session, [expired])
+        assert "blocked" not in expired.metadata
+
+
+async def test_manual_search_validation_error_renders_in_form(client: AsyncClient) -> None:
+    response = await client.post(
+        "/search/ui",
+        data={"query": "x" * 501, "sources": ["slskd"]},
+    )
+    assert response.status_code == 422
+    assert "at most 500 characters" in response.text
+
+
+async def test_json_and_html_manual_search_apply_active_rejection_history(
+    client: AsyncClient, monkeypatch
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import app.database as db_module
+    from app.models.source_candidate_block import SourceCandidateBlock
+    from app.schemas.health import SourceStatus
+    from app.schemas.search import SearchResult
+
+    async def fake_source(name, settings, request, budget):
+        del settings, request, budget
+        return (
+            name,
+            [
+                SearchResult(
+                    source="slskd",
+                    title="A blocked",
+                    metadata={"username": "peer", "filename": "Artist/track.flac"},
+                ),
+                SearchResult(
+                    source="slskd",
+                    title="B usable",
+                    metadata={"username": "other", "filename": "Artist/other.flac"},
+                ),
+            ],
+            SourceStatus(available=True, details={}),
+        )
+
+    from dataclasses import replace
+
+    import app.routers.search as search_router
+
+    monkeypatch.setattr("app.routers.search._search_source", fake_source)
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        runtime = await search_router.get_runtime_settings(session)
+        runtime = replace(
+            runtime,
+            source_priority=[{"name": "slskd", "enabled": True}],
+        )
+
+        async def forced_runtime(db):
+            del db
+            return runtime
+
+        monkeypatch.setattr(search_router, "get_runtime_settings", forced_runtime)
+        block = SourceCandidateBlock(
+            provider="slskd", peer="peer", filename="Artist/track.flac", reason="denied"
+        )
+        session.add(block)
+        await session.commit()
+
+        active = await client.post("/search", json={"query": "track", "sources": ["slskd"]})
+        assert active.status_code == 200
+        active_results = active.json()["results"]
+        assert [result["title"] for result in active_results] == ["B usable", "A blocked"]
+        assert active_results[1]["metadata"]["blocked"] is True
+
+        html = await client.post("/search/ui", data={"query": "track", "sources": ["slskd"]})
+        assert html.status_code == 200
+        assert html.text.index("B usable") < html.text.index("A blocked")
+
+        block.blocked_until = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    expired = await client.post("/search", json={"query": "track", "sources": ["slskd"]})
+    assert expired.status_code == 200
+    assert [result["title"] for result in expired.json()["results"]] == [
+        "A blocked",
+        "B usable",
+    ]
+    assert "blocked" not in expired.json()["results"][0]["metadata"]
+
+
+async def test_manual_search_rejects_malformed_duration_inline(client: AsyncClient) -> None:
+    response = await client.post(
+        "/search/ui",
+        data={"query": "track", "sources": ["slskd"], "expected_duration_sec": "not-a-number"},
+    )
+    assert response.status_code == 422
+    assert "valid integer" in response.text

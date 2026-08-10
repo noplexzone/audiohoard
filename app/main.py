@@ -248,12 +248,18 @@ def create_app() -> FastAPI:
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
         request.state.activity_summary = None
-        if request.method == "GET" and not request.url.path.startswith(
-            ("/static/", "/api/", "/artwork")
+        if (
+            request.method == "GET"
+            and request.cookies.get("session")
+            and not request.url.path.startswith(("/static/", "/api/", "/artwork", "/login"))
         ):
             try:
                 async with get_session_factory()() as db:
+                    await get_current_user(request, db)
                     request.state.activity_summary = await get_activity_summary(db)
+            except HTTPException:
+                # Authentication handling remains with the route dependency/HTML exception handler.
+                pass
             except Exception:
                 logger.warning("Activity summary unavailable for navigation", exc_info=True)
         return await call_next(request)
