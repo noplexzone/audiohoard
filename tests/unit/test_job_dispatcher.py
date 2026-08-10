@@ -758,7 +758,7 @@ async def test_terminal_cleanup_retries_transient_sqlite_lock(
             raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
         return []
 
-    async def no_transfers(factory, adapter, job_ids=None, *, max_attempts=3):
+    async def no_transfers(factory, adapter, job_ids=None, *, max_attempts=3, **_kwargs):
         return 0
 
     async def no_sleep(delay):

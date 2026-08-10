@@ -33,6 +33,11 @@ _CATEGORY_NAMES = (
     "exact_artifact_mismatched",
     "empty_directories_eligible",
     "empty_directories_not_eligible",
+    "unmatched_terminal_transfers",
+    "ambiguous_attempts",
+    "review_import_debt",
+    "unreferenced_complete_files",
+    "incomplete_tree_entries",
 )
 
 
@@ -96,9 +101,9 @@ def _attempt_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(
         connection.execute(
             """
-            SELECT id, peer, remote_path, provider_uuid, provider_state,
+            SELECT id, job_id, peer, remote_path, provider_uuid, provider_state,
                    provider_cleanup_state, file_cleanup_state, file_cleanup_eligible,
-                   retention_disposition, staged_path, partial_path,
+                   retention_disposition, outcome, terminal_at, staged_path, partial_path,
                    artifact_device, artifact_inode, artifact_mtime_ns, artifact_size,
                    artifact_sha256
             FROM acquisition_attempts
@@ -111,6 +116,100 @@ def _attempt_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
 
 def _snapshot_uuid(item: dict[str, object]) -> str | None:
     return canonical_provider_uuid(item.get("id") or item.get("transferId"))
+
+
+def _snapshot_is_terminal(item: dict[str, object]) -> bool:
+    terminal = {
+        "completed",
+        "complete",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "canceled",
+        "timedout",
+        "timed_out",
+    }
+    values: list[str] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if str(key).casefold() in {"state", "status", "downloadstate"}:
+                    values.append(str(child).casefold().replace(" ", "").replace("-", "_"))
+                collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    collect(item)
+    return any(value in terminal for value in values)
+
+
+def _reference_paths(connection: sqlite3.Connection, attempts: list[sqlite3.Row]) -> set[Path]:
+    paths = {
+        Path(str(value)).absolute()
+        for row in attempts
+        for value in (row["staged_path"], row["partial_path"])
+        if value
+    }
+    for table, columns in (
+        ("tracks", ("source_path", "staging_path")),
+        (
+            "import_plans",
+            ("source_path", "staging_path", "destination_path", "destination_temp_path"),
+        ),
+    ):
+        if not _table_exists(connection, table):
+            continue
+        available = {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+        selected = [column for column in columns if column in available]
+        if not selected:
+            continue
+        query = "SELECT " + ", ".join(selected) + f" FROM {table}"
+        for row in connection.execute(query):
+            paths.update(Path(str(value)).absolute() for value in row if value)
+    return paths
+
+
+def _review_import_debt(connection: sqlite3.Connection) -> list[dict[str, object]]:
+    if not _table_exists(connection, "import_plans"):
+        return []
+    return [
+        {"plan_id": int(row["id"]), "status": str(row["status"])}
+        for row in connection.execute(
+            """
+            SELECT id, status FROM import_plans
+            WHERE status IN ('needs_review', 'ready', 'importing')
+            ORDER BY id
+            """
+        )
+    ]
+
+
+def _root_entries(root: Path) -> tuple[list[Path], list[tuple[Path, str]]]:
+    files: list[Path] = []
+    entries: list[tuple[Path, str]] = []
+    try:
+        configured = root.resolve(strict=True)
+    except OSError:
+        return files, entries
+    if configured.is_symlink() or not configured.is_dir():
+        return files, entries
+    for current, dirs, names in os.walk(configured, topdown=True, followlinks=False):
+        current_path = Path(current)
+        dirs[:] = sorted(name for name in dirs if not (current_path / name).is_symlink())
+        for name in dirs:
+            entries.append((current_path / name, "directory"))
+        for name in sorted(names):
+            candidate = current_path / name
+            try:
+                current_stat = candidate.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISREG(current_stat.st_mode):
+                files.append(candidate)
+                entries.append((candidate, "file"))
+    return files, entries
 
 
 def _normalized_path(value: object) -> str:
@@ -178,6 +277,8 @@ async def build_report(
     with open_readonly(database) as connection:
         effective = _effective_settings(connection, settings)
         attempts = _attempt_rows(connection)
+        referenced_paths = _reference_paths(connection, attempts)
+        review_debt = _review_import_debt(connection)
 
     provider: dict[str, str]
     snapshot: list[dict[str, object]] | None = None
@@ -213,6 +314,10 @@ async def build_report(
                 categories["queue_rows_without_attempt_owner"].append(
                     {"provider_uuid": provider_uuid}
                 )
+                if _snapshot_is_terminal(queue_item):
+                    categories["unmatched_terminal_transfers"].append(
+                        {"provider_uuid": provider_uuid}
+                    )
             else:
                 categories["queue_uuids_with_attempt_owner"].append(
                     {"provider_uuid": provider_uuid, "attempt_id": int(owner["id"])}
@@ -238,6 +343,18 @@ async def build_report(
                 categories["attempt_obligations_live_queue_uuid"].append(
                     {"attempt_id": attempt_id, "provider_uuid": provider_uuid}
                 )
+
+    for row in attempts:
+        if canonical_provider_uuid(row["provider_uuid"]) is None and str(
+            row["provider_cleanup_state"]
+        ) not in {"completed", "not_required"}:
+            categories["ambiguous_attempts"].append(
+                {
+                    "attempt_id": int(row["id"]),
+                    "reason": "missing_canonical_provider_uuid",
+                }
+            )
+    categories["review_import_debt"].extend(review_debt)
 
     roots = tuple(
         (label, root)
@@ -283,6 +400,20 @@ async def build_report(
             )
         else:
             categories["exact_artifact_present"].append({"attempt_id": attempt_id, **safe})
+
+    if effective.slskd_complete_root is not None:
+        complete_files, _complete_entries = await asyncio.to_thread(
+            _root_entries, effective.slskd_complete_root
+        )
+        for path in complete_files:
+            if path.absolute() not in referenced_paths:
+                categories["unreferenced_complete_files"].append(_safe_path(path, roots))
+    if effective.slskd_incomplete_root is not None:
+        _incomplete_files, incomplete_entries = await asyncio.to_thread(
+            _root_entries, effective.slskd_incomplete_root
+        )
+        for path, kind in incomplete_entries:
+            categories["incomplete_tree_entries"].append({**_safe_path(path, roots), "kind": kind})
 
     configured_roots = tuple(root for _, root in roots)
     if snapshot is not None and configured_roots:

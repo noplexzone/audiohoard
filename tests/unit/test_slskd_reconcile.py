@@ -14,7 +14,11 @@ from app.config import Settings
 from app.database import Base
 from app.maintenance.slskd_reconcile import build_report, create_parser, open_readonly
 from app.models.acquisition_attempt import AcquisitionAttempt, CleanupState, ProviderTransferState
+from app.models.import_plan import ImportPlan
 from app.models.job import Job
+from app.models.release import Release
+from app.models.track import Track
+from app.models.workflow import ImportWorkflowState
 
 UUID_LIVE = "2d93899b-cf9a-4567-8f10-993610f274cf"
 UUID_MISSING = "06fdfa12-6d4a-4f9e-aa13-bc35685fef65"
@@ -48,6 +52,18 @@ async def _fixture_database(path: Path, artifact: Path) -> None:
         job = Job(source="slskd", query="fixture")
         db.add(job)
         await db.flush()
+        release = Release(job=job, source="slskd", title="Review debt")
+        track = Track(job=job, release=release, source="slskd", staging_path=str(artifact))
+        db.add(
+            ImportPlan(
+                release=release,
+                track=track,
+                source_path=str(artifact),
+                staging_path=str(artifact),
+                destination_path=str(artifact.parent / "library.flac"),
+                status=ImportWorkflowState.needs_review,
+            )
+        )
         db.add_all(
             [
                 AcquisitionAttempt(
@@ -95,6 +111,13 @@ async def _fixture_database(path: Path, artifact: Path) -> None:
                     provider_cleanup_state=CleanupState.completed,
                     file_cleanup_state=CleanupState.not_required,
                 ),
+                AcquisitionAttempt(
+                    job_id=job.id,
+                    provider="slskd",
+                    peer="ambiguous",
+                    remote_path="Album/ambiguous.flac",
+                    provider_state=ProviderTransferState.failed,
+                ),
             ]
         )
         await db.commit()
@@ -110,6 +133,11 @@ async def test_report_classifies_fixture_and_performs_zero_mutations(tmp_path: P
     artifact.write_bytes(b"exact artifact")
     empty = incomplete / "old-empty"
     empty.mkdir(parents=True)
+    stray = complete / "Album" / "unreferenced.flac"
+    stray.write_bytes(b"unreferenced")
+    partial = incomplete / "peer" / "partial.tmp"
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"partial")
     import os
     import time
 
@@ -151,9 +179,22 @@ async def test_report_classifies_fixture_and_performs_zero_mutations(tmp_path: P
         UUID_MISMATCH,
     ]
     assert categories["queue_rows_without_attempt_owner"] == [{"provider_uuid": UUID_ORPHAN}]
+    assert categories["unmatched_terminal_transfers"] == [{"provider_uuid": UUID_ORPHAN}]
+    assert categories["ambiguous_attempts"] == [
+        {"attempt_id": 5, "reason": "missing_canonical_provider_uuid"}
+    ]
+    assert categories["review_import_debt"] == [{"plan_id": 1, "status": "needs_review"}]
+    assert categories["unreferenced_complete_files"] == [
+        {"root": "complete", "path": "Album/unreferenced.flac"}
+    ]
+    assert {tuple(sorted(row.items())) for row in categories["incomplete_tree_entries"]} >= {
+        tuple(sorted({"root": "incomplete", "path": "old-empty", "kind": "directory"}.items())),
+        tuple(sorted({"root": "incomplete", "path": "peer/partial.tmp", "kind": "file"}.items())),
+    }
     assert [row["attempt_id"] for row in categories["attempt_obligations_live_queue_uuid"]] == [1]
     assert [row["attempt_id"] for row in categories["attempt_obligations_missing_queue_uuid"]] == [
-        2
+        2,
+        5,
     ]
     assert [
         row["attempt_id"] for row in categories["attempt_obligations_mismatched_queue_uuid"]
