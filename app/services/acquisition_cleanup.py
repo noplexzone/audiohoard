@@ -1481,6 +1481,7 @@ async def cleanup_durable_slskd_transfers(
     job_ids: set[int] | None = None,
     *,
     max_attempts: int = 3,
+    complete_root: Path | None = None,
     incomplete_root: Path | None = None,
     partial_minimum_age: timedelta = timedelta(days=1),
 ) -> int:
@@ -1496,11 +1497,39 @@ async def cleanup_durable_slskd_transfers(
             query = query.where(AcquisitionAttempt.job_id.in_(job_ids))
         attempt_ids = list((await db.scalars(query.order_by(AcquisitionAttempt.id))).all())
 
+        file_query = select(
+            AcquisitionAttempt.id,
+            AcquisitionAttempt.artifact_state,
+            AcquisitionAttempt.staged_path,
+        ).where(
+            AcquisitionAttempt.provider == "slskd",
+            AcquisitionAttempt.provider_cleanup_state == CleanupState.completed,
+            AcquisitionAttempt.file_cleanup_state.in_({CleanupState.pending, CleanupState.failed}),
+            AcquisitionAttempt.file_cleanup_eligible.is_(True),
+            AcquisitionAttempt.retention_disposition == RetentionDisposition.cleanup_eligible,
+            AcquisitionAttempt.artifact_state.in_({ArtifactState.staged, ArtifactState.partial}),
+        )
+        if job_ids is not None:
+            file_query = file_query.where(AcquisitionAttempt.job_id.in_(job_ids))
+        file_attempts = list(
+            (
+                await db.execute(
+                    file_query.order_by(
+                        AcquisitionAttempt.file_cleanup_last_attempted_at.asc().nulls_first(),
+                        AcquisitionAttempt.id,
+                    )
+                )
+            ).all()
+        )
+
     completed = 0
     for attempt_id in attempt_ids:
         result = await cleanup_attempt_provider(session_factory, adapter, attempt_id)
         if result in {AttemptCleanupResult.removed, AttemptCleanupResult.already_absent}:
             completed += 1
+    configured_roots = tuple(root for root in (complete_root, incomplete_root) if root is not None)
+    for attempt_id, artifact_state, staged_path in file_attempts:
+        if artifact_state == ArtifactState.partial:
             if incomplete_root is not None:
                 await cleanup_attempt_partial(
                     session_factory,
@@ -1509,6 +1538,12 @@ async def cleanup_durable_slskd_transfers(
                     incomplete_root,
                     minimum_age=partial_minimum_age,
                 )
+            continue
+        if staged_path is None:
+            continue
+        cleanup_root = _configured_attempt_root(Path(staged_path), configured_roots)
+        if cleanup_root is not None:
+            await cleanup_attempt_file(session_factory, attempt_id, cleanup_root)
     return completed
 
 
@@ -1569,6 +1604,7 @@ async def cleanup_terminal_acquisitions(
     slskd_api_key: str,
     job_ids: set[int] | None = None,
     max_attempts: int = 3,
+    slskd_complete_root: Path | None = None,
     slskd_incomplete_root: Path | None = None,
     partial_minimum_age: timedelta = timedelta(days=1),
 ) -> tuple[list[int], int]:
@@ -1584,6 +1620,7 @@ async def cleanup_terminal_acquisitions(
             adapter,
             job_ids,
             max_attempts=max_attempts,
+            complete_root=slskd_complete_root,
             incomplete_root=slskd_incomplete_root,
             partial_minimum_age=partial_minimum_age,
         )

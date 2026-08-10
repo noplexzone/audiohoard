@@ -655,6 +655,7 @@ async def run_job(
                 slskd_url=cfg.slskd_url,
                 slskd_api_key=cfg.slskd_api_key,
                 job_ids={job_id},
+                slskd_complete_root=cfg.slskd_complete_root,
                 slskd_incomplete_root=cfg.slskd_incomplete_root,
                 partial_minimum_age=timedelta(seconds=cfg.slskd_directory_sweep_min_age_seconds),
             )

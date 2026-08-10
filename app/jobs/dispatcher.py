@@ -398,6 +398,7 @@ class JobDispatcher:
             factory,
             slskd_url=settings.slskd_url,
             slskd_api_key=settings.slskd_api_key,
+            slskd_complete_root=settings.slskd_complete_root,
             slskd_incomplete_root=settings.slskd_incomplete_root,
             partial_minimum_age=timedelta(seconds=settings.slskd_directory_sweep_min_age_seconds),
         )

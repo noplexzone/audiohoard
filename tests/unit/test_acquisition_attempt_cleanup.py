@@ -645,3 +645,116 @@ async def test_partial_cleanup_blocks_symlink_and_replaced_inode(
         is AttemptCleanupResult.blocked
     )
     assert target.exists() and link.is_symlink() and outside.exists()
+
+
+async def test_periodic_cleanup_retries_staged_file_after_provider_cleanup_completed(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "complete"
+    root.mkdir()
+    staged = root / "song.flac"
+    staged.write_bytes(b"owned audio")
+    attempt = await _attempt(db_session, staged_path=staged)
+    remove_claimed_file = acquisition_cleanup._remove_claimed_file
+    calls = 0
+
+    def fail_once(claim, configured_root):  # noqa: ANN001
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AttemptCleanupResult.retryable_failure
+        return remove_claimed_file(claim, configured_root)
+
+    monkeypatch.setattr(acquisition_cleanup, "_remove_claimed_file", fail_once)
+
+    assert (
+        await cleanup_durable_slskd_transfers(
+            _factory(db_session), FakeAdapter([]), complete_root=root
+        )
+        == 0
+    )
+    assert staged.exists()
+    await db_session.refresh(attempt)
+    assert attempt.file_cleanup_state is CleanupState.failed
+    attempt.file_cleanup_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+    await db_session.commit()
+
+    assert (
+        await cleanup_durable_slskd_transfers(
+            _factory(db_session), FakeAdapter([]), complete_root=root
+        )
+        == 0
+    )
+    assert not staged.exists()
+    await db_session.refresh(attempt)
+    assert attempt.file_cleanup_state is CleanupState.completed
+
+
+@pytest.mark.parametrize("deferred_by", ["age", "live", "retry"])
+async def test_periodic_cleanup_retries_deferred_partial_after_provider_cleanup_completed(
+    db_session: AsyncSession, tmp_path: Path, deferred_by: str
+) -> None:
+    root = tmp_path / "incomplete"
+    root.mkdir()
+    partial = root / "peer" / "song.flac.part"
+    partial.parent.mkdir()
+    partial.write_bytes(b"partial")
+    old = (datetime.now(UTC) - timedelta(days=2)).timestamp()
+    os.utime(partial, (old, old))
+    attempt = await _partial_attempt(db_session, partial)
+    live_snapshot = [
+        {
+            "id": UUID,
+            "username": "peer",
+            "filename": "Album/01 Song.flac",
+            "state": "InProgress",
+            "localPath": str(partial),
+        }
+    ]
+
+    class RetryAdapter(FakeAdapter):
+        async def downloads(self, *, force_refresh: bool = False) -> list[dict[str, object]]:
+            self.calls.append(("get", force_refresh))
+            if len(self.calls) == 1:
+                raise RuntimeError("temporary snapshot failure")
+            return []
+
+    adapter = (
+        FakeAdapter([live_snapshot, []])
+        if deferred_by == "live"
+        else RetryAdapter([])
+        if deferred_by == "retry"
+        else FakeAdapter([[], []])
+    )
+
+    first_minimum_age = timedelta(days=3) if deferred_by == "age" else timedelta(0)
+    assert (
+        await cleanup_durable_slskd_transfers(
+            _factory(db_session),
+            adapter,
+            incomplete_root=root,
+            partial_minimum_age=first_minimum_age,
+        )
+        == 0
+    )
+    assert partial.exists()
+    await db_session.refresh(attempt)
+    if deferred_by == "retry":
+        assert attempt.file_cleanup_state is CleanupState.failed
+        attempt.file_cleanup_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db_session.commit()
+    else:
+        assert attempt.file_cleanup_state is CleanupState.pending
+
+    assert (
+        await cleanup_durable_slskd_transfers(
+            _factory(db_session),
+            adapter,
+            incomplete_root=root,
+            partial_minimum_age=timedelta(0),
+        )
+        == 0
+    )
+    assert not partial.exists()
+    await db_session.refresh(attempt)
+    assert attempt.file_cleanup_state is CleanupState.completed
