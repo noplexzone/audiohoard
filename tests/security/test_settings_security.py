@@ -167,3 +167,36 @@ async def test_member_cannot_read_settings(unauthenticated_client: AsyncClient) 
             path, data=data, headers={"X-CSRF-Token": client.cookies["csrf"]}
         )
         assert response.status_code == 403, path
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["2852039166", "0xa9fea9fe", "0251.0376.0251.0376"],
+)
+def test_provider_url_rejects_alternative_metadata_ipv4_forms(host: str) -> None:
+    from pydantic import ValidationError
+
+    from app.schemas.settings import SettingsTestRequest
+
+    with pytest.raises(ValidationError, match="provider URL address is not allowed"):
+        SettingsTestRequest(provider="slskd", slskd_url=f"http://{host}:5030")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "host",
+    ["2852039166", "0xa9fea9fe", "0251.0376.0251.0376"],
+)
+async def test_html_provider_probe_rejects_alternative_metadata_ipv4_forms(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    async def forbidden_health(self):
+        raise AssertionError("provider adapter must not receive a prohibited URL")
+
+    monkeypatch.setattr("app.sources.slskd.SlskdAdapter.health", forbidden_health)
+    response = await client.post(
+        "/settings/test",
+        data={"provider": "slskd", "slskd_url": f"http://{host}:5030"},
+    )
+    assert response.status_code == 303
+    assert "Provider%20URL%20is%20not%20allowed" in response.headers["location"]

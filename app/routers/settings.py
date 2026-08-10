@@ -22,7 +22,12 @@ from app.jobs.dispatcher import job_dispatcher
 from app.models.auth import AppUser
 from app.naming.convention import render_path
 from app.schemas.health import SourceStatus
-from app.schemas.settings import SettingField, SettingsSaveRequest, SettingsTestRequest
+from app.schemas.settings import (
+    SettingField,
+    SettingsSaveRequest,
+    SettingsTestRequest,
+    validate_provider_url_value,
+)
 from app.services.discovery import discovery_service
 from app.services.health_status import CachedProviderStatus, get_health_status_service
 from app.settings_service import (
@@ -62,6 +67,15 @@ async def _probe_provider(
     from app.sources.base import CapabilityState
 
     cap: CapabilityState
+    if provider in {"slskd", "prowlarr", "sabnzbd"}:
+        try:
+            validate_provider_url_value(url)
+        except ValueError:
+            return SourceStatus(
+                available=False,
+                reason="Provider URL is not allowed",
+                details={"code": "invalid_provider_url", "retryable": False},
+            )
     if provider == "slskd":
         cap = await SlskdAdapter(url, key).health()
     elif provider == "prowlarr":

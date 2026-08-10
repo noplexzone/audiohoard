@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 from ipaddress import ip_address
 from typing import Literal
 from urllib.parse import urlsplit
@@ -33,7 +34,13 @@ def validate_provider_url_value(value: str | None) -> str | None:
     try:
         address = ip_address(hostname)
     except ValueError:
-        return value
+        # libc accepts legacy one-part, hexadecimal, and octal IPv4 forms. Normalize
+        # those before applying address policy so metadata IPs cannot hide behind an
+        # alternative textual representation.
+        try:
+            address = ip_address(socket.inet_aton(hostname))
+        except OSError:
+            return value
     if (
         address.is_link_local
         or address.is_multicast
