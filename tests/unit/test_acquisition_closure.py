@@ -816,6 +816,55 @@ async def test_pending_cleanup_rotates_unattempted_plan_before_failed_plan(
     assert pending[0].plan_id == plans[1].id
 
 
+async def test_failed_bounded_cleanup_rotates_past_low_id_prefix(
+    db_session: AsyncSession, tmp_path, monkeypatch
+) -> None:
+    job = Job(source="slskd", query="cleanup", status=JobStatus.done)
+    release = Release(job=job, source="slskd", title="Album")
+    plans: list[ImportPlan] = []
+    for index in range(3):
+        staged = tmp_path / f"stage-{index}.flac"
+        staged.write_bytes(b"audio")
+        track = Track(
+            job=job,
+            release=release,
+            source="slskd",
+            source_job_id=f"transfer-{index}",
+            staging_path=str(staged),
+            acquisition_provenance_json=json.dumps(
+                {"source": "slskd", "username": "peer", "filename": staged.name}
+            ),
+        )
+        plan = ImportPlan(
+            release=release,
+            track=track,
+            source_path=str(staged),
+            staging_path=str(staged),
+            destination_path=str(tmp_path / "music" / staged.name),
+            status=ImportWorkflowState.imported,
+        )
+        plans.append(plan)
+        db_session.add_all([track, plan])
+    db_session.add_all([job, release])
+    await db_session.commit()
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+
+    first = await pending_imported_source_cleanups(db_session, limit=2)
+    assert [item.plan_id for item in first] == [plans[0].id, plans[1].id]
+    await cleanup_imported_sources(first)
+
+    async with factory() as verify:
+        second = await pending_imported_source_cleanups(verify, limit=2)
+        assert second[0].plan_id == plans[2].id
+        attempted = []
+        for plan in plans[:2]:
+            persisted = await verify.get(ImportPlan, plan.id)
+            assert persisted is not None
+            attempted.append(persisted.cleanup_attempted_at)
+    assert all(value is not None for value in attempted)
+
+
 async def test_prune_orphaned_terminal_records_removes_only_rows_without_files(
     db_session: AsyncSession, tmp_path
 ) -> None:

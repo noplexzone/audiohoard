@@ -179,7 +179,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         name="catalog-ownership-startup-reconciliation",
     )
     app.state.catalog_ownership_reconciliation_task = ownership_task
-    await cleanup_imported_sources(pending_cleanups)
+    await cleanup_imported_sources(
+        pending_cleanups,
+        complete_root=effective_settings.slskd_complete_root,
+        incomplete_root=effective_settings.slskd_incomplete_root,
+    )
     await job_dispatcher.recover()
     settings = get_settings()
     await job_dispatcher.start_watchdog(

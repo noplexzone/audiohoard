@@ -1424,6 +1424,9 @@ async def pending_imported_source_cleanups(
     db: AsyncSession, *, limit: int = 500
 ) -> tuple[ImportedSourceCleanup, ...]:
     """Load durable post-import obligations represented by a retained staging path."""
+    if db.bind is None:
+        return ()
+    session_factory = async_sessionmaker(db.bind, expire_on_commit=False)
     plans = list(
         (
             await db.scalars(
@@ -1455,9 +1458,7 @@ async def pending_imported_source_cleanups(
                 plan.track.acquisition_provenance_json if plan.track else None,
                 plan.track.source_job_id if plan.track else None,
                 plan.track_id,
-                session_factory=async_sessionmaker(db.bind, expire_on_commit=False)
-                if db.bind is not None
-                else None,
+                session_factory=session_factory,
             )
         )
     return tuple(items)
@@ -1699,6 +1700,51 @@ async def _mark_cleanup_attempted(
         await _cleanup_retry_delay(attempt)
 
 
+async def _mark_attempt_cleanup_scheduling(
+    item: ImportedSourceCleanup, *, completed: bool, max_attempts: int = 3
+) -> None:
+    """Rotate an exact imported obligation without filesystem I/O in a DB transaction."""
+    if item.plan_id is None:
+        return
+    session_factory = item.session_factory or get_session_factory()
+    accepted_path = str(item.staged_path)
+    for attempt_no in range(1, max_attempts + 1):
+        async with session_factory() as db:
+            try:
+                plan = await db.get(
+                    ImportPlan, item.plan_id, options=(selectinload(ImportPlan.track),)
+                )
+                if (
+                    plan is None
+                    or plan.status != ImportWorkflowState.imported
+                    or plan.track_id != item.track_id
+                    or plan.staging_path != accepted_path
+                ):
+                    return
+                track = plan.track
+                if item.track_id is not None and (
+                    track is None
+                    or track.id != item.track_id
+                    or track.staging_path != accepted_path
+                    or track.source_job_id != item.source_job_id
+                    or _slskd_identity(track.acquisition_provenance_json)
+                    != _slskd_identity(item.provenance_json)
+                ):
+                    return
+                plan.cleanup_attempted_at = datetime.now(UTC)
+                if completed:
+                    plan.staging_path = None
+                    if track is not None and track.staging_path == accepted_path:
+                        track.staging_path = None
+                await db.commit()
+                return
+            except Exception as exc:
+                await db.rollback()
+                if attempt_no == max_attempts or not _transient_cleanup_error(exc):
+                    raise
+        await _cleanup_retry_delay(attempt_no)
+
+
 async def _provider_cleanup_completed_current(item: ImportedSourceCleanup) -> bool:
     if item.track_id is None:
         return _source_cleanup_completed(item.provenance_json)
@@ -1747,17 +1793,55 @@ async def _prepare_attempt_cleanup_for_imported_item(
         return attempt.id
 
 
-async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> None:
+def _configured_attempt_root(path: Path, roots: tuple[Path, ...]) -> Path | None:
+    """Select the narrowest explicit provider root containing a persisted artifact path."""
+    absolute = path.absolute()
+    candidates = [root.absolute() for root in roots if absolute.is_relative_to(root.absolute())]
+    return max(candidates, key=lambda root: len(root.parts), default=None)
+
+
+async def cleanup_imported_sources(
+    items: tuple[ImportedSourceCleanup, ...],
+    *,
+    complete_root: Path | None = None,
+    incomplete_root: Path | None = None,
+) -> None:
     """Idempotently finish currently-owned cleanup obligations after import commit."""
-    staging_root = get_settings().staging_root
+    if not items:
+        return
+    factory = items[0].session_factory or get_session_factory()
+    configured = get_settings()
+    settings = configured
+    loaded_effective = False
+    try:
+        async with factory() as db:
+            settings = await build_effective_settings(db, configured)
+        loaded_effective = True
+    except Exception:
+        # Legacy cleanup remains available if settings storage is unavailable, but
+        # attempt-backed deletion still requires roots supplied by a lifecycle caller.
+        logger.warning("effective post-import cleanup settings unavailable", exc_info=True)
+    staging_root = getattr(settings, "staging_root", configured.staging_root)
+    effective_complete_root = (
+        getattr(settings, "slskd_complete_root", None) if loaded_effective else None
+    )
+    effective_incomplete_root = (
+        getattr(settings, "slskd_incomplete_root", None) if loaded_effective else None
+    )
+    configured_attempt_roots = tuple(
+        root
+        for root in (
+            complete_root if complete_root is not None else effective_complete_root,
+            incomplete_root if incomplete_root is not None else effective_incomplete_root,
+        )
+        if root is not None
+    )
     adapter = None
     if any(_slskd_identity(item.provenance_json) for item in items):
-        try:
-            async with get_session_factory()() as db:
-                settings = await build_effective_settings(db, get_settings())
-            adapter = SlskdAdapter(settings.slskd_url, settings.slskd_api_key)
-        except Exception:
-            logger.exception("post-import slskd cleanup setup failed")
+        adapter = SlskdAdapter(
+            getattr(settings, "slskd_url", configured.slskd_url),
+            getattr(settings, "slskd_api_key", configured.slskd_api_key),
+        )
 
     for original_item in items:
         attempt_id = await _prepare_attempt_cleanup_for_imported_item(original_item)
@@ -1768,22 +1852,34 @@ async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> 
                 if adapter is not None
                 else AttemptCleanupResult.retryable_failure
             )
+            completed = False
             if provider_result in {
                 AttemptCleanupResult.removed,
                 AttemptCleanupResult.already_absent,
             }:
-                file_result = await cleanup_attempt_file(factory, attempt_id, staging_root)
-                if file_result in {
-                    AttemptCleanupResult.removed,
-                    AttemptCleanupResult.already_absent,
-                }:
-                    await _mark_cleanup_attempted(original_item, completed=True)
+                cleanup_root = _configured_attempt_root(
+                    original_item.staged_path, configured_attempt_roots
+                )
+                if cleanup_root is not None:
+                    file_result = await cleanup_attempt_file(factory, attempt_id, cleanup_root)
+                    completed = file_result in {
+                        AttemptCleanupResult.removed,
+                        AttemptCleanupResult.already_absent,
+                    }
+            try:
+                await _mark_attempt_cleanup_scheduling(original_item, completed=completed)
+            except Exception:
+                logger.exception("failed to record attempt-backed post-import cleanup")
             continue
         if _slskd_identity(
             original_item.provenance_json
         ) is not None and not await _provider_cleanup_completed_current(original_item):
             # Unfenced legacy provider ownership is report-only. Do not move or
             # delete its recoverable artifact while that obligation is unresolved.
+            try:
+                await _mark_attempt_cleanup_scheduling(original_item, completed=False)
+            except Exception:
+                logger.exception("failed to record blocked legacy post-import cleanup")
             continue
         item = (
             await _claim_cleanup_quarantine(original_item)

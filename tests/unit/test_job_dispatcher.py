@@ -785,6 +785,114 @@ async def test_cleanup_reconciler_has_single_owned_task(
     assert dispatcher._cleanup_task is None
 
 
+async def test_periodic_cleanup_revisits_imported_attempt_files_with_effective_roots(
+    session_factory: async_sessionmaker[AsyncSession], tmp_path: Path, monkeypatch
+) -> None:
+    import hashlib
+
+    from app import settings_service
+    from app.config import get_settings
+    from app.models.acquisition_attempt import (
+        AcquisitionAttempt,
+        ArtifactState,
+        AttemptOutcome,
+        CleanupState,
+        ProviderTransferState,
+        RetentionDisposition,
+    )
+    from app.models.import_plan import ImportPlan
+    from app.models.release import Release
+    from app.services import acquisition_cleanup
+
+    complete = tmp_path / "db-complete"
+    complete.mkdir()
+    incomplete = tmp_path / "db-incomplete"
+    staged = complete / "song.flac"
+    staged.write_bytes(b"owned audio")
+    current = staged.stat()
+    async with session_factory() as db:
+        job = Job(source="slskd", query="cleanup", status=JobStatus.done)
+        release = Release(job=job, source="slskd", title="Album")
+        track = Track(
+            job=job,
+            release=release,
+            source="slskd",
+            source_job_id="2d93899b-cf9a-4567-8f10-993610f274cf",
+            staging_path=str(staged),
+            acquisition_provenance_json=json.dumps(
+                {"source": "slskd", "username": "peer", "filename": "Album/song.flac"}
+            ),
+        )
+        plan = ImportPlan(
+            release=release,
+            track=track,
+            source_path=str(staged),
+            staging_path=str(staged),
+            destination_path=str(tmp_path / "library" / "song.flac"),
+            status=ImportWorkflowState.imported,
+        )
+        attempt = AcquisitionAttempt(
+            job=job,
+            track=track,
+            provider="slskd",
+            peer="peer",
+            remote_path="Album/song.flac",
+            provider_uuid="2d93899b-cf9a-4567-8f10-993610f274cf",
+            provider_state=ProviderTransferState.completed,
+            provider_cleanup_state=CleanupState.failed,
+            staged_path=str(staged),
+            artifact_state=ArtifactState.staged,
+            artifact_device=current.st_dev,
+            artifact_inode=current.st_ino,
+            artifact_mtime_ns=current.st_mtime_ns,
+            artifact_size=current.st_size,
+            artifact_sha256=hashlib.sha256(staged.read_bytes()).hexdigest(),
+            outcome=AttemptOutcome.imported,
+            file_cleanup_eligible=True,
+            retention_disposition=RetentionDisposition.cleanup_eligible,
+        )
+        db.add_all([job, release, track, plan, attempt])
+        await db.commit()
+        plan_id, attempt_id = plan.id, attempt.id
+
+    effective = get_settings().model_copy(
+        update={
+            "staging_root": tmp_path / "wrong-static-root",
+            "slskd_complete_root": complete,
+            "slskd_incomplete_root": incomplete,
+            "slskd_url": "",
+            "slskd_api_key": "",
+        }
+    )
+
+    async def effective_settings(db, configured):  # noqa: ANN001
+        return effective
+
+    async def terminal_cleanup(factory, **kwargs):  # noqa: ANN001
+        async with factory() as db:
+            current_attempt = await db.get(AcquisitionAttempt, attempt_id)
+            assert current_attempt is not None
+            current_attempt.provider_cleanup_state = CleanupState.completed
+            await db.commit()
+        return [], 1
+
+    monkeypatch.setattr(settings_service, "build_effective_settings", effective_settings)
+    monkeypatch.setattr(acquisition_cleanup, "build_effective_settings", effective_settings)
+    monkeypatch.setattr(acquisition_cleanup, "cleanup_terminal_acquisitions", terminal_cleanup)
+    dispatcher = JobDispatcher(runner=AsyncMock(), session_factory=session_factory)
+
+    await dispatcher._cleanup_reconcile_tick()
+
+    assert not staged.exists()
+    async with session_factory() as db:
+        persisted_plan = await db.get(ImportPlan, plan_id)
+        persisted_attempt = await db.get(AcquisitionAttempt, attempt_id)
+        assert persisted_plan is not None and persisted_plan.staging_path is None
+        assert persisted_plan.cleanup_attempted_at is not None
+        assert persisted_attempt is not None
+        assert persisted_attempt.file_cleanup_state is CleanupState.completed
+
+
 async def test_dispatcher_respects_max_concurrent_jobs() -> None:
     current = 0
     peak = 0

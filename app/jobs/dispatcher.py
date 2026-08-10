@@ -399,6 +399,18 @@ class JobDispatcher:
             slskd_url=settings.slskd_url,
             slskd_api_key=settings.slskd_api_key,
         )
+        from app.services.acquisition_cleanup import (
+            cleanup_imported_sources,
+            pending_imported_source_cleanups,
+        )
+
+        async with factory() as db:
+            pending_cleanups = await pending_imported_source_cleanups(db)
+        await cleanup_imported_sources(
+            pending_cleanups,
+            complete_root=settings.slskd_complete_root,
+            incomplete_root=settings.slskd_incomplete_root,
+        )
         sweep_roots = tuple(
             root
             for root in (settings.slskd_complete_root, settings.slskd_incomplete_root)
