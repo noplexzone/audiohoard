@@ -22,6 +22,7 @@ from app.models.job import Job
 from app.services.acquisition_cleanup import (
     AttemptCleanupResult,
     cleanup_attempt_file,
+    cleanup_attempt_partial,
     cleanup_attempt_provider,
     cleanup_durable_slskd_transfers,
     reconcile_terminal_slskd_intents,
@@ -342,3 +343,150 @@ async def test_retention_disposition_prevents_file_cleanup(
         is AttemptCleanupResult.blocked
     )
     assert staged.exists()
+
+
+async def _partial_attempt(
+    db: AsyncSession, partial: Path, *, provider_cleanup: CleanupState = CleanupState.completed
+) -> AcquisitionAttempt:
+    job = Job(source="slskd", query="partial")
+    current = await asyncio.to_thread(partial.stat, follow_symlinks=False)
+    attempt = AcquisitionAttempt(
+        job=job,
+        provider="slskd",
+        peer="peer",
+        remote_path="Album/01 Song.flac",
+        provider_uuid=UUID,
+        provider_state=ProviderTransferState.failed,
+        provider_cleanup_state=provider_cleanup,
+        partial_path=str(partial),
+        artifact_state=ArtifactState.partial,
+        outcome=AttemptOutcome.failed,
+        terminal_at=datetime.now(UTC) - timedelta(days=2),
+        artifact_device=current.st_dev,
+        artifact_inode=current.st_ino,
+        artifact_mtime_ns=current.st_mtime_ns,
+        artifact_size=current.st_size,
+        file_cleanup_eligible=True,
+        retention_disposition=RetentionDisposition.cleanup_eligible,
+    )
+    db.add_all([job, attempt])
+    await db.commit()
+    return attempt
+
+
+async def test_exact_owned_partial_removed_only_after_fresh_absence_and_grace(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    root = tmp_path / "incomplete"
+    root.mkdir()
+    partial = root / "peer" / "song.flac.part"
+    partial.parent.mkdir()
+    partial.write_bytes(b"partial")
+    old = (datetime.now(UTC) - timedelta(days=2)).timestamp()
+    os.utime(partial, (old, old))
+    attempt = await _partial_attempt(db_session, partial)
+
+    result = await cleanup_attempt_partial(
+        _factory(db_session), FakeAdapter([[]]), attempt.id, root, minimum_age=timedelta(days=1)
+    )
+
+    assert result is AttemptCleanupResult.removed
+    assert not partial.exists()
+    assert not partial.parent.exists()
+    await db_session.refresh(attempt)
+    assert attempt.file_cleanup_state is CleanupState.completed
+
+
+async def test_partial_cleanup_preserves_live_new_unremoved_and_escaped_artifacts(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    root = tmp_path / "incomplete"
+    root.mkdir()
+    old_partial = root / "live.part"
+    new_partial = root / "new.part"
+    outside = tmp_path / "outside.part"
+    for path in (old_partial, new_partial, outside):
+        path.write_bytes(b"partial")
+    old = (datetime.now(UTC) - timedelta(days=2)).timestamp()
+    os.utime(old_partial, (old, old))
+    os.utime(outside, (old, old))
+    live_attempt = await _partial_attempt(db_session, old_partial)
+    new_attempt = await _partial_attempt(db_session, new_partial)
+    pending_attempt = await _partial_attempt(
+        db_session, outside, provider_cleanup=CleanupState.pending
+    )
+    snapshot = [
+        {
+            "id": UUID,
+            "username": "peer",
+            "filename": "Album/01 Song.flac",
+            "state": "InProgress",
+            "localPath": str(old_partial),
+        }
+    ]
+
+    assert (
+        await cleanup_attempt_partial(
+            _factory(db_session),
+            FakeAdapter([snapshot]),
+            live_attempt.id,
+            root,
+            minimum_age=timedelta(days=1),
+        )
+        is AttemptCleanupResult.not_eligible
+    )
+    assert (
+        await cleanup_attempt_partial(
+            _factory(db_session),
+            FakeAdapter([[]]),
+            new_attempt.id,
+            root,
+            minimum_age=timedelta(days=1),
+        )
+        is AttemptCleanupResult.not_eligible
+    )
+    assert (
+        await cleanup_attempt_partial(
+            _factory(db_session),
+            FakeAdapter([[]]),
+            pending_attempt.id,
+            root,
+            minimum_age=timedelta(days=1),
+        )
+        is AttemptCleanupResult.not_eligible
+    )
+    assert old_partial.exists() and new_partial.exists() and outside.exists()
+
+
+async def test_partial_cleanup_blocks_symlink_and_replaced_inode(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    root = tmp_path / "incomplete"
+    root.mkdir()
+    target = root / "target.part"
+    target.write_bytes(b"partial")
+    old = (datetime.now(UTC) - timedelta(days=2)).timestamp()
+    os.utime(target, (old, old))
+    replaced = await _partial_attempt(db_session, target)
+    target.unlink()
+    target.write_bytes(b"replacement")
+    os.utime(target, (old, old))
+    outside = tmp_path / "outside.part"
+    outside.write_bytes(b"outside")
+    link = root / "link.part"
+    link.symlink_to(outside)
+    linked = await _partial_attempt(db_session, link)
+
+    assert (
+        await cleanup_attempt_partial(
+            _factory(db_session), FakeAdapter([[]]), replaced.id, root, minimum_age=timedelta(0)
+        )
+        is AttemptCleanupResult.blocked
+    )
+    assert (
+        await cleanup_attempt_partial(
+            _factory(db_session), FakeAdapter([[]]), linked.id, root, minimum_age=timedelta(0)
+        )
+        is AttemptCleanupResult.blocked
+    )
+    assert target.exists() and link.is_symlink() and outside.exists()

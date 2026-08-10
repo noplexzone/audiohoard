@@ -10,7 +10,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import ParseResult, urlparse
 
@@ -40,6 +40,7 @@ from app.models.acquisition_attempt import (
     ArtifactState,
     AttemptOutcome,
     ProviderTransferState,
+    RetentionDisposition,
 )
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
 from app.models.import_plan import ImportPlan
@@ -262,6 +263,7 @@ async def _call_poll_slskd_transfer(
     on_provider_id: Callable[[str], Awaitable[None]],
     on_provider_state: Callable[[AcquisitionState], Awaitable[None]],
     on_cancelled: Callable[[], Awaitable[None]],
+    on_partial_path: Callable[[str], Awaitable[None]],
 ) -> tuple[Path, str]:
     parameters = inspect.signature(_poll_slskd_transfer).parameters
     args: list[object] = [
@@ -278,6 +280,8 @@ async def _call_poll_slskd_transfer(
         args.append(on_provider_state)
     if "on_cancelled" in parameters:
         args.append(on_cancelled)
+    if "on_partial_path" in parameters:
+        args.append(on_partial_path)
     return await _poll_slskd_transfer(*args)  # type: ignore[arg-type]
 
 
@@ -292,6 +296,7 @@ async def _poll_slskd_transfer(
     on_provider_id: Callable[[str], Awaitable[None]] | None = None,
     on_provider_state: Callable[[AcquisitionState], Awaitable[None]] | None = None,
     on_cancelled: Callable[[], Awaitable[None]] | None = None,
+    on_partial_path: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[Path, str]:
     """Poll slskd until terminal and return the staged path plus exact provider ID."""
     import time as _time
@@ -315,6 +320,10 @@ async def _poll_slskd_transfer(
             acq_state = map_slskd_transfer_state(state)
             if on_provider_state is not None:
                 await on_provider_state(acq_state)
+            if acq_state != AcquisitionState.downloaded and on_partial_path is not None:
+                partial_path = _provider_local_path(state.extra)
+                if partial_path is not None:
+                    await on_partial_path(partial_path)
 
             if acq_state == AcquisitionState.downloaded:
                 staged = await _locate_slskd_artifact(filename, state.extra, staging_root)
@@ -341,6 +350,32 @@ async def _poll_slskd_transfer(
         with contextlib.suppress(Exception):
             await asyncio.shield(adapter.cancel(username, filename, transfer_id))
         raise
+
+
+def _provider_local_path(payload: dict[str, object]) -> str | None:
+    """Return one absolute provider-reported local artifact path, without inference."""
+    preferred = ("incompletePath", "incomplete_path", "localPath", "local_path")
+    found: dict[str, list[str]] = {key.casefold(): [] for key in preferred}
+
+    def collect(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = str(key).casefold()
+                if normalized in found and isinstance(child, str):
+                    candidate = child.strip()
+                    if candidate and Path(candidate).is_absolute():
+                        found[normalized].append(candidate)
+                collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    collect(payload)
+    for key in preferred:
+        candidates = list(dict.fromkeys(found[key.casefold()]))
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
 
 
 async def _poll_sab_job(
@@ -620,6 +655,8 @@ async def run_job(
                 slskd_url=cfg.slskd_url,
                 slskd_api_key=cfg.slskd_api_key,
                 job_ids={job_id},
+                slskd_incomplete_root=cfg.slskd_incomplete_root,
+                partial_minimum_age=timedelta(seconds=cfg.slskd_directory_sweep_min_age_seconds),
             )
         except Exception:
             logger.exception("Job %d terminal acquisition cleanup failed", job_id)
@@ -963,6 +1000,10 @@ async def _run_job_in_session(
                 }:
                     attempt.provider_state = ProviderTransferState.failed
                     attempt.provider_terminal_at = _now()
+                if attempt.partial_path is not None:
+                    attempt.artifact_state = ArtifactState.partial
+                    attempt.file_cleanup_eligible = True
+                    attempt.retention_disposition = RetentionDisposition.cleanup_eligible
                 if track is not None:
                     track.acquisition_state = AcquisitionState.failed
                     track.source_status = exc.code
@@ -995,6 +1036,10 @@ async def _run_job_in_session(
                 attempt.outcome = AttemptOutcome.failed
                 attempt.error_code = "result_processing_failed"
                 attempt.terminal_at = _now()
+                if attempt.partial_path is not None:
+                    attempt.artifact_state = ArtifactState.partial
+                    attempt.file_cleanup_eligible = True
+                    attempt.retention_disposition = RetentionDisposition.cleanup_eligible
                 if track is not None:
                     track.acquisition_state = AcquisitionState.failed
                 logger.warning("Result processing failed", exc_info=True)
@@ -2109,9 +2154,28 @@ async def _prepare_acquisition(
                 attempt.terminal_at = now
                 attempt.error_code = "cancelled"
                 attempt.error_detail = "acquisition cancelled by user"
+                if attempt.partial_path is not None:
+                    attempt.artifact_state = ArtifactState.partial
+                    attempt.file_cleanup_eligible = True
+                    attempt.retention_disposition = RetentionDisposition.cleanup_eligible
             if track is not None:
                 track.acquisition_state = AcquisitionState.cancelled
                 track.source_status = "cancelled"
+            if checkpoint is not None:
+                await checkpoint()
+
+        async def persist_partial_path(path: str) -> None:
+            if attempt is None:
+                return
+            partial = Path(path)
+            attempt.partial_path = str(partial)
+            attempt.artifact_state = ArtifactState.partial
+            with contextlib.suppress(OSError):
+                current = await asyncio.to_thread(partial.stat, follow_symlinks=False)
+                attempt.artifact_device = current.st_dev
+                attempt.artifact_inode = current.st_ino
+                attempt.artifact_mtime_ns = current.st_mtime_ns
+                attempt.artifact_size = current.st_size
             if checkpoint is not None:
                 await checkpoint()
 
@@ -2126,6 +2190,8 @@ async def _prepare_acquisition(
         ]
         if "on_cancelled" in inspect.signature(_call_poll_slskd_transfer).parameters:
             poll_args.append(persist_cancelled)
+        if "on_partial_path" in inspect.signature(_call_poll_slskd_transfer).parameters:
+            poll_args.append(persist_partial_path)
         staged, transfer_id = await _call_poll_slskd_transfer(*poll_args)  # type: ignore[arg-type]
         if track is not None:
             # slskd queue responses may omit the provider UUID. Polling exposes it;

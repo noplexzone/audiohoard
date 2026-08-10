@@ -304,6 +304,20 @@ class _CleanupClaim:
     attempt_count: int
 
 
+@dataclass(frozen=True)
+class _PartialCleanupClaim:
+    attempt_id: int
+    token: str
+    version: int
+    provider_uuid: str
+    partial_path: str
+    device: int
+    inode: int
+    mtime_ns: int
+    size: int
+    attempt_count: int
+
+
 def _slskd_identity(provenance_json: str | None) -> tuple[str, str] | None:
     with contextlib.suppress(json.JSONDecodeError, TypeError):
         provenance = json.loads(provenance_json or "{}")
@@ -1092,12 +1106,264 @@ async def reconcile_terminal_slskd_intents(
     return reconciled
 
 
+async def _claim_partial_cleanup(
+    session_factory: async_sessionmaker[AsyncSession],
+    attempt_id: int,
+    *,
+    lease_seconds: int,
+) -> tuple[_PartialCleanupClaim | None, AttemptCleanupResult | None]:
+    now = datetime.now(UTC)
+    async with session_factory() as db:
+        attempt = await db.get(AcquisitionAttempt, attempt_id)
+        if attempt is None or attempt.provider != "slskd":
+            return None, AttemptCleanupResult.not_eligible
+        if attempt.file_cleanup_state == CleanupState.completed:
+            return None, AttemptCleanupResult.already_absent
+        required = (
+            attempt.provider_cleanup_state == CleanupState.completed,
+            attempt.provider_uuid,
+            attempt.partial_path,
+            attempt.file_cleanup_eligible,
+            attempt.retention_disposition == RetentionDisposition.cleanup_eligible,
+            attempt.artifact_state == ArtifactState.partial,
+            attempt.artifact_device,
+            attempt.artifact_inode,
+            attempt.artifact_mtime_ns,
+            attempt.artifact_size,
+        )
+        if not all(value is not None and value is not False for value in required):
+            return None, AttemptCleanupResult.not_eligible
+        if (
+            attempt.file_cleanup_retry_at is not None
+            and attempt.file_cleanup_retry_at.replace(tzinfo=UTC) > now
+        ):
+            return None, AttemptCleanupResult.not_eligible
+        if (
+            attempt.file_cleanup_state == CleanupState.claimed
+            and attempt.cleanup_lease_expires_at is not None
+            and attempt.cleanup_lease_expires_at.replace(tzinfo=UTC) > now
+        ):
+            return None, AttemptCleanupResult.claimed_elsewhere
+        old_version = attempt.cleanup_claim_version
+        token = str(uuid4())
+        version = old_version + 1
+        state_ok = or_(
+            AcquisitionAttempt.file_cleanup_state.in_(
+                {CleanupState.pending, CleanupState.failed, CleanupState.blocked}
+            ),
+            and_(
+                AcquisitionAttempt.file_cleanup_state == CleanupState.claimed,
+                AcquisitionAttempt.cleanup_lease_expires_at <= now,
+            ),
+        )
+        updated = await db.execute(
+            update(AcquisitionAttempt)
+            .execution_options(synchronize_session=False)
+            .where(
+                AcquisitionAttempt.id == attempt_id,
+                AcquisitionAttempt.cleanup_claim_version == old_version,
+                state_ok,
+            )
+            .values(
+                file_cleanup_state=CleanupState.claimed,
+                file_cleanup_attempt_count=attempt.file_cleanup_attempt_count + 1,
+                file_cleanup_last_attempted_at=now,
+                file_cleanup_retry_at=None,
+                cleanup_claim_token=token,
+                cleanup_claim_version=version,
+                cleanup_claimed_at=now,
+                cleanup_lease_expires_at=now + timedelta(seconds=lease_seconds),
+                error_code=None,
+                error_detail=None,
+            )
+        )
+        if not isinstance(updated, CursorResult) or updated.rowcount != 1:
+            await db.rollback()
+            return None, AttemptCleanupResult.claimed_elsewhere
+        await db.commit()
+        assert attempt.provider_uuid is not None
+        assert attempt.partial_path is not None
+        assert attempt.artifact_device is not None
+        assert attempt.artifact_inode is not None
+        assert attempt.artifact_mtime_ns is not None
+        assert attempt.artifact_size is not None
+        return (
+            _PartialCleanupClaim(
+                attempt.id,
+                token,
+                version,
+                attempt.provider_uuid,
+                attempt.partial_path,
+                attempt.artifact_device,
+                attempt.artifact_inode,
+                attempt.artifact_mtime_ns,
+                attempt.artifact_size,
+                attempt.file_cleanup_attempt_count + 1,
+            ),
+            None,
+        )
+
+
+def _remove_owned_partial(
+    claim: _PartialCleanupClaim, root: Path, *, minimum_age: timedelta
+) -> AttemptCleanupResult:
+    path = Path(claim.partial_path)
+    try:
+        root_resolved = root.resolve(strict=True)
+        root_stat = root.stat(follow_symlinks=False)
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            return AttemptCleanupResult.blocked
+        if not path.is_absolute() or not path.absolute().is_relative_to(root.absolute()):
+            return AttemptCleanupResult.blocked
+        parent = path.parent.resolve(strict=True)
+        if not parent.is_relative_to(root_resolved):
+            return AttemptCleanupResult.blocked
+        current = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return AttemptCleanupResult.already_absent
+    except OSError:
+        return AttemptCleanupResult.blocked
+    expected = (claim.device, claim.inode, claim.mtime_ns, claim.size)
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+        return AttemptCleanupResult.blocked
+    if (current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size) != expected:
+        return AttemptCleanupResult.blocked
+    cutoff = datetime.now(UTC).timestamp() - minimum_age.total_seconds()
+    if current.st_mtime > cutoff:
+        return AttemptCleanupResult.not_eligible
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        parent_fd = os.open(parent, flags)
+    except OSError:
+        return AttemptCleanupResult.blocked
+    try:
+        rechecked = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            stat.S_ISLNK(rechecked.st_mode)
+            or (
+                rechecked.st_dev,
+                rechecked.st_ino,
+                rechecked.st_mtime_ns,
+                rechecked.st_size,
+            )
+            != expected
+        ):
+            return AttemptCleanupResult.blocked
+        os.unlink(path.name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return AttemptCleanupResult.already_absent
+    except OSError:
+        return AttemptCleanupResult.retryable_failure
+    finally:
+        os.close(parent_fd)
+    _prune_empty_parents(path, root)
+    return AttemptCleanupResult.removed
+
+
+async def _finish_partial_claim(
+    session_factory: async_sessionmaker[AsyncSession],
+    claim: _PartialCleanupClaim,
+    result: AttemptCleanupResult,
+) -> bool:
+    now = datetime.now(UTC)
+    if result in {AttemptCleanupResult.removed, AttemptCleanupResult.already_absent}:
+        state = CleanupState.completed
+    elif result == AttemptCleanupResult.blocked:
+        state = CleanupState.blocked
+    elif result == AttemptCleanupResult.not_eligible:
+        state = CleanupState.pending
+    else:
+        state = CleanupState.failed
+    values: dict[str, object] = {
+        "file_cleanup_state": state,
+        "cleanup_claim_token": None,
+        "cleanup_claimed_at": None,
+        "cleanup_lease_expires_at": None,
+        "error_code": None,
+        "error_detail": None,
+    }
+    if state == CleanupState.completed:
+        values.update(
+            file_cleanup_completed_at=now,
+            file_cleanup_retry_at=None,
+            retention_disposition=RetentionDisposition.removed,
+            artifact_state=ArtifactState.missing,
+        )
+    elif state == CleanupState.blocked:
+        values.update(
+            error_code="partial_cleanup_identity_mismatch",
+            error_detail="partial retained; cleanup requires review",
+        )
+    elif state == CleanupState.failed:
+        values.update(
+            error_code="partial_cleanup_failed",
+            error_detail="partial cleanup will be retried",
+            file_cleanup_retry_at=now
+            + timedelta(seconds=min(3600, 30 * (2 ** max(0, claim.attempt_count - 1)))),
+        )
+    async with session_factory() as db:
+        updated = await db.execute(
+            update(AcquisitionAttempt)
+            .execution_options(synchronize_session=False)
+            .where(
+                AcquisitionAttempt.id == claim.attempt_id,
+                AcquisitionAttempt.file_cleanup_state == CleanupState.claimed,
+                AcquisitionAttempt.cleanup_claim_token == claim.token,
+                AcquisitionAttempt.cleanup_claim_version == claim.version,
+            )
+            .values(**values)
+        )
+        await db.commit()
+        return isinstance(updated, CursorResult) and updated.rowcount == 1
+
+
+async def cleanup_attempt_partial(
+    session_factory: async_sessionmaker[AsyncSession],
+    adapter: SlskdCleanupAdapter,
+    attempt_id: int,
+    incomplete_root: Path,
+    *,
+    minimum_age: timedelta,
+    lease_seconds: int = 300,
+) -> AttemptCleanupResult:
+    """Remove one exact provider-owned partial after UUID cleanup and a fresh live check."""
+    claim, immediate = await _claim_partial_cleanup(
+        session_factory, attempt_id, lease_seconds=lease_seconds
+    )
+    if claim is None:
+        assert immediate is not None
+        return immediate
+    try:
+        snapshot = await adapter.downloads(force_refresh=True)
+    except asyncio.CancelledError:
+        await _finish_partial_claim(session_factory, claim, AttemptCleanupResult.retryable_failure)
+        raise
+    except Exception:
+        await _finish_partial_claim(session_factory, claim, AttemptCleanupResult.retryable_failure)
+        return AttemptCleanupResult.retryable_failure
+    partial = Path(claim.partial_path)
+    exact_live = any(_snapshot_provider_uuid(item) == claim.provider_uuid for item in snapshot)
+    path_live = any(
+        _paths_intersect(partial, active) for active in _active_transfer_local_paths(snapshot)
+    )
+    if exact_live or path_live:
+        result = AttemptCleanupResult.not_eligible
+    else:
+        result = await asyncio.to_thread(
+            _remove_owned_partial, claim, incomplete_root, minimum_age=minimum_age
+        )
+    finalized = await _finish_partial_claim(session_factory, claim, result)
+    return result if finalized else AttemptCleanupResult.claimed_elsewhere
+
+
 async def cleanup_durable_slskd_transfers(
     session_factory: async_sessionmaker[AsyncSession],
     adapter: SlskdCleanupAdapter,
     job_ids: set[int] | None = None,
     *,
     max_attempts: int = 3,
+    incomplete_root: Path | None = None,
+    partial_minimum_age: timedelta = timedelta(days=1),
 ) -> int:
     """Consume exact attempt-backed obligations; legacy Track rows remain report-only."""
     del max_attempts  # Claim retries/backoff are persisted per attempt.
@@ -1116,6 +1382,14 @@ async def cleanup_durable_slskd_transfers(
         result = await cleanup_attempt_provider(session_factory, adapter, attempt_id)
         if result in {AttemptCleanupResult.removed, AttemptCleanupResult.already_absent}:
             completed += 1
+            if incomplete_root is not None:
+                await cleanup_attempt_partial(
+                    session_factory,
+                    adapter,
+                    attempt_id,
+                    incomplete_root,
+                    minimum_age=partial_minimum_age,
+                )
     return completed
 
 
@@ -1176,6 +1450,8 @@ async def cleanup_terminal_acquisitions(
     slskd_api_key: str,
     job_ids: set[int] | None = None,
     max_attempts: int = 3,
+    slskd_incomplete_root: Path | None = None,
+    partial_minimum_age: timedelta = timedelta(days=1),
 ) -> tuple[list[int], int]:
     """Serialize cleanup while retrying only short database transitions."""
     async with _TERMINAL_CLEANUP_LOCK:
@@ -1189,6 +1465,8 @@ async def cleanup_terminal_acquisitions(
             adapter,
             job_ids,
             max_attempts=max_attempts,
+            incomplete_root=slskd_incomplete_root,
+            partial_minimum_age=partial_minimum_age,
         )
         return hidden, removed
 

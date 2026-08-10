@@ -398,6 +398,8 @@ class JobDispatcher:
             factory,
             slskd_url=settings.slskd_url,
             slskd_api_key=settings.slskd_api_key,
+            slskd_incomplete_root=settings.slskd_incomplete_root,
+            partial_minimum_age=timedelta(seconds=settings.slskd_directory_sweep_min_age_seconds),
         )
         from app.services.acquisition_cleanup import (
             cleanup_imported_sources,
@@ -417,8 +419,6 @@ class JobDispatcher:
             if root is not None
         )
         if sweep_roots and settings.slskd_configured:
-            from datetime import timedelta
-
             from app.services.acquisition_cleanup import sweep_empty_slskd_directories
             from app.sources.slskd import SlskdAdapter
 

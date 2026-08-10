@@ -166,6 +166,63 @@ async def test_enqueue_without_uuid_keeps_fallback_provisional_and_checkpoints_u
     assert attempt.artifact_mtime_ns is not None
 
 
+async def test_poll_persists_provider_incomplete_local_path(
+    test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canonical = "2d93899b-cf9a-4567-8f10-993610f274cf"
+    incomplete = test_settings.staging_root / "incomplete" / "song.flac.part"
+    incomplete.parent.mkdir(parents=True)
+    incomplete.write_bytes(b"partial audio")
+    staged = test_settings.staging_root / "song.flac"
+    staged.write_bytes(b"audio")
+    attempt = AcquisitionAttempt(
+        job_id=1,
+        provider="slskd",
+        peer="peer",
+        remote_path="Album/01 Song.flac",
+        provider_uuid=canonical,
+        provider_state=ProviderTransferState.downloading,
+    )
+    checkpoints: list[str | None] = []
+
+    class FakeSlskd:
+        def __init__(self, url: str, key: str) -> None:
+            pass
+
+    async def fake_poll(
+        transfer_id: str,
+        username: str,
+        filename: str,
+        adapter: object,
+        cfg: Settings,
+        on_provider_id: object,
+        on_provider_state: object,
+        on_cancelled: object,
+        on_partial_path: object,
+    ) -> tuple[Path, str]:
+        await on_partial_path(str(incomplete))  # type: ignore[operator]
+        return staged, canonical
+
+    async def checkpoint() -> None:
+        checkpoints.append(attempt.partial_path)
+
+    monkeypatch.setattr(runner, "SlskdAdapter", FakeSlskd)
+    monkeypatch.setattr(runner, "_call_poll_slskd_transfer", fake_poll)
+    result = SearchResult(
+        source="slskd",
+        title="Song",
+        metadata={"username": "peer", "filename": "Album/01 Song.flac"},
+    )
+
+    await runner._prepare_acquisition(
+        result, "slskd", test_settings, attempt=attempt, checkpoint=checkpoint
+    )
+
+    assert str(incomplete) in checkpoints
+    assert attempt.partial_path == str(incomplete)
+    assert attempt.artifact_state is ArtifactState.staged
+
+
 async def test_candidate_attempt_adopts_only_active_transfer(db_session: AsyncSession) -> None:
     job = Job(source="slskd", query="Artist Song")
     active = AcquisitionAttempt(
