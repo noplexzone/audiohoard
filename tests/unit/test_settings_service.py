@@ -127,6 +127,8 @@ async def test_get_all_effective_returns_all_keys(db_session: object) -> None:
     expected_keys = {
         "slskd_url",
         "slskd_api_key",
+        "slskd_complete_root",
+        "slskd_incomplete_root",
         "prowlarr_url",
         "prowlarr_api_key",
         "sabnzbd_url",

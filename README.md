@@ -142,3 +142,25 @@ The command creates and verifies a timestamped backup, obtains an exclusive SQLi
 lock, aborts if the database changed while the backup was captured, removes only review
 rows whose track or release no longer exists, and verifies database/FK integrity before
 committing. Never run `--apply` while the Audiohoard container is active.
+
+### slskd ownership reconciliation report
+
+Audit durable slskd attempt ownership, live queue UUIDs, exact staged artifacts, and old
+empty download directories with the report-only reconciler:
+
+```bash
+docker compose exec app python -m app.maintenance.slskd_reconcile
+```
+
+The command opens SQLite read-only with `PRAGMA query_only`, makes one read-only slskd GET,
+and only inspects filesystem metadata/content. It has no apply or delete mode and never
+invokes cleanup. Output is bounded JSON and omits provider credentials and raw errors.
+
+Empty-directory inspection and periodic sweeping remain disabled unless
+`SLSKD_COMPLETE_ROOT` and/or `SLSKD_INCOMPLETE_ROOT` are explicitly configured as exact
+**container-visible mounted paths**. Audiohoard never infers these roots from a remote
+filename and never assumes an unmounted host path is equivalent. Sweeping is bottom-up,
+removes directories only (never files or roots), does not follow symlinks, honors
+`SLSKD_DIRECTORY_SWEEP_MIN_AGE_SECONDS` (default 24 hours), and skips the entire run when a
+fresh slskd transfer snapshot is unavailable. Add matching read/write volume mounts to your
+Compose override before enabling either root.

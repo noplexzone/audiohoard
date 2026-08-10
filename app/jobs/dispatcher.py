@@ -210,20 +210,6 @@ class JobDispatcher:
         session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> list[int]:
         factory = session_factory or self._factory()
-        try:
-            from app.config import get_settings
-            from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
-            from app.settings_service import build_effective_settings
-
-            async with factory() as cleanup_db:
-                settings = await build_effective_settings(cleanup_db, get_settings())
-            await cleanup_terminal_acquisitions(
-                factory,
-                slskd_url=settings.slskd_url,
-                slskd_api_key=settings.slskd_api_key,
-            )
-        except Exception:
-            logger.exception("Startup terminal acquisition cleanup failed")
         recovered_ids: list[int] = []
         async with factory() as db:
 
@@ -290,6 +276,23 @@ class JobDispatcher:
                 recovered_ids[:] = attempt_ids
 
             await run_with_sqlite_lock_retry(db, recover_jobs)
+        # Recover interrupted jobs before any destructive cleanup. This prevents a
+        # pre-artifact provider completion checkpoint from being mistaken for a
+        # terminal cleanup obligation during startup.
+        try:
+            from app.config import get_settings
+            from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
+            from app.settings_service import build_effective_settings
+
+            async with factory() as cleanup_db:
+                settings = await build_effective_settings(cleanup_db, get_settings())
+            await cleanup_terminal_acquisitions(
+                factory,
+                slskd_url=settings.slskd_url,
+                slskd_api_key=settings.slskd_api_key,
+            )
+        except Exception:
+            logger.exception("Startup terminal acquisition cleanup failed")
         for job_id in recovered_ids:
             await self.dispatch(job_id)
         return recovered_ids
@@ -395,7 +398,36 @@ class JobDispatcher:
             factory,
             slskd_url=settings.slskd_url,
             slskd_api_key=settings.slskd_api_key,
+            slskd_complete_root=settings.slskd_complete_root,
+            slskd_incomplete_root=settings.slskd_incomplete_root,
+            partial_minimum_age=timedelta(seconds=settings.slskd_directory_sweep_min_age_seconds),
         )
+        from app.services.acquisition_cleanup import (
+            cleanup_imported_sources,
+            pending_imported_source_cleanups,
+        )
+
+        async with factory() as db:
+            pending_cleanups = await pending_imported_source_cleanups(db)
+        await cleanup_imported_sources(
+            pending_cleanups,
+            complete_root=settings.slskd_complete_root,
+            incomplete_root=settings.slskd_incomplete_root,
+        )
+        sweep_roots = tuple(
+            root
+            for root in (settings.slskd_complete_root, settings.slskd_incomplete_root)
+            if root is not None
+        )
+        if sweep_roots and settings.slskd_configured:
+            from app.services.acquisition_cleanup import sweep_empty_slskd_directories
+            from app.sources.slskd import SlskdAdapter
+
+            await sweep_empty_slskd_directories(
+                SlskdAdapter(settings.slskd_url, settings.slskd_api_key),
+                sweep_roots,
+                minimum_age=timedelta(seconds=settings.slskd_directory_sweep_min_age_seconds),
+            )
 
     async def _cleanup_reconcile_loop(self, interval_seconds: int) -> None:
         while True:

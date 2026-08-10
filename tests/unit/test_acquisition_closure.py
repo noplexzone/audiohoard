@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from datetime import UTC
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
 from app.jobs.runner import _fetch_slskd_album_results, _without_blocked_slskd_results
+from app.models.acquisition_attempt import AcquisitionAttempt, CleanupState
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
@@ -355,7 +357,7 @@ async def test_approved_legacy_release_is_mapped_and_recovered_once(
     assert calls == 1
 
 
-async def test_committed_slskd_cleanup_removes_provider_row_and_staged_file(
+async def test_legacy_slskd_cleanup_retains_unfenced_provider_row_and_staged_file(
     monkeypatch, tmp_path
 ) -> None:
     staged = tmp_path / "staged.flac"
@@ -403,8 +405,8 @@ async def test_committed_slskd_cleanup_removes_provider_row_and_staged_file(
         )
     )
 
-    assert calls == [("peer", "Album\\01.flac", "original-transfer-id")]
-    assert not staged.exists()
+    assert calls == []
+    assert staged.exists()
 
 
 async def test_recovery_limit_counts_eligible_releases_not_older_ineligible_rows(
@@ -814,6 +816,55 @@ async def test_pending_cleanup_rotates_unattempted_plan_before_failed_plan(
     assert pending[0].plan_id == plans[1].id
 
 
+async def test_failed_bounded_cleanup_rotates_past_low_id_prefix(
+    db_session: AsyncSession, tmp_path, monkeypatch
+) -> None:
+    job = Job(source="slskd", query="cleanup", status=JobStatus.done)
+    release = Release(job=job, source="slskd", title="Album")
+    plans: list[ImportPlan] = []
+    for index in range(3):
+        staged = tmp_path / f"stage-{index}.flac"
+        staged.write_bytes(b"audio")
+        track = Track(
+            job=job,
+            release=release,
+            source="slskd",
+            source_job_id=f"transfer-{index}",
+            staging_path=str(staged),
+            acquisition_provenance_json=json.dumps(
+                {"source": "slskd", "username": "peer", "filename": staged.name}
+            ),
+        )
+        plan = ImportPlan(
+            release=release,
+            track=track,
+            source_path=str(staged),
+            staging_path=str(staged),
+            destination_path=str(tmp_path / "music" / staged.name),
+            status=ImportWorkflowState.imported,
+        )
+        plans.append(plan)
+        db_session.add_all([track, plan])
+    db_session.add_all([job, release])
+    await db_session.commit()
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+
+    first = await pending_imported_source_cleanups(db_session, limit=2)
+    assert [item.plan_id for item in first] == [plans[0].id, plans[1].id]
+    await cleanup_imported_sources(first)
+
+    async with factory() as verify:
+        second = await pending_imported_source_cleanups(verify, limit=2)
+        assert second[0].plan_id == plans[2].id
+        attempted = []
+        for plan in plans[:2]:
+            persisted = await verify.get(ImportPlan, plan.id)
+            assert persisted is not None
+            attempted.append(persisted.cleanup_attempted_at)
+    assert all(value is not None for value in attempted)
+
+
 async def test_prune_orphaned_terminal_records_removes_only_rows_without_files(
     db_session: AsyncSession, tmp_path
 ) -> None:
@@ -888,6 +939,29 @@ async def test_prune_orphaned_terminal_records_removes_only_rows_without_files(
     assert await db_session.get(Track, ids["imported_track"]) is not None
     assert await db_session.get(Track, ids["active_track"]) is not None
     assert await db_session.get(Job, ids["mixed_job"]) is not None
+
+
+async def test_prune_preserves_no_track_job_with_unresolved_attempt_cleanup(
+    db_session: AsyncSession,
+) -> None:
+    job = Job(source="slskd", query="rejected", status=JobStatus.failed)
+    attempt = AcquisitionAttempt(
+        job=job,
+        provider="slskd",
+        peer="peer",
+        remote_path="Album/01 Song.flac",
+        provider_cleanup_state=CleanupState.pending,
+        file_cleanup_state=CleanupState.not_required,
+    )
+    db_session.add_all([job, attempt])
+    await db_session.flush()
+    job_id, attempt_id = job.id, attempt.id
+
+    result = await prune_orphaned_terminal_records(db_session, batch_size=1)
+
+    assert result.jobs == 0
+    assert await db_session.get(Job, job_id) is not None
+    assert await db_session.get(AcquisitionAttempt, attempt_id) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1252,8 +1326,27 @@ async def test_quarantine_cleanup_preserves_replacement_at_original_path(
     db_session: AsyncSession, monkeypatch, tmp_path
 ) -> None:
     item, plan, track = await _pending_cleanup_fixture(db_session, tmp_path)
+    provenance = json.loads(item.provenance_json or "{}")
+    provenance["source_cleanup_completed_at"] = "2026-08-09T00:00:00+00:00"
+    serialized = json.dumps(provenance, sort_keys=True)
+    track.acquisition_provenance_json = serialized
+    item = replace(item, provenance_json=serialized)
+    await db_session.commit()
     factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
     monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+    real_revalidate = acquisition_cleanup._revalidate_cleanup_obligation
+    replacement_written = False
+
+    async def replace_after_quarantine(claimed, *, protect_destination=True):  # noqa: ANN001
+        nonlocal replacement_written
+        if not replacement_written:
+            item.staged_path.write_bytes(b"replacement")
+            replacement_written = True
+        return await real_revalidate(claimed, protect_destination=protect_destination)
+
+    monkeypatch.setattr(
+        acquisition_cleanup, "_revalidate_cleanup_obligation", replace_after_quarantine
+    )
 
     class ReplacingAdapter:
         def __init__(self, url: str, api_key: str) -> None:
@@ -1286,6 +1379,12 @@ async def test_crash_before_quarantine_commit_recovers_owned_inode_and_preserves
     db_session: AsyncSession, monkeypatch, tmp_path
 ) -> None:
     item, plan, track = await _pending_cleanup_fixture(db_session, tmp_path)
+    provenance = json.loads(item.provenance_json or "{}")
+    provenance["source_cleanup_completed_at"] = "2026-08-09T00:00:00+00:00"
+    serialized = json.dumps(provenance, sort_keys=True)
+    track.acquisition_provenance_json = serialized
+    item = replace(item, provenance_json=serialized)
+    await db_session.commit()
     assert item.expected_device is not None and item.expected_inode is not None
     assert item.expected_mtime_ns is not None and item.expected_size is not None
     quarantine = acquisition_cleanup._cleanup_quarantine_path(

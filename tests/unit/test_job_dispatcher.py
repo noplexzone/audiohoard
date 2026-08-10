@@ -423,7 +423,7 @@ class TestAutomaticTerminalCleanup:
             row = await session.get(Job, root_id)
             assert row is not None and row.queue_hidden is False
 
-    async def test_slskd_cleanup_is_idempotent_and_runs_without_database_transaction(
+    async def test_legacy_slskd_rows_remain_report_only_without_provider_io(
         self, session_factory: async_sessionmaker[AsyncSession], tmp_path: Path
     ) -> None:
         staged = tmp_path / "song.flac"
@@ -501,12 +501,9 @@ class TestAutomaticTerminalCleanup:
         first = await cleanup_durable_slskd_transfers(session_factory, FakeAdapter())
         second = await cleanup_durable_slskd_transfers(session_factory, FakeAdapter())
 
-        assert first == 2
+        assert first == 0
         assert second == 0
-        assert calls == [
-            ("success-peer", "success.flac"),
-            ("timeout-peer", "timeout.flac"),
-        ]
+        assert calls == []
         async with session_factory() as session:
             cleaned = list(
                 (
@@ -516,13 +513,12 @@ class TestAutomaticTerminalCleanup:
                 ).all()
             )
             assert all(
-                json.loads(track.acquisition_provenance_json or "{}").get(
-                    "source_cleanup_completed_at"
-                )
+                "source_cleanup_completed_at"
+                not in json.loads(track.acquisition_provenance_json or "{}")
                 for track in cleaned
             )
 
-    async def test_slskd_cleanup_does_not_mark_a_concurrently_reassigned_transfer(
+    async def test_legacy_slskd_cleanup_does_not_touch_unfenced_transfer(
         self, session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
         async with session_factory() as session:
@@ -569,17 +565,17 @@ class TestAutomaticTerminalCleanup:
 
         removed = await cleanup_durable_slskd_transfers(session_factory, ReassigningAdapter())
 
-        assert removed == 1
+        assert removed == 0
         async with session_factory() as session:
             current = await session.get(Track, track_id)
             assert current is not None
             provenance = json.loads(current.acquisition_provenance_json or "{}")
-            assert current.source_job_id == "new-transfer"
+            assert current.source_job_id == "old-transfer"
             assert provenance["username"] == "old-peer"
             assert "source_cleanup_completed_at" not in provenance
 
 
-async def test_slskd_cleanup_retries_only_marker_after_provider_cancel(
+async def test_legacy_slskd_cleanup_does_not_create_completion_marker(
     session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async with session_factory() as session:
@@ -632,16 +628,16 @@ async def test_slskd_cleanup_retries_only_marker_after_provider_cancel(
     monkeypatch.setattr(AsyncSession, "commit", lock_first_marker_commit)
     monkeypatch.setattr(asyncio, "sleep", no_sleep)
 
-    assert await cleanup_durable_slskd_transfers(session_factory, FakeAdapter()) == 1
+    assert await cleanup_durable_slskd_transfers(session_factory, FakeAdapter()) == 0
 
-    assert cancel_calls == 1
-    assert marker_commits == 2
+    assert cancel_calls == 0
+    assert marker_commits == 0
     async with session_factory() as session:
         current = await session.get(Track, track_id)
         assert current is not None
-        assert json.loads(current.acquisition_provenance_json or "{}")[
-            "source_cleanup_completed_at"
-        ]
+        assert "source_cleanup_completed_at" not in json.loads(
+            current.acquisition_provenance_json or "{}"
+        )
 
 
 class TestRetry:
@@ -762,7 +758,7 @@ async def test_terminal_cleanup_retries_transient_sqlite_lock(
             raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
         return []
 
-    async def no_transfers(factory, adapter, job_ids=None, *, max_attempts=3):
+    async def no_transfers(factory, adapter, job_ids=None, *, max_attempts=3, **_kwargs):
         return 0
 
     async def no_sleep(delay):
@@ -787,6 +783,114 @@ async def test_cleanup_reconciler_has_single_owned_task(
     assert dispatcher._cleanup_task is first
     await dispatcher.shutdown()
     assert dispatcher._cleanup_task is None
+
+
+async def test_periodic_cleanup_revisits_imported_attempt_files_with_effective_roots(
+    session_factory: async_sessionmaker[AsyncSession], tmp_path: Path, monkeypatch
+) -> None:
+    import hashlib
+
+    from app import settings_service
+    from app.config import get_settings
+    from app.models.acquisition_attempt import (
+        AcquisitionAttempt,
+        ArtifactState,
+        AttemptOutcome,
+        CleanupState,
+        ProviderTransferState,
+        RetentionDisposition,
+    )
+    from app.models.import_plan import ImportPlan
+    from app.models.release import Release
+    from app.services import acquisition_cleanup
+
+    complete = tmp_path / "db-complete"
+    complete.mkdir()
+    incomplete = tmp_path / "db-incomplete"
+    staged = complete / "song.flac"
+    staged.write_bytes(b"owned audio")
+    current = staged.stat()
+    async with session_factory() as db:
+        job = Job(source="slskd", query="cleanup", status=JobStatus.done)
+        release = Release(job=job, source="slskd", title="Album")
+        track = Track(
+            job=job,
+            release=release,
+            source="slskd",
+            source_job_id="2d93899b-cf9a-4567-8f10-993610f274cf",
+            staging_path=str(staged),
+            acquisition_provenance_json=json.dumps(
+                {"source": "slskd", "username": "peer", "filename": "Album/song.flac"}
+            ),
+        )
+        plan = ImportPlan(
+            release=release,
+            track=track,
+            source_path=str(staged),
+            staging_path=str(staged),
+            destination_path=str(tmp_path / "library" / "song.flac"),
+            status=ImportWorkflowState.imported,
+        )
+        attempt = AcquisitionAttempt(
+            job=job,
+            track=track,
+            provider="slskd",
+            peer="peer",
+            remote_path="Album/song.flac",
+            provider_uuid="2d93899b-cf9a-4567-8f10-993610f274cf",
+            provider_state=ProviderTransferState.completed,
+            provider_cleanup_state=CleanupState.failed,
+            staged_path=str(staged),
+            artifact_state=ArtifactState.staged,
+            artifact_device=current.st_dev,
+            artifact_inode=current.st_ino,
+            artifact_mtime_ns=current.st_mtime_ns,
+            artifact_size=current.st_size,
+            artifact_sha256=hashlib.sha256(staged.read_bytes()).hexdigest(),
+            outcome=AttemptOutcome.imported,
+            file_cleanup_eligible=True,
+            retention_disposition=RetentionDisposition.cleanup_eligible,
+        )
+        db.add_all([job, release, track, plan, attempt])
+        await db.commit()
+        plan_id, attempt_id = plan.id, attempt.id
+
+    effective = get_settings().model_copy(
+        update={
+            "staging_root": tmp_path / "wrong-static-root",
+            "slskd_complete_root": complete,
+            "slskd_incomplete_root": incomplete,
+            "slskd_url": "",
+            "slskd_api_key": "",
+        }
+    )
+
+    async def effective_settings(db, configured):  # noqa: ANN001
+        return effective
+
+    async def terminal_cleanup(factory, **kwargs):  # noqa: ANN001
+        async with factory() as db:
+            current_attempt = await db.get(AcquisitionAttempt, attempt_id)
+            assert current_attempt is not None
+            current_attempt.provider_cleanup_state = CleanupState.completed
+            await db.commit()
+        return [], 1
+
+    monkeypatch.setattr(settings_service, "build_effective_settings", effective_settings)
+    monkeypatch.setattr(acquisition_cleanup, "build_effective_settings", effective_settings)
+    monkeypatch.setattr(acquisition_cleanup, "cleanup_terminal_acquisitions", terminal_cleanup)
+    dispatcher = JobDispatcher(runner=AsyncMock(), session_factory=session_factory)
+
+    await dispatcher._cleanup_reconcile_tick()
+
+    assert not staged.exists()
+    async with session_factory() as db:
+        persisted_plan = await db.get(ImportPlan, plan_id)
+        persisted_attempt = await db.get(AcquisitionAttempt, attempt_id)
+        assert persisted_plan is not None and persisted_plan.staging_path is None
+        assert persisted_plan.cleanup_attempted_at is not None
+        assert persisted_attempt is not None
+        assert persisted_attempt.file_cleanup_state is CleanupState.completed
 
 
 async def test_dispatcher_respects_max_concurrent_jobs() -> None:

@@ -444,6 +444,53 @@ class TestSlskdTransfers:
         assert status.reason == "completed, succeeded"
         assert status.extra["id"] == "4dd4add9-96ce-4ab2-80d4-5b171b324e3e"
 
+    async def test_provisional_transfer_match_reports_unique_exact_peer_path_evidence(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer1",
+                    "files": [
+                        {"id": "first", "filename": r"Music\Album\01 Song.flac"},
+                        {"id": "other", "filename": "Music/Album/02 Song.flac"},
+                    ],
+                }
+            ],
+        )
+
+        evidence = await SlskdAdapter("http://slskd.local", "key123").match_provisional_transfer(
+            "peer1", "Music/Album/01 Song.flac", force_refresh=True
+        )
+
+        assert evidence.match_count == 1
+        assert evidence.transfer is not None
+        assert evidence.transfer["id"] == "first"
+
+    async def test_provisional_transfer_match_with_multiple_matches_returns_no_transfer(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer1",
+                    "files": [
+                        {"id": "first", "filename": "Music/Album/01 Song.flac"},
+                        {"id": "replacement", "filename": "Music/Album/01 Song.flac"},
+                    ],
+                }
+            ],
+        )
+
+        evidence = await SlskdAdapter("http://slskd.local", "key123").match_provisional_transfer(
+            "peer1", "Music/Album/01 Song.flac", force_refresh=True
+        )
+
+        assert evidence.match_count == 2
+        assert evidence.transfer is None
+
     async def test_concurrent_status_calls_share_one_download_snapshot(
         self, httpx_mock: HTTPXMock
     ) -> None:

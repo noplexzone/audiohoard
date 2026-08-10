@@ -53,6 +53,14 @@ class _DownloadSnapshot:
     in_flight: asyncio.Task[list[dict[str, object]]] | None = None
 
 
+@dataclass(frozen=True)
+class ProvisionalTransferMatch:
+    """Evidence for an exact provisional peer/path lookup."""
+
+    match_count: int
+    transfer: dict[str, object] | None = None
+
+
 _download_snapshots: dict[tuple[str, bytes], _DownloadSnapshot] = {}
 
 
@@ -124,6 +132,11 @@ def _flatten_downloads(data: object) -> list[dict[str, object]]:
     for root in roots:
         visit(root, {})
     return flattened
+
+
+def slskd_fallback_transfer_id(username: str, filename: str) -> str:
+    """Return the deterministic peer/path identity used before a UUID is known."""
+    return f"{username}:{filename}"
 
 
 class SlskdAdapter:
@@ -317,7 +330,7 @@ class SlskdAdapter:
         response_id = (
             (data.get("id") or data.get("transferId")) if isinstance(data, dict) else None
         )
-        transfer_id = str(response_id or f"{username}:{filename}")
+        transfer_id = str(response_id or slskd_fallback_transfer_id(username, filename))
         return transfer_id
 
     async def _fetch_downloads(self) -> list[dict[str, object]]:
@@ -380,14 +393,52 @@ class SlskdAdapter:
             snapshot.in_flight = None
         return downloads
 
-    async def status(self, transfer_id: str) -> CapabilityState:
-        for item in await self.downloads():
+    async def status(self, transfer_id: str, *, force_refresh: bool = False) -> CapabilityState:
+        for item in await self.downloads(force_refresh=force_refresh):
             provider_id = item.get("id") or item.get("transferId")
-            fallback_id = f"{item.get('username')}:{item.get('filename')}"
+            fallback_id = slskd_fallback_transfer_id(
+                str(item.get("username") or ""), str(item.get("filename") or "")
+            )
             if transfer_id in {str(provider_id) if provider_id is not None else "", fallback_id}:
                 state = str(item.get("state") or item.get("status") or "queued").casefold()
                 return CapabilityState(True, state, dict(item))
         return CapabilityState(False, "transfer not found", {"transfer_id": transfer_id})
+
+    async def match_provisional_transfer(
+        self, username: str, filename: str, *, force_refresh: bool = False
+    ) -> ProvisionalTransferMatch:
+        """Return evidence only when a provisional peer/path has one exact live match."""
+        expected_filename = filename.replace("\\", "/")
+        matches = [
+            dict(item)
+            for item in await self.downloads(force_refresh=force_refresh)
+            if str(item.get("username") or "") == username
+            and str(item.get("filename") or "").replace("\\", "/") == expected_filename
+        ]
+        return ProvisionalTransferMatch(
+            match_count=len(matches),
+            transfer=matches[0] if len(matches) == 1 else None,
+        )
+
+    async def remove_exact(self, username: str, provider_uuid: str) -> None:
+        """Delete one exact canonical UUID; callers must freshly verify identity/absence."""
+        from app.services.acquisition_attempts import canonical_provider_uuid
+
+        canonical = canonical_provider_uuid(provider_uuid)
+        if canonical is None:
+            raise ValueError("slskd cleanup requires a canonical provider UUID")
+        safe_username = quote(username, safe="")
+        safe_transfer_id = quote(canonical, safe="")
+        async with self._client() as client:
+            resp = await request_with_retry(
+                client,
+                "DELETE",
+                f"/api/v0/transfers/downloads/{safe_username}/{safe_transfer_id}",
+                params={"remove": "true"},
+            )
+            if resp.status_code != 404:
+                resp.raise_for_status()
+        _download_snapshots.pop(self._download_snapshot_key(), None)
 
     async def cancel(self, username: str, filename: str, transfer_id: str | None = None) -> bool:
         """Remove one tracked download, optionally requiring its exact provider ID."""
@@ -411,22 +462,15 @@ class SlskdAdapter:
                 resolved_transfer_id = str(provider_id)
             break
         if resolved_transfer_id is None:
-            fallback_id = f"{username}:{filename}"
+            fallback_id = slskd_fallback_transfer_id(username, filename)
             # A persisted fallback identity cannot distinguish this transfer from a
             # replacement using the same peer/path. Keep the cleanup obligation for
             # later/manual reconciliation rather than report a false success.
             return not (matched_identity and transfer_id == fallback_id)
 
-        safe_username = quote(username, safe="")
-        safe_transfer_id = quote(resolved_transfer_id, safe="")
-        async with self._client() as client:
-            resp = await request_with_retry(
-                client,
-                "DELETE",
-                f"/api/v0/transfers/downloads/{safe_username}/{safe_transfer_id}",
-                params={"remove": "true"},
-            )
-            if resp.status_code != 404:
-                resp.raise_for_status()
-        _download_snapshots.pop(self._download_snapshot_key(), None)
+        from app.services.acquisition_attempts import canonical_provider_uuid
+
+        if canonical_provider_uuid(resolved_transfer_id) is None:
+            return False
+        await self.remove_exact(username, resolved_transfer_id)
         return True

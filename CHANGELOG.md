@@ -6,7 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-10
+
 ### Added
+
+- Persist every slskd candidate attempt with canonical transfer UUID and content-bound artifact metadata, and suppress redundant exact-release acquisitions without conflating other editions.
+- Add disabled-by-default, explicitly mounted slskd complete/incomplete empty-directory sweeping with live-transfer and age safeguards, plus a bounded report-only JSON reconciliation command.
 
 - Add provider-scoped release-family monitoring with durable per-edition overrides, explicit-first defaults, unknown fallback, clean-off defaults, and startup reconciliation for existing artists.
 - Automatically approve import-review mismatches only when the exact catalog-position Deezer preview produces a high-confidence acoustic match, with per-MBID score evidence, source/catalog revalidation, operator-precedence fencing, append-only audit attempts, and safe track-level MBID overrides.
@@ -23,6 +28,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Make slskd enqueue, adoption, provider cleanup, staged-file cleanup, and partial-file cleanup crash-, cancellation-, and replacement-safe using durable ownership fences and fail-closed reconciliation.
+- Retry provider and artifact cleanup independently without starving later obligations, preserve review/import/recovery artifacts, and retain content-erased tombstones rather than path-unlinking an unverified replacement.
 - Persist the slskd download timeout when saving the Behavior settings form.
 - Refresh expired signed Deezer reference previews before rendering import review so comparison audio and alignment remain usable.
 - Serve cached MP3 review audio for FLAC files on mobile browsers so matched timestamps seek to the correct audible passage without changing the downloaded source.

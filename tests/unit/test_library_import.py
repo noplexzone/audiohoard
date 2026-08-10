@@ -834,6 +834,8 @@ async def test_partial_import_preserves_committed_plan_and_imports_later_track(
         track_ids={tracks[0].id},
     )
     await execute_release_import(db_session, release, library_root=library)
+    await db_session.commit()
+    await wait_for_imported_source_cleanups()
 
     assert first_plans[0].status == ImportWorkflowState.imported
     assert tracks[0].import_state == ImportWorkflowState.imported
@@ -888,6 +890,8 @@ async def test_execute_import_is_scoped_to_selected_ready_plan_ids(
     assert plans[1].status == ImportWorkflowState.ready
     assert tracks[1].import_state != ImportWorkflowState.imported
     assert not Path(plans[1].destination_path).exists()  # noqa: ASYNC240
+    await db_session.commit()
+    await wait_for_imported_source_cleanups()
 
     await execute_release_import(
         db_session,

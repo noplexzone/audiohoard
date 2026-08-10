@@ -18,6 +18,8 @@ from app.database import Base
 # Encode the full expected table set explicitly so a missing import is caught clearly.
 EXPECTED_TABLES: frozenset[str] = frozenset(
     {
+        "acquisition_attempts",
+        "acquisition_dispatch_claims",
         "app_settings",
         "app_users",
         "auth_sessions",

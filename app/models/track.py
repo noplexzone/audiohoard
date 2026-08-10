@@ -11,6 +11,7 @@ from app.database import Base
 from app.models.workflow import AcoustIDVerificationState, AcquisitionState, ImportWorkflowState
 
 if TYPE_CHECKING:
+    from app.models.acquisition_attempt import AcquisitionAttempt
     from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
     from app.models.import_plan import ImportPlan
     from app.models.job import Job
@@ -106,6 +107,9 @@ class Track(Base):
     )
     acoustid_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    acquisition_attempts: Mapped[list[AcquisitionAttempt]] = relationship(
+        "AcquisitionAttempt", back_populates="track"
+    )
     job: Mapped[Job] = relationship("Job", back_populates="tracks")
     release: Mapped[Release | None] = relationship("Release", back_populates="tracks")
     catalog_album: Mapped[CatalogAlbum | None] = relationship(

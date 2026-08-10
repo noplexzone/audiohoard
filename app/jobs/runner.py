@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
 import logging
+import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import ParseResult, urlparse
 
@@ -33,6 +35,13 @@ from app.metadata.filename_parse import (
     strip_non_identity_descriptors,
 )
 from app.metadata.musicbrainz import MusicBrainzClient
+from app.models.acquisition_attempt import (
+    AcquisitionAttempt,
+    ArtifactState,
+    AttemptOutcome,
+    ProviderTransferState,
+    RetentionDisposition,
+)
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
 from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
@@ -47,6 +56,7 @@ from app.models.workflow import (
 )
 from app.naming.convention import NamingError, render_path
 from app.schemas.search import SearchRequest, SearchResult
+from app.services.acquisition_attempts import canonical_provider_uuid
 from app.services.monitoring import map_slskd_transfer_state
 from app.settings_service import (
     DEFAULT_FREE_TEXT_RESULT_LIMIT,
@@ -56,7 +66,7 @@ from app.settings_service import (
 from app.sources.base import SourceAdapter
 from app.sources.prowlarr import ProwlarrAdapter
 from app.sources.sabnzbd import SabnzbdAdapter
-from app.sources.slskd import SlskdAdapter
+from app.sources.slskd import SlskdAdapter, slskd_fallback_transfer_id
 from app.sources.tidal import TidalAdapter
 from app.sources.youtube import ProviderError, YouTubeAdapter
 
@@ -185,6 +195,96 @@ async def _locate_slskd_artifact(
     )
 
 
+async def _candidate_attempt(
+    db: AsyncSession, job: Job, result: SearchResult
+) -> AcquisitionAttempt:
+    peer = str(result.metadata.get("username") or "") or None
+    raw_path = str(result.metadata.get("filename") or "")
+    remote_path = raw_path.replace("\\", "/").strip() or None
+    attempt = await db.scalar(
+        select(AcquisitionAttempt)
+        .where(
+            AcquisitionAttempt.job_id == job.id,
+            AcquisitionAttempt.provider == result.source,
+            AcquisitionAttempt.peer == peer,
+            AcquisitionAttempt.remote_path == remote_path,
+            AcquisitionAttempt.terminal_at.is_(None),
+            AcquisitionAttempt.provider_state.in_(
+                (
+                    ProviderTransferState.pending,
+                    ProviderTransferState.enqueued,
+                    ProviderTransferState.queued,
+                    ProviderTransferState.downloading,
+                )
+            ),
+        )
+        .order_by(AcquisitionAttempt.id.desc())
+        .limit(1)
+    )
+    if attempt is None:
+        attempt = AcquisitionAttempt(
+            job_id=job.id,
+            catalog_album_id=job.catalog_album_id,
+            catalog_track_id=job.catalog_track_id,
+            provider=result.source,
+            peer=peer,
+            remote_path=remote_path,
+        )
+        db.add(attempt)
+        await db.flush()
+    attempt.outcome = AttemptOutcome.selected
+    attempt.terminal_at = None
+    attempt.error_code = None
+    attempt.error_detail = None
+    return attempt
+
+
+def _artifact_binding(path: Path) -> tuple[int, int, int, int, str]:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+        stat_result = os.fstat(handle.fileno())
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_mtime_ns,
+        stat_result.st_size,
+        digest.hexdigest(),
+    )
+
+
+async def _call_poll_slskd_transfer(
+    transfer_id: str,
+    username: str,
+    filename: str,
+    adapter: SlskdAdapter,
+    cfg: Settings,
+    on_provider_id: Callable[[str], Awaitable[None]],
+    on_provider_state: Callable[[AcquisitionState], Awaitable[None]],
+    on_cancelled: Callable[[], Awaitable[None]],
+    on_partial_path: Callable[[str], Awaitable[None]],
+) -> tuple[Path, str]:
+    parameters = inspect.signature(_poll_slskd_transfer).parameters
+    args: list[object] = [
+        transfer_id,
+        username,
+        filename,
+        adapter,
+        cfg.staging_root,
+        cfg.slskd_poll_interval,
+        cfg.slskd_poll_timeout,
+        on_provider_id,
+    ]
+    if "on_provider_state" in parameters:
+        args.append(on_provider_state)
+    if "on_cancelled" in parameters:
+        args.append(on_cancelled)
+    if "on_partial_path" in parameters:
+        args.append(on_partial_path)
+    return await _poll_slskd_transfer(*args)  # type: ignore[arg-type]
+
+
 async def _poll_slskd_transfer(
     transfer_id: str,
     username: str,
@@ -194,6 +294,9 @@ async def _poll_slskd_transfer(
     poll_interval: float,
     poll_timeout: float,
     on_provider_id: Callable[[str], Awaitable[None]] | None = None,
+    on_provider_state: Callable[[AcquisitionState], Awaitable[None]] | None = None,
+    on_cancelled: Callable[[], Awaitable[None]] | None = None,
+    on_partial_path: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[Path, str]:
     """Poll slskd until terminal and return the staged path plus exact provider ID."""
     import time as _time
@@ -215,6 +318,12 @@ async def _poll_slskd_transfer(
                     await on_provider_id(transfer_id)
 
             acq_state = map_slskd_transfer_state(state)
+            if on_provider_state is not None:
+                await on_provider_state(acq_state)
+            if acq_state != AcquisitionState.downloaded and on_partial_path is not None:
+                partial_path = _provider_local_path(state.extra)
+                if partial_path is not None:
+                    await on_partial_path(partial_path)
 
             if acq_state == AcquisitionState.downloaded:
                 staged = await _locate_slskd_artifact(filename, state.extra, staging_root)
@@ -236,9 +345,37 @@ async def _poll_slskd_transfer(
 
             await asyncio.sleep(min(poll_interval, max(0.01, remaining)))
     except asyncio.CancelledError:
+        if on_cancelled is not None:
+            await asyncio.shield(on_cancelled())
         with contextlib.suppress(Exception):
-            await adapter.cancel(username, filename, transfer_id)
+            await asyncio.shield(adapter.cancel(username, filename, transfer_id))
         raise
+
+
+def _provider_local_path(payload: dict[str, object]) -> str | None:
+    """Return one absolute provider-reported local artifact path, without inference."""
+    preferred = ("incompletePath", "incomplete_path", "localPath", "local_path")
+    found: dict[str, list[str]] = {key.casefold(): [] for key in preferred}
+
+    def collect(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = str(key).casefold()
+                if normalized in found and isinstance(child, str):
+                    candidate = child.strip()
+                    if candidate and Path(candidate).is_absolute():
+                        found[normalized].append(candidate)
+                collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    collect(payload)
+    for key in preferred:
+        candidates = list(dict.fromkeys(found[key.casefold()]))
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
 
 
 async def _poll_sab_job(
@@ -459,6 +596,7 @@ async def run_job(
                 JobStatus.done,
                 JobStatus.partial,
                 JobStatus.failed,
+                JobStatus.cancelled,
             }:
                 raise RuntimeError(f"job {job_id} execution did not reach a terminal status")
             # Real execution has already committed the complete terminal unit. This
@@ -517,6 +655,9 @@ async def run_job(
                 slskd_url=cfg.slskd_url,
                 slskd_api_key=cfg.slskd_api_key,
                 job_ids={job_id},
+                slskd_complete_root=cfg.slskd_complete_root,
+                slskd_incomplete_root=cfg.slskd_incomplete_root,
+                partial_minimum_age=timedelta(seconds=cfg.slskd_directory_sweep_min_age_seconds),
             )
         except Exception:
             logger.exception("Job %d terminal acquisition cleanup failed", job_id)
@@ -529,6 +670,40 @@ async def _run_job_in_session(
     if job is None:
         logger.error("Job %d not found", job_id)
         return None
+
+    if job.catalog_album_id is not None and job.catalog_track_id is not None:
+        from app.services.acquisition_ownership import (
+            claim_catalog_acquisition,
+            has_committed_catalog_ownership,
+        )
+
+        if await has_committed_catalog_ownership(
+            db, job.catalog_album_id, job.catalog_track_id, cfg.library_root
+        ):
+            job.status = JobStatus.done
+            job.result_json = json.dumps(
+                {"tracks_created": 0, "skipped": "exact_catalog_track_owned"}, sort_keys=True
+            )
+            job.updated_at = _now()
+            await db.flush()
+            if commit_progress:
+                await db.commit()
+            return None
+        claimed = await claim_catalog_acquisition(
+            db, job.catalog_album_id, job.catalog_track_id, job.id
+        )
+        if not claimed:
+            job.status = JobStatus.cancelled
+            job.queue_hidden = True
+            job.result_json = json.dumps(
+                {"tracks_created": 0, "cancelled": "equivalent_acquisition_active"},
+                sort_keys=True,
+            )
+            job.updated_at = _now()
+            await db.flush()
+            if commit_progress:
+                await db.commit()
+            return None
 
     job.status = JobStatus.running
     job.updated_at = _now()
@@ -672,6 +847,9 @@ async def _run_job_in_session(
             else []
         )
         for result in results:
+            attempt = await _candidate_attempt(db, job, result)
+            if commit_progress:
+                await db.commit()
             if (
                 result.source == "slskd"
                 and selected_catalog_track is not None
@@ -681,6 +859,9 @@ async def _run_job_in_session(
                     required_terms=selected_required_terms,
                 )
             ):
+                attempt.outcome = AttemptOutcome.rejected
+                attempt.error_code = "candidate_identity_mismatch"
+                attempt.terminal_at = _now()
                 failures.append(
                     {
                         "code": "candidate_identity_mismatch",
@@ -699,6 +880,9 @@ async def _run_job_in_session(
                 catalog_track,
             )
             if track is not None and track.acquisition_state == AcquisitionState.downloaded:
+                attempt.track_id = track.id
+                attempt.outcome = AttemptOutcome.downloaded
+                attempt.terminal_at = _now()
                 tracks_created += 1
                 continue
             try:
@@ -774,6 +958,7 @@ async def _run_job_in_session(
                     track.disc = catalog_track.disc
                     track.disc_total = catalog_disc_total
                     track.track_no = catalog_track.position
+                attempt.track_id = track.id
                 if commit_progress:
                     job.updated_at = _now()
                     await db.commit()
@@ -782,12 +967,17 @@ async def _run_job_in_session(
                     job.updated_at = _now()
                     await db.commit()
 
+                prepare_kwargs: dict[str, object] = {
+                    "checkpoint": checkpoint if commit_progress else None,
+                }
+                if "attempt" in inspect.signature(_call_prepare_acquisition).parameters:
+                    prepare_kwargs["attempt"] = attempt
                 source_job_id, source_status = await _call_prepare_acquisition(
                     result,
                     job.source,
                     cfg,
                     track,
-                    checkpoint=checkpoint if commit_progress else None,
+                    **prepare_kwargs,  # type: ignore[arg-type]
                 )
                 track.source_job_id = source_job_id
                 track.source_status = source_status
@@ -801,6 +991,20 @@ async def _run_job_in_session(
 
                 tracks_created += 1
             except ProviderError as exc:
+                attempt.outcome = AttemptOutcome.failed
+                attempt.error_code = exc.code
+                attempt.error_detail = str(exc)
+                attempt.terminal_at = _now()
+                if attempt.provider_state not in {
+                    ProviderTransferState.completed,
+                    ProviderTransferState.cancelled,
+                }:
+                    attempt.provider_state = ProviderTransferState.failed
+                    attempt.provider_terminal_at = _now()
+                if attempt.partial_path is not None:
+                    attempt.artifact_state = ArtifactState.partial
+                    attempt.file_cleanup_eligible = True
+                    attempt.retention_disposition = RetentionDisposition.cleanup_eligible
                 if track is not None:
                     track.acquisition_state = AcquisitionState.failed
                     track.source_status = exc.code
@@ -830,9 +1034,16 @@ async def _run_job_in_session(
                 logger.warning("Provider result processing failed with code %s", exc.code)
                 failures.append(exc.details())
             except Exception:
+                attempt.outcome = AttemptOutcome.failed
+                attempt.error_code = "result_processing_failed"
+                attempt.terminal_at = _now()
+                if attempt.partial_path is not None:
+                    attempt.artifact_state = ArtifactState.partial
+                    attempt.file_cleanup_eligible = True
+                    attempt.retention_disposition = RetentionDisposition.cleanup_eligible
                 if track is not None:
                     track.acquisition_state = AcquisitionState.failed
-                logger.warning("Result processing failed")
+                logger.warning("Result processing failed", exc_info=True)
                 failures.append({"code": "result_processing_failed"})
             if commit_progress:
                 job.updated_at = _now()
@@ -1765,13 +1976,25 @@ async def _call_prepare_acquisition(
     track: Track,
     *,
     checkpoint: Callable[[], Awaitable[None]] | None,
+    attempt: AcquisitionAttempt | None = None,
 ) -> tuple[str | None, str | None]:
+    kwargs: dict[str, object] = {}
+    parameters = inspect.signature(_prepare_acquisition).parameters
+    if "checkpoint" in parameters:
+        kwargs["checkpoint"] = checkpoint
+    if "attempt" in parameters:
+        kwargs["attempt"] = attempt
+    return await _prepare_acquisition(result, source, cfg, track, **kwargs)  # type: ignore[arg-type]
+
+
+async def _cancellation_safe_checkpoint(checkpoint: Callable[[], Awaitable[None]]) -> None:
+    """Finish a provider-response commit before propagating caller cancellation."""
+    checkpoint_task: asyncio.Future[None] = asyncio.ensure_future(checkpoint())
     try:
-        return await _prepare_acquisition(result, source, cfg, track, checkpoint=checkpoint)
-    except TypeError as exc:
-        if "checkpoint" not in str(exc) or "unexpected keyword" not in str(exc):
-            raise
-        return await _prepare_acquisition(result, source, cfg, track)
+        await asyncio.shield(checkpoint_task)
+    except asyncio.CancelledError:
+        await checkpoint_task
+        raise
 
 
 async def _prepare_acquisition(
@@ -1781,6 +2004,7 @@ async def _prepare_acquisition(
     track: Track | None = None,
     *,
     checkpoint: Callable[[], Awaitable[None]] | None = None,
+    attempt: AcquisitionAttempt | None = None,
 ) -> tuple[str | None, str | None]:
     if source in {"youtube", "tidal"}:
         if not result.url:
@@ -1816,7 +2040,9 @@ async def _prepare_acquisition(
             )
         adapter = SlskdAdapter(cfg.slskd_url, cfg.slskd_api_key)
         transfer_id: str | None = None
-        if track is not None and track.source_job_id:
+        if attempt is not None:
+            transfer_id = attempt.provider_uuid or attempt.provisional_transfer_id
+        if transfer_id is None and track is not None and track.source_job_id:
             if track.acquisition_state == AcquisitionState.acquiring:
                 transfer_id = track.source_job_id
             else:
@@ -1824,8 +2050,66 @@ async def _prepare_acquisition(
                 existing_state = map_slskd_transfer_state(existing)
                 if existing_state not in {AcquisitionState.failed, AcquisitionState.cancelled}:
                     transfer_id = track.source_job_id
-        if not transfer_id:
+
+        enqueue_required = transfer_id is None
+        if attempt is not None and attempt.provider_uuid is None:
+            had_enqueue_intent = attempt.provisional_transfer_id is not None
+            fallback_id = attempt.provisional_transfer_id or slskd_fallback_transfer_id(
+                username, filename
+            )
+            if not had_enqueue_intent:
+                attempt.provisional_transfer_id = fallback_id
+                attempt.provider_state = ProviderTransferState.pending
+                if checkpoint is not None:
+                    # Commit deterministic identity and enqueue intent before the POST.
+                    await checkpoint()
+            if attempt.provider_enqueued_at is None and had_enqueue_intent:
+                parameters = inspect.signature(adapter.status).parameters
+                if "force_refresh" in parameters:
+                    existing = await adapter.status(fallback_id, force_refresh=True)
+                else:
+                    existing = await adapter.status(fallback_id)
+                if existing.available:
+                    transfer_id = fallback_id
+                    enqueue_required = False
+                    provider_id = existing.extra.get("id") or existing.extra.get("transferId")
+                    canonical = canonical_provider_uuid(
+                        str(provider_id) if provider_id is not None else None
+                    )
+                    if canonical is not None:
+                        attempt.provider_uuid = canonical
+                        attempt.provider_uuid_discovered_at = _now()
+                    attempt.provider_enqueued_at = _now()
+                    mapped_state = map_slskd_transfer_state(existing)
+                    attempt.provider_state = {
+                        AcquisitionState.queued: ProviderTransferState.queued,
+                        AcquisitionState.searching: ProviderTransferState.queued,
+                        AcquisitionState.acquiring: ProviderTransferState.downloading,
+                        # Completion is not durable until the staged artifact and its
+                        # content binding are checkpointed together below.
+                        AcquisitionState.downloaded: ProviderTransferState.downloading,
+                    }.get(mapped_state, ProviderTransferState.enqueued)
+                    if checkpoint is not None:
+                        await checkpoint()
+                else:
+                    transfer_id = fallback_id
+                    enqueue_required = True
+            elif attempt.provider_enqueued_at is not None:
+                enqueue_required = False
+
+        enqueue_response_pending_checkpoint = False
+        if enqueue_required:
             transfer_id = await adapter.enqueue(username, filename, result.size_bytes)
+            enqueue_response_pending_checkpoint = True
+            if attempt is not None:
+                attempt.provisional_transfer_id = attempt.provisional_transfer_id or transfer_id
+                provider_uuid = canonical_provider_uuid(transfer_id)
+                if provider_uuid is not None:
+                    attempt.provider_uuid = provider_uuid
+                    attempt.provider_uuid_discovered_at = _now()
+                attempt.provider_enqueued_at = _now()
+                attempt.provider_state = ProviderTransferState.enqueued
+        assert transfer_id is not None
         if track is not None:
             track.source_job_id = transfer_id
             track.source_status = "acquiring"
@@ -1834,24 +2118,82 @@ async def _prepare_acquisition(
                 {"source": "slskd", "username": username, "filename": filename}, sort_keys=True
             )
         if checkpoint is not None:
-            await checkpoint()
+            if enqueue_response_pending_checkpoint:
+                await _cancellation_safe_checkpoint(checkpoint)
+            else:
+                await checkpoint()
 
         async def persist_provider_id(provider_id: str) -> None:
             if track is not None:
                 track.source_job_id = provider_id
+            canonical = canonical_provider_uuid(provider_id)
+            if attempt is not None and canonical is not None:
+                attempt.provider_uuid = canonical
+                attempt.provider_uuid_discovered_at = _now()
             if checkpoint is not None:
                 await checkpoint()
 
-        staged, transfer_id = await _poll_slskd_transfer(
+        async def persist_provider_state(state: AcquisitionState) -> None:
+            if attempt is not None:
+                attempt.provider_state = {
+                    AcquisitionState.queued: ProviderTransferState.queued,
+                    AcquisitionState.searching: ProviderTransferState.queued,
+                    AcquisitionState.acquiring: ProviderTransferState.downloading,
+                    AcquisitionState.downloaded: ProviderTransferState.completed,
+                    AcquisitionState.failed: ProviderTransferState.failed,
+                    AcquisitionState.cancelled: ProviderTransferState.cancelled,
+                }.get(state, ProviderTransferState.downloading)
+                if checkpoint is not None:
+                    await checkpoint()
+
+        async def persist_cancelled() -> None:
+            if attempt is not None:
+                now = _now()
+                attempt.outcome = AttemptOutcome.failed
+                attempt.provider_state = ProviderTransferState.cancelled
+                attempt.provider_terminal_at = now
+                attempt.terminal_at = now
+                attempt.error_code = "cancelled"
+                attempt.error_detail = "acquisition cancelled by user"
+                if attempt.partial_path is not None:
+                    attempt.artifact_state = ArtifactState.partial
+                    attempt.file_cleanup_eligible = True
+                    attempt.retention_disposition = RetentionDisposition.cleanup_eligible
+            if track is not None:
+                track.acquisition_state = AcquisitionState.cancelled
+                track.source_status = "cancelled"
+            if checkpoint is not None:
+                await checkpoint()
+
+        async def persist_partial_path(path: str) -> None:
+            if attempt is None:
+                return
+            partial = Path(path)
+            attempt.partial_path = str(partial)
+            attempt.artifact_state = ArtifactState.partial
+            with contextlib.suppress(OSError):
+                current = await asyncio.to_thread(partial.stat, follow_symlinks=False)
+                attempt.artifact_device = current.st_dev
+                attempt.artifact_inode = current.st_ino
+                attempt.artifact_mtime_ns = current.st_mtime_ns
+                attempt.artifact_size = current.st_size
+            if checkpoint is not None:
+                await checkpoint()
+
+        poll_args: list[object] = [
             transfer_id,
             username,
             filename,
             adapter,
-            cfg.staging_root,
-            cfg.slskd_poll_interval,
-            cfg.slskd_poll_timeout,
+            cfg,
             persist_provider_id,
-        )
+            persist_provider_state,
+        ]
+        if "on_cancelled" in inspect.signature(_call_poll_slskd_transfer).parameters:
+            poll_args.append(persist_cancelled)
+        if "on_partial_path" in inspect.signature(_call_poll_slskd_transfer).parameters:
+            poll_args.append(persist_partial_path)
+        staged, transfer_id = await _call_poll_slskd_transfer(*poll_args)  # type: ignore[arg-type]
         if track is not None:
             # slskd queue responses may omit the provider UUID. Polling exposes it;
             # persist it before cleanup so deletion never falls back to peer/path.
@@ -1865,6 +2207,24 @@ async def _prepare_acquisition(
                 suffix = staged.suffix.lower().lstrip(".")
                 if suffix and len(suffix) <= 16 and suffix.isalnum():
                     track.file_format = suffix
+        if attempt is not None:
+            canonical = canonical_provider_uuid(transfer_id)
+            if canonical is not None:
+                attempt.provider_uuid = canonical
+                attempt.provider_uuid_discovered_at = attempt.provider_uuid_discovered_at or _now()
+            attempt.provider_state = ProviderTransferState.completed
+            attempt.provider_terminal_at = _now()
+            attempt.staged_path = str(staged)
+            attempt.artifact_state = ArtifactState.staged
+            attempt.outcome = AttemptOutcome.downloaded
+            attempt.terminal_at = _now()
+            (
+                attempt.artifact_device,
+                attempt.artifact_inode,
+                attempt.artifact_mtime_ns,
+                attempt.artifact_size,
+                attempt.artifact_sha256,
+            ) = await asyncio.to_thread(_artifact_binding, staged)
         if checkpoint is not None:
             await checkpoint()
         return transfer_id, "downloaded"

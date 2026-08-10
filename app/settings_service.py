@@ -499,6 +499,8 @@ _ENV_BACKED_KEYS: dict[str, str] = {
     "acoustid_api_key": "acoustid_api_key",
     "library_root": "library_root",
     "staging_root": "staging_root",
+    "slskd_complete_root": "slskd_complete_root",
+    "slskd_incomplete_root": "slskd_incomplete_root",
     "naming_template": "naming_template",
     "tidal_config_path": "tidal_config_path",
     "tidal_session_path": "tidal_session_path",
@@ -516,7 +518,9 @@ SECRET_KEYS: frozenset[str] = frozenset(
 )
 
 # Settings keys that store Path objects in Settings (need str↔Path conversion).
-_PATH_KEYS: frozenset[str] = frozenset({"library_root", "staging_root"})
+_PATH_KEYS: frozenset[str] = frozenset(
+    {"library_root", "staging_root", "slskd_complete_root", "slskd_incomplete_root"}
+)
 
 
 @dataclass

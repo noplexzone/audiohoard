@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audiohoard"
-version = "0.23.0"
+version = "0.24.0"
 description = "Self-hosted music acquisition, metadata enrichment, and library naming"
 requires-python = ">=3.12"
 dependencies = [
@@ -29,6 +29,7 @@ dependencies = [
 
 [project.scripts]
 audiohoard-repair-reviews = "app.maintenance.orphan_reviews:main"
+audiohoard-slskd-reconcile = "app.maintenance.slskd_reconcile:main"
 
 [project.optional-dependencies]
 dev = [
