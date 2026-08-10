@@ -23,7 +23,10 @@ from app.services.acquisition_cleanup import (
     AttemptCleanupResult,
     cleanup_attempt_file,
     cleanup_attempt_provider,
+    cleanup_durable_slskd_transfers,
+    reconcile_terminal_slskd_intents,
 )
+from app.sources.base import CapabilityState
 
 UUID = "2d93899b-cf9a-4567-8f10-993610f274cf"
 OTHER_UUID = "06fdfa12-6d4a-4f9e-aa13-bc35685fef65"
@@ -55,8 +58,13 @@ async def _attempt(
         peer="peer",
         remote_path="Album/01 Song.flac",
         provider_uuid=provider_uuid,
-        provider_state=ProviderTransferState.completed,
-        outcome=AttemptOutcome.downloaded,
+        provider_state=(
+            ProviderTransferState.completed
+            if staged_path is not None
+            else ProviderTransferState.failed
+        ),
+        outcome=AttemptOutcome.downloaded if staged_path is not None else AttemptOutcome.failed,
+        provider_terminal_at=datetime.now(UTC),
         terminal_at=datetime.now(UTC),
     )
     if staged_path is not None:
@@ -119,6 +127,72 @@ async def test_missing_uuid_is_blocked_without_provider_delete(db_session: Async
     await db_session.refresh(attempt)
     assert attempt.provider_cleanup_state is CleanupState.blocked
     assert attempt.error_code == "cleanup_missing_provider_uuid"
+
+
+async def test_completed_transfer_without_durable_artifact_binding_is_not_cleanup_eligible(
+    db_session: AsyncSession,
+) -> None:
+    attempt = await _attempt(db_session)
+    attempt.provider_state = ProviderTransferState.completed
+    attempt.outcome = AttemptOutcome.downloaded
+    attempt.artifact_state = ArtifactState.none
+    attempt.staged_path = None
+    attempt.artifact_sha256 = None
+    await db_session.commit()
+    adapter = FakeAdapter([[{"id": UUID, "username": "peer"}]])
+
+    assert (
+        await cleanup_attempt_provider(_factory(db_session), adapter, attempt.id)
+        is AttemptCleanupResult.not_eligible
+    )
+    assert await cleanup_durable_slskd_transfers(_factory(db_session), adapter) == 0
+    assert adapter.calls == []
+
+
+@pytest.mark.parametrize("response_was_checkpointed", [True, False])
+async def test_terminal_job_reconciles_post_enqueue_cancellation_to_exact_uuid_cleanup(
+    db_session: AsyncSession, response_was_checkpointed: bool
+) -> None:
+    job = Job(source="slskd", query="Artist Song", status="cancelled")
+    attempt = AcquisitionAttempt(
+        job=job,
+        provider="slskd",
+        peer="peer",
+        remote_path="Album/01 Song.flac",
+        provisional_transfer_id="peer:Album/01 Song.flac",
+        provider_uuid=UUID if response_was_checkpointed else None,
+        provider_state=ProviderTransferState.enqueued
+        if response_was_checkpointed
+        else ProviderTransferState.pending,
+        provider_enqueued_at=datetime.now(UTC) if response_was_checkpointed else None,
+    )
+    db_session.add_all([job, attempt])
+    await db_session.commit()
+
+    class ReconcileAdapter(FakeAdapter):
+        async def status(
+            self, transfer_id: str, *, force_refresh: bool = False
+        ) -> CapabilityState:
+            self.calls.append(("status", transfer_id, force_refresh))
+            return CapabilityState(
+                True,
+                "InProgress",
+                {"id": UUID, "username": "peer", "filename": "Album/01 Song.flac"},
+            )
+
+    adapter = ReconcileAdapter(
+        [[{"id": UUID, "username": "peer", "filename": "Album/01 Song.flac"}], []]
+    )
+    assert await reconcile_terminal_slskd_intents(_factory(db_session), adapter) == 1
+    await db_session.refresh(attempt)
+    assert attempt.provider_uuid == UUID
+    assert attempt.provider_state is ProviderTransferState.cancelled
+    assert attempt.terminal_at is not None
+    await db_session.rollback()
+
+    assert await cleanup_durable_slskd_transfers(_factory(db_session), adapter) == 1
+    assert ("delete", "peer", UUID) in adapter.calls
+    assert all(call[0] != "delete" or call[2] == UUID for call in adapter.calls)
 
 
 async def test_contradictory_uuid_identity_is_blocked(db_session: AsyncSession) -> None:

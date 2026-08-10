@@ -210,20 +210,6 @@ class JobDispatcher:
         session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> list[int]:
         factory = session_factory or self._factory()
-        try:
-            from app.config import get_settings
-            from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
-            from app.settings_service import build_effective_settings
-
-            async with factory() as cleanup_db:
-                settings = await build_effective_settings(cleanup_db, get_settings())
-            await cleanup_terminal_acquisitions(
-                factory,
-                slskd_url=settings.slskd_url,
-                slskd_api_key=settings.slskd_api_key,
-            )
-        except Exception:
-            logger.exception("Startup terminal acquisition cleanup failed")
         recovered_ids: list[int] = []
         async with factory() as db:
 
@@ -290,6 +276,23 @@ class JobDispatcher:
                 recovered_ids[:] = attempt_ids
 
             await run_with_sqlite_lock_retry(db, recover_jobs)
+        # Recover interrupted jobs before any destructive cleanup. This prevents a
+        # pre-artifact provider completion checkpoint from being mistaken for a
+        # terminal cleanup obligation during startup.
+        try:
+            from app.config import get_settings
+            from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
+            from app.settings_service import build_effective_settings
+
+            async with factory() as cleanup_db:
+                settings = await build_effective_settings(cleanup_db, get_settings())
+            await cleanup_terminal_acquisitions(
+                factory,
+                slskd_url=settings.slskd_url,
+                slskd_api_key=settings.slskd_api_key,
+            )
+        except Exception:
+            logger.exception("Startup terminal acquisition cleanup failed")
         for job_id in recovered_ids:
             await self.dispatch(job_id)
         return recovered_ids

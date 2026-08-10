@@ -100,6 +100,8 @@ class ImportedSourceCleanup:
 class SlskdCleanupAdapter(Protocol):
     async def downloads(self, *, force_refresh: bool = False) -> list[dict[str, object]]: ...
 
+    async def status(self, transfer_id: str, *, force_refresh: bool = False) -> object: ...
+
     async def remove_exact(self, username: str, provider_uuid: str) -> None: ...
 
 
@@ -451,6 +453,75 @@ async def _block_cleanup(
         await db.commit()
 
 
+def _completed_transfer_has_durable_artifact(attempt: AcquisitionAttempt) -> bool:
+    return (
+        attempt.outcome
+        in {
+            AttemptOutcome.downloaded,
+            AttemptOutcome.review_retained,
+            AttemptOutcome.imported,
+            AttemptOutcome.superseded,
+        }
+        and attempt.terminal_at is not None
+        and attempt.provider_terminal_at is not None
+        and attempt.artifact_state in {ArtifactState.staged, ArtifactState.imported}
+        and attempt.staged_path is not None
+        and all(
+            value is not None
+            for value in (
+                attempt.artifact_device,
+                attempt.artifact_inode,
+                attempt.artifact_mtime_ns,
+                attempt.artifact_size,
+                attempt.artifact_sha256,
+            )
+        )
+    )
+
+
+def _provider_cleanup_eligible(attempt: AcquisitionAttempt) -> bool:
+    if attempt.terminal_at is None or attempt.provider_terminal_at is None:
+        return False
+    if attempt.provider_state == ProviderTransferState.completed:
+        return _completed_transfer_has_durable_artifact(attempt)
+    return (
+        attempt.provider_state in {ProviderTransferState.failed, ProviderTransferState.cancelled}
+        and attempt.outcome != AttemptOutcome.pending
+    )
+
+
+def _provider_cleanup_eligibility_expression() -> ColumnElement[bool]:
+    bound_completed = and_(
+        AcquisitionAttempt.provider_state == ProviderTransferState.completed,
+        AcquisitionAttempt.outcome.in_(
+            {
+                AttemptOutcome.downloaded,
+                AttemptOutcome.review_retained,
+                AttemptOutcome.imported,
+                AttemptOutcome.superseded,
+            }
+        ),
+        AcquisitionAttempt.artifact_state.in_({ArtifactState.staged, ArtifactState.imported}),
+        AcquisitionAttempt.staged_path.is_not(None),
+        AcquisitionAttempt.artifact_device.is_not(None),
+        AcquisitionAttempt.artifact_inode.is_not(None),
+        AcquisitionAttempt.artifact_mtime_ns.is_not(None),
+        AcquisitionAttempt.artifact_size.is_not(None),
+        AcquisitionAttempt.artifact_sha256.is_not(None),
+    )
+    failed_or_cancelled = and_(
+        AcquisitionAttempt.provider_state.in_(
+            {ProviderTransferState.failed, ProviderTransferState.cancelled}
+        ),
+        AcquisitionAttempt.outcome != AttemptOutcome.pending,
+    )
+    return and_(
+        AcquisitionAttempt.terminal_at.is_not(None),
+        AcquisitionAttempt.provider_terminal_at.is_not(None),
+        or_(bound_completed, failed_or_cancelled),
+    )
+
+
 async def _claim_provider_cleanup(
     session_factory: async_sessionmaker[AsyncSession],
     attempt_id: int,
@@ -473,12 +544,7 @@ async def _claim_provider_cleanup(
                 code="cleanup_missing_provider_uuid",
             )
             return None, AttemptCleanupResult.blocked
-        terminal_states = {
-            ProviderTransferState.completed,
-            ProviderTransferState.failed,
-            ProviderTransferState.cancelled,
-        }
-        if attempt.provider_state not in terminal_states:
+        if not _provider_cleanup_eligible(attempt):
             return None, AttemptCleanupResult.not_eligible
         if (
             attempt.provider_cleanup_retry_at is not None
@@ -939,6 +1005,93 @@ async def cleanup_attempt_file(
     return result if finalized else AttemptCleanupResult.claimed_elsewhere
 
 
+async def reconcile_terminal_slskd_intents(
+    session_factory: async_sessionmaker[AsyncSession],
+    adapter: SlskdCleanupAdapter,
+    job_ids: set[int] | None = None,
+) -> int:
+    """Turn terminal jobs' provisional enqueue intents into exact cleanup obligations."""
+    terminal_jobs = {JobStatus.done, JobStatus.failed, JobStatus.partial, JobStatus.cancelled}
+    async with session_factory() as db:
+        query = (
+            select(
+                AcquisitionAttempt.id,
+                AcquisitionAttempt.provisional_transfer_id,
+                AcquisitionAttempt.provider_uuid,
+                AcquisitionAttempt.peer,
+                AcquisitionAttempt.remote_path,
+            )
+            .join(Job, Job.id == AcquisitionAttempt.job_id)
+            .where(
+                Job.status.in_(terminal_jobs),
+                AcquisitionAttempt.provider == "slskd",
+                AcquisitionAttempt.provisional_transfer_id.is_not(None),
+                AcquisitionAttempt.provider_state.in_(
+                    {ProviderTransferState.pending, ProviderTransferState.enqueued}
+                ),
+                AcquisitionAttempt.provider_cleanup_state != CleanupState.completed,
+            )
+            .order_by(AcquisitionAttempt.id)
+        )
+        if job_ids is not None:
+            query = query.where(AcquisitionAttempt.job_id.in_(job_ids))
+        intents = list((await db.execute(query)).all())
+
+    reconciled = 0
+    for attempt_id, fallback_id, persisted_uuid, peer, remote_path in intents:
+        assert fallback_id is not None
+        try:
+            status = await adapter.status(fallback_id, force_refresh=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("terminal slskd enqueue-intent probe failed", exc_info=True)
+            continue
+        available = bool(getattr(status, "available", False))
+        extra = getattr(status, "extra", {})
+        if not isinstance(extra, dict):
+            extra = {}
+        discovered = _snapshot_provider_uuid(extra) if available else None
+        canonical = discovered or persisted_uuid
+        if canonical is None:
+            continue
+        if available and (
+            (extra.get("username") and str(extra["username"]) != (peer or ""))
+            or (
+                extra.get("filename")
+                and _normalized_remote_path(extra["filename"])
+                != _normalized_remote_path(remote_path)
+            )
+        ):
+            logger.warning("terminal slskd enqueue-intent identity mismatch")
+            continue
+        now = datetime.now(UTC)
+        async with session_factory() as db:
+            attempt = await db.get(AcquisitionAttempt, attempt_id)
+            if attempt is None:
+                continue
+            job = await db.get(Job, attempt.job_id)
+            if (
+                job is None
+                or job.status not in terminal_jobs
+                or attempt.provider_state
+                not in {ProviderTransferState.pending, ProviderTransferState.enqueued}
+            ):
+                continue
+            attempt.provider_uuid = canonical
+            attempt.provider_uuid_discovered_at = attempt.provider_uuid_discovered_at or now
+            attempt.provider_enqueued_at = attempt.provider_enqueued_at or now
+            attempt.provider_state = ProviderTransferState.cancelled
+            attempt.provider_terminal_at = now
+            attempt.outcome = AttemptOutcome.failed
+            attempt.terminal_at = now
+            attempt.error_code = "cancelled"
+            attempt.error_detail = "terminal job left an accepted slskd enqueue intent"
+            await db.commit()
+            reconciled += 1
+    return reconciled
+
+
 async def cleanup_durable_slskd_transfers(
     session_factory: async_sessionmaker[AsyncSession],
     adapter: SlskdCleanupAdapter,
@@ -951,13 +1104,7 @@ async def cleanup_durable_slskd_transfers(
     async with session_factory() as db:
         query = select(AcquisitionAttempt.id).where(
             AcquisitionAttempt.provider == "slskd",
-            AcquisitionAttempt.provider_state.in_(
-                {
-                    ProviderTransferState.completed,
-                    ProviderTransferState.failed,
-                    ProviderTransferState.cancelled,
-                }
-            ),
+            _provider_cleanup_eligibility_expression(),
             AcquisitionAttempt.provider_cleanup_state != CleanupState.completed,
         )
         if job_ids is not None:
@@ -1035,9 +1182,11 @@ async def cleanup_terminal_acquisitions(
         hidden = await hide_completed_and_timed_out_jobs(
             session_factory, job_ids, max_attempts=max_attempts
         )
+        adapter = SlskdAdapter(slskd_url, slskd_api_key)
+        await reconcile_terminal_slskd_intents(session_factory, adapter, job_ids)
         removed = await cleanup_durable_slskd_transfers(
             session_factory,
-            SlskdAdapter(slskd_url, slskd_api_key),
+            adapter,
             job_ids,
             max_attempts=max_attempts,
         )

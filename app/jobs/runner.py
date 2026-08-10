@@ -1941,6 +1941,16 @@ async def _call_prepare_acquisition(
     return await _prepare_acquisition(result, source, cfg, track, **kwargs)  # type: ignore[arg-type]
 
 
+async def _cancellation_safe_checkpoint(checkpoint: Callable[[], Awaitable[None]]) -> None:
+    """Finish a provider-response commit before propagating caller cancellation."""
+    checkpoint_task: asyncio.Future[None] = asyncio.ensure_future(checkpoint())
+    try:
+        await asyncio.shield(checkpoint_task)
+    except asyncio.CancelledError:
+        await checkpoint_task
+        raise
+
+
 async def _prepare_acquisition(
     result: SearchResult,
     source: str,
@@ -2029,7 +2039,9 @@ async def _prepare_acquisition(
                         AcquisitionState.queued: ProviderTransferState.queued,
                         AcquisitionState.searching: ProviderTransferState.queued,
                         AcquisitionState.acquiring: ProviderTransferState.downloading,
-                        AcquisitionState.downloaded: ProviderTransferState.completed,
+                        # Completion is not durable until the staged artifact and its
+                        # content binding are checkpointed together below.
+                        AcquisitionState.downloaded: ProviderTransferState.downloading,
                     }.get(mapped_state, ProviderTransferState.enqueued)
                     if checkpoint is not None:
                         await checkpoint()
@@ -2039,8 +2051,10 @@ async def _prepare_acquisition(
             elif attempt.provider_enqueued_at is not None:
                 enqueue_required = False
 
+        enqueue_response_pending_checkpoint = False
         if enqueue_required:
             transfer_id = await adapter.enqueue(username, filename, result.size_bytes)
+            enqueue_response_pending_checkpoint = True
             if attempt is not None:
                 attempt.provisional_transfer_id = attempt.provisional_transfer_id or transfer_id
                 provider_uuid = canonical_provider_uuid(transfer_id)
@@ -2058,7 +2072,10 @@ async def _prepare_acquisition(
                 {"source": "slskd", "username": username, "filename": filename}, sort_keys=True
             )
         if checkpoint is not None:
-            await checkpoint()
+            if enqueue_response_pending_checkpoint:
+                await _cancellation_safe_checkpoint(checkpoint)
+            else:
+                await checkpoint()
 
         async def persist_provider_id(provider_id: str) -> None:
             if track is not None:
