@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-10
+
 ### Added
 
 - Persist every slskd candidate attempt with canonical transfer UUID and content-bound artifact metadata, and suppress redundant exact-release acquisitions without conflating other editions.
@@ -26,6 +28,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Make slskd enqueue, adoption, provider cleanup, staged-file cleanup, and partial-file cleanup crash-, cancellation-, and replacement-safe using durable ownership fences and fail-closed reconciliation.
+- Retry provider and artifact cleanup independently without starving later obligations, preserve review/import/recovery artifacts, and retain content-erased tombstones rather than path-unlinking an unverified replacement.
 - Persist the slskd download timeout when saving the Behavior settings form.
 - Refresh expired signed Deezer reference previews before rendering import review so comparison audio and alignment remain usable.
 - Serve cached MP3 review audio for FLAC files on mobile browsers so matched timestamps seek to the correct audible passage without changing the downloaded source.
