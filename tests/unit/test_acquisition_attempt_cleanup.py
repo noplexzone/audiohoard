@@ -426,7 +426,7 @@ async def test_expired_lease_recovery(db_session: AsyncSession) -> None:
     assert attempt.provider_cleanup_state is CleanupState.completed
 
 
-async def test_content_bound_file_cleanup_removes_exact_file_and_repeats_idempotently(
+async def test_content_bound_file_cleanup_erases_content_but_retains_tombstone(
     db_session: AsyncSession, tmp_path: Path
 ) -> None:
     root = tmp_path / "staging"
@@ -434,15 +434,59 @@ async def test_content_bound_file_cleanup_removes_exact_file_and_repeats_idempot
     staged = root / "song.flac"
     staged.write_bytes(b"owned audio")
     attempt = await _attempt(db_session, staged_path=staged)
+    quarantine = acquisition_cleanup._file_quarantine_path(staged, attempt.id)
+
     assert (
         await cleanup_attempt_file(_factory(db_session), attempt.id, root)
-        is AttemptCleanupResult.removed
+        is AttemptCleanupResult.quarantined
     )
     assert not staged.exists()
+    assert quarantine.is_file()
+    assert quarantine.read_bytes() == b""
+    await db_session.refresh(attempt)
+    assert attempt.file_cleanup_state is CleanupState.completed
+    assert attempt.retention_disposition is RetentionDisposition.retained
+    assert attempt.artifact_state is ArtifactState.missing
     assert (
         await cleanup_attempt_file(_factory(db_session), attempt.id, root)
         is AttemptCleanupResult.already_absent
     )
+
+
+async def test_content_erased_tombstone_recovers_after_claim_finalization_loss(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "staging"
+    root.mkdir()
+    staged = root / "song.flac"
+    staged.write_bytes(b"owned audio")
+    attempt = await _attempt(db_session, staged_path=staged)
+    quarantine = acquisition_cleanup._file_quarantine_path(staged, attempt.id)
+    finish_file_claim = acquisition_cleanup._finish_file_claim
+
+    async def lose_finalization(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    monkeypatch.setattr(acquisition_cleanup, "_finish_file_claim", lose_finalization)
+    assert (
+        await cleanup_attempt_file(_factory(db_session), attempt.id, root)
+        is AttemptCleanupResult.claimed_elsewhere
+    )
+    assert quarantine.read_bytes() == b""
+
+    monkeypatch.setattr(acquisition_cleanup, "_finish_file_claim", finish_file_claim)
+    await db_session.refresh(attempt)
+    attempt.cleanup_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    await db_session.commit()
+
+    assert (
+        await cleanup_attempt_file(_factory(db_session), attempt.id, root)
+        is AttemptCleanupResult.quarantined
+    )
+    await db_session.refresh(attempt)
+    assert attempt.file_cleanup_state is CleanupState.completed
+    assert attempt.retention_disposition is RetentionDisposition.retained
+    assert quarantine.read_bytes() == b""
 
 
 @pytest.mark.parametrize("mutation", ["metadata", "hash"])
@@ -491,8 +535,8 @@ async def test_symlink_and_root_escape_are_blocked_and_retained(
     assert outside.exists() and link.is_symlink()
 
 
-async def test_file_replacement_at_final_unlink_window_is_retained_and_blocked(
-    db_session: AsyncSession, tmp_path: Path, monkeypatch
+async def test_replacement_inserted_after_final_hash_is_retained_and_blocked(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "staging"
     root.mkdir()
@@ -500,24 +544,32 @@ async def test_file_replacement_at_final_unlink_window_is_retained_and_blocked(
     staged.write_bytes(b"owned audio")
     attempt = await _attempt(db_session, staged_path=staged)
     quarantine = acquisition_cleanup._file_quarantine_path(staged, attempt.id)
-    real_identity = acquisition_cleanup._identity_without_hash
-    identity_reads = 0
+    hook_called = False
 
-    def replace_after_final_identity(path: Path):
-        nonlocal identity_reads
-        identity = real_identity(path)
-        identity_reads += 1
-        if identity_reads == 2:
-            path.unlink()
-            path.write_bytes(b"replacement audio")
-        return identity
+    def replace_in_final_erase_window(parent_fd: int, name: str) -> None:
+        nonlocal hook_called
+        hook_called = True
+        os.unlink(name, dir_fd=parent_fd)
+        replacement_fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.write(replacement_fd, b"replacement audio")
+        finally:
+            os.close(replacement_fd)
 
     monkeypatch.setattr(
-        acquisition_cleanup, "_identity_without_hash", replace_after_final_identity
+        acquisition_cleanup,
+        "_before_final_file_erase",
+        replace_in_final_erase_window,
     )
 
     result = await cleanup_attempt_file(_factory(db_session), attempt.id, root)
 
+    assert hook_called
     assert result is AttemptCleanupResult.blocked
     assert not staged.exists()
     assert quarantine.read_bytes() == b"replacement audio"

@@ -111,6 +111,7 @@ class SlskdCleanupAdapter(Protocol):
 
 class AttemptCleanupResult(StrEnum):
     removed = "removed"
+    quarantined = "quarantined"
     already_absent = "already_absent"
     blocked = "blocked"
     retryable_failure = "retryable_failure"
@@ -962,6 +963,74 @@ def _hash_open_regular_at(
         os.close(fd)
 
 
+def _before_final_file_erase(_parent_fd: int, _name: str) -> None:
+    """Test seam after final fd-bound validation and before content erasure."""
+
+
+def _erase_validated_regular_at(
+    parent_fd: int,
+    name: str,
+    expected_content: tuple[tuple[int | None, int | None, int | None, int | None], str | None],
+) -> AttemptCleanupResult:
+    """Erase only the validated inode, retaining its directory entry as a tombstone."""
+    expected_identity, expected_sha256 = expected_content
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError:
+        return AttemptCleanupResult.blocked
+    try:
+        before = os.fstat(fd)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mtime_ns,
+            before.st_size,
+        )
+        if not stat.S_ISREG(before.st_mode) or before_identity != expected_identity:
+            return AttemptCleanupResult.blocked
+        digest = hashlib.sha256()
+        while chunk := os.read(fd, 1024 * 1024):
+            digest.update(chunk)
+        after_hash = os.fstat(fd)
+        after_hash_identity = (
+            after_hash.st_dev,
+            after_hash.st_ino,
+            after_hash.st_mtime_ns,
+            after_hash.st_size,
+        )
+        if after_hash_identity != expected_identity or digest.hexdigest() != expected_sha256:
+            return AttemptCleanupResult.blocked
+
+        # Pathname unlink cannot be conditional. From this point onward operate
+        # only on the validated open inode and deliberately retain the entry.
+        _before_final_file_erase(parent_fd, name)
+        os.ftruncate(fd, 0)
+        os.fsync(fd)
+        erased = os.fstat(fd)
+        if (erased.st_dev, erased.st_ino, erased.st_size) != (
+            expected_identity[0],
+            expected_identity[1],
+            0,
+        ):
+            return AttemptCleanupResult.retryable_failure
+    except OSError:
+        return AttemptCleanupResult.retryable_failure
+    finally:
+        os.close(fd)
+
+    current = _regular_identity_at(parent_fd, name)
+    if current is None:
+        return AttemptCleanupResult.blocked
+    if (current[0], current[1], current[3]) != (
+        expected_identity[0],
+        expected_identity[1],
+        0,
+    ):
+        return AttemptCleanupResult.blocked
+    return AttemptCleanupResult.quarantined
+
+
 def _rename_noreplace_at(parent_fd: int, source_name: str, quarantine_name: str) -> None:
     """Atomically quarantine without ever replacing an existing claim (Linux renameat2)."""
     renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
@@ -995,6 +1064,14 @@ def _remove_claimed_file(claim: _CleanupClaim, root: Path) -> AttemptCleanupResu
         return AttemptCleanupResult.blocked
     try:
         quarantine_identity = _regular_identity_at(parent_fd, quarantine.name)
+        if quarantine_identity is not None and (
+            quarantine_identity[0],
+            quarantine_identity[1],
+            quarantine_identity[3],
+        ) == (expected[0], expected[1], 0):
+            # Recovery after content erasure succeeded but durable claim
+            # finalization did not. The empty inode is the retained tombstone.
+            return AttemptCleanupResult.quarantined
         if quarantine_identity is None:
             if _entry_exists_at(parent_fd, quarantine.name):
                 return AttemptCleanupResult.blocked
@@ -1017,21 +1094,15 @@ def _remove_claimed_file(claim: _CleanupClaim, root: Path) -> AttemptCleanupResu
             except OSError:
                 return AttemptCleanupResult.retryable_failure
 
-        # Validate the quarantined claim once after the atomic move/recovery and
-        # once again immediately before unlink. Both reads are fd-bound and do
-        # not follow links; the pathname probe between them is not trusted.
+        # Validate after the atomic move/recovery, then validate and erase via
+        # one open fd. Never unlink the pathname: POSIX offers no conditional
+        # unlink, so retaining an empty tombstone is the fail-closed boundary.
         if _hash_open_regular_at(parent_fd, quarantine.name) != expected_content:
             _restore_quarantine_at(parent_fd, quarantine.name, source.name)
             return AttemptCleanupResult.blocked
         if _identity_without_hash(quarantine) != expected:
             return AttemptCleanupResult.blocked
-        if _hash_open_regular_at(parent_fd, quarantine.name) != expected_content:
-            return AttemptCleanupResult.blocked
-        try:
-            os.unlink(quarantine.name, dir_fd=parent_fd)
-        except OSError:
-            return AttemptCleanupResult.retryable_failure
-        return AttemptCleanupResult.removed
+        return _erase_validated_regular_at(parent_fd, quarantine.name, expected_content)
     finally:
         os.close(parent_fd)
 
@@ -1042,7 +1113,11 @@ async def _finish_file_claim(
     result: AttemptCleanupResult,
 ) -> bool:
     now = datetime.now(UTC)
-    if result in {AttemptCleanupResult.removed, AttemptCleanupResult.already_absent}:
+    if result in {
+        AttemptCleanupResult.removed,
+        AttemptCleanupResult.quarantined,
+        AttemptCleanupResult.already_absent,
+    }:
         state = CleanupState.completed
     elif result == AttemptCleanupResult.blocked:
         state = CleanupState.blocked
@@ -1068,7 +1143,11 @@ async def _finish_file_claim(
         values.update(
             file_cleanup_completed_at=now,
             file_cleanup_retry_at=None,
-            retention_disposition=RetentionDisposition.removed,
+            retention_disposition=(
+                RetentionDisposition.retained
+                if result == AttemptCleanupResult.quarantined
+                else RetentionDisposition.removed
+            ),
             artifact_state=ArtifactState.missing,
         )
     elif state == CleanupState.failed:
@@ -2333,6 +2412,7 @@ async def cleanup_imported_sources(
                     file_result = await cleanup_attempt_file(factory, attempt_id, cleanup_root)
                     completed = file_result in {
                         AttemptCleanupResult.removed,
+                        AttemptCleanupResult.quarantined,
                         AttemptCleanupResult.already_absent,
                     }
             try:
