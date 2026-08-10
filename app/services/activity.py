@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -89,7 +90,17 @@ async def get_activity_summary(db: AsyncSession) -> ActivitySummary:
         )
         .scalar_subquery()
     )
-    rejected_sources = select(func.count(SourceCandidateBlock.id)).scalar_subquery()
+    now = datetime.now(UTC)
+    rejected_sources = (
+        select(func.count(SourceCandidateBlock.id))
+        .where(
+            or_(
+                SourceCandidateBlock.blocked_until.is_(None),
+                SourceCandidateBlock.blocked_until > now,
+            )
+        )
+        .scalar_subquery()
+    )
     row = (
         await db.execute(
             select(

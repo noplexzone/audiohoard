@@ -892,7 +892,12 @@ async def test_pending_review_count_nav_badge_appears_only_when_needed(
     pending = await client.get("/downloads")
 
     assert pending.status_code == 200
-    assert pending.text.count('class="nav-badge">1</span>') == 2
+    assert (
+        pending.text.count(
+            'class="nav-badge" aria-label="1 activity item needs attention">1</span>'
+        )
+        == 2
+    )
 
 
 async def test_review_alignment_matches_deezer_preview(

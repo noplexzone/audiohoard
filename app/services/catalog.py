@@ -1461,6 +1461,7 @@ async def get_missing_releases_page(
     *,
     q: str = "",
     sort: str = "year",
+    status: str = "all",
     page: int = 1,
     per_page: int = _DEFAULT_PAGE_SIZE,
 ) -> Page[MissingReleaseRow]:
@@ -1491,6 +1492,25 @@ async def get_missing_releases_page(
     if q:
         pattern = f"%{q}%"
         filters.append(or_(CatalogArtist.name.ilike(pattern), CatalogAlbum.title.ilike(pattern)))
+    active_job = exists(
+        select(Job.id).where(
+            Job.catalog_album_id == CatalogAlbum.id,
+            Job.status.in_((JobStatus.pending, JobStatus.running)),
+        )
+    )
+    failed_job = exists(
+        select(Job.id).where(
+            Job.catalog_album_id == CatalogAlbum.id,
+            Job.status.in_((JobStatus.failed, JobStatus.partial)),
+        )
+    )
+    any_job = exists(select(Job.id).where(Job.catalog_album_id == CatalogAlbum.id))
+    if status == "active":
+        filters.append(active_job)
+    elif status == "failed":
+        filters.append(failed_job)
+    elif status == "needs-search":
+        filters.append(~any_job)
     rows_query = (
         select(
             CatalogAlbum.id.label("album_id"),

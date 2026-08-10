@@ -321,6 +321,35 @@ async def test_wanted_page_shows_partial_release_and_hides_fully_owned_release(
     assert "Complete Wanted Album" not in response.text
     assert "Nonwatchlisted Missing Album" not in response.text
     assert "Explicitly Unwatched Album" not in response.text
+    assert "Queue this page" in response.text
+    assert ">Queue all<" not in response.text
+    assert 'name="status"' in response.text
+    assert "Needs search" in response.text
+    assert "tab=sources" in response.text
+
+
+async def test_wanted_failed_filter_uses_persistent_job_state(client: AsyncClient) -> None:
+    ids = await _seed_wanted_view_releases()
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        session.add(
+            Job(
+                source="slskd",
+                query="failed wanted query",
+                status=JobStatus.failed,
+                catalog_album_id=ids["partial"],
+                result_json='{"error":"No candidates"}',
+            )
+        )
+        await session.commit()
+
+    response = await client.get("/wanted?status=failed")
+
+    assert response.status_code == 200
+    assert "Partial Wanted Album" in response.text
+    assert "Second Partial Wanted Album" not in response.text
+    assert "Failed" in response.text
+    assert "No candidates" in response.text
 
 
 async def test_wanted_queue_two_ids_queues_only_missing_tracks(

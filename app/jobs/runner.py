@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import ParseResult, urlparse
 
-from sqlalchemy import select, text, update
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -58,6 +58,11 @@ from app.naming.convention import NamingError, render_path
 from app.schemas.search import SearchRequest, SearchResult
 from app.services.acquisition_attempts import canonical_provider_uuid
 from app.services.monitoring import map_slskd_transfer_state
+from app.services.rejected_sources import (
+    RejectionClass,
+    calculate_blocked_until,
+    classify_rejection_reason,
+)
 from app.settings_service import (
     DEFAULT_FREE_TEXT_RESULT_LIMIT,
     build_effective_settings,
@@ -1013,20 +1018,39 @@ async def _run_job_in_session(
                     filename = str(result.metadata.get("filename") or "")
                     if peer and filename:
                         existing_block = await db.scalar(
-                            select(SourceCandidateBlock.id).where(
+                            select(SourceCandidateBlock).where(
                                 SourceCandidateBlock.provider == "slskd",
                                 SourceCandidateBlock.peer == peer,
                                 SourceCandidateBlock.filename == filename,
                             )
                         )
+                        failed_at = _now()
                         if existing_block is None:
+                            retry_count = 1
                             db.add(
                                 SourceCandidateBlock(
                                     provider="slskd",
                                     peer=peer,
                                     filename=filename,
-                                    reason="timeout",
+                                    reason="transfer_timeout",
+                                    retry_count=retry_count,
+                                    last_failure_at=failed_at,
+                                    blocked_until=calculate_blocked_until(
+                                        "transfer_timeout", retry_count, failed_at
+                                    ),
                                 )
+                            )
+                        elif (
+                            classify_rejection_reason(existing_block.reason)
+                            is RejectionClass.temporary
+                        ):
+                            existing_block.reason = "transfer_timeout"
+                            existing_block.retry_count += 1
+                            existing_block.last_failure_at = failed_at
+                            existing_block.blocked_until = calculate_blocked_until(
+                                existing_block.reason,
+                                existing_block.retry_count,
+                                failed_at,
                             )
                         await db.flush()
                         if commit_progress:
@@ -1444,10 +1468,15 @@ def _slskd_identity_from_provenance(provenance_json: str | None) -> tuple[str, s
 
 
 async def _blocked_slskd_identities(db: AsyncSession) -> set[tuple[str, str]]:
+    now = _now()
     block_rows = (
         await db.execute(
             select(SourceCandidateBlock.peer, SourceCandidateBlock.filename).where(
-                SourceCandidateBlock.provider == "slskd"
+                SourceCandidateBlock.provider == "slskd",
+                or_(
+                    SourceCandidateBlock.blocked_until.is_(None),
+                    SourceCandidateBlock.blocked_until > now,
+                ),
             )
         )
     ).all()

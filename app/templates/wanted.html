@@ -10,6 +10,13 @@
 <form method="get" action="/wanted" class="filter-bar" role="search" aria-label="Filter wanted releases">
   <label class="sr-only" for="wanted-q">Search</label>
   <input id="wanted-q" type="search" name="q" value="{{ q }}" placeholder="Search artists or releases…" aria-label="Search wanted releases">
+  <label for="wanted-status">State</label>
+  <select id="wanted-status" name="status">
+    <option value="all" {% if status == "all" %}selected{% endif %}>All states</option>
+    <option value="needs-search" {% if status == "needs-search" %}selected{% endif %}>Needs search</option>
+    <option value="active" {% if status == "active" %}selected{% endif %}>Search scheduled / downloading</option>
+    <option value="failed" {% if status == "failed" %}selected{% endif %}>Failed / partial</option>
+  </select>
   <label class="sr-only" for="wanted-sort">Sort</label>
   <select id="wanted-sort" name="sort" aria-label="Sort order">
     <option value="year" {% if sort == "year" %}selected{% endif %}>Year</option>
@@ -17,7 +24,7 @@
     <option value="title" {% if sort == "title" %}selected{% endif %}>Title</option>
   </select>
   <button type="submit" class="btn">Filter</button>
-  {% if q %}<a href="/wanted" class="btn secondary">Clear</a>{% endif %}
+  {% if q or status != "all" %}<a href="/wanted" class="btn secondary">Clear</a>{% endif %}
 </form>
 {% if releases.items %}
 <div class="bulk-actions" aria-label="Wanted release bulk actions">
@@ -34,7 +41,7 @@
     {% for release in releases.items %}
     <input type="hidden" name="catalog_album_ids" value="{{ release.id }}">
     {% endfor %}
-    <button type="submit" class="btn" data-queue-all>Queue all</button>
+    <button type="submit" class="btn" data-queue-all data-confirm="Queue every release shown on this page?">Queue this page</button>
   </form>
 </div>
 <div class="album-grid" role="list" aria-label="Wanted releases">
@@ -51,8 +58,19 @@
       <h3><a href="/albums/{{ release.id }}" title="{{ release.title | e }}">{{ release.title }}</a></h3>
       <p class="muted-line">{{ release.artist_name }}{% if release.year %} · {{ release.year }}{% endif %}</p>
       <p class="release-progress">{{ release.downloaded_track_count }} / {{ release.wanted_track_count }} downloaded</p>
+      {% set context = wanted_context.get(release.id) %}
+      {% if context %}
+      <div class="wanted-state" aria-label="Acquisition state">
+        <span class="badge {% if context.state in ['Downloading', 'Search scheduled'] %}info{% elif context.state in ['No usable candidates', 'Failed'] %}warn{% elif context.state == 'Awaiting review' %}pending{% else %}neutral{% endif %}">{{ context.state }}</span>
+        {% if context.provider %}<span class="muted-line">Last source: {{ context.provider }}</span>{% endif %}
+        {% if context.last_attempt %}<span class="muted-line">Last attempt: {{ context.last_attempt }}</span>{% endif %}
+        {% if context.failure %}<p class="field-error">{{ context.failure }}</p>{% endif %}
+        {% if context.rejected_count %}<a href="/blocklist?q={{ release.title | urlencode }}">{{ context.rejected_count }} rejected source{% if context.rejected_count != 1 %}s{% endif %}</a>{% endif %}
+        {% if context.review_count %}<a href="/review">{{ context.review_count }} awaiting review</a>{% endif %}
+      </div>
+      {% endif %}
       <div class="album-card-actions">
-        <a class="btn secondary" href="/search?tab=advanced&amp;artist={{ release.artist_name | urlencode }}&amp;album={{ release.title | urlencode }}">Manual search</a><button type="submit" class="btn secondary album-download" form="wanted-selected-form" formaction="/albums/{{ release.id }}/download">Queue missing</button>
+        <a class="btn secondary" href="/search?tab=sources&amp;q={{ (release.artist_name ~ ' ' ~ release.title) | urlencode }}&amp;artist={{ release.artist_name | urlencode }}&amp;album={{ release.title | urlencode }}">Manual search</a><button type="submit" class="btn secondary album-download" form="wanted-selected-form" formaction="/albums/{{ release.id }}/download">Queue missing</button>
       </div>
     </div>
   </article>

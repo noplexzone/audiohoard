@@ -1,31 +1,52 @@
 {% extends "base.html" %}
-{% block title %}Source blocklist — Audiohoard{% endblock %}
+{% block title %}Rejected Sources — Audiohoard{% endblock %}
 {% macro csrf() -%}<input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">{%- endmacro %}
 {% block content %}
-<header class="page-header"><div><p class="eyebrow">Acquisition safety</p><h1>Source blocklist</h1><p>Exact provider artifacts blocked after denial or timeout. Removing a block makes that source eligible for future searches again.</p></div></header>
+<header class="page-header"><div><p class="eyebrow">Acquisition safety</p><h1>Rejected Sources</h1><p>This page contains exact acquisition artifacts Audiohoard should avoid after a user decision or a failed attempt. It is not a list of blocked artists or releases.</p></div></header>
 {% include "partials/_activity_tabs.html" %}
-{% if removed %}<div class="alert ok" role="status">Source block removed.</div>{% endif %}
+{% if allowed %}<div class="alert ok" role="status">Source allowed again{% if retried %} and its acquisition was queued for retry{% endif %}.</div>{% endif %}
+{% if retry_unavailable %}<div class="alert warn" role="status">The source is allowed again, but its related acquisition is no longer retryable.</div>{% endif %}
+<form method="get" action="/blocklist" class="filter-bar" role="search" aria-label="Filter rejected sources">
+  <label class="sr-only" for="rejected-q">Search peer or filename</label><input id="rejected-q" type="search" name="q" value="{{ q }}" placeholder="Peer or filename…">
+  <label class="sr-only" for="rejected-status">Status</label><select id="rejected-status" name="status">
+    {% for value, label in [('all', 'All statuses'), ('active', 'Currently rejected'), ('permanent', 'Permanent'), ('temporary', 'Temporary'), ('eligible', 'Eligible now')] %}<option value="{{ value }}" {% if status == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+  </select>
+  <label class="sr-only" for="rejected-provider">Provider</label><input id="rejected-provider" name="provider" value="{{ provider }}" placeholder="Provider">
+  <label class="sr-only" for="rejected-reason">Reason</label><input id="rejected-reason" name="reason" value="{{ reason }}" placeholder="Reason">
+  <input type="hidden" name="per_page" value="{{ request.query_params.get('per_page', '50') | e }}">
+  <button class="btn" type="submit">Filter</button>{% if q or status != 'all' or provider or reason %}<a class="btn secondary" href="/blocklist">Clear</a>{% endif %}
+</form>
 <section class="card">
   {% if blocks %}
   <div class="table-scroll">
     <table>
-      <thead><tr><th scope="col">Provider</th><th scope="col">Peer / source</th><th scope="col">Remote filename</th><th scope="col">Reason</th><th scope="col">Blocked</th><th scope="col">Action</th></tr></thead>
+      <thead><tr><th scope="col">Related music</th><th scope="col">Provider / source</th><th scope="col">Artifact</th><th scope="col">Reason</th><th scope="col">Rejection</th><th scope="col">Actions</th></tr></thead>
       <tbody>
-        {% for block in blocks %}
+        {% for item in blocks %}{% set block = item.block %}
         <tr>
-          <td>{{ display_name(block.provider) }}</td>
-          <td><code>{{ block.peer }}</code></td>
+          <td>{% if item.artist_name %}<strong>{{ item.artist_name }}</strong><br>{% endif %}{% if item.album_title %}<a href="/albums/{{ item.album_id }}">{{ item.album_title }}</a>{% else %}<span class="muted-line">No related release</span>{% endif %}{% if item.track_title %}<br><span>{{ item.track_title }}</span>{% endif %}</td>
+          <td>{{ display_name(block.provider) }}<br><code>{{ block.peer }}</code></td>
           <td><code>{{ block.filename }}</code></td>
-          <td><span class="badge warn">{{ block.reason }}</span></td>
-          <td>{{ block.created_at.strftime('%Y-%m-%d %H:%M') if block.created_at else 'unknown' }}</td>
-          <td><form method="post" action="/blocklist/{{ block.id }}/remove" data-confirm="Remove this block and allow Audiohoard to use this exact source again?">{{ csrf() }}<button class="btn secondary" type="submit">Remove block</button></form></td>
+          <td><span class="badge warn">{{ block.reason | replace('_', ' ') }}</span>{% if item.attempt_id %}<br><span class="muted-line">Attempt #{{ item.attempt_id }}</span>{% endif %}</td>
+          <td><strong>{{ 'Temporary' if item.classification.value == 'temporary' else 'Permanent' }}</strong><br>{% if item.classification.value == 'temporary' %}{% if item.active %}<span>Retry eligible {{ block.blocked_until.strftime('%Y-%m-%d %H:%M') if block.blocked_until else '' }}</span>{% else %}<span class="badge ok">Eligible now</span>{% endif %}<br><span class="muted-line">{{ block.retry_count }} failure{% if block.retry_count != 1 %}s{% endif %}</span>{% else %}<span class="muted-line">User or identity safety decision</span>{% endif %}<br><span class="muted-line">{{ block.created_at.strftime('%Y-%m-%d %H:%M') if block.created_at else 'unknown' }}</span></td>
+          <td><div class="table-actions">
+            <form method="post" action="/blocklist/{{ block.id }}/allow" data-confirm="Allow Audiohoard to use this exact source again?">{{ csrf() }}<button class="btn secondary" type="submit">Allow again</button></form>
+            {% if item.can_retry %}<form method="post" action="/blocklist/{{ block.id }}/allow-retry" data-confirm="Allow this source and retry the related acquisition now?">{{ csrf() }}<button class="btn" type="submit">Allow + retry now</button></form>{% endif %}
+            {% if item.job_id %}<a class="btn secondary" href="/jobs/{{ item.job_id }}">Acquisition details</a>{% endif %}
+            <a class="btn secondary" href="/search?tab=advanced{% if item.artist_name %}&amp;artist={{ item.artist_name | urlencode }}{% endif %}{% if item.album_title %}&amp;album={{ item.album_title | urlencode }}{% endif %}{% if item.track_title %}&amp;track={{ item.track_title | urlencode }}{% endif %}">Search alternatives</a>
+          </div></td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
+  <nav class="pagination" aria-label="Rejected source pagination">
+    {% if page > 1 %}<a href="/blocklist?{{ filter_qs }}&amp;page={{ page - 1 }}" class="btn secondary">← Prev</a>{% else %}<span class="btn secondary disabled" aria-disabled="true">← Prev</span>{% endif %}
+    <span class="pagination-info">Page {{ page }} of {{ total_pages }} ({{ total }} sources)</span>
+    {% if page < total_pages %}<a href="/blocklist?{{ filter_qs }}&amp;page={{ page + 1 }}" class="btn secondary">Next →</a>{% else %}<span class="btn secondary disabled" aria-disabled="true">Next →</span>{% endif %}
+  </nav>
   {% else %}
-  <div class="empty-state mini"><h3>No blocked sources</h3><p>Denied provider artifacts will appear here when Audiohoard blocks them from future acquisition attempts.</p></div>
+  <div class="empty-state mini"><h3>No rejected sources</h3><p>Exact provider artifacts rejected by a user decision or active failure cooldown will appear here.</p></div>
   {% endif %}
 </section>
 {% endblock %}

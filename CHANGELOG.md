@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Turn Wanted into a state-aware acquisition work queue with server-side filtering, persistent attempt/failure/review context, contextual Manual search links, and an accurately bounded **Queue this page** action.
+- Rename the blocklist UI to Rejected Sources, add pagination and operational context, safe allow/retry controls, and reversible temporary-failure cooldown fields with capped exponential retry delays.
 - Add a task-oriented Activity hub with aggregate Wanted, download, review, and rejected-source counts plus shared tabs and actionable navigation badges.
 - Add a Settings overview with actionable readiness warnings, task-oriented sections, reusable provider cards, bounded Save and test, configured-root permission checks, and progressive unsaved/inline feedback.
 - Add Discover and contextual Manual search with explicit source controls, deterministic evidence scoring, safe stable-ID grouping, and monitored-artist discovery context.

@@ -14,15 +14,16 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select, update
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 from tenacity import RetryError
 
 from app.auth import get_current_user, require_mutation
 from app.config import Settings
 from app.database import get_db, run_with_sqlite_lock_retry
 from app.jobs.dispatcher import job_dispatcher
+from app.models.acquisition_attempt import AcquisitionAttempt
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -34,8 +35,10 @@ from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
 from app.models.monitoring import MonitoringRecord, MonitoringStatus
 from app.models.release import Release
+from app.models.source_candidate_block import SourceCandidateBlock
+from app.models.staging_review import StagingReviewItem
 from app.models.track import Track
-from app.models.workflow import ImportWorkflowState
+from app.models.workflow import ImportWorkflowState, ReviewDecision
 from app.services.catalog import (
     ReleaseProgress,
     aggregate_artist_release_rollup,
@@ -1434,6 +1437,95 @@ async def monitored_artists_page() -> RedirectResponse:
     return RedirectResponse("/library", status_code=303)
 
 
+async def _wanted_release_context(
+    db: AsyncSession, album_ids: list[int]
+) -> dict[int, SimpleNamespace]:
+    if not album_ids:
+        return {}
+    latest_job = aliased(Job)
+    latest_job_id = (
+        select(Job.id)
+        .where(Job.catalog_album_id == CatalogAlbum.id)
+        .order_by(Job.updated_at.desc(), Job.id.desc())
+        .limit(1)
+        .correlate(CatalogAlbum)
+        .scalar_subquery()
+    )
+    review_count = (
+        select(func.count(StagingReviewItem.id))
+        .join(Release, Release.id == StagingReviewItem.release_id)
+        .join(Job, Job.id == Release.job_id)
+        .where(
+            Job.catalog_album_id == CatalogAlbum.id,
+            StagingReviewItem.review_state == ReviewDecision.pending,
+        )
+        .correlate(CatalogAlbum)
+        .scalar_subquery()
+    )
+    rejected_count = (
+        select(func.count(func.distinct(SourceCandidateBlock.id)))
+        .select_from(SourceCandidateBlock)
+        .join(
+            AcquisitionAttempt,
+            and_(
+                AcquisitionAttempt.provider == SourceCandidateBlock.provider,
+                AcquisitionAttempt.peer == SourceCandidateBlock.peer,
+                AcquisitionAttempt.remote_path == SourceCandidateBlock.filename,
+            ),
+        )
+        .where(AcquisitionAttempt.catalog_album_id == CatalogAlbum.id)
+        .correlate(CatalogAlbum)
+        .scalar_subquery()
+    )
+    rows = (
+        await db.execute(
+            select(
+                CatalogAlbum.id,
+                latest_job.status,
+                latest_job.updated_at,
+                latest_job.result_json,
+                latest_job.source,
+                review_count.label("review_count"),
+                rejected_count.label("rejected_count"),
+            )
+            .outerjoin(latest_job, latest_job.id == latest_job_id)
+            .where(CatalogAlbum.id.in_(album_ids))
+        )
+    ).all()
+    result: dict[int, SimpleNamespace] = {}
+    for row in rows:
+        failure = ""
+        if row.result_json:
+            try:
+                payload = json.loads(row.result_json)
+                raw_error = payload.get("error") or payload.get("message") or payload.get("code")
+                if isinstance(raw_error, dict):
+                    raw_error = raw_error.get("message") or raw_error.get("code")
+                failure = str(raw_error or "")
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                failure = "Acquisition failed"
+        state = "Needs search"
+        if row.review_count:
+            state = "Awaiting review"
+        elif row.status == JobStatus.running:
+            state = "Downloading"
+        elif row.status == JobStatus.pending:
+            state = "Search scheduled"
+        elif row.status == JobStatus.partial:
+            state = "Partially downloaded"
+        elif row.status == JobStatus.failed:
+            state = "No usable candidates" if row.rejected_count else "Failed"
+        result[int(row.id)] = SimpleNamespace(
+            state=state,
+            last_attempt=row.updated_at,
+            failure=failure,
+            provider=row.source,
+            rejected_count=int(row.rejected_count or 0),
+            review_count=int(row.review_count or 0),
+        )
+    return result
+
+
 @router.get("/wanted", response_class=HTMLResponse)
 async def wanted_page(
     request: Request,
@@ -1442,9 +1534,18 @@ async def wanted_page(
     sort: str = "year",
     page: int = Query(default=1, ge=1, le=10_000),
     per_page: int = Query(default=50, ge=1, le=200),
+    status: str = "all",
 ) -> HTMLResponse:
-    releases = await get_missing_releases_page(db, q=q, sort=sort, page=page, per_page=per_page)
-    filter_params: dict[str, str] = {"sort": sort, "per_page": str(per_page)}
+    valid_status = status if status in {"all", "needs-search", "active", "failed"} else "all"
+    releases = await get_missing_releases_page(
+        db, q=q, sort=sort, status=valid_status, page=page, per_page=per_page
+    )
+    wanted_context = await _wanted_release_context(db, [release.id for release in releases.items])
+    filter_params: dict[str, str] = {
+        "sort": sort,
+        "status": valid_status,
+        "per_page": str(per_page),
+    }
     if q:
         filter_params["q"] = q
     return _templates(request).TemplateResponse(
@@ -1454,6 +1555,8 @@ async def wanted_page(
             "releases": releases,
             "q": q,
             "sort": sort,
+            "status": valid_status,
+            "wanted_context": wanted_context,
             "per_page": per_page,
             "filter_qs": urlencode(filter_params),
         },

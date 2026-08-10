@@ -46,6 +46,12 @@ Audiohoard follows **Discover → Monitor → Acquire → Verify → Library**. 
 
 Discover uses the catalog entity types the configured adapters can identify reliably. Current catalog adapters expose artist search; artist pages then provide provider-backed releases without fuzzy-merging uncertain identities. The no-query page combines supported provider feeds with monitored artists from the local catalog. **Manual search** queries only the acquisition sources selected in the form, accepts contextual artist/album/track/duration/format fields, and ranks candidates with a deterministic evidence score. Candidate grouping requires a shared stable artifact namespace and ID; filename similarity alone never merges results. Catalog previews remain browsing samples, not import-verification evidence.
 
+## Wanted and Rejected Sources
+
+Wanted is the acquisition work queue for monitored releases that are incomplete. It supports server-side state filters, shows persistent search/download/failure/review context, links failed releases to Manual search and Rejected Sources, and deliberately labels its bounded bulk operation **Queue this page**.
+
+`/blocklist` remains the compatible route and is presented as **Rejected Sources**. Exact source artifacts show provider, peer, filename, reason, related acquisition context, temporary cooldown or permanent status, and safe **Allow again** / **Allow and retry now** actions. Transient transfer failures use capped exponential cooldowns; explicit user denials and identity mismatches remain blocked until an operator allows them.
+
 ## Settings workflow
 
 Settings is organized around Acquisition, Metadata & discovery, Library & naming, Automation, Quality & verification, and Advanced & system. The overview uses cached health state to identify blocking configuration without probing providers on page load. Provider cards support **Save and test** with bounded checks and inline status, while secrets remain write-only. Path diagnostics test only the effective configured library and staging roots. Environment-backed values remain locked.

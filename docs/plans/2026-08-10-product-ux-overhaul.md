@@ -1,7 +1,7 @@
 # Audiohoard product UX overhaul — implementation map
 
 **Date:** 2026-08-10  
-**Status:** Phases 1–4 implemented; Phases 5–6 pending.
+**Status:** Phases 1–5 implemented; Phase 6 pending.
 
 This map anchors the brief to the current server-rendered application. All slices preserve authenticated mutations, CSRF, environment locks, root-contained filesystem operations, transactional imports, and persistent job recovery.
 
@@ -37,11 +37,13 @@ This map anchors the brief to the current server-rendered application. All slice
 - Release, track, Wanted, and failed-download views link into prefilled Manual search while preserving legacy `/search` and existing POST contracts.
 - Coverage: `tests/unit/test_manual_search_scoring.py` and `tests/integration/test_search.py`.
 
-## Phase 5 — Wanted and Rejected Sources (**pending**)
+## Phase 5 — Wanted and Rejected Sources (**implemented**)
 
-Current anchors: Wanted query/POST paths in `app/routers/catalog.py`, `app/templates/wanted.html`, `app/routers/blocklist.py`, `app/models/source_candidate_block.py`, job/acquisition models, and Alembic migrations.
-
-Implement server-side work-queue state/filters, truthful queue-all semantics, paginated contextual Rejected Sources, permanent/temporary classification and cooldown, restore/retry actions, and cross-links.
+- Wanted now exposes durable acquisition state, latest attempt/failure/provider context, review/rejected-source links, and supported server-side state filters without per-row queries.
+- The bulk control is truthfully bounded and labeled **Queue this page**; existing queue/authentication/CSRF contracts remain intact.
+- `/blocklist` remains compatible while the UI is named Rejected Sources and adds pagination, exact artifact context, filters, allow, and allow-plus-retry actions.
+- Migration `0030` adds reversible `blocked_until`, `retry_count`, and `last_failure_at` fields. Known transient timeouts are backfilled into cooldowns; explicit denial and identity failures remain permanent.
+- Active Activity counts and acquisition exclusion logic ignore expired temporary rejections.
 
 ## Phase 6 — Supporting cleanup and acceptance (**pending**)
 
