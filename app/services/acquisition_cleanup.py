@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
-from sqlalchemy import and_, case, or_, select, update
+from sqlalchemy import and_, case, or_, select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
@@ -1181,47 +1181,82 @@ async def reconcile_terminal_slskd_intents(
             continue
         now = datetime.now(UTC)
         async with session_factory() as db:
-            attempt = await db.get(AcquisitionAttempt, attempt_id)
-            if attempt is None:
-                continue
-            job = await db.get(Job, attempt.job_id)
-            if (
-                job is None
-                or job.status not in terminal_jobs
-                or attempt.provider_state
-                not in {ProviderTransferState.pending, ProviderTransferState.enqueued}
-                or attempt.provisional_transfer_id != fallback_id
-                or attempt.peer != peer
-                or _normalized_remote_path(attempt.remote_path)
-                != _normalized_remote_path(remote_path)
-            ):
-                continue
-            current_canonical = canonical_provider_uuid(attempt.provider_uuid)
-            if attempt.provider_uuid is not None and current_canonical is None:
-                continue
-            if current_canonical is not None and current_canonical != discovered:
-                continue
-            owned = await db.scalar(
-                select(AcquisitionAttempt.id).where(
-                    AcquisitionAttempt.id != attempt.id,
-                    AcquisitionAttempt.provider == "slskd",
-                    AcquisitionAttempt.provider_uuid == discovered,
+            try:
+                # Reserve SQLite's single writer before rechecking ownership. A replacement
+                # attempt commits its provisional identity before POSTing, so it is visible
+                # here; a concurrent replacement cannot commit and POST until we finish.
+                await db.execute(text("BEGIN IMMEDIATE"))
+                attempt = await db.get(AcquisitionAttempt, attempt_id)
+                if attempt is None:
+                    continue
+                job = await db.get(Job, attempt.job_id)
+                if (
+                    job is None
+                    or job.status not in terminal_jobs
+                    or attempt.provider_state
+                    not in {ProviderTransferState.pending, ProviderTransferState.enqueued}
+                    or attempt.provisional_transfer_id != fallback_id
+                    or attempt.peer != peer
+                    or _normalized_remote_path(attempt.remote_path)
+                    != _normalized_remote_path(remote_path)
+                ):
+                    continue
+                current_canonical = canonical_provider_uuid(attempt.provider_uuid)
+                if attempt.provider_uuid is not None and current_canonical is None:
+                    continue
+                if current_canonical is not None and current_canonical != discovered:
+                    continue
+                active_provider_states = (
+                    ProviderTransferState.pending,
+                    ProviderTransferState.enqueued,
+                    ProviderTransferState.queued,
+                    ProviderTransferState.downloading,
                 )
-            )
-            if owned is not None:
-                logger.warning("terminal slskd enqueue-intent UUID already owned")
-                continue
-            attempt.provider_uuid = discovered
-            attempt.provider_uuid_discovered_at = attempt.provider_uuid_discovered_at or now
-            attempt.provider_enqueued_at = attempt.provider_enqueued_at or now
-            attempt.provider_state = ProviderTransferState.cancelled
-            attempt.provider_terminal_at = now
-            attempt.outcome = AttemptOutcome.failed
-            attempt.terminal_at = now
-            attempt.error_code = "cancelled"
-            attempt.error_detail = "terminal job left an accepted slskd enqueue intent"
-            await db.commit()
-            reconciled += 1
+                owned = await db.scalar(
+                    select(AcquisitionAttempt.id).where(
+                        AcquisitionAttempt.id != attempt.id,
+                        AcquisitionAttempt.provider == "slskd",
+                        or_(
+                            AcquisitionAttempt.provider_uuid == discovered,
+                            and_(
+                                or_(
+                                    AcquisitionAttempt.provisional_transfer_id == fallback_id,
+                                    and_(
+                                        AcquisitionAttempt.peer == peer,
+                                        AcquisitionAttempt.remote_path == remote_path,
+                                    ),
+                                ),
+                                or_(
+                                    AcquisitionAttempt.terminal_at.is_(None),
+                                    AcquisitionAttempt.provider_state.in_(active_provider_states),
+                                ),
+                            ),
+                        ),
+                    )
+                )
+                if owned is not None:
+                    logger.warning(
+                        "terminal slskd enqueue-intent UUID or provisional "
+                        "generation already owned"
+                    )
+                    continue
+                attempt.provider_uuid = discovered
+                attempt.provider_uuid_discovered_at = attempt.provider_uuid_discovered_at or now
+                attempt.provider_enqueued_at = attempt.provider_enqueued_at or now
+                attempt.provider_state = ProviderTransferState.cancelled
+                attempt.provider_terminal_at = now
+                attempt.outcome = AttemptOutcome.failed
+                attempt.terminal_at = now
+                attempt.error_code = "cancelled"
+                attempt.error_detail = "terminal job left an accepted slskd enqueue intent"
+                await db.commit()
+                reconciled += 1
+            except OperationalError:
+                await db.rollback()
+                logger.warning(
+                    "terminal slskd enqueue-intent ownership transaction failed closed",
+                    exc_info=True,
+                )
     return reconciled
 
 

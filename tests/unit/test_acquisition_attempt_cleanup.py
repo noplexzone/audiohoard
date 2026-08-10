@@ -316,6 +316,49 @@ async def test_terminal_intent_never_adopts_uuid_claimed_during_provider_probe(
     assert all(call[0] != "delete" for call in adapter.calls)
 
 
+async def test_terminal_intent_never_adopts_new_attempt_before_uuid_checkpoint(
+    db_session: AsyncSession,
+) -> None:
+    old_attempt = await _terminal_intent(db_session)
+
+    class AcceptedReplacementAdapter(ReconcileAdapter):
+        async def match_provisional_transfer(
+            self, username: str, filename: str, *, force_refresh: bool = False
+        ) -> ProvisionalTransferMatch:
+            evidence = await super().match_provisional_transfer(
+                username, filename, force_refresh=force_refresh
+            )
+            async with _factory(db_session)() as db:
+                db.add(
+                    AcquisitionAttempt(
+                        job=Job(source="slskd", query="replacement"),
+                        provider="slskd",
+                        peer="peer",
+                        remote_path="Album/01 Song.flac",
+                        provisional_transfer_id="peer:Album/01 Song.flac",
+                        provider_uuid=None,
+                        provider_state=ProviderTransferState.pending,
+                    )
+                )
+                await db.commit()
+            return evidence
+
+    adapter = AcceptedReplacementAdapter(
+        [{"id": UUID, "username": "peer", "filename": "Album/01 Song.flac"}],
+        [[{"id": UUID, "username": "peer", "filename": "Album/01 Song.flac"}], []],
+    )
+
+    reconciled = await reconcile_terminal_slskd_intents(_factory(db_session), adapter)
+    cleaned = await cleanup_durable_slskd_transfers(_factory(db_session), adapter)
+
+    await db_session.refresh(old_attempt)
+    assert reconciled == 0
+    assert cleaned == 0
+    assert old_attempt.provider_uuid is None
+    assert old_attempt.provider_state is ProviderTransferState.pending
+    assert all(call[0] != "delete" for call in adapter.calls)
+
+
 async def test_contradictory_uuid_identity_is_blocked(db_session: AsyncSession) -> None:
     attempt = await _attempt(db_session)
     adapter = FakeAdapter(
