@@ -126,6 +126,11 @@ def _flatten_downloads(data: object) -> list[dict[str, object]]:
     return flattened
 
 
+def slskd_fallback_transfer_id(username: str, filename: str) -> str:
+    """Return the deterministic peer/path identity used before a UUID is known."""
+    return f"{username}:{filename}"
+
+
 class SlskdAdapter:
     name = "slskd"
 
@@ -317,7 +322,7 @@ class SlskdAdapter:
         response_id = (
             (data.get("id") or data.get("transferId")) if isinstance(data, dict) else None
         )
-        transfer_id = str(response_id or f"{username}:{filename}")
+        transfer_id = str(response_id or slskd_fallback_transfer_id(username, filename))
         return transfer_id
 
     async def _fetch_downloads(self) -> list[dict[str, object]]:
@@ -380,10 +385,12 @@ class SlskdAdapter:
             snapshot.in_flight = None
         return downloads
 
-    async def status(self, transfer_id: str) -> CapabilityState:
-        for item in await self.downloads():
+    async def status(self, transfer_id: str, *, force_refresh: bool = False) -> CapabilityState:
+        for item in await self.downloads(force_refresh=force_refresh):
             provider_id = item.get("id") or item.get("transferId")
-            fallback_id = f"{item.get('username')}:{item.get('filename')}"
+            fallback_id = slskd_fallback_transfer_id(
+                str(item.get("username") or ""), str(item.get("filename") or "")
+            )
             if transfer_id in {str(provider_id) if provider_id is not None else "", fallback_id}:
                 state = str(item.get("state") or item.get("status") or "queued").casefold()
                 return CapabilityState(True, state, dict(item))
@@ -431,7 +438,7 @@ class SlskdAdapter:
                 resolved_transfer_id = str(provider_id)
             break
         if resolved_transfer_id is None:
-            fallback_id = f"{username}:{filename}"
+            fallback_id = slskd_fallback_transfer_id(username, filename)
             # A persisted fallback identity cannot distinguish this transfer from a
             # replacement using the same peer/path. Keep the cleanup obligation for
             # later/manual reconciliation rather than report a false success.

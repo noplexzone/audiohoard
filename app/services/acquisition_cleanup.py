@@ -973,6 +973,16 @@ async def prune_orphaned_terminal_records(
                         Job.status.in_(terminal),
                         ~Job.tracks.any(),
                         ~Job.releases.any(),
+                        ~Job.acquisition_attempts.any(
+                            or_(
+                                AcquisitionAttempt.provider_cleanup_state.not_in(
+                                    (CleanupState.completed, CleanupState.not_required)
+                                ),
+                                AcquisitionAttempt.file_cleanup_state.not_in(
+                                    (CleanupState.completed, CleanupState.not_required)
+                                ),
+                            )
+                        ),
                     )
                     .order_by(Job.id)
                     .limit(batch_size)

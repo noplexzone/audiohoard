@@ -116,6 +116,48 @@ async def test_concurrent_catalog_claims_have_one_winner(tmp_path: Path) -> None
     await engine.dispose()
 
 
+async def test_concurrent_terminal_owner_takeover_has_exactly_one_winner(
+    tmp_path: Path,
+) -> None:
+    from app.models.job import JobStatus
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'takeover.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as seed:
+        artist = CatalogArtist(name="Artist")
+        album = CatalogAlbum(title="Album", artist=artist)
+        track = CatalogAlbumTrack(album=album, position=1, disc=1, title="Track")
+        owner = Job(source="slskd", query="owner", status=JobStatus.failed)
+        contenders = [Job(source="slskd", query=f"retry-{index}") for index in range(2)]
+        seed.add_all([artist, album, track, owner, *contenders])
+        await seed.commit()
+        assert await claim_catalog_acquisition(seed, album.id, track.id, owner.id)
+        await seed.commit()
+        identity = album.id, track.id
+        contender_ids = [job.id for job in contenders]
+
+    ready = 0
+    ready_lock = asyncio.Lock()
+    release = asyncio.Event()
+
+    async def claim(job_id: int) -> bool:
+        nonlocal ready
+        async with factory() as session:
+            async with ready_lock:
+                ready += 1
+                if ready == len(contender_ids):
+                    release.set()
+            await release.wait()
+            won = await claim_catalog_acquisition(session, *identity, job_id)
+            await session.commit()
+            return won
+
+    assert sum(await asyncio.gather(*(claim(job_id) for job_id in contender_ids))) == 1
+    await engine.dispose()
+
+
 async def test_owned_exact_release_skips_search_and_enqueue(
     db_session: AsyncSession,
     test_settings: Settings,

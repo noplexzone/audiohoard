@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
 from app.jobs.runner import _fetch_slskd_album_results, _without_blocked_slskd_results
+from app.models.acquisition_attempt import AcquisitionAttempt, CleanupState
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
@@ -889,6 +890,29 @@ async def test_prune_orphaned_terminal_records_removes_only_rows_without_files(
     assert await db_session.get(Track, ids["imported_track"]) is not None
     assert await db_session.get(Track, ids["active_track"]) is not None
     assert await db_session.get(Job, ids["mixed_job"]) is not None
+
+
+async def test_prune_preserves_no_track_job_with_unresolved_attempt_cleanup(
+    db_session: AsyncSession,
+) -> None:
+    job = Job(source="slskd", query="rejected", status=JobStatus.failed)
+    attempt = AcquisitionAttempt(
+        job=job,
+        provider="slskd",
+        peer="peer",
+        remote_path="Album/01 Song.flac",
+        provider_cleanup_state=CleanupState.pending,
+        file_cleanup_state=CleanupState.not_required,
+    )
+    db_session.add_all([job, attempt])
+    await db_session.flush()
+    job_id, attempt_id = job.id, attempt.id
+
+    result = await prune_orphaned_terminal_records(db_session, batch_size=1)
+
+    assert result.jobs == 0
+    assert await db_session.get(Job, job_id) is not None
+    assert await db_session.get(AcquisitionAttempt, attempt_id) is not None
 
 
 # ---------------------------------------------------------------------------

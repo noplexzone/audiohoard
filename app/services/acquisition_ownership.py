@@ -4,10 +4,11 @@ import asyncio
 import stat
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database import run_with_sqlite_lock_retry
 from app.models.acquisition_claim import AcquisitionDispatchClaim
 from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
@@ -62,35 +63,35 @@ async def has_committed_catalog_ownership(
 async def claim_catalog_acquisition(
     db: AsyncSession, catalog_album_id: int, catalog_track_id: int, job_id: int
 ) -> bool:
-    """Fence equivalent runners with one short SQLite uniqueness claim."""
-    existing = await db.scalar(
-        select(AcquisitionDispatchClaim).where(
-            AcquisitionDispatchClaim.catalog_album_id == catalog_album_id,
-            AcquisitionDispatchClaim.catalog_track_id == catalog_track_id,
-        )
-    )
-    if existing is not None and existing.job_id == job_id:
-        return True
+    """Atomically claim an exact catalog track, taking over only terminal owners."""
     terminal = (JobStatus.done, JobStatus.failed, JobStatus.partial, JobStatus.cancelled)
-    if existing is not None:
-        owner_status = await db.scalar(select(Job.status).where(Job.id == existing.job_id))
-        if owner_status not in terminal:
-            return False
-        await db.delete(existing)
-        await db.flush()
-    await db.execute(
-        sqlite_insert(AcquisitionDispatchClaim)
-        .values(
-            catalog_album_id=catalog_album_id,
-            catalog_track_id=catalog_track_id,
-            job_id=job_id,
+    claimed = False
+
+    async def operation() -> None:
+        nonlocal claimed
+        statement = (
+            sqlite_insert(AcquisitionDispatchClaim)
+            .values(
+                catalog_album_id=catalog_album_id,
+                catalog_track_id=catalog_track_id,
+                job_id=job_id,
+            )
+            .on_conflict_do_update(
+                index_elements=["catalog_album_id", "catalog_track_id"],
+                set_={"job_id": job_id},
+                where=or_(
+                    AcquisitionDispatchClaim.job_id == job_id,
+                    exists(
+                        select(Job.id).where(
+                            Job.id == AcquisitionDispatchClaim.job_id,
+                            Job.status.in_(terminal),
+                        )
+                    ),
+                ),
+            )
+            .returning(AcquisitionDispatchClaim.job_id)
         )
-        .on_conflict_do_nothing(index_elements=["catalog_album_id", "catalog_track_id"])
-    )
-    owner_job_id = await db.scalar(
-        select(AcquisitionDispatchClaim.job_id).where(
-            AcquisitionDispatchClaim.catalog_album_id == catalog_album_id,
-            AcquisitionDispatchClaim.catalog_track_id == catalog_track_id,
-        )
-    )
-    return owner_job_id == job_id
+        claimed = (await db.execute(statement)).scalar_one_or_none() == job_id
+
+    await run_with_sqlite_lock_retry(db, operation)
+    return claimed
