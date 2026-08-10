@@ -389,6 +389,26 @@ class SlskdAdapter:
                 return CapabilityState(True, state, dict(item))
         return CapabilityState(False, "transfer not found", {"transfer_id": transfer_id})
 
+    async def remove_exact(self, username: str, provider_uuid: str) -> None:
+        """Delete one exact canonical UUID; callers must freshly verify identity/absence."""
+        from app.services.acquisition_attempts import canonical_provider_uuid
+
+        canonical = canonical_provider_uuid(provider_uuid)
+        if canonical is None:
+            raise ValueError("slskd cleanup requires a canonical provider UUID")
+        safe_username = quote(username, safe="")
+        safe_transfer_id = quote(canonical, safe="")
+        async with self._client() as client:
+            resp = await request_with_retry(
+                client,
+                "DELETE",
+                f"/api/v0/transfers/downloads/{safe_username}/{safe_transfer_id}",
+                params={"remove": "true"},
+            )
+            if resp.status_code != 404:
+                resp.raise_for_status()
+        _download_snapshots.pop(self._download_snapshot_key(), None)
+
     async def cancel(self, username: str, filename: str, transfer_id: str | None = None) -> bool:
         """Remove one tracked download, optionally requiring its exact provider ID."""
         expected_filename = filename.replace("\\", "/")
@@ -417,16 +437,9 @@ class SlskdAdapter:
             # later/manual reconciliation rather than report a false success.
             return not (matched_identity and transfer_id == fallback_id)
 
-        safe_username = quote(username, safe="")
-        safe_transfer_id = quote(resolved_transfer_id, safe="")
-        async with self._client() as client:
-            resp = await request_with_retry(
-                client,
-                "DELETE",
-                f"/api/v0/transfers/downloads/{safe_username}/{safe_transfer_id}",
-                params={"remove": "true"},
-            )
-            if resp.status_code != 404:
-                resp.raise_for_status()
-        _download_snapshots.pop(self._download_snapshot_key(), None)
+        from app.services.acquisition_attempts import canonical_provider_uuid
+
+        if canonical_provider_uuid(resolved_transfer_id) is None:
+            return False
+        await self.remove_exact(username, resolved_transfer_id)
         return True

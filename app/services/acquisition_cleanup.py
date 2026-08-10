@@ -8,11 +8,14 @@ import logging
 import os
 import stat
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
-from sqlalchemy import and_, case, or_, select, text
+from sqlalchemy import and_, case, or_, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -21,6 +24,14 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from app.config import get_settings
 from app.database import get_session_factory
+from app.models.acquisition_attempt import (
+    AcquisitionAttempt,
+    ArtifactState,
+    AttemptOutcome,
+    CleanupState,
+    ProviderTransferState,
+    RetentionDisposition,
+)
 from app.models.catalog_entities import CatalogAlbumTrack
 from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
@@ -87,9 +98,36 @@ class ImportedSourceCleanup:
 
 
 class SlskdCleanupAdapter(Protocol):
-    async def cancel(
-        self, username: str, filename: str, transfer_id: str | None = None
-    ) -> bool | None: ...
+    async def downloads(self, *, force_refresh: bool = False) -> list[dict[str, object]]: ...
+
+    async def remove_exact(self, username: str, provider_uuid: str) -> None: ...
+
+
+class AttemptCleanupResult(StrEnum):
+    removed = "removed"
+    already_absent = "already_absent"
+    blocked = "blocked"
+    retryable_failure = "retryable_failure"
+    claimed_elsewhere = "claimed_elsewhere"
+    not_eligible = "not_eligible"
+
+
+@dataclass(frozen=True)
+class _CleanupClaim:
+    attempt_id: int
+    token: str
+    version: int
+    peer: str | None
+    remote_path: str | None
+    provider_uuid: str | None
+    staged_path: str | None
+    quarantine_path: str | None
+    device: int | None
+    inode: int | None
+    mtime_ns: int | None
+    size: int | None
+    sha256: str | None
+    attempt_count: int
 
 
 def _slskd_identity(provenance_json: str | None) -> tuple[str, str] | None:
@@ -198,6 +236,537 @@ async def hide_completed_and_timed_out_jobs(
     raise RuntimeError("cleanup retry loop exited unexpectedly")
 
 
+def _normalized_remote_path(value: object) -> str:
+    return str(value or "").replace("\\", "/")
+
+
+def _snapshot_provider_uuid(item: dict[str, object]) -> str | None:
+    from app.services.acquisition_attempts import canonical_provider_uuid
+
+    return canonical_provider_uuid(item.get("id") or item.get("transferId"))
+
+
+async def _block_cleanup(
+    session_factory: async_sessionmaker[AsyncSession],
+    attempt_id: int,
+    *,
+    provider: bool,
+    code: str,
+) -> None:
+    state_column = (
+        AcquisitionAttempt.provider_cleanup_state
+        if provider
+        else AcquisitionAttempt.file_cleanup_state
+    )
+    async with session_factory() as db:
+        await db.execute(
+            update(AcquisitionAttempt)
+            .where(
+                AcquisitionAttempt.id == attempt_id,
+                state_column != CleanupState.completed,
+            )
+            .values(
+                {
+                    state_column.key: CleanupState.blocked,
+                    "error_code": code,
+                    "error_detail": "cleanup requires manual review",
+                    "cleanup_claim_token": None,
+                    "cleanup_claimed_at": None,
+                    "cleanup_lease_expires_at": None,
+                }
+            )
+        )
+        await db.commit()
+
+
+async def _claim_provider_cleanup(
+    session_factory: async_sessionmaker[AsyncSession],
+    attempt_id: int,
+    *,
+    lease_seconds: int,
+) -> tuple[_CleanupClaim | None, AttemptCleanupResult | None]:
+    now = datetime.now(UTC)
+    async with session_factory() as db:
+        attempt = await db.get(AcquisitionAttempt, attempt_id)
+        if attempt is None or attempt.provider != "slskd":
+            return None, AttemptCleanupResult.not_eligible
+        if attempt.provider_cleanup_state == CleanupState.completed:
+            return None, AttemptCleanupResult.already_absent
+        if attempt.provider_uuid is None:
+            await db.rollback()
+            await _block_cleanup(
+                session_factory,
+                attempt_id,
+                provider=True,
+                code="cleanup_missing_provider_uuid",
+            )
+            return None, AttemptCleanupResult.blocked
+        terminal_states = {
+            ProviderTransferState.completed,
+            ProviderTransferState.failed,
+            ProviderTransferState.cancelled,
+        }
+        if attempt.provider_state not in terminal_states:
+            return None, AttemptCleanupResult.not_eligible
+        if (
+            attempt.provider_cleanup_retry_at is not None
+            and attempt.provider_cleanup_retry_at.replace(tzinfo=UTC) > now
+        ):
+            return None, AttemptCleanupResult.not_eligible
+        if (
+            attempt.provider_cleanup_state == CleanupState.claimed
+            and attempt.cleanup_lease_expires_at is not None
+            and attempt.cleanup_lease_expires_at.replace(tzinfo=UTC) > now
+        ):
+            return None, AttemptCleanupResult.claimed_elsewhere
+        old_version = attempt.cleanup_claim_version
+        token = str(uuid4())
+        version = old_version + 1
+        eligible_state = or_(
+            AcquisitionAttempt.provider_cleanup_state.in_(
+                {CleanupState.pending, CleanupState.failed, CleanupState.blocked}
+            ),
+            and_(
+                AcquisitionAttempt.provider_cleanup_state == CleanupState.claimed,
+                AcquisitionAttempt.cleanup_lease_expires_at <= now,
+            ),
+        )
+        result = await db.execute(
+            update(AcquisitionAttempt)
+            .execution_options(synchronize_session=False)
+            .where(
+                AcquisitionAttempt.id == attempt_id,
+                AcquisitionAttempt.cleanup_claim_version == old_version,
+                eligible_state,
+            )
+            .values(
+                provider_cleanup_state=CleanupState.claimed,
+                provider_cleanup_attempt_count=attempt.provider_cleanup_attempt_count + 1,
+                provider_cleanup_last_attempted_at=now,
+                provider_cleanup_retry_at=None,
+                cleanup_claim_token=token,
+                cleanup_claim_version=version,
+                cleanup_claimed_at=now,
+                cleanup_lease_expires_at=now + timedelta(seconds=lease_seconds),
+                error_code=None,
+                error_detail=None,
+            )
+        )
+        if not isinstance(result, CursorResult) or result.rowcount != 1:
+            await db.rollback()
+            return None, AttemptCleanupResult.claimed_elsewhere
+        await db.commit()
+        return (
+            _CleanupClaim(
+                attempt_id=attempt.id,
+                token=token,
+                version=version,
+                peer=attempt.peer,
+                remote_path=attempt.remote_path,
+                provider_uuid=attempt.provider_uuid,
+                staged_path=attempt.staged_path,
+                quarantine_path=attempt.quarantine_path,
+                device=attempt.artifact_device,
+                inode=attempt.artifact_inode,
+                mtime_ns=attempt.artifact_mtime_ns,
+                size=attempt.artifact_size,
+                sha256=attempt.artifact_sha256,
+                attempt_count=attempt.provider_cleanup_attempt_count + 1,
+            ),
+            None,
+        )
+
+
+async def _finish_provider_claim(
+    session_factory: async_sessionmaker[AsyncSession],
+    claim: _CleanupClaim,
+    *,
+    state: CleanupState,
+    error_code: str | None = None,
+) -> bool:
+    now = datetime.now(UTC)
+    values: dict[str, object] = {
+        "provider_cleanup_state": state,
+        "cleanup_claim_token": None,
+        "cleanup_claimed_at": None,
+        "cleanup_lease_expires_at": None,
+        "error_code": error_code,
+        "error_detail": "provider cleanup will be retried"
+        if state == CleanupState.failed
+        else None,
+    }
+    if state == CleanupState.completed:
+        values["provider_cleanup_completed_at"] = now
+        values["provider_cleanup_retry_at"] = None
+    elif state == CleanupState.failed:
+        values["provider_cleanup_retry_at"] = now + timedelta(
+            seconds=min(3600, 30 * (2 ** max(0, claim.attempt_count - 1)))
+        )
+    async with session_factory() as db:
+        result = await db.execute(
+            update(AcquisitionAttempt)
+            .execution_options(synchronize_session=False)
+            .where(
+                AcquisitionAttempt.id == claim.attempt_id,
+                AcquisitionAttempt.provider_cleanup_state == CleanupState.claimed,
+                AcquisitionAttempt.cleanup_claim_token == claim.token,
+                AcquisitionAttempt.cleanup_claim_version == claim.version,
+            )
+            .values(**values)
+        )
+        await db.commit()
+        return isinstance(result, CursorResult) and result.rowcount == 1
+
+
+async def cleanup_attempt_provider(
+    session_factory: async_sessionmaker[AsyncSession],
+    adapter: SlskdCleanupAdapter,
+    attempt_id: int,
+    *,
+    lease_seconds: int = 300,
+) -> AttemptCleanupResult:
+    """Claim, exactly remove, freshly verify, and CAS-finalize one slskd attempt."""
+    claim, immediate = await _claim_provider_cleanup(
+        session_factory, attempt_id, lease_seconds=lease_seconds
+    )
+    if claim is None:
+        assert immediate is not None
+        return immediate
+    assert claim.provider_uuid is not None
+    try:
+        before = await adapter.downloads(force_refresh=True)
+        exact = [item for item in before if _snapshot_provider_uuid(item) == claim.provider_uuid]
+        if exact:
+            if len(exact) != 1 or any(
+                str(item.get("username") or "") != (claim.peer or "")
+                or _normalized_remote_path(item.get("filename"))
+                != _normalized_remote_path(claim.remote_path)
+                for item in exact
+            ):
+                await _finish_provider_claim(
+                    session_factory,
+                    claim,
+                    state=CleanupState.blocked,
+                    error_code="provider_cleanup_identity_mismatch",
+                )
+                return AttemptCleanupResult.blocked
+            await adapter.remove_exact(claim.peer or "", claim.provider_uuid)
+            after = await adapter.downloads(force_refresh=True)
+            if any(_snapshot_provider_uuid(item) == claim.provider_uuid for item in after):
+                await _finish_provider_claim(
+                    session_factory,
+                    claim,
+                    state=CleanupState.failed,
+                    error_code="provider_cleanup_still_present",
+                )
+                return AttemptCleanupResult.retryable_failure
+            finalized = await _finish_provider_claim(
+                session_factory, claim, state=CleanupState.completed
+            )
+            return (
+                AttemptCleanupResult.removed
+                if finalized
+                else AttemptCleanupResult.claimed_elsewhere
+            )
+        finalized = await _finish_provider_claim(
+            session_factory, claim, state=CleanupState.completed
+        )
+        return (
+            AttemptCleanupResult.already_absent
+            if finalized
+            else AttemptCleanupResult.claimed_elsewhere
+        )
+    except asyncio.CancelledError:
+        await _finish_provider_claim(
+            session_factory,
+            claim,
+            state=CleanupState.failed,
+            error_code="provider_cleanup_cancelled",
+        )
+        raise
+    except Exception:
+        logger.warning("exact slskd attempt cleanup failed", exc_info=True)
+        await _finish_provider_claim(
+            session_factory,
+            claim,
+            state=CleanupState.failed,
+            error_code="provider_cleanup_failed",
+        )
+        return AttemptCleanupResult.retryable_failure
+
+
+def _file_quarantine_path(path: Path, attempt_id: int) -> Path:
+    return path.with_name(f".{path.name}.audiohoard-attempt-{attempt_id}")
+
+
+async def _claim_file_cleanup(
+    session_factory: async_sessionmaker[AsyncSession],
+    attempt_id: int,
+    *,
+    lease_seconds: int,
+) -> tuple[_CleanupClaim | None, AttemptCleanupResult | None]:
+    now = datetime.now(UTC)
+    async with session_factory() as db:
+        attempt = await db.get(AcquisitionAttempt, attempt_id)
+        if attempt is None:
+            return None, AttemptCleanupResult.not_eligible
+        if attempt.file_cleanup_state == CleanupState.completed:
+            return None, AttemptCleanupResult.already_absent
+        eligible = (
+            attempt.file_cleanup_eligible
+            and attempt.retention_disposition == RetentionDisposition.cleanup_eligible
+            and attempt.provider_cleanup_state == CleanupState.completed
+            and attempt.staged_path is not None
+            and all(
+                value is not None
+                for value in (
+                    attempt.artifact_device,
+                    attempt.artifact_inode,
+                    attempt.artifact_mtime_ns,
+                    attempt.artifact_size,
+                    attempt.artifact_sha256,
+                )
+            )
+        )
+        if not eligible:
+            await db.rollback()
+            await _block_cleanup(
+                session_factory,
+                attempt_id,
+                provider=False,
+                code="file_cleanup_not_eligible",
+            )
+            return None, AttemptCleanupResult.blocked
+        if (
+            attempt.file_cleanup_retry_at is not None
+            and attempt.file_cleanup_retry_at.replace(tzinfo=UTC) > now
+        ):
+            return None, AttemptCleanupResult.not_eligible
+        if (
+            attempt.file_cleanup_state == CleanupState.claimed
+            and attempt.cleanup_lease_expires_at is not None
+            and attempt.cleanup_lease_expires_at.replace(tzinfo=UTC) > now
+        ):
+            return None, AttemptCleanupResult.claimed_elsewhere
+        old_version = attempt.cleanup_claim_version
+        token = str(uuid4())
+        version = old_version + 1
+        staged_path = attempt.staged_path
+        assert staged_path is not None
+        quarantine = attempt.quarantine_path or str(
+            _file_quarantine_path(Path(staged_path), attempt.id)
+        )
+        state_ok = or_(
+            AcquisitionAttempt.file_cleanup_state.in_(
+                {CleanupState.pending, CleanupState.failed, CleanupState.blocked}
+            ),
+            and_(
+                AcquisitionAttempt.file_cleanup_state == CleanupState.claimed,
+                AcquisitionAttempt.cleanup_lease_expires_at <= now,
+            ),
+        )
+        result = await db.execute(
+            update(AcquisitionAttempt)
+            .execution_options(synchronize_session=False)
+            .where(
+                AcquisitionAttempt.id == attempt_id,
+                AcquisitionAttempt.cleanup_claim_version == old_version,
+                state_ok,
+            )
+            .values(
+                file_cleanup_state=CleanupState.claimed,
+                file_cleanup_attempt_count=attempt.file_cleanup_attempt_count + 1,
+                file_cleanup_last_attempted_at=now,
+                file_cleanup_retry_at=None,
+                quarantine_path=quarantine,
+                cleanup_claim_token=token,
+                cleanup_claim_version=version,
+                cleanup_claimed_at=now,
+                cleanup_lease_expires_at=now + timedelta(seconds=lease_seconds),
+                error_code=None,
+                error_detail=None,
+            )
+        )
+        if not isinstance(result, CursorResult) or result.rowcount != 1:
+            await db.rollback()
+            return None, AttemptCleanupResult.claimed_elsewhere
+        await db.commit()
+        return _CleanupClaim(
+            attempt.id,
+            token,
+            version,
+            attempt.peer,
+            attempt.remote_path,
+            attempt.provider_uuid,
+            attempt.staged_path,
+            quarantine,
+            attempt.artifact_device,
+            attempt.artifact_inode,
+            attempt.artifact_mtime_ns,
+            attempt.artifact_size,
+            attempt.artifact_sha256,
+            attempt.file_cleanup_attempt_count + 1,
+        ), None
+
+
+def _path_is_contained_regular(path: Path, root: Path) -> bool:
+    try:
+        root_resolved = root.resolve(strict=True)
+        if path.is_symlink():
+            return False
+        resolved = path.resolve(strict=True)
+        return resolved.is_relative_to(root_resolved) and stat.S_ISREG(
+            path.stat(follow_symlinks=False).st_mode
+        )
+    except OSError:
+        return False
+
+
+def _identity_without_hash(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        current = path.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(current.st_mode):
+        return None
+    return current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size
+
+
+def _hash_open_regular(path: Path) -> tuple[tuple[int, int, int, int], str] | None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        current = os.fstat(fd)
+        if not stat.S_ISREG(current.st_mode):
+            return None
+        digest = hashlib.sha256()
+        while chunk := os.read(fd, 1024 * 1024):
+            digest.update(chunk)
+        return (
+            (current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size),
+            digest.hexdigest(),
+        )
+    finally:
+        os.close(fd)
+
+
+def _remove_claimed_file(claim: _CleanupClaim, root: Path) -> AttemptCleanupResult:
+    assert claim.staged_path is not None and claim.quarantine_path is not None
+    source = Path(claim.staged_path)
+    quarantine = Path(claim.quarantine_path)
+    expected = (claim.device, claim.inode, claim.mtime_ns, claim.size)
+    if quarantine.exists() or quarantine.is_symlink():
+        target = quarantine
+    elif source.exists() or source.is_symlink():
+        if not _path_is_contained_regular(source, root):
+            return AttemptCleanupResult.blocked
+        if _identity_without_hash(source) != expected:
+            return AttemptCleanupResult.blocked
+        try:
+            os.replace(source, quarantine)
+        except OSError:
+            return AttemptCleanupResult.retryable_failure
+        target = quarantine
+    else:
+        return AttemptCleanupResult.already_absent
+    if not _path_is_contained_regular(target, root):
+        return AttemptCleanupResult.blocked
+    current = _hash_open_regular(target)
+    if current is None or current != (expected, claim.sha256):
+        if not source.exists() and not source.is_symlink():
+            with contextlib.suppress(OSError):
+                os.replace(target, source)
+        return AttemptCleanupResult.blocked
+    if _identity_without_hash(target) != expected:
+        return AttemptCleanupResult.blocked
+    try:
+        target.unlink()
+    except OSError:
+        return AttemptCleanupResult.retryable_failure
+    return AttemptCleanupResult.removed
+
+
+async def _finish_file_claim(
+    session_factory: async_sessionmaker[AsyncSession],
+    claim: _CleanupClaim,
+    result: AttemptCleanupResult,
+) -> bool:
+    now = datetime.now(UTC)
+    if result in {AttemptCleanupResult.removed, AttemptCleanupResult.already_absent}:
+        state = CleanupState.completed
+    elif result == AttemptCleanupResult.blocked:
+        state = CleanupState.blocked
+    else:
+        state = CleanupState.failed
+    values: dict[str, object] = {
+        "file_cleanup_state": state,
+        "cleanup_claim_token": None,
+        "cleanup_claimed_at": None,
+        "cleanup_lease_expires_at": None,
+        "error_code": None
+        if state == CleanupState.completed
+        else "file_cleanup_identity_mismatch"
+        if state == CleanupState.blocked
+        else "file_cleanup_failed",
+        "error_detail": None
+        if state == CleanupState.completed
+        else "file retained; cleanup requires review"
+        if state == CleanupState.blocked
+        else "file cleanup will be retried",
+    }
+    if state == CleanupState.completed:
+        values.update(
+            file_cleanup_completed_at=now,
+            file_cleanup_retry_at=None,
+            retention_disposition=RetentionDisposition.removed,
+            artifact_state=ArtifactState.missing,
+        )
+    elif state == CleanupState.failed:
+        values["file_cleanup_retry_at"] = now + timedelta(
+            seconds=min(3600, 30 * (2 ** max(0, claim.attempt_count - 1)))
+        )
+    async with session_factory() as db:
+        updated = await db.execute(
+            update(AcquisitionAttempt)
+            .execution_options(synchronize_session=False)
+            .where(
+                AcquisitionAttempt.id == claim.attempt_id,
+                AcquisitionAttempt.file_cleanup_state == CleanupState.claimed,
+                AcquisitionAttempt.cleanup_claim_token == claim.token,
+                AcquisitionAttempt.cleanup_claim_version == claim.version,
+            )
+            .values(**values)
+        )
+        await db.commit()
+        return isinstance(updated, CursorResult) and updated.rowcount == 1
+
+
+async def cleanup_attempt_file(
+    session_factory: async_sessionmaker[AsyncSession],
+    attempt_id: int,
+    root: Path,
+    *,
+    lease_seconds: int = 300,
+) -> AttemptCleanupResult:
+    """Remove only an explicitly eligible artifact bound to exact persisted content."""
+    claim, immediate = await _claim_file_cleanup(
+        session_factory, attempt_id, lease_seconds=lease_seconds
+    )
+    if claim is None:
+        assert immediate is not None
+        return immediate
+    try:
+        result = await asyncio.to_thread(_remove_claimed_file, claim, root)
+    except asyncio.CancelledError:
+        await _finish_file_claim(session_factory, claim, AttemptCleanupResult.retryable_failure)
+        raise
+    finalized = await _finish_file_claim(session_factory, claim, result)
+    return result if finalized else AttemptCleanupResult.claimed_elsewhere
+
+
 async def cleanup_durable_slskd_transfers(
     session_factory: async_sessionmaker[AsyncSession],
     adapter: SlskdCleanupAdapter,
@@ -205,83 +774,29 @@ async def cleanup_durable_slskd_transfers(
     *,
     max_attempts: int = 3,
 ) -> int:
-    """Remove durable completed/timeout transfers with no DB transaction held during I/O."""
+    """Consume exact attempt-backed obligations; legacy Track rows remain report-only."""
+    del max_attempts  # Claim retries/backoff are persisted per attempt.
     async with session_factory() as db:
-        query = select(Track).where(
-            Track.source == "slskd",
-            Track.source_job_id.is_not(None),
-            Track.acquisition_provenance_json.is_not(None),
+        query = select(AcquisitionAttempt.id).where(
+            AcquisitionAttempt.provider == "slskd",
+            AcquisitionAttempt.provider_state.in_(
+                {
+                    ProviderTransferState.completed,
+                    ProviderTransferState.failed,
+                    ProviderTransferState.cancelled,
+                }
+            ),
+            AcquisitionAttempt.provider_cleanup_state != CleanupState.completed,
         )
         if job_ids is not None:
-            query = query.where(Track.job_id.in_(job_ids))
-        tracks = list((await db.scalars(query.order_by(Track.id))).all())
-        attempts: dict[tuple[str, str], list[tuple[int, str]]] = {}
-        for track in tracks:
-            if _source_cleanup_completed(track.acquisition_provenance_json):
-                continue
-            durable = (
-                track.acquisition_state == AcquisitionState.downloaded and bool(track.staging_path)
-            ) or track.source_status == "transfer_timeout"
-            identity = _slskd_identity(track.acquisition_provenance_json)
-            source_job_id = track.source_job_id
-            if durable and identity is not None and source_job_id is not None:
-                attempts.setdefault(identity, []).append((track.id, source_job_id))
+            query = query.where(AcquisitionAttempt.job_id.in_(job_ids))
+        attempt_ids = list((await db.scalars(query.order_by(AcquisitionAttempt.id))).all())
 
     completed = 0
-    cleaned_track_identities: dict[int, tuple[tuple[str, str], str]] = {}
-    for identity, track_refs in sorted(attempts.items()):
-        # Revalidate immediately before provider I/O. The adapter additionally targets
-        # the exact provider transfer ID, so a replacement with the same peer/path
-        # cannot be removed after this transaction is released.
-        async with session_factory() as db:
-            current_tracks = list(
-                (
-                    await db.scalars(
-                        select(Track).where(Track.id.in_([ref[0] for ref in track_refs]))
-                    )
-                ).all()
-            )
-            current_refs = [
-                (track.id, expected_source_job_id)
-                for track in current_tracks
-                for expected_track_id, expected_source_job_id in track_refs
-                if track.id == expected_track_id
-                and track.source_job_id == expected_source_job_id
-                and _slskd_identity(track.acquisition_provenance_json) == identity
-                and not _source_cleanup_completed(track.acquisition_provenance_json)
-                and (
-                    (
-                        track.acquisition_state == AcquisitionState.downloaded
-                        and bool(track.staging_path)
-                    )
-                    or track.source_status == "transfer_timeout"
-                )
-            ]
-        if not current_refs:
-            continue
-        # Every row grouped under an identity should refer to the same provider
-        # transfer. Refuse ambiguous historical groups rather than deleting by path.
-        transfer_ids = {source_job_id for _, source_job_id in current_refs}
-        if len(transfer_ids) != 1:
-            logger.warning("skipping ambiguous durable slskd transfer cleanup identity")
-            continue
-        transfer_id = next(iter(transfer_ids))
-        try:
-            cleanup_result = await adapter.cancel(*identity, transfer_id)
-            if cleanup_result is False:
-                continue
-        except Exception:
-            logger.exception("durable slskd transfer cleanup failed")
-        else:
+    for attempt_id in attempt_ids:
+        result = await cleanup_attempt_provider(session_factory, adapter, attempt_id)
+        if result in {AttemptCleanupResult.removed, AttemptCleanupResult.already_absent}:
             completed += 1
-            cleaned_track_identities.update(
-                {track_id: (identity, source_job_id) for track_id, source_job_id in current_refs}
-            )
-
-    if cleaned_track_identities:
-        await _mark_durable_source_cleanups(
-            session_factory, cleaned_track_identities, max_attempts=max_attempts
-        )
     return completed
 
 
@@ -688,87 +1203,88 @@ async def _revalidate_cleanup_obligation(
 
 
 async def _claim_cleanup_quarantine(item: ImportedSourceCleanup) -> ImportedSourceCleanup | None:
-    """Durably claim an owned inode at a deterministic crash-recoverable path."""
+    """Move legacy imported content outside DB transactions, then persist the path."""
     if item.plan_id is None or item.track_id is None:
         return None
     factory = item.session_factory or get_session_factory()
-    current_item = item
-    for attempt in range(1, 4):
+    async with factory() as db:
+        if not await _cleanup_obligation_is_current(db, item, protect_destination=True):
+            return None
+        plan = await db.get(ImportPlan, item.plan_id)
+        track = await db.get(Track, item.track_id)
+        if plan is None or track is None:
+            return None
+        configured = Path(plan.staging_path or plan.source_path)
+        await db.commit()
+
+    if any(
+        value is None
+        for value in (
+            item.expected_device,
+            item.expected_inode,
+            item.expected_mtime_ns,
+            item.expected_size,
+        )
+    ):
+        return item
+    try:
+        digest = item.expected_digest or await asyncio.to_thread(_file_sha256, item.staged_path)
+    except OSError:
+        return None
+    assert digest is not None
+    current_item = replace(item, expected_digest=digest)
+    assert current_item.expected_device is not None
+    assert current_item.expected_inode is not None
+    assert current_item.expected_mtime_ns is not None
+    assert current_item.expected_size is not None
+    quarantine = _cleanup_quarantine_path(
+        configured,
+        item.plan_id,
+        current_item.expected_device,
+        current_item.expected_inode,
+        current_item.expected_mtime_ns,
+        current_item.expected_size,
+        digest,
+    )
+    try:
+        if current_item.staged_path != quarantine:
+            if quarantine.exists() or quarantine.is_symlink():
+                return None
+            await asyncio.to_thread(os.replace, current_item.staged_path, quarantine)
+            current_item = replace(current_item, staged_path=quarantine)
+        current = await asyncio.to_thread(quarantine.stat, follow_symlinks=False)
+        current_digest = await asyncio.to_thread(_file_sha256, quarantine)
+    except OSError:
+        return None
+    if (
+        current.st_dev,
+        current.st_ino,
+        current.st_mtime_ns,
+        current.st_size,
+        current_digest,
+    ) != (
+        current_item.expected_device,
+        current_item.expected_inode,
+        current_item.expected_mtime_ns,
+        current_item.expected_size,
+        current_item.expected_digest,
+    ):
+        if not await asyncio.to_thread(configured.exists):
+            with contextlib.suppress(OSError):
+                await asyncio.to_thread(os.replace, quarantine, configured)
+        return None
+
+    for attempt_no in range(1, 4):
         async with factory() as db:
             try:
-                await db.execute(text("BEGIN IMMEDIATE"))
-                if not await _cleanup_obligation_is_current(
-                    db, current_item, protect_destination=True
-                ):
-                    await db.rollback()
+                if not await _cleanup_obligation_is_current(db, item, protect_destination=True):
+                    if not await asyncio.to_thread(configured.exists):
+                        with contextlib.suppress(OSError):
+                            await asyncio.to_thread(os.replace, quarantine, configured)
                     return None
-                plan = await db.get(ImportPlan, current_item.plan_id)
-                track = await db.get(Track, current_item.track_id)
+                plan = await db.get(ImportPlan, item.plan_id)
+                track = await db.get(Track, item.track_id)
                 if plan is None or track is None:
-                    await db.rollback()
-                    return None
-                configured = Path(plan.staging_path or plan.source_path)
-                if any(
-                    value is None
-                    for value in (
-                        current_item.expected_device,
-                        current_item.expected_inode,
-                        current_item.expected_mtime_ns,
-                        current_item.expected_size,
-                    )
-                ):
-                    # The old artifact is already absent. Preserve any later file at
-                    # the configured name and finish provider cleanup only.
-                    await db.rollback()
-                    return current_item
-                expected_device = current_item.expected_device
-                expected_inode = current_item.expected_inode
-                expected_mtime_ns = current_item.expected_mtime_ns
-                expected_size = current_item.expected_size
-                assert expected_device is not None
-                assert expected_inode is not None
-                assert expected_mtime_ns is not None
-                assert expected_size is not None
-                expected_digest = current_item.expected_digest
-                if expected_digest is None:
-                    expected_digest = await asyncio.to_thread(
-                        _file_sha256, current_item.staged_path
-                    )
-                    current_item = replace(current_item, expected_digest=expected_digest)
-                quarantine = _cleanup_quarantine_path(
-                    configured,
-                    plan.id,
-                    expected_device,
-                    expected_inode,
-                    expected_mtime_ns,
-                    expected_size,
-                    expected_digest,
-                )
-                if current_item.staged_path != quarantine:
-                    if quarantine.exists():
-                        await db.rollback()
-                        return None
-                    await asyncio.to_thread(os.replace, current_item.staged_path, quarantine)
-                    current_item = replace(current_item, staged_path=quarantine)
-                current = await asyncio.to_thread(quarantine.stat, follow_symlinks=False)
-                current_digest = await asyncio.to_thread(_file_sha256, quarantine)
-                if (
-                    current.st_dev,
-                    current.st_ino,
-                    current.st_mtime_ns,
-                    current.st_size,
-                    current_digest,
-                ) != (
-                    current_item.expected_device,
-                    current_item.expected_inode,
-                    current_item.expected_mtime_ns,
-                    current_item.expected_size,
-                    current_item.expected_digest,
-                ):
-                    configured_exists = await asyncio.to_thread(configured.exists)
-                    if not configured_exists:
-                        await asyncio.to_thread(os.replace, quarantine, configured)
-                    await db.rollback()
                     return None
                 plan.staging_path = str(quarantine)
                 track.staging_path = str(quarantine)
@@ -776,9 +1292,9 @@ async def _claim_cleanup_quarantine(item: ImportedSourceCleanup) -> ImportedSour
                 return current_item
             except Exception as exc:
                 await db.rollback()
-                if attempt == 3 or not _transient_cleanup_error(exc):
+                if attempt_no == 3 or not _transient_cleanup_error(exc):
                     raise
-        await _cleanup_retry_delay(attempt)
+        await _cleanup_retry_delay(attempt_no)
     return None
 
 
@@ -867,6 +1383,39 @@ async def _provider_cleanup_completed_current(item: ImportedSourceCleanup) -> bo
         )
 
 
+async def _prepare_attempt_cleanup_for_imported_item(
+    item: ImportedSourceCleanup,
+) -> int | None:
+    """Durably make the exact staged attempt eligible after the import committed."""
+    if item.track_id is None:
+        return None
+    factory = item.session_factory or get_session_factory()
+    async with factory() as db:
+        attempts = list(
+            (
+                await db.scalars(
+                    select(AcquisitionAttempt).where(
+                        AcquisitionAttempt.track_id == item.track_id,
+                        AcquisitionAttempt.provider == "slskd",
+                        AcquisitionAttempt.staged_path == str(item.staged_path),
+                        AcquisitionAttempt.outcome.in_(
+                            {AttemptOutcome.downloaded, AttemptOutcome.imported}
+                        ),
+                    )
+                )
+            ).all()
+        )
+        if len(attempts) != 1:
+            return None
+        attempt = attempts[0]
+        attempt.outcome = AttemptOutcome.imported
+        attempt.artifact_state = ArtifactState.imported
+        attempt.file_cleanup_eligible = True
+        attempt.retention_disposition = RetentionDisposition.cleanup_eligible
+        await db.commit()
+        return attempt.id
+
+
 async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> None:
     """Idempotently finish currently-owned cleanup obligations after import commit."""
     staging_root = get_settings().staging_root
@@ -880,6 +1429,31 @@ async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> 
             logger.exception("post-import slskd cleanup setup failed")
 
     for original_item in items:
+        attempt_id = await _prepare_attempt_cleanup_for_imported_item(original_item)
+        if attempt_id is not None:
+            factory = original_item.session_factory or get_session_factory()
+            provider_result = (
+                await cleanup_attempt_provider(factory, adapter, attempt_id)
+                if adapter is not None
+                else AttemptCleanupResult.retryable_failure
+            )
+            if provider_result in {
+                AttemptCleanupResult.removed,
+                AttemptCleanupResult.already_absent,
+            }:
+                file_result = await cleanup_attempt_file(factory, attempt_id, staging_root)
+                if file_result in {
+                    AttemptCleanupResult.removed,
+                    AttemptCleanupResult.already_absent,
+                }:
+                    await _mark_cleanup_attempted(original_item, completed=True)
+            continue
+        if _slskd_identity(
+            original_item.provenance_json
+        ) is not None and not await _provider_cleanup_completed_current(original_item):
+            # Unfenced legacy provider ownership is report-only. Do not move or
+            # delete its recoverable artifact while that obligation is unresolved.
+            continue
         item = (
             await _claim_cleanup_quarantine(original_item)
             if original_item.plan_id is not None
@@ -908,25 +1482,10 @@ async def cleanup_imported_sources(items: tuple[ImportedSourceCleanup, ...]) -> 
         identity = _slskd_identity(item.provenance_json)
         provider_cleanup_completed = await _provider_cleanup_completed_current(item)
         if identity is not None and not provider_cleanup_completed:
-            if adapter is None:
-                failed = True
-            else:
-                try:
-                    if item.source_job_id is None:
-                        raise RuntimeError("slskd cleanup requires an exact transfer ID")
-                    cleanup_result = await adapter.cancel(*identity, item.source_job_id)
-                    if cleanup_result is False:
-                        failed = True
-                    elif item.track_id is not None:
-                        factory = item.session_factory or get_session_factory()
-                        await _mark_durable_source_cleanups(
-                            factory,
-                            {item.track_id: (identity, item.source_job_id)},
-                            max_attempts=3,
-                        )
-                except Exception:
-                    failed = True
-                    logger.exception("post-import slskd transfer cleanup failed")
+            # Legacy Track projections have no claim/version fence. They remain
+            # report-safe and are never destructively deleted by peer/path or an
+            # unowned transfer ID; only attempt-backed cleanup performs provider I/O.
+            failed = True
         if not await _revalidate_cleanup_obligation(item):
             continue
         if not failed:

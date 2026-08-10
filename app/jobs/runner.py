@@ -252,6 +252,7 @@ async def _call_poll_slskd_transfer(
     cfg: Settings,
     on_provider_id: Callable[[str], Awaitable[None]],
     on_provider_state: Callable[[AcquisitionState], Awaitable[None]],
+    on_cancel: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[Path, str]:
     parameters = inspect.signature(_poll_slskd_transfer).parameters
     args: list[object] = [
@@ -266,6 +267,8 @@ async def _call_poll_slskd_transfer(
     ]
     if "on_provider_state" in parameters:
         args.append(on_provider_state)
+    if "on_cancel" in parameters:
+        args.append(on_cancel)
     return await _poll_slskd_transfer(*args)  # type: ignore[arg-type]
 
 
@@ -279,6 +282,7 @@ async def _poll_slskd_transfer(
     poll_timeout: float,
     on_provider_id: Callable[[str], Awaitable[None]] | None = None,
     on_provider_state: Callable[[AcquisitionState], Awaitable[None]] | None = None,
+    on_cancel: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[Path, str]:
     """Poll slskd until terminal and return the staged path plus exact provider ID."""
     import time as _time
@@ -323,8 +327,14 @@ async def _poll_slskd_transfer(
 
             await asyncio.sleep(min(poll_interval, max(0.01, remaining)))
     except asyncio.CancelledError:
-        with contextlib.suppress(Exception):
-            await adapter.cancel(username, filename, transfer_id)
+        if on_cancel is not None:
+            with contextlib.suppress(Exception):
+                await on_cancel()
+        else:
+            # Legacy callers may not have an attempt row yet. The adapter still
+            # requires an exact canonical provider UUID before it removes anything.
+            with contextlib.suppress(Exception):
+                await adapter.cancel(username, filename, transfer_id)
         raise
 
 
@@ -2018,6 +2028,18 @@ async def _prepare_acquisition(
                 if checkpoint is not None:
                     await checkpoint()
 
+        async def persist_cancellation() -> None:
+            if attempt is not None:
+                attempt.provider_state = ProviderTransferState.cancelled
+                attempt.provider_terminal_at = _now()
+                attempt.outcome = AttemptOutcome.failed
+                attempt.terminal_at = _now()
+            if checkpoint is not None:
+                await checkpoint()
+
+        poll_kwargs: dict[str, object] = {}
+        if "on_cancel" in inspect.signature(_call_poll_slskd_transfer).parameters:
+            poll_kwargs["on_cancel"] = persist_cancellation
         staged, transfer_id = await _call_poll_slskd_transfer(
             transfer_id,
             username,
@@ -2026,6 +2048,7 @@ async def _prepare_acquisition(
             cfg,
             persist_provider_id,
             persist_provider_state,
+            **poll_kwargs,  # type: ignore[arg-type]
         )
         if track is not None:
             # slskd queue responses may omit the provider UUID. Polling exposes it;

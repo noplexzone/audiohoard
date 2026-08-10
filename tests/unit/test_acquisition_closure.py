@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from datetime import UTC
 from pathlib import Path
 from types import SimpleNamespace
@@ -355,7 +356,7 @@ async def test_approved_legacy_release_is_mapped_and_recovered_once(
     assert calls == 1
 
 
-async def test_committed_slskd_cleanup_removes_provider_row_and_staged_file(
+async def test_legacy_slskd_cleanup_retains_unfenced_provider_row_and_staged_file(
     monkeypatch, tmp_path
 ) -> None:
     staged = tmp_path / "staged.flac"
@@ -403,8 +404,8 @@ async def test_committed_slskd_cleanup_removes_provider_row_and_staged_file(
         )
     )
 
-    assert calls == [("peer", "Album\\01.flac", "original-transfer-id")]
-    assert not staged.exists()
+    assert calls == []
+    assert staged.exists()
 
 
 async def test_recovery_limit_counts_eligible_releases_not_older_ineligible_rows(
@@ -1252,8 +1253,27 @@ async def test_quarantine_cleanup_preserves_replacement_at_original_path(
     db_session: AsyncSession, monkeypatch, tmp_path
 ) -> None:
     item, plan, track = await _pending_cleanup_fixture(db_session, tmp_path)
+    provenance = json.loads(item.provenance_json or "{}")
+    provenance["source_cleanup_completed_at"] = "2026-08-09T00:00:00+00:00"
+    serialized = json.dumps(provenance, sort_keys=True)
+    track.acquisition_provenance_json = serialized
+    item = replace(item, provenance_json=serialized)
+    await db_session.commit()
     factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
     monkeypatch.setattr(acquisition_cleanup, "get_session_factory", lambda: factory)
+    real_revalidate = acquisition_cleanup._revalidate_cleanup_obligation
+    replacement_written = False
+
+    async def replace_after_quarantine(claimed, *, protect_destination=True):  # noqa: ANN001
+        nonlocal replacement_written
+        if not replacement_written:
+            item.staged_path.write_bytes(b"replacement")
+            replacement_written = True
+        return await real_revalidate(claimed, protect_destination=protect_destination)
+
+    monkeypatch.setattr(
+        acquisition_cleanup, "_revalidate_cleanup_obligation", replace_after_quarantine
+    )
 
     class ReplacingAdapter:
         def __init__(self, url: str, api_key: str) -> None:
@@ -1286,6 +1306,12 @@ async def test_crash_before_quarantine_commit_recovers_owned_inode_and_preserves
     db_session: AsyncSession, monkeypatch, tmp_path
 ) -> None:
     item, plan, track = await _pending_cleanup_fixture(db_session, tmp_path)
+    provenance = json.loads(item.provenance_json or "{}")
+    provenance["source_cleanup_completed_at"] = "2026-08-09T00:00:00+00:00"
+    serialized = json.dumps(provenance, sort_keys=True)
+    track.acquisition_provenance_json = serialized
+    item = replace(item, provenance_json=serialized)
+    await db_session.commit()
     assert item.expected_device is not None and item.expected_inode is not None
     assert item.expected_mtime_ns is not None and item.expected_size is not None
     quarantine = acquisition_cleanup._cleanup_quarantine_path(
