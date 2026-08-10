@@ -27,7 +27,7 @@ from app.services.acquisition_cleanup import (
     cleanup_durable_slskd_transfers,
     reconcile_terminal_slskd_intents,
 )
-from app.sources.base import CapabilityState
+from app.sources.slskd import ProvisionalTransferMatch
 
 UUID = "2d93899b-cf9a-4567-8f10-993610f274cf"
 OTHER_UUID = "06fdfa12-6d4a-4f9e-aa13-bc35685fef65"
@@ -150,10 +150,9 @@ async def test_completed_transfer_without_durable_artifact_binding_is_not_cleanu
     assert adapter.calls == []
 
 
-@pytest.mark.parametrize("response_was_checkpointed", [True, False])
-async def test_terminal_job_reconciles_post_enqueue_cancellation_to_exact_uuid_cleanup(
-    db_session: AsyncSession, response_was_checkpointed: bool
-) -> None:
+async def _terminal_intent(
+    db_session: AsyncSession, *, provider_uuid: str | None = None
+) -> AcquisitionAttempt:
     job = Job(source="slskd", query="Artist Song", status="cancelled")
     attempt = AcquisitionAttempt(
         job=job,
@@ -161,28 +160,47 @@ async def test_terminal_job_reconciles_post_enqueue_cancellation_to_exact_uuid_c
         peer="peer",
         remote_path="Album/01 Song.flac",
         provisional_transfer_id="peer:Album/01 Song.flac",
-        provider_uuid=UUID if response_was_checkpointed else None,
+        provider_uuid=provider_uuid,
         provider_state=ProviderTransferState.enqueued
-        if response_was_checkpointed
+        if provider_uuid
         else ProviderTransferState.pending,
-        provider_enqueued_at=datetime.now(UTC) if response_was_checkpointed else None,
+        provider_enqueued_at=datetime.now(UTC) if provider_uuid else None,
     )
     db_session.add_all([job, attempt])
     await db_session.commit()
+    return attempt
 
-    class ReconcileAdapter(FakeAdapter):
-        async def status(
-            self, transfer_id: str, *, force_refresh: bool = False
-        ) -> CapabilityState:
-            self.calls.append(("status", transfer_id, force_refresh))
-            return CapabilityState(
-                True,
-                "InProgress",
-                {"id": UUID, "username": "peer", "filename": "Album/01 Song.flac"},
-            )
+
+class ReconcileAdapter(FakeAdapter):
+    def __init__(
+        self,
+        matches: list[dict[str, object]],
+        cleanup_snapshots: list[list[dict[str, object]]] | None = None,
+    ) -> None:
+        super().__init__(cleanup_snapshots or [])
+        self.matches = matches
+
+    async def match_provisional_transfer(
+        self, username: str, filename: str, *, force_refresh: bool = False
+    ) -> ProvisionalTransferMatch:
+        self.calls.append(("match", username, filename, force_refresh))
+        return ProvisionalTransferMatch(
+            match_count=len(self.matches),
+            transfer=self.matches[0] if len(self.matches) == 1 else None,
+        )
+
+
+@pytest.mark.parametrize("response_was_checkpointed", [True, False])
+async def test_terminal_job_reconciles_unique_enqueue_intent_to_exact_uuid_cleanup(
+    db_session: AsyncSession, response_was_checkpointed: bool
+) -> None:
+    attempt = await _terminal_intent(
+        db_session, provider_uuid=UUID if response_was_checkpointed else None
+    )
 
     adapter = ReconcileAdapter(
-        [[{"id": UUID, "username": "peer", "filename": "Album/01 Song.flac"}], []]
+        [{"id": UUID, "username": "peer", "filename": "Album/01 Song.flac"}],
+        [[{"id": UUID, "username": "peer", "filename": "Album/01 Song.flac"}], []],
     )
     assert await reconcile_terminal_slskd_intents(_factory(db_session), adapter) == 1
     await db_session.refresh(attempt)
@@ -194,6 +212,107 @@ async def test_terminal_job_reconciles_post_enqueue_cancellation_to_exact_uuid_c
     assert await cleanup_durable_slskd_transfers(_factory(db_session), adapter) == 1
     assert ("delete", "peer", UUID) in adapter.calls
     assert all(call[0] != "delete" or call[2] == UUID for call in adapter.calls)
+
+
+async def test_terminal_intent_never_adopts_or_deletes_racing_replacement(
+    db_session: AsyncSession,
+) -> None:
+    attempt = await _terminal_intent(db_session)
+
+    class RacingReplacementAdapter(ReconcileAdapter):
+        async def match_provisional_transfer(
+            self, username: str, filename: str, *, force_refresh: bool = False
+        ) -> ProvisionalTransferMatch:
+            evidence = await super().match_provisional_transfer(
+                username, filename, force_refresh=force_refresh
+            )
+            async with _factory(db_session)() as db:
+                current = await db.get(AcquisitionAttempt, attempt.id)
+                assert current is not None
+                current.provider_uuid = UUID
+                await db.commit()
+            return evidence
+
+    adapter = RacingReplacementAdapter(
+        [{"id": OTHER_UUID, "username": "peer", "filename": "Album/01 Song.flac"}]
+    )
+
+    assert await reconcile_terminal_slskd_intents(_factory(db_session), adapter) == 0
+    await db_session.refresh(attempt)
+    assert attempt.provider_uuid == UUID
+    assert attempt.provider_state is ProviderTransferState.pending
+    assert await cleanup_durable_slskd_transfers(_factory(db_session), adapter) == 0
+    assert all(call[0] != "delete" for call in adapter.calls)
+
+
+@pytest.mark.parametrize(
+    "matches",
+    [
+        [],
+        [
+            {"id": UUID, "username": "peer", "filename": "Album/01 Song.flac"},
+            {"id": OTHER_UUID, "username": "peer", "filename": "Album/01 Song.flac"},
+        ],
+        [
+            {
+                "id": "peer:Album/01 Song.flac",
+                "username": "peer",
+                "filename": "Album/01 Song.flac",
+            }
+        ],
+    ],
+    ids=["zero", "multiple", "noncanonical-peer-path-id"],
+)
+async def test_terminal_intent_never_adopts_or_deletes_unproven_matches(
+    db_session: AsyncSession, matches: list[dict[str, object]]
+) -> None:
+    attempt = await _terminal_intent(db_session)
+    adapter = ReconcileAdapter(matches)
+
+    assert await reconcile_terminal_slskd_intents(_factory(db_session), adapter) == 0
+    await db_session.refresh(attempt)
+    assert attempt.provider_uuid is None
+    assert attempt.provider_state is ProviderTransferState.pending
+    assert await cleanup_durable_slskd_transfers(_factory(db_session), adapter) == 0
+    assert all(call[0] != "delete" for call in adapter.calls)
+
+
+async def test_terminal_intent_never_adopts_uuid_claimed_during_provider_probe(
+    db_session: AsyncSession,
+) -> None:
+    attempt = await _terminal_intent(db_session)
+
+    class RacingOwnerAdapter(ReconcileAdapter):
+        async def match_provisional_transfer(
+            self, username: str, filename: str, *, force_refresh: bool = False
+        ) -> ProvisionalTransferMatch:
+            evidence = await super().match_provisional_transfer(
+                username, filename, force_refresh=force_refresh
+            )
+            async with _factory(db_session)() as db:
+                db.add(
+                    AcquisitionAttempt(
+                        job=Job(source="slskd", query="owner"),
+                        provider="slskd",
+                        peer="other-peer",
+                        remote_path="Other/Song.flac",
+                        provider_uuid=UUID,
+                        provider_state=ProviderTransferState.downloading,
+                    )
+                )
+                await db.commit()
+            return evidence
+
+    adapter = RacingOwnerAdapter(
+        [{"id": UUID, "username": "peer", "filename": "Album/01 Song.flac"}]
+    )
+
+    assert await reconcile_terminal_slskd_intents(_factory(db_session), adapter) == 0
+    await db_session.refresh(attempt)
+    assert attempt.provider_uuid is None
+    assert attempt.provider_state is ProviderTransferState.pending
+    assert await cleanup_durable_slskd_transfers(_factory(db_session), adapter) == 0
+    assert all(call[0] != "delete" for call in adapter.calls)
 
 
 async def test_contradictory_uuid_identity_is_blocked(db_session: AsyncSession) -> None:

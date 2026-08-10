@@ -53,6 +53,14 @@ class _DownloadSnapshot:
     in_flight: asyncio.Task[list[dict[str, object]]] | None = None
 
 
+@dataclass(frozen=True)
+class ProvisionalTransferMatch:
+    """Evidence for an exact provisional peer/path lookup."""
+
+    match_count: int
+    transfer: dict[str, object] | None = None
+
+
 _download_snapshots: dict[tuple[str, bytes], _DownloadSnapshot] = {}
 
 
@@ -395,6 +403,22 @@ class SlskdAdapter:
                 state = str(item.get("state") or item.get("status") or "queued").casefold()
                 return CapabilityState(True, state, dict(item))
         return CapabilityState(False, "transfer not found", {"transfer_id": transfer_id})
+
+    async def match_provisional_transfer(
+        self, username: str, filename: str, *, force_refresh: bool = False
+    ) -> ProvisionalTransferMatch:
+        """Return evidence only when a provisional peer/path has one exact live match."""
+        expected_filename = filename.replace("\\", "/")
+        matches = [
+            dict(item)
+            for item in await self.downloads(force_refresh=force_refresh)
+            if str(item.get("username") or "") == username
+            and str(item.get("filename") or "").replace("\\", "/") == expected_filename
+        ]
+        return ProvisionalTransferMatch(
+            match_count=len(matches),
+            transfer=matches[0] if len(matches) == 1 else None,
+        )
 
     async def remove_exact(self, username: str, provider_uuid: str) -> None:
         """Delete one exact canonical UUID; callers must freshly verify identity/absence."""

@@ -39,7 +39,7 @@ from app.models.release import Release
 from app.models.track import Track
 from app.models.workflow import AcquisitionState, ImportWorkflowState
 from app.settings_service import build_effective_settings
-from app.sources.slskd import SlskdAdapter
+from app.sources.slskd import ProvisionalTransferMatch, SlskdAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +100,9 @@ class ImportedSourceCleanup:
 class SlskdCleanupAdapter(Protocol):
     async def downloads(self, *, force_refresh: bool = False) -> list[dict[str, object]]: ...
 
-    async def status(self, transfer_id: str, *, force_refresh: bool = False) -> object: ...
+    async def match_provisional_transfer(
+        self, username: str, filename: str, *, force_refresh: bool = False
+    ) -> ProvisionalTransferMatch: ...
 
     async def remove_exact(self, username: str, provider_uuid: str) -> None: ...
 
@@ -1054,29 +1056,34 @@ async def reconcile_terminal_slskd_intents(
     reconciled = 0
     for attempt_id, fallback_id, persisted_uuid, peer, remote_path in intents:
         assert fallback_id is not None
+        if not peer or not remote_path:
+            continue
         try:
-            status = await adapter.status(fallback_id, force_refresh=True)
+            evidence = await adapter.match_provisional_transfer(
+                peer, remote_path, force_refresh=True
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.warning("terminal slskd enqueue-intent probe failed", exc_info=True)
             continue
-        available = bool(getattr(status, "available", False))
-        extra = getattr(status, "extra", {})
-        if not isinstance(extra, dict):
-            extra = {}
-        discovered = _snapshot_provider_uuid(extra) if available else None
-        canonical = discovered or persisted_uuid
-        if canonical is None:
+        extra = evidence.transfer
+        if evidence.match_count != 1 or extra is None:
             continue
-        if available and (
-            (extra.get("username") and str(extra["username"]) != (peer or ""))
-            or (
-                extra.get("filename")
-                and _normalized_remote_path(extra["filename"])
-                != _normalized_remote_path(remote_path)
-            )
-        ):
+        discovered = _snapshot_provider_uuid(extra)
+        if discovered is None:
+            continue
+        from app.services.acquisition_attempts import canonical_provider_uuid
+
+        persisted_canonical = canonical_provider_uuid(persisted_uuid)
+        if persisted_uuid is not None and persisted_canonical is None:
+            continue
+        if persisted_canonical is not None and persisted_canonical != discovered:
+            logger.warning("terminal slskd enqueue-intent canonical UUID mismatch")
+            continue
+        if str(extra.get("username") or "") != peer or _normalized_remote_path(
+            extra.get("filename")
+        ) != _normalized_remote_path(remote_path):
             logger.warning("terminal slskd enqueue-intent identity mismatch")
             continue
         now = datetime.now(UTC)
@@ -1090,9 +1097,28 @@ async def reconcile_terminal_slskd_intents(
                 or job.status not in terminal_jobs
                 or attempt.provider_state
                 not in {ProviderTransferState.pending, ProviderTransferState.enqueued}
+                or attempt.provisional_transfer_id != fallback_id
+                or attempt.peer != peer
+                or _normalized_remote_path(attempt.remote_path)
+                != _normalized_remote_path(remote_path)
             ):
                 continue
-            attempt.provider_uuid = canonical
+            current_canonical = canonical_provider_uuid(attempt.provider_uuid)
+            if attempt.provider_uuid is not None and current_canonical is None:
+                continue
+            if current_canonical is not None and current_canonical != discovered:
+                continue
+            owned = await db.scalar(
+                select(AcquisitionAttempt.id).where(
+                    AcquisitionAttempt.id != attempt.id,
+                    AcquisitionAttempt.provider == "slskd",
+                    AcquisitionAttempt.provider_uuid == discovered,
+                )
+            )
+            if owned is not None:
+                logger.warning("terminal slskd enqueue-intent UUID already owned")
+                continue
+            attempt.provider_uuid = discovered
             attempt.provider_uuid_discovered_at = attempt.provider_uuid_discovered_at or now
             attempt.provider_enqueued_at = attempt.provider_enqueued_at or now
             attempt.provider_state = ProviderTransferState.cancelled
