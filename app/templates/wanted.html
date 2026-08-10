@@ -52,7 +52,7 @@
       <p class="muted-line">{{ release.artist_name }}{% if release.year %} · {{ release.year }}{% endif %}</p>
       <p class="release-progress">{{ release.downloaded_track_count }} / {{ release.wanted_track_count }} downloaded</p>
       <div class="album-card-actions">
-        <button type="submit" class="btn secondary album-download" form="wanted-selected-form" formaction="/albums/{{ release.id }}/download">Queue missing</button>
+        <a class="btn secondary" href="/search?tab=advanced&amp;artist={{ release.artist_name | urlencode }}&amp;album={{ release.title | urlencode }}">Manual search</a><button type="submit" class="btn secondary album-download" form="wanted-selected-form" formaction="/albums/{{ release.id }}/download">Queue missing</button>
       </div>
     </div>
   </article>

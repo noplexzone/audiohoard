@@ -1,7 +1,7 @@
 # Audiohoard product UX overhaul — implementation map
 
 **Date:** 2026-08-10  
-**Status:** Phases 1–3 implemented; Phases 4–6 pending.
+**Status:** Phases 1–4 implemented; Phases 5–6 pending.
 
 This map anchors the brief to the current server-rendered application. All slices preserve authenticated mutations, CSRF, environment locks, root-contained filesystem operations, transactional imports, and persistent job recovery.
 
@@ -29,11 +29,13 @@ This map anchors the brief to the current server-rendered application. All slice
 - Packaging includes nested settings templates.
 - Coverage: `tests/integration/test_settings.py`, `tests/security/test_settings_security.py`, settings service/runtime unit tests, and packaging tests.
 
-## Phase 4 — Search and Discover (**pending**)
+## Phase 4 — Search and Discover (**implemented**)
 
-Current anchors: `app/routers/search.py`, `app/services/discovery.py`, `app/templates/search.html`, `app/templates/discover_list.html`, contextual release/track pages, and source adapters.
-
-Implement grouped supported entities without fuzzy identity merging, personalized sections backed by existing data, contextual Manual search, visible source controls, deterministic candidate scoring, and high-confidence candidate grouping.
+- `app/routers/search.py` and `app/templates/search.html`: Discover naming, supported artist catalog search, monitored-artist context, contextual Manual search fields, and visible enabled-source selection.
+- `app/services/manual_search.py`: documented deterministic evidence scoring and grouping only by stable artifact namespace/ID.
+- `app/schemas/search.py`: bounded duration, preferred-format, expected-count, and catalog-ID context fields.
+- Release, track, Wanted, and failed-download views link into prefilled Manual search while preserving legacy `/search` and existing POST contracts.
+- Coverage: `tests/unit/test_manual_search_scoring.py` and `tests/integration/test_search.py`.
 
 ## Phase 5 — Wanted and Rejected Sources (**pending**)
 

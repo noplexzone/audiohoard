@@ -108,6 +108,7 @@
           {% if group.action_attempt and group.action_attempt.status.value in ['pending', 'running'] %}
           <form method="post" action="/downloads/{{ group.action_attempt.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Cancel</button></form>
           {% elif group.action_attempt and group.action_attempt.status.value in ['failed', 'partial', 'cancelled'] %}
+          <a class="btn secondary" href="/search?tab=advanced&amp;artist={{ (group.artist_name or '') | urlencode }}&amp;album={{ (group.album_title or group.label) | urlencode }}">Manual search</a>
           <form method="post" action="/downloads/{{ group.action_attempt.id }}/retry"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Retry</button></form>
           {% endif %}
           {% if group.attempts | length == 1 and status in ['done', 'failed', 'partial', 'cancelled'] %}

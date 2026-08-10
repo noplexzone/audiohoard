@@ -10,6 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Add a task-oriented Activity hub with aggregate Wanted, download, review, and rejected-source counts plus shared tabs and actionable navigation badges.
 - Add a Settings overview with actionable readiness warnings, task-oriented sections, reusable provider cards, bounded Save and test, configured-root permission checks, and progressive unsaved/inline feedback.
+- Add Discover and contextual Manual search with explicit source controls, deterministic evidence scoring, safe stable-ID grouping, and monitored-artist discovery context.
 
 ### Changed
 

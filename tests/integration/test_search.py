@@ -122,3 +122,20 @@ async def test_naming_preview_endpoint(client: AsyncClient) -> None:
     assert "rendered_path" in data
     assert "Bohemian Rhapsody" in data["rendered_path"]
     assert data["rendered_path"].endswith(".flac")
+
+
+async def test_manual_search_requires_visible_source_selection(client: AsyncClient) -> None:
+    page = await client.get(
+        "/search?tab=advanced&artist=Massive+Attack&album=Mezzanine&track=Teardrop&expected_duration_sec=331&preferred_format=flac"
+    )
+    assert page.status_code == 200
+    assert "<h1>Discover</h1>" in page.text
+    assert "Manual search" in page.text
+    assert 'value="Massive Attack"' in page.text
+    csrf = client.cookies.get("csrf")
+    response = await client.post(
+        "/search/ui", data={"csrf_token": csrf, "artist": "Massive Attack"}
+    )
+    assert response.status_code == 200
+    assert "Select at least one enabled source" in response.text
+    assert 'value="Massive Attack"' in response.text

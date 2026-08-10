@@ -1,24 +1,24 @@
 {% extends "base.html" %}
-{% block title %}Search – Audiohoard{% endblock %}
+{% block title %}Discover – Audiohoard{% endblock %}
 {% block content %}
 <div class="page-header">
-  <h1>Search</h1>
-  <p>Search the metadata catalog first, then acquire selected albums or tracks through configured download sources. Use Advanced for raw listings and direct TIDAL track URL downloads.</p>
+  <h1>Discover</h1>
+  <p>Find artists in configured catalogs, explore releases, and use Manual search when you need exact acquisition-source results.</p>
 </div>
 <nav class="tabs search-tabs">
-  <a class="btn {{ 'secondary' if tab == 'advanced' else '' }}" href="/search">Catalog</a>
-  <a class="btn {{ '' if tab == 'advanced' else 'secondary' }}" href="/search?tab=advanced">Advanced (sources)</a>
+  <a class="btn {{ 'secondary' if tab == 'advanced' else '' }}" href="/search">Discover</a>
+  <a class="btn {{ '' if tab == 'advanced' else 'secondary' }}" href="/search?tab=advanced">Manual search</a>
 </nav>
 
 {% if tab != 'advanced' %}
 <section class="card">
-  <h2>Catalog search</h2>
+  <h2>Search artists</h2><p class="hint">Catalog adapters currently expose reliable artist search here. Open an artist to browse its provider-backed releases; uncertain provider identities remain separate.</p>
   {% if not metadata_enabled %}
     <div class="empty-state" role="status"><h3>No metadata providers enabled</h3><p>Enable MusicBrainz, Deezer, or iTunes before catalog search can run.</p><a class="btn" href="/settings/metadata">Fix in Settings</a></div>
   {% else %}
   <form method="get" action="/search" class="form-row search-form" role="search" aria-label="Catalog search">
-    <label class="sr-only" for="catalog-query">Artist catalog query</label>
-    <input id="catalog-query" type="text" name="q" value="{{ catalog_query | e }}" placeholder="Search artist catalog…" class="search-query" required>
+    <label class="sr-only" for="catalog-query">Artist query</label>
+    <input id="catalog-query" type="text" name="q" value="{{ catalog_query | e }}" placeholder="Search artists…" class="search-query" required>
     <label class="sr-only" for="catalog-provider">Metadata provider</label>
     <select id="catalog-provider" name="provider">
       <option value="primary" {% if catalog_provider == 'primary' %}selected{% endif %}>Primary ({{ display_name(primary_metadata_provider) }})</option>
@@ -27,7 +27,7 @@
       <option value="{{ item.name }}" {% if catalog_provider == item.name %}selected{% endif %}>{{ display_name(item.name) }}</option>
       {% endif %}{% endfor %}
     </select>
-    <button type="submit" class="btn">Search catalog</button>
+    <button type="submit" class="btn">Search artists</button>
   </form>
   {% endif %}
   {% if primary_error %}<div class="alert error" role="alert">Primary provider {{ display_name(primary_metadata_provider) }}: {{ primary_error }} <a href="/search?q={{ catalog_query | urlencode }}&provider=all">Search all instead</a></div>{% endif %}
@@ -38,6 +38,7 @@
       {% endfor %}
     </div>
     {% set any_hits = namespace(value=false) %}
+    <h3>Artists</h3>
     <div class="grid catalog-result-grid">
     {% for outcome in catalog_outcomes %}
       {% for artist_hit in outcome.artists %}
@@ -52,6 +53,14 @@
   {% endif %}
 </section>
 {% if not catalog_query %}
+{% if monitored_catalog_artists %}
+<section class="card discovery-section" aria-labelledby="continue-discography">
+  <div class="page-header"><div><h2 id="continue-discography">Continue building this discography</h2><p>Artists you monitor, kept separate by Audiohoard's stable catalog identity.</p></div><a class="btn secondary" href="/library">Open library</a></div>
+  <div class="grid catalog-result-grid">
+    {% for artist in monitored_catalog_artists %}<a class="card" href="/artists/catalog/{{ artist.id }}"><span class="badge ok">Monitored</span><h3>{{ artist.name }}</h3><span>View known releases →</span></a>{% endfor %}
+  </div>
+</section>
+{% endif %}
 <div class="discovery-region-note" role="status">Discovery region: <strong>{{ discovery_region }}</strong>. Global fallback is labeled below.</div>
 {% for section in discovery_sections %}
 <section class="card discovery-section" aria-labelledby="discovery-{{ section.feed }}">
@@ -70,29 +79,33 @@
 {% endif %}
 {% else %}
 <section class="card">
-  <h2>Advanced source search</h2><p class="hint">Use this for raw source listings and direct TIDAL track URL downloads.</p>
-  <form method="post" action="/search/ui" class="form-row search-form advanced-search-form" role="search" aria-label="Advanced source search">
+  <h2>Manual search</h2><p class="hint">Search enabled acquisition sources directly. Context from a release, missing track, Wanted item, or failed acquisition is prefilled when available.</p>
+  <form method="post" action="/search/ui" class="search-form advanced-search-form" role="search" aria-label="Manual source search">
     <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
-    <label class="sr-only" for="source-artist">Artist</label><input id="source-artist" type="text" name="artist" value="{{ artist | default('') | e }}" placeholder="Artist" class="source-field">
-    <label class="sr-only" for="source-album">Album</label><input id="source-album" type="text" name="album" value="{{ album | default('') | e }}" placeholder="Album" class="source-field">
-    <label class="sr-only" for="source-track">Track</label><input id="source-track" type="text" name="track" value="{{ track | default('') | e }}" placeholder="Track" class="source-field">
-    <label class="sr-only" for="source-query">Free-text query</label><input id="source-query" type="text" name="query" value="{{ query | e }}" placeholder="Free text…" class="source-query">
-    <button type="submit" class="btn">Search sources</button>
+    <div class="form-row">
+      <label for="source-artist">Artist</label><input id="source-artist" type="text" name="artist" value="{{ artist | default('') | e }}" placeholder="Artist" class="source-field">
+      <label for="source-album">Album</label><input id="source-album" type="text" name="album" value="{{ album | default('') | e }}" placeholder="Album" class="source-field">
+      <label for="source-track">Track</label><input id="source-track" type="text" name="track" value="{{ track | default('') | e }}" placeholder="Track" class="source-field">
+      <label for="source-query">Free text</label><input id="source-query" type="text" name="query" value="{{ query | e }}" placeholder="Free text…" class="source-query">
+    </div>
+    <div class="form-row">
+      <label for="source-duration">Expected duration (seconds)</label><input id="source-duration" type="number" min="1" max="86400" name="expected_duration_sec" value="{{ expected_duration_sec or '' }}">
+      <label for="source-format">Preferred format</label><input id="source-format" type="text" maxlength="20" name="preferred_format" value="{{ preferred_format | default('') | e }}" placeholder="flac">
+    </div>
+    <fieldset class="source-picker"><legend>Enabled sources</legend>
+      {% for source in enabled_sources %}<label class="checkbox-control"><input type="checkbox" name="sources" value="{{ source | e }}" {% if source in selected_sources %}checked{% endif %}><span>{{ display_name(source) }}</span></label>{% endfor %}
+      {% if not enabled_sources %}<p class="hint">No acquisition sources are enabled. <a href="/settings/acquisition">Configure sources</a>.</p>{% endif %}
+    </fieldset>
+    <button type="submit" class="btn" {% if not enabled_sources %}disabled{% endif %}>Search selected sources</button>
   </form>
   {% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
   {% if results is not none %}
-    {% if source_states %}
-    <div class="source-statuses">
-      {% for name, state in source_states.items() %}
-      <span class="badge {{ 'ok' if state.available else 'error' }}"><span class="dot"></span>{{ display_name(name) }}{% if state.details.elapsed_ms %} · {{ state.details.elapsed_ms }}ms{% endif %}{% if not state.available %}: {{ state.reason or 'unavailable' }} <a href="/settings#provider-{{ name }}">Fix in Settings</a>{% endif %}</span>
-      {% endfor %}
-    </div>
-    {% endif %}
-    {% if results %}
-    <div class="table-wrap"><table><thead><tr><th scope="col">Source</th><th scope="col">Title</th><th scope="col">Artist</th><th scope="col">Album</th><th scope="col">Format</th><th scope="col">Size</th><th scope="col">Duration</th><th scope="col">Action</th></tr></thead><tbody>
-    {% for r in results %}<tr><td><span class="badge info">{{ display_name(r.source) }}</span></td><td>{{ r.title or "–" }}</td><td>{{ r.artist or "–" }}</td><td>{{ r.album or "–" }}</td><td>{{ r.format or "–" }}</td><td>{{ (r.size_bytes // 1048576) ~ " MB" if r.size_bytes else "–" }}</td><td>{{ ("%d:%02d" % (r.duration_sec // 60, r.duration_sec % 60)) if r.duration_sec else "–" }}</td><td><form method="post" action="/downloads/create" class="inline-form"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><input type="hidden" name="query" value="{{ (r.title or query) | e }}"><input type="hidden" name="source" value="{{ r.source | e }}"><input type="hidden" name="selected_result" value="{{ r.model_dump_json() | e }}"><button type="submit" class="btn secondary enqueue-button">Enqueue</button></form></td></tr>{% endfor %}
+    {% if source_states %}<div class="source-statuses">{% for name, state in source_states.items() %}<span class="badge {{ 'ok' if state.available else 'error' }}"><span class="dot"></span>{{ display_name(name) }}{% if state.details.elapsed_ms %} · {{ state.details.elapsed_ms }}ms{% endif %}{% if not state.available %}: {{ state.reason or 'unavailable' }} <a href="/settings/acquisition#provider-{{ name }}">Fix in Settings</a>{% endif %}</span>{% endfor %}</div>{% endif %}
+    {% if result_groups %}
+    <div class="table-wrap"><table><thead><tr><th scope="col">Rank</th><th scope="col">Source</th><th scope="col">Title / match evidence</th><th scope="col">Artist</th><th scope="col">Album</th><th scope="col">Format</th><th scope="col">Size</th><th scope="col">Duration</th><th scope="col">Action</th></tr></thead><tbody>
+    {% for group in result_groups %}{% for item in group.options %}{% set r = item.result %}<tr><td><strong>{{ item.score }}</strong>{% if group.options | length > 1 %}<br><span class="badge info">{{ group.options | length }} exact-ID options</span>{% endif %}</td><td><span class="badge info">{{ display_name(r.source) }}</span></td><td>{{ r.title or "–" }}{% if item.reasons %}<br><span class="hint">{{ item.reasons[:4] | join(', ') }}</span>{% endif %}</td><td>{{ r.artist or "–" }}</td><td>{{ r.album or "–" }}</td><td>{{ r.format or "–" }}</td><td>{{ (r.size_bytes // 1048576) ~ " MB" if r.size_bytes else "–" }}</td><td>{{ ("%d:%02d" % (r.duration_sec // 60, r.duration_sec % 60)) if r.duration_sec else "–" }}</td><td><form method="post" action="/downloads/create" class="inline-form"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><input type="hidden" name="query" value="{{ (r.title or query) | e }}"><input type="hidden" name="source" value="{{ r.source | e }}"><input type="hidden" name="selected_result" value="{{ r.model_dump_json() | e }}"><button type="submit" class="btn secondary enqueue-button">Enqueue exact result</button></form></td></tr>{% endfor %}{% endfor %}
     </tbody></table></div>
-    {% else %}<div class="empty-state" role="status"><h3>No results found</h3><p>Try different fields or check provider readiness in Settings.</p><a class="btn secondary" href="/settings">Check settings</a></div>{% endif %}
+    {% else %}<div class="empty-state" role="status"><h3>No results found</h3><p>Try different fields, select another enabled source, or check provider readiness.</p><a class="btn secondary" href="/settings/acquisition">Check settings</a></div>{% endif %}
   {% endif %}
 </section>
 {% endif %}
