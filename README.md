@@ -38,6 +38,10 @@ The web app never starts an interactive login. Missing or expired authentication
 - **AcoustID** — acoustic fingerprinting via `fpcalc` (optional; degrades gracefully when binary absent)
 - **AcoustID Lookup** — matches fingerprint against the AcoustID database when a key is configured
 
+## Navigation and activity
+
+Audiohoard follows **Discover → Monitor → Acquire → Verify → Library**. The primary navigation is Home, Discover, Library, Activity, and Settings; mobile keeps Settings in the header. Activity unifies Wanted, Downloads, Review, and Rejected Sources without breaking their existing URLs, and its badge counts only failed/partial acquisitions and review decisions that need attention.
+
 ## Automated acquisition and import
 
 Album searches group slskd results by peer, folder, and format before selecting a coherent release according to the quality profile in Settings. Incomplete albums automatically schedule bounded, track-specific continuation searches without redownloading catalog tracks already acquired.

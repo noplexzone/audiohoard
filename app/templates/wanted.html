@@ -6,6 +6,7 @@
   <h1>Wanted</h1>
   <p>{{ releases.total }} incomplete release{% if releases.total != 1 %}s{% endif %} from watchlisted artists</p>
 </div>
+{% include "partials/_activity_tabs.html" %}
 <form method="get" action="/wanted" class="filter-bar" role="search" aria-label="Filter wanted releases">
   <label class="sr-only" for="wanted-q">Search</label>
   <input id="wanted-q" type="search" name="q" value="{{ q }}" placeholder="Search artists or releases…" aria-label="Search wanted releases">

@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Add a task-oriented Activity hub with aggregate Wanted, download, review, and rejected-source counts plus shared tabs and actionable navigation badges.
+
 ### Changed
 
 - Restrict import-review comparison audio to exact Deezer track or album-position identities, persist complete cache provenance, refresh expired exact references, and make the review UI explicit when no verified clip exists.

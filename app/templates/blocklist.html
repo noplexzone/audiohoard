@@ -3,6 +3,7 @@
 {% macro csrf() -%}<input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">{%- endmacro %}
 {% block content %}
 <header class="page-header"><div><p class="eyebrow">Acquisition safety</p><h1>Source blocklist</h1><p>Exact provider artifacts blocked after denial or timeout. Removing a block makes that source eligible for future searches again.</p></div></header>
+{% include "partials/_activity_tabs.html" %}
 {% if removed %}<div class="alert ok" role="status">Source block removed.</div>{% endif %}
 <section class="card">
   {% if blocks %}

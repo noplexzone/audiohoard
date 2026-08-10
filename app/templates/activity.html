@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Activity — Audiohoard{% endblock %}
+{% block content %}
+<header class="page-header">
+  <div>
+    <p class="eyebrow">Acquisition activity</p>
+    <h1>Activity</h1>
+    <p>See what Audiohoard is acquiring, what needs a decision, and where recovery is required.</p>
+  </div>
+</header>
+
+{% include "partials/_activity_tabs.html" %}
+
+{% if activity_summary %}
+<section class="activity-overview" aria-label="Activity overview" data-activity-attention="{{ activity_summary.attention }}">
+  <a class="activity-summary-card" href="/wanted">
+    <svg aria-hidden="true"><use href="#i-wanted"/></svg>
+    <span class="activity-summary-copy"><strong data-activity-count="wanted">{{ activity_summary.wanted }}</strong><span>Wanted releases</span></span>
+    <span class="hint">Need acquisition</span>
+  </a>
+  <a class="activity-summary-card" href="/downloads?status=running">
+    <svg aria-hidden="true"><use href="#i-download"/></svg>
+    <span class="activity-summary-copy"><strong data-activity-count="active-downloads">{{ activity_summary.active_downloads }}</strong><span>Active downloads</span></span>
+    <span class="hint">Pending or running</span>
+  </a>
+  <a class="activity-summary-card{% if activity_summary.acquisition_issues %} needs-attention{% endif %}" href="/downloads?status=failed">
+    <svg aria-hidden="true"><use href="#i-alert"/></svg>
+    <span class="activity-summary-copy"><strong data-activity-count="acquisition-issues">{{ activity_summary.acquisition_issues }}</strong><span>Acquisition issues</span></span>
+    <span class="hint">Failed or partial</span>
+  </a>
+  <a class="activity-summary-card{% if activity_summary.awaiting_review %} needs-attention{% endif %}" href="/review">
+    <svg aria-hidden="true"><use href="#i-review"/></svg>
+    <span class="activity-summary-copy"><strong data-activity-count="awaiting-review">{{ activity_summary.awaiting_review }}</strong><span>Awaiting review</span></span>
+    <span class="hint">Need a decision</span>
+  </a>
+  <a class="activity-summary-card" href="/blocklist">
+    <svg aria-hidden="true"><use href="#i-rejected"/></svg>
+    <span class="activity-summary-copy"><strong data-activity-count="rejected-sources">{{ activity_summary.rejected_sources }}</strong><span>Rejected sources</span></span>
+    <span class="hint">Excluded candidates</span>
+  </a>
+</section>
+
+{% if activity_summary.attention > 0 %}
+<div class="alert warn activity-attention" role="status">
+  <strong>{{ activity_summary.attention }} item{{ "" if activity_summary.attention == 1 else "s" }} need attention.</strong>
+  Resolve acquisition issues or review pending tracks to keep imports moving.
+</div>
+{% else %}
+<div class="empty-state mini" role="status">
+  <h2>Nothing needs your attention</h2>
+  <p>Active work and informational counts remain available above.</p>
+</div>
+{% endif %}
+{% else %}
+<div class="alert error" role="alert">
+  <strong>Activity counts are temporarily unavailable.</strong>
+  The acquisition pages are still available from the tabs above. Refresh to try again.
+</div>
+{% endif %}
+{% endblock %}

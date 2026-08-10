@@ -16,7 +16,6 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import Response
 
@@ -25,10 +24,8 @@ from app.config import Settings, get_settings
 from app.database import get_db, get_session_factory
 from app.display_names import display_name
 from app.jobs.dispatcher import job_dispatcher
-from app.models.release import Release
-from app.models.staging_review import StagingReviewItem
-from app.models.workflow import ReviewDecision
 from app.routers import (
+    activity,
     artwork,
     auth,
     blocklist,
@@ -51,6 +48,7 @@ from app.services.acquisition_cleanup import (
     wait_for_imported_source_cleanups,
 )
 from app.services.acquisition_recovery import recover_approved_downloads
+from app.services.activity import get_activity_summary
 from app.services.artist_monitoring import DiscographyRefreshScheduler
 from app.services.catalog_metadata import (
     reconcile_deezer_release_snapshots,
@@ -246,23 +244,18 @@ def create_app() -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
     @app.middleware("http")
-    async def pending_review_count_middleware(
+    async def activity_summary_middleware(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        request.state.pending_review_count = 0
+        request.state.activity_summary = None
         if request.method == "GET" and not request.url.path.startswith(
             ("/static/", "/api/", "/artwork")
         ):
-            async with get_session_factory()() as db:
-                count = await db.scalar(
-                    select(func.count(StagingReviewItem.id))
-                    .join(Release, StagingReviewItem.release_id == Release.id)
-                    .where(
-                        StagingReviewItem.review_state == ReviewDecision.pending,
-                        Release.review_dismissed_at.is_(None),
-                    )
-                )
-            request.state.pending_review_count = int(count or 0)
+            try:
+                async with get_session_factory()() as db:
+                    request.state.activity_summary = await get_activity_summary(db)
+            except Exception:
+                logger.warning("Activity summary unavailable for navigation", exc_info=True)
         return await call_next(request)
 
     @app.exception_handler(HTTPException)
@@ -315,6 +308,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router, tags=["health"])
     app.include_router(auth.router, tags=["auth"])
+    app.include_router(activity.router, tags=["activity"])
     app.include_router(artwork.router, tags=["artwork"])
     app.include_router(catalog_router.router, tags=["catalog"])
     app.include_router(search.router, tags=["search"])

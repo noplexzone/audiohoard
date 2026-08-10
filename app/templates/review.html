@@ -11,6 +11,8 @@
   <a class="btn secondary" href="/review">Refresh</a>
 </header>
 
+{% include "partials/_activity_tabs.html" %}
+
 {% if review %}
 <article class="review-deck-card" data-review-deck data-swipe-surface
   data-alignment-url="/staging/review/{{ review.item.id }}/alignment"

@@ -1,7 +1,7 @@
 # Audiohoard product UX overhaul — implementation map
 
 **Date:** 2026-08-10  
-**Status:** Phase 1 implemented; Phases 2–6 are planning only.
+**Status:** Phases 1–2 implemented; Phases 3–6 are planning only.
 
 This map anchors each phase to the current server-rendered application. It is not a claim that later-phase behavior has been built, and later phases must preserve authenticated mutations, CSRF protection, root-contained filesystem operations, transactional imports, and the existing provider/job recovery guarantees.
 
@@ -13,11 +13,12 @@ This map anchors each phase to the current server-rendered application. It is no
 - `app/routers/staging.py` already performs denial as transactional quarantine: the staged file is moved aside before commit, restored on failure, and deleted only after commit succeeds; bounded reacquisition remains intact.
 - Primary coverage: `tests/unit/test_reference_audio.py`, `tests/integration/test_review.py`, and the denial/quarantine cases in `tests/integration/test_staging_review.py`.
 
-## Phase 2 — Downloads and acquisition status (**not implemented**)
+## Phase 2 — Navigation and Activity (**implemented**)
 
-Current-code anchors: `app/templates/downloads.html`, `app/templates/partials/_downloads_queue.html`, `app/static/js/downloads.js`, `app/routers/jobs.py`, and `app/jobs/runner.py`.
-
-Plan the queue around truthful provider/search/download/import states, actionable failures, bounded retry/cancel behavior, and compact responsive progress. No Phase 2 production changes are included in this slice.
+- `app/services/activity.py` provides one aggregate database round trip for Wanted releases, active downloads, failed/partial acquisitions, pending review decisions, and rejected sources.
+- `app/routers/activity.py`, `app/templates/activity.html`, and `app/templates/partials/_activity_tabs.html` add `/activity` and shared secondary navigation while preserving `/wanted`, `/downloads`, `/review`, `/blocklist`, and `/search`.
+- `app/templates/base.html` now exposes Home, Discover, Library, Activity, and Settings on desktop and Home, Discover, Library, and Activity on mobile. Only failed/partial acquisitions and pending review decisions contribute to the attention badge.
+- Coverage: `tests/unit/test_activity.py` and `tests/integration/test_activity_hub.py`.
 
 ## Phase 3 — Library browsing and playback (**not implemented**)
 

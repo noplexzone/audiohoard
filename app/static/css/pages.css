@@ -2766,3 +2766,132 @@ a.metric-card:hover {
     flex: 1 1 8rem;
   }
 }
+
+/* Activity hub and shared acquisition navigation */
+.activity-tabs {
+  display: flex;
+  gap: .4rem;
+  margin: -0.5rem 0 1.4rem;
+  padding-bottom: .2rem;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.activity-tabs a {
+  display: inline-flex;
+  min-height: 44px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: .48rem;
+  padding: .62rem .78rem;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: .82rem;
+  font-weight: 700;
+}
+
+.activity-tabs a:hover,
+.activity-tabs a.active {
+  border-color: var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.activity-tabs a.active {
+  box-shadow: inset 0 -2px var(--accent);
+}
+
+.activity-tabs svg {
+  width: 18px;
+  height: 18px;
+}
+
+.activity-tab-count {
+  min-width: 1.35rem;
+  padding: .12rem .35rem;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--text);
+  font-size: .69rem;
+  text-align: center;
+}
+
+.activity-overview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: .8rem;
+  margin-bottom: 1.2rem;
+}
+
+.activity-summary-card {
+  display: grid;
+  min-height: 132px;
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: .75rem;
+  padding: 1rem;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.activity-summary-card:hover {
+  border-color: var(--border);
+  background: var(--surface-2);
+}
+
+.activity-summary-card.needs-attention {
+  border-color: var(--warn);
+}
+
+.activity-summary-card > svg {
+  width: 22px;
+  height: 22px;
+  color: var(--accent);
+}
+
+.activity-summary-copy {
+  display: grid;
+  gap: .08rem;
+}
+
+.activity-summary-copy strong {
+  font-size: 1.65rem;
+  line-height: 1;
+}
+
+.activity-summary-card > .hint {
+  grid-column: 2;
+  margin-top: auto;
+}
+
+.activity-attention {
+  margin-bottom: 1rem;
+}
+
+@media (max-width: 759px) {
+  .activity-tabs {
+    margin-inline: -1rem;
+    padding-inline: 1rem;
+  }
+
+  .activity-tabs a {
+    min-width: max-content;
+  }
+
+  .activity-overview {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .activity-summary-card {
+    min-height: 122px;
+  }
+}
+
+@media (max-width: 430px) {
+  .activity-overview {
+    grid-template-columns: 1fr;
+  }
+}
