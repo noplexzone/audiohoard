@@ -119,10 +119,10 @@ HTTP. Set `AUTH_COOKIE_SECURE=true` whenever Audiohoard is served behind HTTPS.
 
 ## Container image
 
-The release workflow publishes tagged builds to `noplexzone/audiohoard` on Docker Hub after the quality gate passes. Pull v0.7.1 with:
+The release workflow publishes tagged builds to `noplexzone/audiohoard` on Docker Hub after the quality gate passes. Pull v0.25.0 with:
 
 ```bash
-docker pull noplexzone/audiohoard:0.7.1
+docker pull noplexzone/audiohoard:0.25.0
 ```
 
 ## Continuous integration

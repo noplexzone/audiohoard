@@ -6,7 +6,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-08-10
+
 ### Added
+
+- Add deterministic Playwright coverage for provider setup, discovery and monitoring, contextual Manual search, Wanted queueing, import review decisions, rejected-source recovery, Activity navigation, and mobile layout.
 
 - Turn Wanted into a state-aware acquisition work queue with server-side filtering, persistent attempt/failure/review context, contextual Manual search links, and an accurately bounded **Queue this page** action.
 - Rename the blocklist UI to Rejected Sources, add pagination and operational context, safe allow/retry controls, and reversible temporary-failure cooldown fields with capped exponential retry delays.
@@ -16,6 +20,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Restrict Settings UI and mutations to administrators, constrain provider submissions to provider-specific fields, reject unsafe provider URL forms, avoid unauthenticated Activity aggregation, and use current acquisition/rejection/review state in Wanted and Manual search.
 - Restrict import-review comparison audio to exact Deezer track or album-position identities, persist complete cache provenance, refresh expired exact references, and make the review UI explicit when no verified clip exists.
 - Delete denied staged files only after same-directory quarantine and a successful database commit, restoring the file when the transaction fails.
 

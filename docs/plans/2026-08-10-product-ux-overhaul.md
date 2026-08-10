@@ -1,7 +1,7 @@
 # Audiohoard product UX overhaul — implementation map
 
-**Date:** 2026-08-10  
-**Status:** Phases 1–5 implemented; Phase 6 pending.
+**Date:** 2026-08-10
+**Status:** Phases 1–6 implemented; release validation pending.
 
 This map anchors the brief to the current server-rendered application. All slices preserve authenticated mutations, CSRF, environment locks, root-contained filesystem operations, transactional imports, and persistent job recovery.
 
@@ -45,8 +45,10 @@ This map anchors the brief to the current server-rendered application. All slice
 - Migration `0030` adds reversible `blocked_until`, `retry_count`, and `last_failure_at` fields. Known transient timeouts are backfilled into cooldowns; explicit denial and identity failures remain permanent.
 - Active Activity counts and acquisition exclusion logic ignore expired temporary rejections.
 
-## Phase 6 — Supporting cleanup and acceptance (**pending**)
+## Phase 6 — Supporting cleanup and acceptance (**implemented**)
 
-Current anchors: `pyproject.toml`, README, Docker/release metadata, changelog, Alembic, project validation scripts, and browser-test configuration.
-
-Reconcile version sources, finish documentation/accessibility/security review, add deterministic browser smoke coverage, verify migration upgrade/downgrade, run the full validation suite, review the final diff, and publish only after independent approval.
+- Version sources now agree on `0.25.0`, enforced by `tests/unit/test_version_consistency.py` across project metadata, lockfile, container label, README, and changelog.
+- `tests/browser/` runs a disposable in-process application and database with mocked provider boundaries; it covers provider setup, discovery/monitoring, contextual Manual search, Wanted queueing, review decisions, rejected-source recovery, Activity tabs, and mobile navigation.
+- CI installs Chromium and runs browser coverage with the complete test suite.
+- Independent review findings were remediated with admin-only Settings, provider-field whitelists, provider URL validation, authenticated-only Activity aggregation, latest-job Wanted filters, active-only rejection context, and form-safe Manual search validation.
+- Release gates include migration upgrade/downgrade, full pytest, Ruff lint/format, mypy, package build, Docker build, browser acceptance, final diff review, and CI/image digest verification.
