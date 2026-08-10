@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audiohoard"
-version = "0.24.0"
+version = "0.25.0"
 description = "Self-hosted music acquisition, metadata enrichment, and library naming"
 requires-python = ">=3.12"
 dependencies = [
@@ -51,7 +51,7 @@ where = ["."]
 include = ["app*"]
 
 [tool.setuptools.package-data]
-app = ["templates/*.html", "templates/partials/*.html", "static/css/*.css", "static/js/*.js", "static/branding/*"]
+app = ["templates/*.html", "templates/partials/*.html", "templates/settings/*.html", "templates/settings/partials/*.html", "static/css/*.css", "static/js/*.js", "static/branding/*"]
 
 [tool.setuptools.data-files]
 "." = ["CHANGELOG.md"]
@@ -90,3 +90,8 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["tests.*"]
 disable_error_code = ["no-untyped-def", "arg-type", "attr-defined", "index", "unused-ignore"]
+
+[dependency-groups]
+dev = [
+    "pytest-playwright>=0.9.0",
+]

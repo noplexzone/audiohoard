@@ -444,6 +444,7 @@ pre code {
   }
 
   .mobile-nav a {
+    position: relative;
     display: grid;
     min-width: 44px;
     flex: 1 1 0;
@@ -471,6 +472,17 @@ pre code {
   .mobile-nav svg {
     width: 20px;
     height: 20px;
+  }
+
+  .mobile-nav .nav-badge {
+    position: absolute;
+    top: .25rem;
+    right: calc(50% - 1.4rem);
+    min-width: 1.15rem;
+    height: 1.15rem;
+    margin: 0;
+    padding: 0 .25rem;
+    font-size: .58rem;
   }
 
   main {

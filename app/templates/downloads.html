@@ -11,6 +11,8 @@
   <a class="btn secondary" href="/downloads{% if selected_status %}?status={{ selected_status }}{% endif %}">Refresh</a>
 </header>
 
+{% include "partials/_activity_tabs.html" %}
+
 <nav class="download-tabs" aria-label="Download queue filters">
   <a href="/downloads" {% if not selected_status %}class="active" aria-current="page"{% endif %}>All</a>
   <a href="/downloads?status=running" {% if selected_status == "running" %}class="active" aria-current="page"{% endif %}>Running</a>

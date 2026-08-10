@@ -73,5 +73,6 @@
 
 <div class="page-actions">
   <a href="/downloads" class="btn secondary">&larr; Back to downloads</a>
+  <a href="/search?tab=advanced&amp;artist={{ (track.album_artist or track.artist or '') | urlencode }}&amp;album={{ (track.album or '') | urlencode }}&amp;track={{ (track.title or '') | urlencode }}{% if track.duration_sec %}&amp;expected_duration_sec={{ track.duration_sec }}{% endif %}" class="btn">Find sources</a>
 </div>
 {% endblock %}

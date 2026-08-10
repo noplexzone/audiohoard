@@ -22,10 +22,17 @@
 <svg class="svg-sprite" aria-hidden="true">
   <symbol id="i-home" viewBox="0 0 24 24"><path d="M3 11.5 12 4l9 7.5v8a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></symbol>
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></symbol>
+  <symbol id="i-discover" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2.1 4.9-4.9 2.1 2.1-4.9z"/></symbol>
   <symbol id="i-library" viewBox="0 0 24 24"><path d="M4 5h4v15H4zM10 3h4v17h-4zM16 6h4v14h-4z"/></symbol>
   <symbol id="i-artists" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3.5 20c.2-4 2-6 5.5-6s5.3 2 5.5 6M16 6.5a2.5 2.5 0 0 1 0 5M16 14c2.7.2 4.2 2.2 4.5 5"/></symbol>
   <symbol id="i-jobs" viewBox="0 0 24 24"><path d="M5 7h14v13H5zM9 7V4h6v3M8 12h8M8 16h5"/></symbol>
   <symbol id="i-import" viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M4 18v2h16v-2"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><path d="M4 13h3l2-6 4 11 2-5h5"/></symbol>
+  <symbol id="i-wanted" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v8M8 12h8"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M5 20h14"/></symbol>
+  <symbol id="i-review" viewBox="0 0 24 24"><path d="M5 4h14v16H5zM8 9l2 2 5-5M8 15h8"/></symbol>
+  <symbol id="i-rejected" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m6 6 12 12"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3 2.5 20h19zM12 9v5M12 17.5h.01"/></symbol>
   <symbol id="i-settings" viewBox="0 0 24 24"><path d="M19.14,12.94c.04-.31.06-.63.06-.94s-.02-.63-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.31-.6-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94L14.4 2.81c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41L9.25 5.35c-.59.24-1.13.57-1.62.95l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.31-.09.65-.09.94s.02.63.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.31.6.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.04.24.24.41.48.41h3.84c.24 0 .43-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61zM12 15.5A3.5 3.5 0 1 1 12 8a3.5 3.5 0 0 1 0 7.5z"/></symbol>
   <symbol id="i-logout" viewBox="0 0 24 24"><path d="M10 5H5v14h5M14 8l4 4-4 4M8 12h10"/></symbol>
 </svg>
@@ -36,16 +43,13 @@
   <aside class="sidebar">
     <a class="brand" href="/" aria-label="Audiohoard home"><span class="brand-mark"><img src="/static/branding/icon-32.png" alt="" width="32" height="32"></span><span>Audiohoard</span></a>
     <nav class="primary-nav" aria-label="Primary navigation">
-      <a href="/" {% if path == "/" %}class="active" aria-current="page"{% endif %}><svg><use href="#i-home"/></svg><span>Dashboard</span></a>
-      <a href="/search" {% if path.startswith("/search") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-search"/></svg><span>Search</span></a>
-      <a href="/library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") or path.startswith("/albums") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
-      <a href="/wanted" {% if path.startswith("/wanted") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Wanted</span></a>
-      <a href="/review" {% if path.startswith("/review") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Review</span>{% if request.state.pending_review_count | default(0) > 0 %}<span class="nav-badge">{{ request.state.pending_review_count }}</span>{% endif %}</a>
-      <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span></a>
-    <a href="/blocklist" {% if path.startswith("/blocklist") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Blocklist</span></a>
+      <a href="/" data-nav-destination="home" {% if path == "/" %}class="active" aria-current="page"{% endif %}><svg><use href="#i-home"/></svg><span>Home</span></a>
+      <a href="/search" data-nav-destination="discover" {% if path.startswith("/search") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-discover"/></svg><span>Discover</span></a>
+      <a href="/library" data-nav-destination="library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") or path.startswith("/albums") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
+      <a href="/activity" data-nav-destination="activity" {% if path.startswith("/activity") or path.startswith("/wanted") or path.startswith("/downloads") or path.startswith("/jobs") or path.startswith("/review") or path.startswith("/blocklist") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-activity"/></svg><span>Activity</span>{% if request.state.activity_summary | default(none) and request.state.activity_summary.attention > 0 %}<span class="nav-badge" aria-label="{{ request.state.activity_summary.attention }} activity item{{ ' needs' if request.state.activity_summary.attention == 1 else 's need' }} attention">{{ request.state.activity_summary.attention }}</span>{% endif %}</a>
+      <a href="/settings" data-nav-destination="settings" {% if path.startswith("/settings") or path.startswith("/changelog") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-settings"/></svg><span>Settings</span></a>
     </nav>
     <nav class="utility-nav" aria-label="Utilities">
-      <a href="/settings" {% if path.startswith("/settings") or path.startswith("/changelog") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-settings"/></svg><span>Settings</span></a>
       {% if request.state.current_username is defined %}<p class="account-name">Signed in as <strong>{{ request.state.current_username }}</strong></p>{% endif %}
       <form class="nav-logout" method="post" action="/logout">
         <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
@@ -96,13 +100,10 @@
   </section>
   <audio id="global-audio" preload="metadata"></audio>
   <nav class="mobile-nav" aria-label="Mobile navigation">
-    <a href="/" {% if path == "/" %}class="active" aria-current="page"{% endif %}><svg><use href="#i-home"/></svg><span>Home</span></a>
-    <a href="/search" {% if path.startswith("/search") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-search"/></svg><span>Search</span></a>
-    <a href="/library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") or path.startswith("/albums") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
-    <a href="/wanted" {% if path.startswith("/wanted") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Wanted</span></a>
-    <a href="/review" {% if path.startswith("/review") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Review</span>{% if request.state.pending_review_count | default(0) > 0 %}<span class="nav-badge">{{ request.state.pending_review_count }}</span>{% endif %}</a>
-    <a href="/downloads" {% if path.startswith("/downloads") or path.startswith("/jobs") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-jobs"/></svg><span>Downloads</span></a>
-    <a href="/blocklist" {% if path.startswith("/blocklist") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-import"/></svg><span>Blocklist</span></a>
+    <a href="/" data-nav-destination="home" {% if path == "/" %}class="active" aria-current="page"{% endif %}><svg><use href="#i-home"/></svg><span>Home</span></a>
+    <a href="/search" data-nav-destination="discover" {% if path.startswith("/search") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-discover"/></svg><span>Discover</span></a>
+    <a href="/library" data-nav-destination="library" {% if path.startswith("/library") or path.startswith("/artists") or path.startswith("/tracks") or path.startswith("/albums") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-library"/></svg><span>Library</span></a>
+    <a href="/activity" data-nav-destination="activity" {% if path.startswith("/activity") or path.startswith("/wanted") or path.startswith("/downloads") or path.startswith("/jobs") or path.startswith("/review") or path.startswith("/blocklist") %}class="active" aria-current="page"{% endif %}><svg><use href="#i-activity"/></svg><span>Activity</span>{% if request.state.activity_summary | default(none) and request.state.activity_summary.attention > 0 %}<span class="nav-badge" aria-label="{{ request.state.activity_summary.attention }} activity item{{ ' needs' if request.state.activity_summary.attention == 1 else 's need' }} attention">{{ request.state.activity_summary.attention }}</span>{% endif %}</a>
   </nav>
   {% endif %}
 </div>

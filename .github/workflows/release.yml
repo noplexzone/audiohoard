@@ -22,8 +22,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --extra dev
 
+      - name: Install Playwright Chromium
+        run: uv run playwright install --with-deps chromium
+
       - name: pytest
-        run: uv run pytest
+        run: uv run pytest --ignore=tests/browser
+
+      - name: Browser acceptance
+        run: uv run pytest tests/browser -q
 
       - name: ruff lint
         run: uv run ruff check .

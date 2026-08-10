@@ -1,14 +1,54 @@
 from __future__ import annotations
 
+import socket
+from ipaddress import ip_address
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class SettingField(BaseModel):
     value: str
     configured: bool
     locked_by_environment: bool
+
+
+def validate_provider_url_value(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return value
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("provider URL is invalid") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("provider URL must use http or https")
+    if parsed.username or parsed.password or parsed.fragment:
+        raise ValueError("provider URL cannot contain credentials or fragments")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("provider URL port is invalid")
+    hostname = parsed.hostname.casefold().rstrip(".")
+    if hostname in {"metadata.google.internal", "metadata.google.internal."}:
+        raise ValueError("provider URL host is not allowed")
+    try:
+        address = ip_address(hostname)
+    except ValueError:
+        # libc accepts legacy one-part, hexadecimal, and octal IPv4 forms. Normalize
+        # those before applying address policy so metadata IPs cannot hide behind an
+        # alternative textual representation.
+        try:
+            address = ip_address(socket.inet_aton(hostname))
+        except OSError:
+            return value
+    if (
+        address.is_link_local
+        or address.is_multicast
+        or address.is_unspecified
+        or address.is_reserved
+    ):
+        raise ValueError("provider URL address is not allowed")
+    return value
 
 
 class SettingsSaveRequest(BaseModel):
@@ -28,6 +68,11 @@ class SettingsSaveRequest(BaseModel):
     staging_root: str | None = None
     naming_template: str | None = None
 
+    @field_validator("slskd_url", "prowlarr_url", "sabnzbd_url")
+    @classmethod
+    def validate_provider_url(cls, value: str | None) -> str | None:
+        return validate_provider_url_value(value)
+
 
 _TESTABLE_PROVIDERS = Literal["slskd", "prowlarr", "sabnzbd", "youtube", "tidal"]
 
@@ -44,3 +89,8 @@ class SettingsTestRequest(BaseModel):
     tidal_config_path: str = ""
     tidal_session_path: str = ""
     tidal_quality: Literal["", "Normal", "High", "HiFi", "Master"] = ""
+
+    @field_validator("slskd_url", "prowlarr_url", "sabnzbd_url")
+    @classmethod
+    def validate_provider_url(cls, value: str) -> str:
+        return validate_provider_url_value(value) or ""

@@ -1,0 +1,16 @@
+{% set activity = request.state.activity_summary | default(none) %}
+{% set path = request.url.path %}
+<nav class="activity-tabs" aria-label="Activity sections">
+  <a href="/wanted" {% if path.startswith('/wanted') %}class="active" aria-current="page"{% endif %}>
+    <svg aria-hidden="true"><use href="#i-wanted"/></svg><span>Wanted</span>{% if activity %}<span class="activity-tab-count">{{ activity.wanted }}</span>{% endif %}
+  </a>
+  <a href="/downloads" {% if path.startswith('/downloads') or path.startswith('/jobs') %}class="active" aria-current="page"{% endif %}>
+    <svg aria-hidden="true"><use href="#i-download"/></svg><span>Downloads</span>{% if activity %}<span class="activity-tab-count">{{ activity.active_downloads + activity.acquisition_issues }}</span>{% endif %}
+  </a>
+  <a href="/review" {% if path.startswith('/review') %}class="active" aria-current="page"{% endif %}>
+    <svg aria-hidden="true"><use href="#i-review"/></svg><span>Review</span>{% if activity %}<span class="activity-tab-count">{{ activity.awaiting_review }}</span>{% endif %}
+  </a>
+  <a href="/blocklist" {% if path.startswith('/blocklist') %}class="active" aria-current="page"{% endif %}>
+    <svg aria-hidden="true"><use href="#i-rejected"/></svg><span>Rejected Sources</span>{% if activity %}<span class="activity-tab-count">{{ activity.rejected_sources }}</span>{% endif %}
+  </a>
+</nav>

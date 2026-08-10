@@ -12,6 +12,10 @@ class SearchRequest(BaseModel):
     album: str | None = Field(default=None, max_length=250)
     track: str | None = Field(default=None, max_length=250)
     sources: list[str] = Field(default_factory=list)
+    expected_duration_sec: int | None = Field(default=None, ge=1, le=86400)
+    preferred_format: str | None = Field(default=None, max_length=20)
+    expected_track_count: int | None = Field(default=None, ge=1, le=1000)
+    catalog_ids: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def require_search_terms(self) -> SearchRequest:

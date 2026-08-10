@@ -15,6 +15,8 @@ def test_setuptools_includes_web_assets_in_built_distributions() -> None:
     assert "app" in package_data
     assert "templates/*.html" in package_data["app"]
     assert "templates/partials/*.html" in package_data["app"]
+    assert "templates/settings/*.html" in package_data["app"]
+    assert "templates/settings/partials/*.html" in package_data["app"]
     assert "static/css/*.css" in package_data["app"]
     assert "static/js/*.js" in package_data["app"]
     assert "static/branding/*" in package_data["app"]
@@ -74,7 +76,9 @@ def test_settings_forms_are_native_and_not_double_submitted() -> None:
     templates = Path("app/templates")
     base = (templates / "base.html").read_text()
     setup = (templates / "setup.html").read_text()
-    settings = (templates / "settings.html").read_text()
+    settings = "\n".join(
+        template.read_text() for template in (templates / "settings").rglob("*.html")
+    )
     setup_js = Path("app/static/js/setup.js").read_text()
 
     assert 'document.addEventListener("submit"' not in base
@@ -83,6 +87,9 @@ def test_settings_forms_are_native_and_not_double_submitted() -> None:
     assert 'data-custom-submit="true"' not in settings
     assert 'headers: {"Content-Type": "application/json"' not in settings
     assert 'method="post" action="/settings/save"' in settings
+    assert 'method="post" action="/settings/save-and-test"' in settings
+    assert 'aria-live="polite"' in settings
+    assert "data-settings-form" in settings
     assert '"tidal_config_path", "tidal_session_path", "tidal_quality"' in setup_js
 
 
@@ -127,7 +134,7 @@ def test_favicon_ico_uses_the_requested_artwork_at_every_size() -> None:
 
 def test_dockerfile_version_and_healthcheck_match_current_runtime_contract() -> None:
     dockerfile = Path("docker/Dockerfile").read_text(encoding="utf-8")
-    assert 'org.opencontainers.image.version="0.24.0"' in dockerfile
+    assert 'org.opencontainers.image.version="0.25.0"' in dockerfile
     assert "http://localhost:8000/health/ready" in dockerfile
 
 
@@ -195,7 +202,7 @@ def test_templates_are_compatible_with_the_html_content_security_policy() -> Non
 def test_api_docs_link_is_about_only_not_sidebar() -> None:
     templates = Path("app/templates")
     base = (templates / "base.html").read_text()
-    settings = (templates / "settings.html").read_text()
+    settings = (templates / "settings" / "advanced.html").read_text()
 
     assert "/api/docs" not in base
     assert '<a class="btn secondary" href="/api/docs">API docs</a>' in settings

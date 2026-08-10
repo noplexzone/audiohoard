@@ -10,6 +10,7 @@ from app.models.release import Release
 from app.models.staging_review import StagingReviewItem
 from app.models.track import Track
 from app.models.workflow import AcquisitionState, ImportWorkflowState, ReviewDecision
+from app.services.reference_audio import ReferenceAudio
 
 
 async def _seed_review(staging_root: Path) -> int:
@@ -84,7 +85,13 @@ async def test_review_renders_front_card_audio_and_tag_diff(
     item_id = await _seed_review(test_settings.staging_root)
 
     async def reference(*args, **kwargs):
-        return {"url": "https://cdn.example.test/reference.mp3", "source": "deezer"}
+        return ReferenceAudio(
+            url="https://cdn.example.test/reference.mp3",
+            provider="deezer",
+            provider_track_id="42",
+            match_method="exact_track_id",
+            cached=False,
+        )
 
     monkeypatch.setattr("app.services.staging.resolve_reference_audio", reference)
     response = await client.get("/review")
@@ -103,6 +110,9 @@ async def test_review_renders_front_card_audio_and_tag_diff(
     assert f'data-alignment-url="/staging/review/{item_id}/alignment"' in response.text
     assert 'data-reference-source="deezer"' in response.text
     assert 'data-reference-url="https://cdn.example.test/reference.mp3"' in response.text
+    assert "Exact Deezer track match" in response.text
+    assert "1 track remaining" in response.text
+    assert "Track 1 of" not in response.text
     assert "data-match-section" in response.text
     assert "data-ab-toggle" in response.text
     assert "data-alignment-status" in response.text
@@ -186,26 +196,48 @@ async def test_review_skip_cursor_rejects_values_outside_sqlite_integer_range(
     assert response.status_code == 422
 
 
-async def test_review_reference_badge_reflects_resolver_source(
+async def test_review_template_renders_exact_provenance_and_no_reference_state(
     client: AsyncClient, test_settings, monkeypatch
 ) -> None:
     await _seed_review(test_settings.staging_root)
-    current = {"value": {"url": "https://example.test/deezer.mp3", "source": "deezer"}}
+    current = {
+        "value": ReferenceAudio(
+            url="https://example.test/deezer.mp3",
+            provider="deezer",
+            provider_track_id="42",
+            match_method="exact_track_id",
+            cached=False,
+        )
+    }
 
     async def reference(*args, **kwargs):
         return current["value"]
 
     monkeypatch.setattr("app.services.staging.resolve_reference_audio", reference)
-    deezer = await client.get("/review")
-    assert ">Deezer<" in deezer.text
+    exact_track = await client.get("/review")
+    assert "Exact Deezer track match" in exact_track.text
+    assert "Provider track ID" in exact_track.text
+    assert ">42<" in exact_track.text
+    assert "iTunes" not in exact_track.text
 
-    current["value"] = {"url": "https://example.test/itunes.m4a", "source": "itunes"}
-    itunes = await client.get("/review")
-    assert ">iTunes (fallback)<" in itunes.text
+    current["value"] = ReferenceAudio(
+        url="https://example.test/deezer-position.mp3",
+        provider="deezer",
+        provider_track_id="99",
+        match_method="exact_album_position",
+        cached=True,
+    )
+    exact_position = await client.get("/review")
+    assert "Exact Deezer album-position match" in exact_position.text
+    assert "Cached exact reference" in exact_position.text
 
     current["value"] = None
     missing = await client.get("/review")
-    assert "No reference available" in missing.text
+    assert "No verified reference available" in missing.text
+    assert "No verified comparison clip is available" in missing.text
+    assert "file metadata, fingerprint evidence, and manual listening" in missing.text
+    assert 'src="/staging/audio/' in missing.text
+    assert "Approve" in missing.text and "Deny" in missing.text
 
 
 async def test_review_empty_queue_shows_caught_up(client: AsyncClient) -> None:
