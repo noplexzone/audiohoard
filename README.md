@@ -42,7 +42,7 @@ The web app never starts an interactive login. Missing or expired authentication
 
 Album searches group slskd results by peer, folder, and format before selecting a coherent release according to the quality profile in Settings. Incomplete albums automatically schedule bounded, track-specific continuation searches without redownloading catalog tracks already acquired.
 
-Downloaded files are fingerprinted and compared with the expected MusicBrainz recording through AcoustID. Complete releases import transactionally without a manual Import step only when every catalog track is verified or explicitly approved. Mismatches and unavailable/ambiguous fingerprints remain staged under **Downloads → Pending review**, where authenticated users can listen and approve or deny them. Denial retains the staged file as evidence and schedules bounded reacquisition.
+Downloaded files are fingerprinted and compared with the expected MusicBrainz recording through AcoustID. Complete releases import transactionally without a manual Import step only when every catalog track is verified or explicitly approved. Mismatches and unavailable/ambiguous fingerprints remain staged under **Downloads → Pending review**, where authenticated users can listen and approve or deny them. Import review offers comparison audio only when an exact Deezer track ID or exact Deezer album/disc/position proves the reference identity; fuzzy title/artist matches, iTunes previews, and legacy URL-only cache entries are not used as verification evidence. Denial schedules bounded reacquisition and moves the staged file into a same-directory quarantine before the database transaction commits; the file is restored if the transaction fails and deleted only after a successful commit.
 
 ## Naming Convention
 

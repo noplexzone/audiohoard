@@ -560,11 +560,35 @@ def _store_track_previews(album: CatalogAlbum, provider: str, tracks: list[Album
     provider = provider.casefold()
     if provider not in {"deezer", "itunes"}:
         return
-    previews = {
-        f"{track.disc}:{track.position}": track.preview_url.strip()
-        for track in tracks
-        if isinstance(track.preview_url, str) and track.preview_url.strip()
-    }
+    previews: dict[str, str | dict[str, object]]
+    if provider == "deezer":
+        album_id = str(album.deezer_id or "").strip()
+        position_counts: dict[tuple[int, int], int] = {}
+        for track in tracks:
+            key = (track.disc, track.position)
+            position_counts[key] = position_counts.get(key, 0) + 1
+        previews = {
+            f"{track.disc}:{track.position}": {
+                "url": track.preview_url.strip(),
+                "provider_track_id": str(track.provider_track_id).strip(),
+                "provider_album_id": album_id,
+                "match_method": "exact_album_position",
+                "disc": track.disc,
+                "position": track.position,
+            }
+            for track in tracks
+            if album_id
+            and position_counts[(track.disc, track.position)] == 1
+            and track.provider_track_id
+            and isinstance(track.preview_url, str)
+            and track.preview_url.strip()
+        }
+    else:
+        previews = {
+            f"{track.disc}:{track.position}": track.preview_url.strip()
+            for track in tracks
+            if isinstance(track.preview_url, str) and track.preview_url.strip()
+        }
     if not previews:
         return
     try:

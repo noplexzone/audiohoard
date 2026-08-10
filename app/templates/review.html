@@ -14,7 +14,7 @@
 {% if review %}
 <article class="review-deck-card" data-review-deck data-swipe-surface
   data-alignment-url="/staging/review/{{ review.item.id }}/alignment"
-  {% if review.reference %}data-reference-source="{{ review.reference.source }}" data-reference-url="{{ review.reference.url }}"{% endif %}>
+  {% if review.reference %}data-reference-source="{{ review.reference.provider }}" data-reference-url="{{ review.reference.url }}"{% endif %}>
   <header class="review-deck-heading">
     {% if review.artwork_url %}
     <img class="review-deck-art" src="/artwork?url={{ review.artwork_url | urlencode }}" width="112" height="112" alt="">
@@ -22,7 +22,7 @@
     <div class="cover-tile review-deck-art">{{ (review.album_title or "Unknown album")[:2] | upper }}</div>
     {% endif %}
     <div>
-      <p class="eyebrow">Track 1 of {{ pending_count }} to review</p>
+      <p class="eyebrow">{{ pending_count }} track{{ "" if pending_count == 1 else "s" }} remaining</p>
       <h2>{{ review.artist_name or "Unknown artist" }} — {{ review.album_title or "Unknown album" }}</h2>
       <p>{{ review.should_be.title or review.item.expected_title or "Unknown track" }}</p>
     </div>
@@ -36,17 +36,18 @@
     <div class="review-audio-panel{% if not review.reference %} unavailable{% endif %}">
       <div class="review-player-heading">
         <h3>Reference</h3>
-        {% if review.reference and review.reference.source == "deezer" %}<span class="review-source-badge reference">Deezer</span>
-        {% elif review.reference and review.reference.source == "itunes" %}<span class="review-source-badge reference fallback">iTunes (fallback)</span>
-        {% else %}<span class="review-source-badge unavailable">No reference available</span>{% endif %}
+        {% if review.reference and review.reference.match_method == "exact_track_id" %}<span class="review-source-badge reference">Exact Deezer track match</span>
+        {% elif review.reference and review.reference.match_method == "exact_album_position" %}<span class="review-source-badge reference">Exact Deezer album-position match</span>
+        {% else %}<span class="review-source-badge unavailable">No verified reference available</span>{% endif %}
       </div>
       {% if review.reference %}
       <audio class="review-deck-audio" controls preload="metadata" data-reference-audio src="{{ review.reference.url }}">Your browser does not support audio playback.</audio>
+      <p class="hint">Provider track ID: <code>{{ review.reference.provider_track_id }}</code>{% if review.reference.cached %} · Cached exact reference{% endif %}</p>
+      <p class="hint">The reference is approximately 30 seconds. Audiohoard can attempt to locate the same passage in the downloaded file.</p>
       {% else %}
       <audio class="review-deck-audio" controls data-reference-audio aria-disabled="true"></audio>
-      <p class="hint">No reference available</p>
+      <p class="hint"><strong>No verified comparison clip is available.</strong> Continue reviewing the downloaded file using file metadata, fingerprint evidence, and manual listening. A missing reference does not mean the download is invalid.</p>
       {% endif %}
-      <p class="hint">The reference is approximately 30 seconds. Audiohoard can attempt to locate the same passage in the downloaded file.</p>
     </div>
   </section>
   {% if review.reference %}

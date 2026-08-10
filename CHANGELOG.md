@@ -6,6 +6,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Restrict import-review comparison audio to exact Deezer track or album-position identities, persist complete cache provenance, refresh expired exact references, and make the review UI explicit when no verified clip exists.
+- Delete denied staged files only after same-directory quarantine and a successful database commit, restoring the file when the transaction fails.
+
 ## [0.24.0] - 2026-08-10
 
 ### Added
