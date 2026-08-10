@@ -1,45 +1,48 @@
 # Audiohoard product UX overhaul — implementation map
 
 **Date:** 2026-08-10  
-**Status:** Phases 1–2 implemented; Phases 3–6 are planning only.
+**Status:** Phases 1–3 implemented; Phases 4–6 pending.
 
-This map anchors each phase to the current server-rendered application. It is not a claim that later-phase behavior has been built, and later phases must preserve authenticated mutations, CSRF protection, root-contained filesystem operations, transactional imports, and the existing provider/job recovery guarantees.
+This map anchors the brief to the current server-rendered application. All slices preserve authenticated mutations, CSRF, environment locks, root-contained filesystem operations, transactional imports, and persistent job recovery.
 
-## Phase 1 — Trustworthy import review (**implemented in this slice**)
+## Phase 1 — Import-review correctness (**implemented**)
 
-- `app/services/reference_audio.py` returns a typed `ReferenceAudio` only for an exact Deezer track ID or an exact Deezer album/disc/position. It rejects fuzzy search, iTunes fallback, legacy URL-only cache values, mismatched identities, ambiguous positions, and references that expire too soon; expired exact references are refreshed through the same exact identity.
-- `app/services/catalog_metadata.py` persists Deezer preview URL, provider track/album IDs, match method, disc, and position as cache provenance and does not cache ambiguous positions.
-- `app/templates/review.html` and `tests/integration/test_review.py` expose the exact-match method, cached state, remaining-item count, and a useful no-reference state without blocking manual review.
-- `app/routers/staging.py` already performs denial as transactional quarantine: the staged file is moved aside before commit, restored on failure, and deleted only after commit succeeds; bounded reacquisition remains intact.
-- Primary coverage: `tests/unit/test_reference_audio.py`, `tests/integration/test_review.py`, and the denial/quarantine cases in `tests/integration/test_staging_review.py`.
+- `app/services/reference_audio.py`: typed `ReferenceAudio`; exact Deezer provider identity only; no iTunes, fuzzy search, unproven `Track.deezer_id`, or legacy URL-only cache.
+- `app/services/catalog_metadata.py`: exact album/disc/position cache provenance and ambiguity rejection.
+- `app/templates/review.html`: exact-match provenance, cached state, remaining queue count, and explicit no-reference guidance.
+- `app/routers/staging.py`: denial uses transactional same-directory quarantine, rollback restoration, and deletion only after commit.
+- Coverage: `tests/unit/test_reference_audio.py`, `tests/integration/test_review.py`, and denial cases in `tests/integration/test_staging_review.py`.
 
 ## Phase 2 — Navigation and Activity (**implemented**)
 
-- `app/services/activity.py` provides one aggregate database round trip for Wanted releases, active downloads, failed/partial acquisitions, pending review decisions, and rejected sources.
-- `app/routers/activity.py`, `app/templates/activity.html`, and `app/templates/partials/_activity_tabs.html` add `/activity` and shared secondary navigation while preserving `/wanted`, `/downloads`, `/review`, `/blocklist`, and `/search`.
-- `app/templates/base.html` now exposes Home, Discover, Library, Activity, and Settings on desktop and Home, Discover, Library, and Activity on mobile. Only failed/partial acquisitions and pending review decisions contribute to the attention badge.
+- `app/services/activity.py`: one aggregate round trip for Wanted, active downloads, failed/partial acquisitions, pending review, and rejected sources.
+- `app/routers/activity.py`, `app/templates/activity.html`, and `_activity_tabs.html`: `/activity` overview and shared workflow tabs.
+- `app/templates/base.html`: desktop Home/Discover/Library/Activity/Settings and mobile Home/Discover/Library/Activity; only actionable acquisition/review failures contribute to the badge.
+- Preserved routes: `/wanted`, `/downloads`, `/review`, `/blocklist`, and `/search`.
 - Coverage: `tests/unit/test_activity.py` and `tests/integration/test_activity_hub.py`.
 
-## Phase 3 — Library browsing and playback (**not implemented**)
+## Phase 3 — Settings (**implemented**)
 
-Current-code anchors: `app/templates/index.html`, `app/templates/library_tracks.html`, `app/templates/track.html`, `app/static/js/player.js`, `app/routers/tracks.py`, and the library query services.
+- `app/routers/settings.py`: cached overview context, actionable warning links, bounded Save and test, safe effective-root path diagnostics, legacy section compatibility, and existing environment-lock/secret behavior.
+- `app/templates/settings/`: overview plus Acquisition, Metadata & discovery, Library & naming, Automation, Quality & verification, and Advanced & system sections with reusable fields, status, connection-card, and save-bar partials.
+- `app/static/js/settings.js`: progressive unsaved-change and inline Save-and-test feedback with native form fallback.
+- Packaging includes nested settings templates.
+- Coverage: `tests/integration/test_settings.py`, `tests/security/test_settings_security.py`, settings service/runtime unit tests, and packaging tests.
 
-Plan artwork-first browsing, clear availability/quality state, predictable filtering, and continuous local playback without changing file-authorization or library-root safety contracts. No Phase 3 production changes are included in this slice.
+## Phase 4 — Search and Discover (**pending**)
 
-## Phase 4 — Artist and release workflows (**not implemented**)
+Current anchors: `app/routers/search.py`, `app/services/discovery.py`, `app/templates/search.html`, `app/templates/discover_list.html`, contextual release/track pages, and source adapters.
 
-Current-code anchors: `app/templates/artists.html`, `app/templates/artist_detail.html`, `app/templates/catalog_artist.html`, `app/templates/catalog_album.html`, `app/templates/partials/_artist_card.html`, `app/templates/partials/_release_card.html`, `app/static/js/album.js`, and `app/routers/catalog.py`.
+Implement grouped supported entities without fuzzy identity merging, personalized sections backed by existing data, contextual Manual search, visible source controls, deterministic candidate scoring, and high-confidence candidate grouping.
 
-Plan consistent artist/release hierarchy, edition-aware monitoring, progress, acquisition, and maintenance actions while retaining provider-scoped identities. No Phase 4 production changes are included in this slice.
+## Phase 5 — Wanted and Rejected Sources (**pending**)
 
-## Phase 5 — Search, discovery, and wanted flow (**not implemented**)
+Current anchors: Wanted query/POST paths in `app/routers/catalog.py`, `app/templates/wanted.html`, `app/routers/blocklist.py`, `app/models/source_candidate_block.py`, job/acquisition models, and Alembic migrations.
 
-Current-code anchors: `app/templates/search.html`, `app/templates/discover_list.html`, `app/templates/wanted.html`, `app/static/js/discovery.js`, `app/static/js/wanted.js`, `app/static/js/artist-watchlist.js`, `app/routers/search.py`, and `app/routers/catalog.py`.
+Implement server-side work-queue state/filters, truthful queue-all semantics, paginated contextual Rejected Sources, permanent/temporary classification and cooldown, restore/retry actions, and cross-links.
 
-Plan continuity from discovery/search identity to watchlist, wanted, and acquisition actions, with explicit provider identity and useful empty/error states. No Phase 5 production changes are included in this slice.
+## Phase 6 — Supporting cleanup and acceptance (**pending**)
 
-## Phase 6 — Settings, operations, and acceptance gates (**not implemented**)
+Current anchors: `pyproject.toml`, README, Docker/release metadata, changelog, Alembic, project validation scripts, and browser-test configuration.
 
-Current-code anchors: `app/templates/settings.html`, `app/templates/maintenance.html`, `app/templates/blocklist.html`, `app/static/js/settings.js`, `app/routers/settings.py`, `app/routers/maintenance.py`, `app/routers/blocklist.py`, shared navigation/styles, and the integration suite.
-
-Plan task-oriented settings and diagnostics, confirmation for destructive actions, responsive/accessibility review, and end-to-end regression/performance gates. No Phase 6 production changes are included in this slice.
+Reconcile version sources, finish documentation/accessibility/security review, add deterministic browser smoke coverage, verify migration upgrade/downgrade, run the full validation suite, review the final diff, and publish only after independent approval.

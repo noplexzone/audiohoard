@@ -42,6 +42,10 @@ The web app never starts an interactive login. Missing or expired authentication
 
 Audiohoard follows **Discover → Monitor → Acquire → Verify → Library**. The primary navigation is Home, Discover, Library, Activity, and Settings; mobile keeps Settings in the header. Activity unifies Wanted, Downloads, Review, and Rejected Sources without breaking their existing URLs, and its badge counts only failed/partial acquisitions and review decisions that need attention.
 
+## Settings workflow
+
+Settings is organized around Acquisition, Metadata & discovery, Library & naming, Automation, Quality & verification, and Advanced & system. The overview uses cached health state to identify blocking configuration without probing providers on page load. Provider cards support **Save and test** with bounded checks and inline status, while secrets remain write-only. Path diagnostics test only the effective configured library and staging roots. Environment-backed values remain locked.
+
 ## Automated acquisition and import
 
 Album searches group slskd results by peer, folder, and format before selecting a coherent release according to the quality profile in Settings. Incomplete albums automatically schedule bounded, track-specific continuation searches without redownloading catalog tracks already acquired.

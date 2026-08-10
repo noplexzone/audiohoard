@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Settings — Audiohoard{% endblock %}
+{% macro csrf_input() -%}<input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">{%- endmacro %}
+{% block content %}
+<header class="page-header"><div><p class="eyebrow">Configuration</p><h1>Settings</h1><p>Configure Audiohoard by task, check readiness, and resolve blocking warnings.</p></div></header>
+<div id="settings-feedback" class="settings-feedback" aria-live="polite" aria-atomic="true">
+{% if saved %}<div class="alert ok" role="status" tabindex="-1">Settings saved. <button type="button" class="dismiss-btn" aria-label="Dismiss">×</button></div>{% endif %}
+{% if test_result %}<div class="alert info" role="status" tabindex="-1">Connection test: {{ test_result }}</div>{% endif %}
+{% if path_result %}<div class="alert info" role="status" tabindex="-1">Path test: {{ path_result }}</div>{% endif %}
+{% if validation_error %}<div class="alert error" role="alert" tabindex="-1">Settings not saved: {{ validation_error }}</div>{% endif %}
+</div>
+<div class="settings-layout">
+<nav class="card settings-nav" aria-label="Settings sections">
+<a class="btn {{ '' if section == 'overview' else 'secondary' }}" href="/settings">Overview</a>
+{% for key, label in sections.items() %}<a class="btn {{ '' if key == section else 'secondary' }}" href="/settings/{{ key }}">{{ label }}</a>{% endfor %}
+</nav>
+<section class="card settings-section" aria-labelledby="settings-section-title">
+{% include "settings/" ~ section ~ ".html" %}
+</section>
+</div>
+<script defer src="/static/js/settings.js?v={{ app_version }}" data-page-module="settings"></script>
+{% endblock %}

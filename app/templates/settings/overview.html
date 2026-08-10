@@ -1,0 +1,17 @@
+<h2 id="settings-section-title">Settings overview</h2>
+<p class="hint">Cached provider state and configuration summaries only. Opening this page never contacts a provider or writes to a configured path.</p>
+{% if warnings %}<section aria-labelledby="configuration-warnings"><h3 id="configuration-warnings">Actionable configuration warnings</h3><ul class="settings-warning-list">{% for warning in warnings %}<li><a href="{{ warning.href }}">{{ warning.message }}</a></li>{% endfor %}</ul></section>{% endif %}
+<div class="settings-overview-grid">
+<a class="card settings-summary" href="/settings/acquisition"><h3>Acquisition</h3><p>{{ runtime.enabled_sources|length }} of {{ runtime.source_priority|length }} sources enabled.</p><span>Provider and download-client readiness →</span></a>
+<a class="card settings-summary" href="/settings/metadata"><h3>Metadata & discovery</h3><p>{{ runtime.enabled_metadata_providers|length }} providers enabled; {{ display_name(runtime.primary_metadata_provider) }} is primary.</p><span>Catalog and exact-reference readiness →</span></a>
+<a class="card settings-summary" href="/settings/library"><h3>Library & naming</h3><p>Library: {{ path_diagnostics.library_root }} · staging: {{ path_diagnostics.staging_root }}</p><span>Paths, permissions, and naming →</span></a>
+<a class="card settings-summary" href="/settings/automation"><h3>Automation</h3><p>Automatic acquisition is {{ 'enabled' if runtime.auto_download_wanted else 'disabled' }}; {{ schedule_count }} scheduled jobs configured.</p><span>Acquisition and maintenance schedules →</span></a>
+<a class="card settings-summary" href="/settings/quality"><h3>Quality & verification</h3><p>{{ runtime.quality_profile.format_preference|join(' › ') }} · {{ runtime.quality_profile.min_mp3_bitrate }} kbps MP3 cutoff.</p><span>Quality profile and fingerprint policy →</span></a>
+<a class="card settings-summary" href="/settings/advanced"><h3>Advanced & system</h3><p>Version {{ app_version }} · {{ locked_fields|length }} environment-locked values.</p><span>Limits, timeouts, and diagnostics →</span></a>
+</div>
+<dl class="settings-facts">
+<div><dt>Current source priority</dt><dd>{% for source in runtime.source_priority %}{{ loop.index }}. {{ display_name(source.name) }} ({{ 'on' if source.enabled else 'off' }}){% if not loop.last %}; {% endif %}{% endfor %} <a href="/settings/acquisition#source-priority">Edit</a></dd></div>
+<div><dt>Current quality profile</dt><dd>{{ runtime.quality_profile.format_preference|join(', ') }}; cutoff {{ runtime.quality_profile.min_mp3_bitrate }} kbps <a href="/settings/quality#quality-profile">Edit</a></dd></div>
+<div><dt>Scheduled-job state</dt><dd>{{ schedule_count }} configured schedule{{ '' if schedule_count == 1 else 's' }} <a href="/settings/automation#schedules">Edit</a></dd></div>
+<div><dt>Environment-locked values</dt><dd>{% if locked_fields %}{{ locked_fields|join(', ') }}{% else %}None{% endif %}</dd></div>
+</dl>

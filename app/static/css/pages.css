@@ -2895,3 +2895,33 @@ a.metric-card:hover {
     grid-template-columns: 1fr;
   }
 }
+
+
+/* Task-oriented settings */
+.settings-layout { display: grid; grid-template-columns: minmax(12rem, 15rem) minmax(0, 1fr); gap: 1rem; align-items: start; }
+.settings-nav { position: sticky; top: 1rem; display: grid; gap: .45rem; padding: .75rem; }
+.settings-nav .btn { justify-content: flex-start; text-align: left; }
+.settings-section { min-width: 0; padding: clamp(1rem, 2vw, 1.5rem); }
+.settings-section > section { margin-top: 1.5rem; }
+.settings-overview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: .8rem; margin: 1rem 0; }
+.settings-summary { display: grid; gap: .4rem; padding: 1rem; }
+.settings-summary h3, .settings-summary p { margin: 0; }
+.settings-summary span { color: var(--accent); }
+.settings-warning-list { display: grid; gap: .45rem; padding-left: 1.25rem; }
+.settings-warning-list a { color: var(--warn); text-decoration: underline; text-underline-offset: .18em; }
+.settings-facts { display: grid; gap: .75rem; }
+.settings-facts > div { display: grid; gap: .2rem; padding-block: .7rem; border-bottom: 1px solid var(--border); }
+.settings-facts dt { font-weight: 700; }
+.connection-card { margin-block: .8rem; padding: 1rem; }
+.connection-card > header { display: flex; align-items: center; justify-content: space-between; gap: .75rem; flex-wrap: wrap; }
+.connection-card h4 { margin: 0; }
+.settings-save-bar { position: sticky; bottom: .5rem; z-index: 2; display: flex; align-items: center; justify-content: flex-end; gap: .55rem; flex-wrap: wrap; margin-top: 1rem; padding: .7rem; border: 1px solid var(--border); border-radius: var(--radius); background: color-mix(in srgb, var(--surface-2) 94%, transparent); box-shadow: var(--shadow); }
+.unsaved-indicator { margin-right: auto; color: var(--warn); font-weight: 700; }
+.connection-feedback { min-height: 1.5rem; margin-top: .5rem; }
+.connection-feedback.ok { color: var(--success); }
+.connection-feedback.error { color: var(--danger); }
+@media (max-width: 759px) {
+  .settings-layout { grid-template-columns: 1fr; }
+  .settings-nav { position: static; grid-auto-flow: column; grid-auto-columns: minmax(max-content, 1fr); overflow-x: auto; }
+  .settings-save-bar { bottom: calc(var(--mobile-nav-height) + .5rem); }
+}

@@ -43,6 +43,20 @@ async def test_test_settings_requires_csrf(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_save_and_test_requires_csrf(client: AsyncClient) -> None:
+    client.headers.pop("X-CSRF-Token", None)
+    response = await client.post("/settings/save-and-test", data={"provider": "slskd"})
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_path_test_requires_csrf(client: AsyncClient) -> None:
+    client.headers.pop("X-CSRF-Token", None)
+    response = await client.post("/settings/test-paths")
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_get_settings_does_not_expose_raw_secrets(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

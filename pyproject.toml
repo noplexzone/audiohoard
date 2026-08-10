@@ -51,7 +51,7 @@ where = ["."]
 include = ["app*"]
 
 [tool.setuptools.package-data]
-app = ["templates/*.html", "templates/partials/*.html", "static/css/*.css", "static/js/*.js", "static/branding/*"]
+app = ["templates/*.html", "templates/partials/*.html", "templates/settings/*.html", "templates/settings/partials/*.html", "static/css/*.css", "static/js/*.js", "static/branding/*"]
 
 [tool.setuptools.data-files]
 "." = ["CHANGELOG.md"]

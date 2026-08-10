@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 from httpx import AsyncClient
@@ -812,3 +813,159 @@ async def test_library_settings_naming_template_renders_default_placeholder(
         in response.text
     )
     assert "<strong>Preview:</strong>" in response.text
+
+
+@pytest.mark.asyncio
+async def test_settings_root_renders_task_oriented_overview_without_live_probes(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services.health_status import get_health_status_service
+
+    async def forbidden_refresh(*args: object, **kwargs: object) -> object:
+        raise AssertionError("overview GET must use cached status")
+
+    monkeypatch.setattr(get_health_status_service(), "refresh_all", forbidden_refresh)
+    monkeypatch.setattr(get_health_status_service(), "refresh_provider", forbidden_refresh)
+    response = await client.get("/settings", follow_redirects=False)
+    assert response.status_code == 200
+    body = response.text
+    for heading in (
+        "Settings overview",
+        "Acquisition",
+        "Metadata & discovery",
+        "Library & naming",
+        "Automation",
+        "Quality & verification",
+        "Advanced & system",
+    ):
+        assert heading in body
+    assert "Current source priority" in body
+    assert "Current quality profile" in body
+    assert "Environment-locked values" in body
+
+
+@pytest.mark.asyncio
+async def test_settings_overview_warning_links_target_rendered_anchors(
+    client: AsyncClient,
+) -> None:
+    body = (await client.get("/settings")).text
+    assert 'href="/settings/acquisition#source-priority"' in body
+    assert 'href="/settings/library#library-root"' in body
+    assert 'href="/settings/library#staging-root"' in body
+    assert 'id="source-priority"' in (await client.get("/settings/acquisition")).text
+    library = (await client.get("/settings/library")).text
+    assert 'id="library-root"' in library and 'id="staging-root"' in library
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("legacy", "heading"),
+    [
+        ("download-sources", "Acquisition"),
+        ("download-clients", "Acquisition"),
+        ("behavior", "Advanced & system"),
+        ("about", "Advanced & system"),
+    ],
+)
+async def test_legacy_settings_sections_remain_as_aliases(
+    client: AsyncClient, legacy: str, heading: str
+) -> None:
+    response = await client.get(f"/settings/{legacy}", follow_redirects=False)
+    assert response.status_code == 200
+    assert heading in response.text
+
+
+@pytest.mark.asyncio
+async def test_save_and_test_persists_and_refreshes_visible_status(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.sources.base import CapabilityState
+    from app.sources.slskd import SlskdAdapter
+
+    async def healthy(self: SlskdAdapter) -> CapabilityState:
+        return CapabilityState(available=True)
+
+    monkeypatch.setattr(SlskdAdapter, "health", healthy)
+    response = await client.post(
+        "/settings/save-and-test",
+        data={
+            "provider": "slskd",
+            "section": "acquisition",
+            "slskd_url": "http://saved-and-tested-slskd:5030",
+            "slskd_api_key": "saved-and-tested-secret",
+        },
+        headers={"X-Requested-With": "fetch"},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["saved"] is True and result["provider"] == "slskd"
+    assert result["status"] == "Connected" and result["available"] is True
+    stored = (await client.get("/api/settings")).json()
+    assert stored["slskd_url"]["value"] == "http://saved-and-tested-slskd:5030"
+    assert stored["slskd_api_key"]["value"] == "***"
+    page = await client.get("/settings/acquisition")
+    assert "Connected" in page.text and "saved-and-tested-secret" not in page.text
+
+
+@pytest.mark.asyncio
+async def test_save_and_test_persists_configuration_when_connection_fails(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.sources.base import CapabilityState
+    from app.sources.slskd import SlskdAdapter
+
+    async def unavailable(self: SlskdAdapter) -> CapabilityState:
+        return CapabilityState(available=False, reason="Authentication failed")
+
+    monkeypatch.setattr(SlskdAdapter, "health", unavailable)
+    response = await client.post(
+        "/settings/save-and-test",
+        data={
+            "provider": "slskd",
+            "section": "acquisition",
+            "slskd_url": "http://slskd-needs-new-key:5030",
+            "slskd_api_key": "wrong-but-safely-stored",
+        },
+        headers={"X-Requested-With": "fetch"},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "Authentication failed"
+    assert response.json()["saved"] is True
+    stored = (await client.get("/api/settings")).json()
+    assert stored["slskd_url"]["value"] == "http://slskd-needs-new-key:5030"
+
+
+@pytest.mark.asyncio
+async def test_path_test_uses_only_effective_configured_roots(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from app.config import Settings, override_settings
+    from app.routers import settings as settings_router
+
+    library, staging = tmp_path / "library", tmp_path / "staging"
+    library.mkdir()
+    staging.mkdir()
+    override_settings(
+        Settings(
+            database_url="sqlite+aiosqlite:///:memory:",
+            secret_key="test-secret",
+            auth_cookie_secure=False,
+            library_root=library,
+            staging_root=staging,
+        )
+    )
+    checked: list[str] = []
+    original = settings_router._path_diagnostic
+
+    def capture(path_value: str) -> str:
+        checked.append(path_value)
+        return original(path_value)
+
+    monkeypatch.setattr(settings_router, "_path_diagnostic", capture)
+    response = await client.post(
+        "/settings/test-paths",
+        data={"library_root": "/etc", "staging_root": "/"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert checked == [str(library), str(staging)]

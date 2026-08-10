@@ -8,10 +8,11 @@ from typing import Annotated
 from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.responses import Response
 
 from app.auth import require_admin, require_admin_read, require_mutation
 from app.config import Settings, get_settings
@@ -74,13 +75,18 @@ async def _probe_provider(
 
 
 SETTINGS_SECTIONS = {
-    "download-sources": "Download sources",
-    "download-clients": "Download clients",
-    "metadata": "Metadata",
-    "library": "Library",
-    "behavior": "Behavior",
-    "quality": "Quality",
-    "about": "About",
+    "acquisition": "Acquisition",
+    "metadata": "Metadata & discovery",
+    "library": "Library & naming",
+    "automation": "Automation",
+    "quality": "Quality & verification",
+    "advanced": "Advanced & system",
+}
+LEGACY_SETTINGS_ALIASES = {
+    "download-sources": "acquisition",
+    "download-clients": "acquisition",
+    "behavior": "advanced",
+    "about": "advanced",
 }
 PROVIDER_DESCRIPTIONS = {
     "musicbrainz": "MusicBrainz — canonical IDs, required",
@@ -190,18 +196,162 @@ async def _validate_provider_updates(
         if not (effective_url and effective_key):
             errors[provider] = "URL and API key are required together"
             continue
-        status = await _probe_provider(provider, url=effective_url, key=effective_key, cookies="")
+        status = await asyncio.wait_for(
+            _probe_provider(provider, url=effective_url, key=effective_key, cookies=""),
+            timeout=get_health_status_service().probe_timeout_seconds + 0.5,
+        )
         if not status.available:
             errors[provider] = status.reason or "Connection failed"
     return errors
+
+
+def _path_summary(path_value: str) -> str:
+    """Inspect configured path metadata without creating files or directories."""
+    path = Path(path_value)
+    if not path.exists():
+        return "Missing"
+    if not path.is_dir():
+        return "Not a directory"
+    return "Ready"
+
+
+def _provider_state_label(status: CachedProviderStatus | SourceStatus) -> str:
+    if status.available:
+        return "Connected"
+    reason = (status.reason or "").strip()
+    lowered = reason.casefold()
+    if reason in {"Disabled", "Not configured", "Not checked"}:
+        return reason
+    if "auth" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
+        return "Authentication failed"
+    if "timeout" in lowered or "unreachable" in lowered or "connect" in lowered:
+        return "Host unreachable"
+    if "invalid" in lowered or "response" in lowered:
+        return "Invalid response"
+    return reason or "Misconfigured"
+
+
+def _disabled_status() -> CachedProviderStatus:
+    return CachedProviderStatus(SourceStatus(available=False, reason="Disabled", details={}))
+
+
+async def _settings_context(
+    request: Request, db: AsyncSession, env: Settings, section: str
+) -> dict[str, object]:
+    effective = await get_all_effective(db, env)
+    fields = {
+        key: SettingField(
+            value=value.value,
+            configured=value.configured,
+            locked_by_environment=value.locked_by_environment,
+        )
+        for key, value in effective.items()
+    }
+    runtime = await get_runtime_settings(db)
+    client_statuses = get_health_status_service().snapshot()
+    enabled_sources = set(runtime.enabled_sources)
+    for provider in ("slskd", "prowlarr", "youtube", "tidal"):
+        if provider not in enabled_sources:
+            client_statuses[provider] = _disabled_status()
+    if "prowlarr" not in enabled_sources:
+        client_statuses["sabnzbd"] = _disabled_status()
+    provider_states = {
+        provider: _provider_state_label(status) for provider, status in client_statuses.items()
+    }
+    path_diagnostics = {
+        "library_root": _path_summary(fields["library_root"].value),
+        "staging_root": _path_summary(fields["staging_root"].value),
+    }
+    warnings: list[dict[str, str]] = []
+    if not enabled_sources:
+        warnings.append(
+            {
+                "message": "No acquisition source is enabled.",
+                "href": "/settings/acquisition#source-priority",
+            }
+        )
+    for provider in runtime.enabled_sources:
+        status = client_statuses.get(provider)
+        if status is not None and not status.available and status.reason not in {"Not checked"}:
+            warnings.append(
+                {
+                    "message": f"{provider_states[provider]}: {provider} is not ready.",
+                    "href": f"/settings/acquisition#provider-{provider}",
+                }
+            )
+    if path_diagnostics["library_root"] != "Ready":
+        warnings.append(
+            {
+                "message": f"Library root is {path_diagnostics['library_root'].lower()}.",
+                "href": "/settings/library#library-root",
+            }
+        )
+    if path_diagnostics["staging_root"] != "Ready":
+        warnings.append(
+            {
+                "message": f"Staging path is {path_diagnostics['staging_root'].lower()}.",
+                "href": "/settings/library#staging-root",
+            }
+        )
+    if "deezer" not in runtime.enabled_metadata_providers:
+        warnings.append(
+            {
+                "message": "No exact review-reference provider is available.",
+                "href": "/settings/metadata#metadata-providers",
+            }
+        )
+    if runtime.auto_download_wanted and not any(
+        status.available for status in client_statuses.values()
+    ):
+        warnings.append(
+            {
+                "message": "Automatic downloads are enabled but no download client is ready.",
+                "href": "/settings/automation#automatic-acquisition",
+            }
+        )
+    locked_fields = [key for key, value in fields.items() if value.locked_by_environment]
+    schedule_count = sum(
+        value > 0
+        for value in (
+            runtime.discography_refresh_hours,
+            runtime.library_scan_hours,
+            runtime.duplicate_scan_hours,
+            runtime.upgrade_check_hours,
+        )
+    )
+    return {
+        "settings": fields,
+        "runtime": runtime,
+        "default_sources": DEFAULT_SOURCE_PRIORITY,
+        "default_metadata_providers": DEFAULT_METADATA_PROVIDERS,
+        "discovery_regions": DISCOVERY_REGIONS,
+        "saved": request.query_params.get("saved", ""),
+        "test_result": request.query_params.get("test", ""),
+        "path_result": request.query_params.get("paths", ""),
+        "validation_error": request.query_params.get("error", ""),
+        "section": section,
+        "sections": SETTINGS_SECTIONS,
+        "client_statuses": client_statuses,
+        "provider_states": provider_states,
+        "provider_descriptions": PROVIDER_DESCRIPTIONS,
+        "naming_preview": _naming_preview(fields["naming_template"].value),
+        "path_diagnostics": path_diagnostics,
+        "app_version": request.app.version,
+        "warnings": warnings,
+        "locked_fields": locked_fields,
+        "schedule_count": schedule_count,
+    }
 
 
 @router.get("/settings", response_class=HTMLResponse, include_in_schema=False)
 async def settings_page(
     request: Request,
     _admin: Annotated[AppUser, Depends(require_admin_read)],
-) -> RedirectResponse:
-    return RedirectResponse("/settings/download-sources", status_code=307)
+    db: Annotated[AsyncSession, Depends(get_db)],
+    env: Annotated[Settings, Depends(get_settings)],
+) -> HTMLResponse:
+    context = await _settings_context(request, db, env, "overview")
+    return _get_templates(request).TemplateResponse(request, "settings/index.html", context)
 
 
 @router.get("/settings/{section}", response_class=HTMLResponse, include_in_schema=False)
@@ -211,64 +361,12 @@ async def settings_section_page(
     _admin: Annotated[AppUser, Depends(require_admin_read)],
     db: Annotated[AsyncSession, Depends(get_db)],
     env: Annotated[Settings, Depends(get_settings)],
-) -> HTMLResponse:
-    if section not in SETTINGS_SECTIONS:
+) -> Response:
+    render_section = LEGACY_SETTINGS_ALIASES.get(section, section)
+    if render_section not in SETTINGS_SECTIONS:
         raise HTTPException(status_code=404, detail="Unknown settings section")
-    effective = await get_all_effective(db, env)
-    fields = {
-        k: SettingField(
-            value=v.value, configured=v.configured, locked_by_environment=v.locked_by_environment
-        )
-        for k, v in effective.items()
-    }
-    runtime = await get_runtime_settings(db)
-    client_statuses = (
-        get_health_status_service().snapshot() if section == "download-clients" else {}
-    )
-    if section == "download-clients":
-        enabled_sources = {
-            str(item["name"]) for item in runtime.source_priority if item.get("enabled") is True
-        }
-        for provider in ("slskd", "prowlarr", "youtube", "tidal"):
-            if provider not in enabled_sources:
-                client_statuses[provider] = CachedProviderStatus(
-                    SourceStatus(available=False, reason="Disabled", details={})
-                )
-        if "prowlarr" not in enabled_sources:
-            client_statuses["sabnzbd"] = CachedProviderStatus(
-                SourceStatus(available=False, reason="Disabled", details={})
-            )
-    path_diagnostics: dict[str, str] = {}
-    if section == "library":
-        library_status, staging_status = await asyncio.gather(
-            asyncio.to_thread(_path_diagnostic, fields["library_root"].value),
-            asyncio.to_thread(_path_diagnostic, fields["staging_root"].value),
-        )
-        path_diagnostics = {
-            "library_root": library_status,
-            "staging_root": staging_status,
-        }
-    return _get_templates(request).TemplateResponse(
-        request,
-        "settings.html",
-        {
-            "settings": fields,
-            "runtime": runtime,
-            "default_sources": DEFAULT_SOURCE_PRIORITY,
-            "default_metadata_providers": DEFAULT_METADATA_PROVIDERS,
-            "discovery_regions": DISCOVERY_REGIONS,
-            "saved": request.query_params.get("saved", ""),
-            "test_result": request.query_params.get("test", ""),
-            "validation_error": request.query_params.get("error", ""),
-            "section": section,
-            "sections": SETTINGS_SECTIONS,
-            "client_statuses": client_statuses,
-            "provider_descriptions": PROVIDER_DESCRIPTIONS,
-            "naming_preview": _naming_preview(fields["naming_template"].value),
-            "path_diagnostics": path_diagnostics,
-            "app_version": request.app.version,
-        },
-    )
+    context = await _settings_context(request, db, env, render_section)
+    return _get_templates(request).TemplateResponse(request, "settings/index.html", context)
 
 
 @router.post("/settings", response_class=HTMLResponse, include_in_schema=False)
@@ -363,34 +461,34 @@ async def save_runtime_settings_page(
         )
     auto_download = (
         str(form.get("auto_download_wanted", "")).lower() in {"1", "true", "yes", "on"}
-        if section == "behavior"
+        if section in {"behavior", "automation"}
         else runtime.auto_download_wanted
     )
     duplicate_auto_clean = (
         str(form.get("duplicate_auto_clean", "")).lower() in {"1", "true", "yes", "on"}
-        if section == "behavior"
+        if section in {"behavior", "automation"}
         else runtime.duplicate_auto_clean
     )
     default_watchlist_release_albums = (
         str(form.get("default_watchlist_release_albums", "")).lower() in {"1", "true", "yes", "on"}
-        if section == "behavior"
+        if section in {"behavior", "automation"}
         else runtime.default_watchlist_release_albums
     )
     default_watchlist_release_singles = (
         str(form.get("default_watchlist_release_singles", "")).lower()
         in {"1", "true", "yes", "on"}
-        if section == "behavior"
+        if section in {"behavior", "automation"}
         else runtime.default_watchlist_release_singles
     )
     default_watchlist_release_eps = (
         str(form.get("default_watchlist_release_eps", "")).lower() in {"1", "true", "yes", "on"}
-        if section == "behavior"
+        if section in {"behavior", "automation"}
         else runtime.default_watchlist_release_eps
     )
     default_watchlist_monitor_upgrades = (
         str(form.get("default_watchlist_monitor_upgrades", "")).lower()
         in {"1", "true", "yes", "on"}
-        if section == "behavior"
+        if section in {"behavior", "automation"}
         else runtime.default_watchlist_monitor_upgrades
     )
     if section == "quality":
@@ -456,38 +554,52 @@ async def save_runtime_settings_page(
         await save_runtime_settings(
             db,
             (source_priority or current.source_priority)
-            if section == "download-sources"
+            if section in {"download-sources", "acquisition"}
             else current.source_priority,
-            limit if section == "behavior" else current.free_text_result_limit,
+            limit if section in {"behavior", "advanced"} else current.free_text_result_limit,
             metadata_providers if section == "metadata" else current.metadata_providers,
             primary if section == "metadata" else current.primary_metadata_provider,
-            refresh_hours if section == "behavior" else current.discography_refresh_hours,
-            library_scan_hours if section == "behavior" else current.library_scan_hours,
-            duplicate_scan_hours if section == "behavior" else current.duplicate_scan_hours,
-            duplicate_auto_clean if section == "behavior" else current.duplicate_auto_clean,
-            upgrade_check_hours if section == "behavior" else current.upgrade_check_hours,
-            auto_download if section == "behavior" else current.auto_download_wanted,
+            refresh_hours
+            if section in {"behavior", "automation"}
+            else current.discography_refresh_hours,
+            library_scan_hours
+            if section in {"behavior", "automation"}
+            else current.library_scan_hours,
+            duplicate_scan_hours
+            if section in {"behavior", "automation"}
+            else current.duplicate_scan_hours,
+            duplicate_auto_clean
+            if section in {"behavior", "automation"}
+            else current.duplicate_auto_clean,
+            upgrade_check_hours
+            if section in {"behavior", "automation"}
+            else current.upgrade_check_hours,
+            auto_download
+            if section in {"behavior", "automation"}
+            else current.auto_download_wanted,
             source_search_budget_seconds=(
-                source_budget if section == "behavior" else current.source_search_budget_seconds
+                source_budget
+                if section in {"behavior", "advanced"}
+                else current.source_search_budget_seconds
             ),
             default_watchlist_release_albums=(
                 default_watchlist_release_albums
-                if section == "behavior"
+                if section in {"behavior", "automation"}
                 else current.default_watchlist_release_albums
             ),
             default_watchlist_release_singles=(
                 default_watchlist_release_singles
-                if section == "behavior"
+                if section in {"behavior", "automation"}
                 else current.default_watchlist_release_singles
             ),
             default_watchlist_release_eps=(
                 default_watchlist_release_eps
-                if section == "behavior"
+                if section in {"behavior", "automation"}
                 else current.default_watchlist_release_eps
             ),
             default_watchlist_monitor_upgrades=(
                 default_watchlist_monitor_upgrades
-                if section == "behavior"
+                if section in {"behavior", "automation"}
                 else current.default_watchlist_monitor_upgrades
             ),
             quality_profile=quality_profile if section == "quality" else current.quality_profile,
@@ -496,14 +608,18 @@ async def save_runtime_settings_page(
             ),
             acoustid_acceptance_threshold=(
                 acoustid_threshold
-                if section == "behavior"
+                if section in {"behavior", "quality"}
                 else current.acoustid_acceptance_threshold
             ),
             slskd_download_timeout_seconds=(
-                slskd_timeout if section == "behavior" else current.slskd_download_timeout_seconds
+                slskd_timeout
+                if section in {"behavior", "advanced"}
+                else current.slskd_download_timeout_seconds
             ),
             max_parallel_acquisitions=(
-                max_parallel if section == "behavior" else current.max_parallel_acquisitions
+                max_parallel
+                if section in {"behavior", "advanced"}
+                else current.max_parallel_acquisitions
             ),
             discovery_region=(
                 discovery_region if section == "metadata" else current.discovery_region
@@ -515,7 +631,11 @@ async def save_runtime_settings_page(
             discovery_service.invalidate_region(current.discovery_region)
             discovery_service.invalidate_region(persisted.discovery_region)
         await job_dispatcher.set_max_concurrent_jobs(persisted.max_parallel_acquisitions)
-    redirect_target = section if section in SETTINGS_SECTIONS else "download-sources"
+    redirect_target = (
+        section
+        if section in SETTINGS_SECTIONS or section in LEGACY_SETTINGS_ALIASES
+        else "acquisition"
+    )
     return RedirectResponse(f"/settings/{redirect_target}?saved=1", status_code=303)
 
 
@@ -539,7 +659,11 @@ async def save_settings_page(
     try:
         payload = SettingsSaveRequest.model_validate(updates)
     except ValidationError:
-        target = section if section in SETTINGS_SECTIONS else "download-clients"
+        target = (
+            section
+            if section in SETTINGS_SECTIONS or section in LEGACY_SETTINGS_ALIASES
+            else "acquisition"
+        )
         return RedirectResponse(
             f"/settings/{target}?error=Invalid+settings+value", status_code=303
         )
@@ -553,8 +677,98 @@ async def save_settings_page(
         )
     await save_settings(db, updates, env)
     await db.commit()
-    target = section if section in SETTINGS_SECTIONS else "download-clients"
+    target = (
+        section
+        if section in SETTINGS_SECTIONS or section in LEGACY_SETTINGS_ALIASES
+        else "acquisition"
+    )
     return RedirectResponse(f"/settings/{target}?saved=1", status_code=303)
+
+
+async def _save_and_test_result(
+    provider: str,
+    updates: dict[str, str],
+    db: AsyncSession,
+    env: Settings,
+) -> CachedProviderStatus:
+    if provider not in {"slskd", "prowlarr", "sabnzbd", "youtube", "tidal"}:
+        raise HTTPException(status_code=422, detail="Unknown provider")
+    raw_db = await load_raw_db_values(db, env.secret_key)
+    if provider in {"slskd", "prowlarr", "sabnzbd"}:
+        url = resolve_for_probe(f"{provider}_url", updates.get(f"{provider}_url", ""), env, raw_db)
+        key = resolve_for_probe(
+            f"{provider}_api_key", updates.get(f"{provider}_api_key", ""), env, raw_db
+        )
+        if not (url and key):
+            raise HTTPException(status_code=422, detail="URL and API key are required together")
+    await save_settings(db, updates, env)
+    await db.commit()
+    service = get_health_status_service()
+    try:
+        return await asyncio.wait_for(
+            service.refresh_provider(provider, db, env),
+            timeout=service.probe_timeout_seconds + 0.5,
+        )
+    except TimeoutError:
+        return CachedProviderStatus(
+            SourceStatus(available=False, reason="Probe timed out", details={})
+        )
+
+
+@router.post("/settings/save-and-test", include_in_schema=False)
+async def save_and_test_provider_page(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    env: Annotated[Settings, Depends(get_settings)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> Response:
+    form = await request.form()
+    provider = str(form.get("provider", ""))
+    allowed = set(SettingsSaveRequest.model_fields)
+    updates = {str(key): str(value) for key, value in form.items() if str(key) in allowed}
+    try:
+        SettingsSaveRequest.model_validate(updates)
+        result = await _save_and_test_result(provider, updates, db, env)
+    except (ValidationError, HTTPException) as exc:
+        detail = "Invalid settings value" if isinstance(exc, ValidationError) else str(exc.detail)
+        if request.headers.get("X-Requested-With") == "fetch":
+            return JSONResponse({"saved": False, "error": detail}, status_code=422)
+        return RedirectResponse(
+            f"/settings/acquisition?error={quote_plus(detail)}#provider-{provider}",
+            status_code=303,
+        )
+    status = _provider_state_label(result)
+    payload = {
+        "saved": True,
+        "provider": provider,
+        "available": result.available,
+        "status": status,
+        "reason": result.reason or "",
+        "elapsed_ms": result.elapsed_ms,
+    }
+    if request.headers.get("X-Requested-With") == "fetch":
+        return JSONResponse(payload)
+    feedback = quote_plus(f"{provider}: {status}")
+    return RedirectResponse(
+        f"/settings/acquisition?saved=1&test={feedback}#provider-{provider}", status_code=303
+    )
+
+
+@router.post("/settings/test-paths", include_in_schema=False)
+async def test_configured_paths_page(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    env: Annotated[Settings, Depends(get_settings)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> RedirectResponse:
+    effective = await get_all_effective(db, env)
+    # Deliberately ignore form-supplied paths: only effective configured roots are probed.
+    library_status, staging_status = await asyncio.gather(
+        asyncio.to_thread(_path_diagnostic, effective["library_root"].value),
+        asyncio.to_thread(_path_diagnostic, effective["staging_root"].value),
+    )
+    result = quote_plus(f"Library: {library_status}; staging: {staging_status}")
+    return RedirectResponse(f"/settings/library?paths={result}#path-diagnostics", status_code=303)
 
 
 @router.post("/settings/refresh", include_in_schema=False)
@@ -568,7 +782,11 @@ async def refresh_provider_status_page(
     provider = str(form.get("provider", ""))
     section = str(form.get("section", "download-clients"))
     await get_health_status_service().refresh_provider(provider, db, env)
-    target = section if section in SETTINGS_SECTIONS else "download-clients"
+    target = (
+        section
+        if section in SETTINGS_SECTIONS or section in LEGACY_SETTINGS_ALIASES
+        else "acquisition"
+    )
     return RedirectResponse(f"/settings/{target}?test={provider}:refreshed", status_code=303)
 
 
