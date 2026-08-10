@@ -19,6 +19,7 @@ from app.database import Base
 EXPECTED_TABLES: frozenset[str] = frozenset(
     {
         "acquisition_attempts",
+        "acquisition_dispatch_claims",
         "app_settings",
         "app_users",
         "auth_sessions",

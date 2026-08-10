@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.models.acquisition_attempt import AcquisitionAttempt
+from app.models.acquisition_claim import AcquisitionDispatchClaim
 from app.models.auth import AppUser, AuthSession, UserRole
 from app.models.catalog_entities import (
     CatalogAlbum,
@@ -29,6 +30,7 @@ from app.models.track import Track
 
 __all__ = [
     "AcquisitionAttempt",
+    "AcquisitionDispatchClaim",
     "AppSetting",
     "AppUser",
     "AuthSession",

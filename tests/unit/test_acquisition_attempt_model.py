@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,7 +57,7 @@ async def test_multiple_acquisition_attempts_coexist_for_one_track(
     assert all(attempt.outcome == AttemptOutcome.pending for attempt in attempts)
     assert all(attempt.provider_cleanup_state == CleanupState.pending for attempt in attempts)
     assert all(attempt.file_cleanup_state == CleanupState.pending for attempt in attempts)
-    assert all(attempt.claim_version == 0 for attempt in attempts)
+    assert all(attempt.cleanup_claim_version == 0 for attempt in attempts)
 
 
 async def test_attempt_provider_checkpoint_is_idempotent(db_session: AsyncSession) -> None:
@@ -66,17 +67,29 @@ async def test_attempt_provider_checkpoint_is_idempotent(db_session: AsyncSessio
         provider="slskd",
         peer="peer-a",
         remote_path=r"Artist\\Album\\01 Track.flac",
-        provider_transfer_id="2d93899b-cf9a-4567-8f10-993610f274cf",
+        provider_uuid="2d93899b-cf9a-4567-8f10-993610f274cf",
         provider_state=ProviderTransferState.enqueued,
     )
     db_session.add_all([job, attempt])
     await db_session.commit()
 
-    attempt.provider_transfer_id = "2d93899b-cf9a-4567-8f10-993610f274cf"
+    attempt.provider_uuid = "2d93899b-cf9a-4567-8f10-993610f274cf"
     attempt.provider_state = ProviderTransferState.enqueued
     await db_session.commit()
 
     persisted = await db_session.get(AcquisitionAttempt, attempt.id)
     assert persisted is not None
-    assert persisted.provider_transfer_id == "2d93899b-cf9a-4567-8f10-993610f274cf"
+    assert persisted.provider_uuid == "2d93899b-cf9a-4567-8f10-993610f274cf"
     assert persisted.provider_state == ProviderTransferState.enqueued
+
+
+def test_canonical_provider_uuid_rejects_fallback_identity() -> None:
+    from app.services.acquisition_attempts import canonical_provider_uuid
+
+    assert (
+        canonical_provider_uuid("2d93899b-cf9a-4567-8f10-993610f274cf")
+        == "2d93899b-cf9a-4567-8f10-993610f274cf"
+    )
+    assert canonical_provider_uuid(r"peer:Music\Album\Track.flac") is None
+    with pytest.raises(ValueError):
+        AcquisitionAttempt(job_id=1, provider="slskd", provider_uuid="peer:path")
