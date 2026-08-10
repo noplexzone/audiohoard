@@ -929,13 +929,17 @@ async def _run_job_in_session(
                     job.updated_at = _now()
                     await db.commit()
 
+                prepare_kwargs: dict[str, object] = {
+                    "checkpoint": checkpoint if commit_progress else None,
+                }
+                if "attempt" in inspect.signature(_call_prepare_acquisition).parameters:
+                    prepare_kwargs["attempt"] = attempt
                 source_job_id, source_status = await _call_prepare_acquisition(
                     result,
                     job.source,
                     cfg,
                     track,
-                    checkpoint=checkpoint if commit_progress else None,
-                    attempt=attempt,
+                    **prepare_kwargs,  # type: ignore[arg-type]
                 )
                 track.source_job_id = source_job_id
                 track.source_status = source_status
@@ -993,7 +997,7 @@ async def _run_job_in_session(
                 attempt.terminal_at = _now()
                 if track is not None:
                     track.acquisition_state = AcquisitionState.failed
-                logger.warning("Result processing failed")
+                logger.warning("Result processing failed", exc_info=True)
                 failures.append({"code": "result_processing_failed"})
             if commit_progress:
                 job.updated_at = _now()

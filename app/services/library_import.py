@@ -1526,6 +1526,7 @@ async def execute_release_import(
             plan.file_removed_at = None
             plan.file_removal_reason = None
             plan.collision_state = CollisionState.clear
+        await db.flush()
         imported_tracks = list(
             (
                 await db.scalars(
