@@ -200,3 +200,33 @@ async def test_html_provider_probe_rejects_alternative_metadata_ipv4_forms(
     )
     assert response.status_code == 303
     assert "Provider%20URL%20is%20not%20allowed" in response.headers["location"]
+
+
+@pytest.mark.asyncio
+async def test_save_and_test_revalidates_environment_locked_provider_url(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.config import Settings, override_settings
+
+    async def forbidden_health(self):
+        raise AssertionError("provider adapter must not receive a prohibited stored URL")
+
+    override_settings(
+        Settings(
+            database_url="sqlite+aiosqlite:///:memory:",
+            secret_key="test-secret",
+            auth_cookie_secure=False,
+            slskd_url="http://2852039166:5030",
+            slskd_api_key="legacy-environment-secret",
+        )
+    )
+    monkeypatch.setattr("app.sources.slskd.SlskdAdapter.health", forbidden_health)
+    response = await client.post(
+        "/settings/save-and-test",
+        data={"provider": "slskd", "section": "acquisition"},
+        headers={"X-Requested-With": "fetch"},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["available"] is False
+    assert result["reason"] == "Provider URL is not allowed"

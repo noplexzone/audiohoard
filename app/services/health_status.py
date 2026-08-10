@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
 from app.schemas.health import SourceStatus
+from app.schemas.settings import validate_provider_url_value
 from app.settings_service import load_raw_db_values, resolve_for_probe
 from app.sources.base import CapabilityState
 from app.sources.prowlarr import ProwlarrAdapter
@@ -149,18 +150,24 @@ class HealthStatusService:
         )
 
     async def _probe(self, provider: str, r: Callable[[str], str]) -> CapabilityState:
-        if provider == "slskd":
-            if not (r("slskd_url") and r("slskd_api_key")):
+        if provider in {"slskd", "prowlarr", "sabnzbd"}:
+            url = r(f"{provider}_url")
+            key = r(f"{provider}_api_key")
+            if not (url and key):
                 return CapabilityState(False, "Not configured")
-            return await SlskdAdapter(r("slskd_url"), r("slskd_api_key")).health()
-        if provider == "prowlarr":
-            if not (r("prowlarr_url") and r("prowlarr_api_key")):
-                return CapabilityState(False, "Not configured")
-            return await ProwlarrAdapter(r("prowlarr_url"), r("prowlarr_api_key")).health()
-        if provider == "sabnzbd":
-            if not (r("sabnzbd_url") and r("sabnzbd_api_key")):
-                return CapabilityState(False, "Not configured")
-            return await SabnzbdAdapter(r("sabnzbd_url"), r("sabnzbd_api_key")).health()
+            try:
+                validate_provider_url_value(url)
+            except ValueError:
+                return CapabilityState(
+                    False,
+                    "Provider URL is not allowed",
+                    {"code": "invalid_provider_url", "retryable": False},
+                )
+            if provider == "slskd":
+                return await SlskdAdapter(url, key).health()
+            if provider == "prowlarr":
+                return await ProwlarrAdapter(url, key).health()
+            return await SabnzbdAdapter(url, key).health()
         if provider == "youtube":
             return await YouTubeAdapter(r("ytdlp_cookies_file"), 3.0).local_health()
         if provider == "tidal":
