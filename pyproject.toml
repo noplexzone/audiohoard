@@ -29,6 +29,7 @@ dependencies = [
 
 [project.scripts]
 audiohoard-repair-reviews = "app.maintenance.orphan_reviews:main"
+audiohoard-slskd-reconcile = "app.maintenance.slskd_reconcile:main"
 
 [project.optional-dependencies]
 dev = [

@@ -396,6 +396,22 @@ class JobDispatcher:
             slskd_url=settings.slskd_url,
             slskd_api_key=settings.slskd_api_key,
         )
+        sweep_roots = tuple(
+            root
+            for root in (settings.slskd_complete_root, settings.slskd_incomplete_root)
+            if root is not None
+        )
+        if sweep_roots and settings.slskd_configured:
+            from datetime import timedelta
+
+            from app.services.acquisition_cleanup import sweep_empty_slskd_directories
+            from app.sources.slskd import SlskdAdapter
+
+            await sweep_empty_slskd_directories(
+                SlskdAdapter(settings.slskd_url, settings.slskd_api_key),
+                sweep_roots,
+                minimum_age=timedelta(seconds=settings.slskd_directory_sweep_min_age_seconds),
+            )
 
     async def _cleanup_reconcile_loop(self, interval_seconds: int) -> None:
         while True:

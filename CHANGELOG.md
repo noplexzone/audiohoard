@@ -9,6 +9,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - Persist every slskd candidate attempt with canonical transfer UUID and content-bound artifact metadata, and suppress redundant exact-release acquisitions without conflating other editions.
+- Add disabled-by-default, explicitly mounted slskd complete/incomplete empty-directory sweeping with live-transfer and age safeguards, plus a bounded report-only JSON reconciliation command.
 
 - Add provider-scoped release-family monitoring with durable per-edition overrides, explicit-first defaults, unknown fallback, clean-off defaults, and startup reconciliation for existing artists.
 - Automatically approve import-review mismatches only when the exact catalog-position Deezer preview produces a high-confidence acoustic match, with per-MBID score evidence, source/catalog revalidation, operator-precedence fencing, append-only audit attempts, and safe track-level MBID overrides.

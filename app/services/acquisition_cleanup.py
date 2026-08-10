@@ -113,6 +113,178 @@ class AttemptCleanupResult(StrEnum):
 
 
 @dataclass(frozen=True)
+class DirectorySweepItem:
+    path: Path
+    root: Path
+    reason: str
+
+
+@dataclass(frozen=True)
+class DirectorySweepResult:
+    snapshot_available: bool
+    eligible: tuple[Path, ...] = ()
+    not_eligible: tuple[DirectorySweepItem, ...] = ()
+    removed: tuple[Path, ...] = ()
+    error_code: str | None = None
+
+
+_TERMINAL_TRANSFER_MARKERS = frozenset(
+    {"complete", "completed", "succeeded", "failed", "cancelled", "canceled", "aborted"}
+)
+_LOCAL_PATH_KEYS = frozenset(
+    {
+        "localpath",
+        "local_path",
+        "downloadpath",
+        "download_path",
+        "incompletepath",
+        "incomplete_path",
+    }
+)
+
+
+def _active_transfer_local_paths(snapshot: list[dict[str, object]]) -> tuple[Path, ...]:
+    paths: set[Path] = set()
+
+    def collect(value: object, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                collect(child, str(child_key).casefold())
+        elif isinstance(value, list):
+            for child in value:
+                collect(child, key)
+        elif key in _LOCAL_PATH_KEYS and isinstance(value, str) and value.strip():
+            candidate = Path(value.strip())
+            if candidate.is_absolute():
+                paths.add(candidate.absolute())
+
+    for item in snapshot:
+        raw_state = str(item.get("state") or item.get("status") or "").casefold()
+        words = {word for word in raw_state.replace(",", " ").split() if word}
+        if words & _TERMINAL_TRANSFER_MARKERS:
+            continue
+        collect(item)
+    return tuple(sorted(paths, key=str))
+
+
+def _paths_intersect(left: Path, right: Path) -> bool:
+    return left == right or left.is_relative_to(right) or right.is_relative_to(left)
+
+
+def inspect_empty_slskd_directories(
+    roots: tuple[Path, ...],
+    snapshot: list[dict[str, object]],
+    *,
+    minimum_age: timedelta,
+    now: datetime | None = None,
+) -> DirectorySweepResult:
+    """Classify directory-only trees without following links or mutating the filesystem."""
+    cutoff = (now or datetime.now(UTC)).timestamp() - minimum_age.total_seconds()
+    active_paths = _active_transfer_local_paths(snapshot)
+    eligible: list[Path] = []
+    rejected: list[DirectorySweepItem] = []
+
+    def visit(path: Path, root: Path) -> bool:
+        try:
+            current = path.stat(follow_symlinks=False)
+            entries = list(os.scandir(path))
+        except OSError:
+            rejected.append(DirectorySweepItem(path, root, "unavailable"))
+            return False
+        if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+            rejected.append(DirectorySweepItem(path, root, "symlink_content"))
+            return False
+        if any(_paths_intersect(path, active) for active in active_paths):
+            rejected.append(DirectorySweepItem(path, root, "active_transfer"))
+            return False
+        child_directories: list[Path] = []
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    rejected.append(DirectorySweepItem(path, root, "symlink_content"))
+                    return False
+                if entry.is_dir(follow_symlinks=False):
+                    child_directories.append(Path(entry.path))
+                else:
+                    rejected.append(DirectorySweepItem(path, root, "nonempty"))
+                    return False
+            except OSError:
+                rejected.append(DirectorySweepItem(path, root, "unavailable"))
+                return False
+        children_eligible = all(visit(child, root) for child in child_directories)
+        if not children_eligible:
+            if not any(item.path == path for item in rejected):
+                rejected.append(DirectorySweepItem(path, root, "nonempty"))
+            return False
+        if current.st_mtime > cutoff:
+            rejected.append(DirectorySweepItem(path, root, "too_new"))
+            return False
+        eligible.append(path)
+        return True
+
+    seen_roots: set[Path] = set()
+    for configured in roots:
+        root = configured.absolute()
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
+        try:
+            root_stat = root.stat(follow_symlinks=False)
+            if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+                continue
+            entries = list(os.scandir(root))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    rejected.append(DirectorySweepItem(Path(entry.path), root, "symlink_content"))
+                elif entry.is_dir(follow_symlinks=False):
+                    visit(Path(entry.path), root)
+            except OSError:
+                rejected.append(DirectorySweepItem(Path(entry.path), root, "unavailable"))
+
+    return DirectorySweepResult(
+        snapshot_available=True,
+        eligible=tuple(eligible),
+        not_eligible=tuple(rejected),
+    )
+
+
+async def sweep_empty_slskd_directories(
+    adapter: SlskdCleanupAdapter,
+    roots: tuple[Path, ...],
+    *,
+    minimum_age: timedelta,
+) -> DirectorySweepResult:
+    """Remove only old empty directories after one forced-fresh live transfer snapshot."""
+    if not roots:
+        return DirectorySweepResult(snapshot_available=True)
+    try:
+        snapshot = await adapter.downloads(force_refresh=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("slskd directory sweep skipped: provider snapshot unavailable")
+        return DirectorySweepResult(
+            snapshot_available=False,
+            error_code="provider_unavailable",
+        )
+    inspected = inspect_empty_slskd_directories(roots, snapshot, minimum_age=minimum_age)
+    removed: list[Path] = []
+    # inspect_empty_slskd_directories emits children before parents.
+    for candidate in inspected.eligible:
+        try:
+            if candidate.is_symlink():
+                continue
+            candidate.rmdir()
+        except OSError:
+            continue
+        removed.append(candidate)
+    return replace(inspected, removed=tuple(removed))
+
+
+@dataclass(frozen=True)
 class _CleanupClaim:
     attempt_id: int
     token: str

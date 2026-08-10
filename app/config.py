@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     slskd_api_key: str = ""
     slskd_poll_interval: float = Field(default=5.0, ge=0.1)
     slskd_poll_timeout: float = Field(default=1800.0, ge=10.0, le=86_400.0)
+    # Disabled unless these exact container-visible mounts are explicitly configured.
+    slskd_complete_root: Path | None = None
+    slskd_incomplete_root: Path | None = None
+    slskd_directory_sweep_min_age_seconds: int = Field(default=86_400, ge=300)
 
     # Prowlarr
     prowlarr_url: str = ""
