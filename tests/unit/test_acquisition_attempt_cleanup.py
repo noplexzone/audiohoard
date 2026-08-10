@@ -19,6 +19,7 @@ from app.models.acquisition_attempt import (
     RetentionDisposition,
 )
 from app.models.job import Job
+from app.services import acquisition_cleanup
 from app.services.acquisition_cleanup import (
     AttemptCleanupResult,
     cleanup_attempt_file,
@@ -445,6 +446,41 @@ async def test_symlink_and_root_escape_are_blocked_and_retained(
         is AttemptCleanupResult.blocked
     )
     assert outside.exists() and link.is_symlink()
+
+
+async def test_file_replacement_at_final_unlink_window_is_retained_and_blocked(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "staging"
+    root.mkdir()
+    staged = root / "song.flac"
+    staged.write_bytes(b"owned audio")
+    attempt = await _attempt(db_session, staged_path=staged)
+    quarantine = acquisition_cleanup._file_quarantine_path(staged, attempt.id)
+    real_identity = acquisition_cleanup._identity_without_hash
+    identity_reads = 0
+
+    def replace_after_final_identity(path: Path):
+        nonlocal identity_reads
+        identity = real_identity(path)
+        identity_reads += 1
+        if identity_reads == 2:
+            path.unlink()
+            path.write_bytes(b"replacement audio")
+        return identity
+
+    monkeypatch.setattr(
+        acquisition_cleanup, "_identity_without_hash", replace_after_final_identity
+    )
+
+    result = await cleanup_attempt_file(_factory(db_session), attempt.id, root)
+
+    assert result is AttemptCleanupResult.blocked
+    assert not staged.exists()
+    assert quarantine.read_bytes() == b"replacement audio"
+    await db_session.refresh(attempt)
+    assert attempt.file_cleanup_state is CleanupState.blocked
+    assert attempt.quarantine_path == str(quarantine)
 
 
 async def test_retention_disposition_prevents_file_cleanup(

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
+import errno
 import hashlib
 import json
 import logging
@@ -863,20 +865,69 @@ async def _claim_file_cleanup(
         ), None
 
 
-def _path_is_contained_regular(path: Path, root: Path) -> bool:
+def _open_cleanup_parent(path: Path, quarantine: Path, root: Path) -> int | None:
+    """Pin a non-symlinked artifact parent beneath the configured cleanup root."""
     try:
         root_resolved = root.resolve(strict=True)
-        if path.is_symlink():
-            return False
-        resolved = path.resolve(strict=True)
-        return resolved.is_relative_to(root_resolved) and stat.S_ISREG(
-            path.stat(follow_symlinks=False).st_mode
-        )
+        parent_resolved = path.parent.resolve(strict=True)
+        quarantine_parent = quarantine.parent.resolve(strict=True)
+        relative_parent = parent_resolved.relative_to(root_resolved)
+    except (OSError, ValueError):
+        return None
+    if quarantine_parent != parent_resolved or path.name in {"", ".", ".."}:
+        return None
+    if quarantine.name in {"", ".", ".."}:
+        return None
+
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        parent_fd = os.open(root_resolved, directory_flags)
     except OSError:
+        return None
+    try:
+        if not stat.S_ISDIR(os.fstat(parent_fd).st_mode):
+            os.close(parent_fd)
+            return None
+        for part in relative_parent.parts:
+            next_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+            if not stat.S_ISDIR(os.fstat(parent_fd).st_mode):
+                os.close(parent_fd)
+                return None
+        return parent_fd
+    except OSError:
+        os.close(parent_fd)
+        return None
+
+
+def _entry_exists_at(parent_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
         return False
+    except OSError:
+        return True
+    return True
+
+
+def _regular_identity_at(parent_fd: int, name: str) -> tuple[int, int, int, int] | None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(current.st_mode):
+        return None
+    return current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size
 
 
 def _identity_without_hash(path: Path) -> tuple[int, int, int, int] | None:
+    """Untrusted pathname probe retained only as a pre-final-validation race hook."""
     try:
         current = path.stat(follow_symlinks=False)
     except OSError:
@@ -886,25 +937,51 @@ def _identity_without_hash(path: Path) -> tuple[int, int, int, int] | None:
     return current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size
 
 
-def _hash_open_regular(path: Path) -> tuple[tuple[int, int, int, int], str] | None:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _hash_open_regular_at(
+    parent_fd: int, name: str
+) -> tuple[tuple[int, int, int, int], str] | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags)
+        fd = os.open(name, flags, dir_fd=parent_fd)
     except OSError:
         return None
     try:
-        current = os.fstat(fd)
-        if not stat.S_ISREG(current.st_mode):
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
             return None
         digest = hashlib.sha256()
         while chunk := os.read(fd, 1024 * 1024):
             digest.update(chunk)
-        return (
-            (current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size),
-            digest.hexdigest(),
-        )
+        after = os.fstat(fd)
+        before_identity = (before.st_dev, before.st_ino, before.st_mtime_ns, before.st_size)
+        after_identity = (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_size)
+        if before_identity != after_identity:
+            return None
+        return after_identity, digest.hexdigest()
     finally:
         os.close(fd)
+
+
+def _rename_noreplace_at(parent_fd: int, source_name: str, quarantine_name: str) -> None:
+    """Atomically quarantine without ever replacing an existing claim (Linux renameat2)."""
+    renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable")
+    result = renameat2(
+        parent_fd,
+        os.fsencode(source_name),
+        parent_fd,
+        os.fsencode(quarantine_name),
+        1,  # RENAME_NOREPLACE
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), quarantine_name)
+
+
+def _restore_quarantine_at(parent_fd: int, quarantine_name: str, source_name: str) -> None:
+    with contextlib.suppress(OSError):
+        _rename_noreplace_at(parent_fd, quarantine_name, source_name)
 
 
 def _remove_claimed_file(claim: _CleanupClaim, root: Path) -> AttemptCleanupResult:
@@ -912,35 +989,51 @@ def _remove_claimed_file(claim: _CleanupClaim, root: Path) -> AttemptCleanupResu
     source = Path(claim.staged_path)
     quarantine = Path(claim.quarantine_path)
     expected = (claim.device, claim.inode, claim.mtime_ns, claim.size)
-    if quarantine.exists() or quarantine.is_symlink():
-        target = quarantine
-    elif source.exists() or source.is_symlink():
-        if not _path_is_contained_regular(source, root):
-            return AttemptCleanupResult.blocked
-        if _identity_without_hash(source) != expected:
-            return AttemptCleanupResult.blocked
-        try:
-            os.replace(source, quarantine)
-        except OSError:
-            return AttemptCleanupResult.retryable_failure
-        target = quarantine
-    else:
-        return AttemptCleanupResult.already_absent
-    if not _path_is_contained_regular(target, root):
-        return AttemptCleanupResult.blocked
-    current = _hash_open_regular(target)
-    if current is None or current != (expected, claim.sha256):
-        if not source.exists() and not source.is_symlink():
-            with contextlib.suppress(OSError):
-                os.replace(target, source)
-        return AttemptCleanupResult.blocked
-    if _identity_without_hash(target) != expected:
+    expected_content = (expected, claim.sha256)
+    parent_fd = _open_cleanup_parent(source, quarantine, root)
+    if parent_fd is None:
         return AttemptCleanupResult.blocked
     try:
-        target.unlink()
-    except OSError:
-        return AttemptCleanupResult.retryable_failure
-    return AttemptCleanupResult.removed
+        quarantine_identity = _regular_identity_at(parent_fd, quarantine.name)
+        if quarantine_identity is None:
+            if _entry_exists_at(parent_fd, quarantine.name):
+                return AttemptCleanupResult.blocked
+            source_identity = _identity_without_hash(source)
+            if source_identity is None:
+                return (
+                    AttemptCleanupResult.blocked
+                    if _entry_exists_at(parent_fd, source.name)
+                    else AttemptCleanupResult.already_absent
+                )
+            if (
+                source_identity != expected
+                or _regular_identity_at(parent_fd, source.name) != expected
+            ):
+                return AttemptCleanupResult.blocked
+            try:
+                _rename_noreplace_at(parent_fd, source.name, quarantine.name)
+            except FileExistsError:
+                return AttemptCleanupResult.blocked
+            except OSError:
+                return AttemptCleanupResult.retryable_failure
+
+        # Validate the quarantined claim once after the atomic move/recovery and
+        # once again immediately before unlink. Both reads are fd-bound and do
+        # not follow links; the pathname probe between them is not trusted.
+        if _hash_open_regular_at(parent_fd, quarantine.name) != expected_content:
+            _restore_quarantine_at(parent_fd, quarantine.name, source.name)
+            return AttemptCleanupResult.blocked
+        if _identity_without_hash(quarantine) != expected:
+            return AttemptCleanupResult.blocked
+        if _hash_open_regular_at(parent_fd, quarantine.name) != expected_content:
+            return AttemptCleanupResult.blocked
+        try:
+            os.unlink(quarantine.name, dir_fd=parent_fd)
+        except OSError:
+            return AttemptCleanupResult.retryable_failure
+        return AttemptCleanupResult.removed
+    finally:
+        os.close(parent_fd)
 
 
 async def _finish_file_claim(
