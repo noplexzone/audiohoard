@@ -9,6 +9,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - Run imported-source cleanup from startup in the background so stale cleanup obligations cannot keep the WebUI port closed during application startup.
+- Run startup terminal acquisition cleanup in the background after job recovery so provider/filesystem cleanup debt cannot keep the WebUI port closed.
 
 ## [0.25.0] - 2026-08-10
 
