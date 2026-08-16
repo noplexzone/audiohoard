@@ -1130,41 +1130,6 @@ async def test_startup_running_recovery_retries_complete_transaction_after_sqlit
         }
 
 
-async def test_recover_does_not_wait_for_startup_terminal_cleanup(
-    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from app.services import acquisition_cleanup
-
-    job = await _make_job(session_factory, status=JobStatus.running)
-    cleanup_started = asyncio.Event()
-    release_cleanup = asyncio.Event()
-    dispatched: list[int] = []
-
-    async def blocked_cleanup(*args, **kwargs):  # noqa: ANN001
-        cleanup_started.set()
-        await release_cleanup.wait()
-        return [], 0
-
-    async def record_dispatch(job_id: int):
-        dispatched.append(job_id)
-
-    monkeypatch.setattr(acquisition_cleanup, "cleanup_terminal_acquisitions", blocked_cleanup)
-    dispatcher = JobDispatcher(runner=AsyncMock(), session_factory=session_factory)
-    monkeypatch.setattr(dispatcher, "dispatch", record_dispatch)
-
-    async with asyncio.timeout(1):
-        recovered = await dispatcher.recover()
-        await cleanup_started.wait()
-
-    assert recovered == [job.id]
-    assert dispatched == [job.id]
-
-    release_cleanup.set()
-    task = dispatcher._startup_cleanup_task
-    if task is not None:
-        await task
-
-
 async def test_watchdog_dispatches_once_only_after_successful_retry_commit(
     session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -101,11 +101,12 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
     async with asyncio.timeout(1):
         async with main.lifespan(app):
             await started.wait()
-            await cleanup_started.wait()
             task = app.state.catalog_ownership_reconciliation_task
             cleanup_task = app.state.startup_imported_source_cleanup_task
             assert task.done() is False
+            assert cleanup_task is not None
             assert cleanup_task.done() is False
+            await cleanup_started.wait()
 
     assert task.cancelled()
     assert cleanup_task.cancelled() or cleanup_task.done()

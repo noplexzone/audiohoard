@@ -177,12 +177,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         name="catalog-ownership-startup-reconciliation",
     )
     app.state.catalog_ownership_reconciliation_task = ownership_task
-    startup_cleanup_task = schedule_imported_source_cleanup(
-        pending_cleanups,
-        complete_root=effective_settings.slskd_complete_root,
-        incomplete_root=effective_settings.slskd_incomplete_root,
-    )
-    app.state.startup_imported_source_cleanup_task = startup_cleanup_task
+    app.state.startup_imported_source_cleanup_task = None
     await job_dispatcher.recover()
     settings = get_settings()
     await job_dispatcher.start_watchdog(
@@ -199,6 +194,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await review_automation_scheduler.start()
     await health_status.start()
     await library_reconciliation.start()
+    startup_cleanup_task = schedule_imported_source_cleanup(
+        pending_cleanups,
+        complete_root=effective_settings.slskd_complete_root,
+        incomplete_root=effective_settings.slskd_incomplete_root,
+    )
+    app.state.startup_imported_source_cleanup_task = startup_cleanup_task
     try:
         yield
     finally:
