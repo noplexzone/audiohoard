@@ -58,7 +58,6 @@ class JobDispatcher:
         self._tasks: dict[int, asyncio.Task[None]] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
-        self._startup_cleanup_task: asyncio.Task[None] | None = None
 
     def _factory(self) -> async_sessionmaker[AsyncSession]:
         return self._session_factory or get_session_factory()
@@ -206,49 +205,6 @@ class JobDispatcher:
             await db.commit()
             return len(jobs)
 
-    async def _run_startup_terminal_cleanup(
-        self, factory: async_sessionmaker[AsyncSession]
-    ) -> None:
-        # Terminal cleanup can touch provider APIs and many filesystem paths. Do not
-        # hold application readiness hostage to stale cleanup debt; the periodic
-        # reconciler will keep retrying after startup completes.
-        try:
-            from app.config import get_settings
-            from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
-            from app.settings_service import build_effective_settings
-
-            async with factory() as cleanup_db:
-                settings = await build_effective_settings(cleanup_db, get_settings())
-            await cleanup_terminal_acquisitions(
-                factory,
-                slskd_url=settings.slskd_url,
-                slskd_api_key=settings.slskd_api_key,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Startup terminal acquisition cleanup failed")
-
-    def _schedule_startup_terminal_cleanup(
-        self, factory: async_sessionmaker[AsyncSession]
-    ) -> asyncio.Task[None]:
-        existing = self._startup_cleanup_task
-        if existing is not None and not existing.done():
-            return existing
-
-        task = asyncio.create_task(
-            self._run_startup_terminal_cleanup(factory),
-            name="startup-terminal-acquisition-cleanup",
-        )
-
-        def _clear(done_task: asyncio.Task[None]) -> None:
-            if self._startup_cleanup_task is done_task:
-                self._startup_cleanup_task = None
-
-        task.add_done_callback(_clear)
-        self._startup_cleanup_task = task
-        return task
-
     async def recover(
         self,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
@@ -320,9 +276,6 @@ class JobDispatcher:
                 recovered_ids[:] = attempt_ids
 
             await run_with_sqlite_lock_retry(db, recover_jobs)
-        # Queue terminal cleanup after interrupted jobs are safely recovered, but
-        # do not block application readiness on stale provider or filesystem debt.
-        self._schedule_startup_terminal_cleanup(factory)
         for job_id in recovered_ids:
             await self.dispatch(job_id)
         return recovered_ids
@@ -502,12 +455,6 @@ class JobDispatcher:
     async def shutdown(self) -> None:
         await self.stop_cleanup_reconciler()
         await self.stop_watchdog()
-        startup_cleanup_task = self._startup_cleanup_task
-        if startup_cleanup_task is not None and not startup_cleanup_task.done():
-            startup_cleanup_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await startup_cleanup_task
-        self._startup_cleanup_task = None
         tasks = list(self._tasks.values())
         for task in tasks:
             if not task.done():
