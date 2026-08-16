@@ -42,6 +42,7 @@ from app.routers import (
 from app.routers import catalog as catalog_router
 from app.routers import settings as settings_router
 from app.services.acquisition_cleanup import (
+    ImportedSourceCleanup,
     pending_imported_source_cleanups,
     prune_orphaned_terminal_records,
     schedule_imported_source_cleanup,
@@ -76,6 +77,7 @@ _TEMPLATES_DIR = files("app") / "templates"
 _STATIC_DIR = files("app") / "static"
 
 logger = logging.getLogger(__name__)
+STARTUP_IMPORTED_SOURCE_CLEANUP_DELAY_SECONDS = 5.0
 
 
 async def _reconcile_catalog_ownership_at_startup(settings: Settings) -> None:
@@ -93,6 +95,30 @@ async def _reconcile_catalog_ownership_at_startup(settings: Settings) -> None:
                 "Reconciled %d imported track catalog ownership record(s) at startup",
                 ownership_repairs,
             )
+
+
+async def _run_startup_imported_source_cleanup_after_ready(
+    pending_cleanups: tuple[ImportedSourceCleanup, ...],
+    *,
+    complete_root: Path | None,
+    incomplete_root: Path | None,
+) -> None:
+    try:
+        await asyncio.sleep(STARTUP_IMPORTED_SOURCE_CLEANUP_DELAY_SECONDS)
+        cleanup_task = schedule_imported_source_cleanup(
+            pending_cleanups,
+            complete_root=complete_root,
+            incomplete_root=incomplete_root,
+        )
+        if cleanup_task is not None:
+            await cleanup_task
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug(
+            "ignored failed delayed startup imported-source cleanup task",
+            exc_info=True,
+        )
 
 
 @asynccontextmanager
@@ -194,10 +220,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await review_automation_scheduler.start()
     await health_status.start()
     await library_reconciliation.start()
-    startup_cleanup_task = schedule_imported_source_cleanup(
-        pending_cleanups,
-        complete_root=effective_settings.slskd_complete_root,
-        incomplete_root=effective_settings.slskd_incomplete_root,
+    startup_cleanup_task = asyncio.create_task(
+        _run_startup_imported_source_cleanup_after_ready(
+            pending_cleanups,
+            complete_root=effective_settings.slskd_complete_root,
+            incomplete_root=effective_settings.slskd_incomplete_root,
+        ),
+        name="delayed-startup-imported-source-cleanup",
     )
     app.state.startup_imported_source_cleanup_task = startup_cleanup_task
     try:
@@ -206,12 +235,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await review_automation_scheduler.stop()
         await library_adoption_runner.stop()
         await library_reconciliation.stop()
-        startup_cleanup_task = getattr(app.state, "startup_imported_source_cleanup_task", None)
-        if startup_cleanup_task is not None and not startup_cleanup_task.done():
-            startup_cleanup_task.cancel()
-        if startup_cleanup_task is not None:
+        shutdown_cleanup_task = getattr(app.state, "startup_imported_source_cleanup_task", None)
+        if shutdown_cleanup_task is not None and not shutdown_cleanup_task.done():
+            shutdown_cleanup_task.cancel()
+        if shutdown_cleanup_task is not None:
             try:
-                await startup_cleanup_task
+                await shutdown_cleanup_task
             except asyncio.CancelledError:
                 pass
             except Exception:
