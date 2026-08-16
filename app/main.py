@@ -208,9 +208,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         startup_cleanup_task = getattr(app.state, "startup_imported_source_cleanup_task", None)
         if startup_cleanup_task is not None and not startup_cleanup_task.done():
             startup_cleanup_task.cancel()
-        with suppress(asyncio.CancelledError):
-            if startup_cleanup_task is not None:
+        if startup_cleanup_task is not None:
+            try:
                 await startup_cleanup_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug(
+                    "ignored failed startup imported-source cleanup task during shutdown",
+                    exc_info=True,
+                )
         if not ownership_task.done():
             ownership_task.cancel()
         with suppress(asyncio.CancelledError):
