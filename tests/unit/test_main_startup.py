@@ -106,7 +106,7 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
             assert task.done() is False
             assert cleanup_task is not None
             assert cleanup_task.done() is False
-            await cleanup_started.wait()
+            assert cleanup_started.is_set() is False
 
     assert task.cancelled()
     assert cleanup_task.cancelled() or cleanup_task.done()
