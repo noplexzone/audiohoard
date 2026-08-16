@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Run imported-source cleanup from startup in the background so stale cleanup obligations cannot keep the WebUI port closed during application startup.
+
 ## [0.25.0] - 2026-08-10
 
 ### Added
