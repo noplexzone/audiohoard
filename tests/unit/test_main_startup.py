@@ -28,6 +28,7 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
 ) -> None:
     factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
     started = asyncio.Event()
+    cleanup_started = asyncio.Event()
     startup_order: list[str] = []
 
     class _Reconciliation(_Service):
@@ -51,7 +52,10 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
             )
         ),
     )
-    monkeypatch.setattr(main, "pending_imported_source_cleanups", AsyncMock(return_value=[]))
+    pending_cleanup = SimpleNamespace(session_factory=factory)
+    monkeypatch.setattr(
+        main, "pending_imported_source_cleanups", AsyncMock(return_value=(pending_cleanup,))
+    )
 
     async def recover_deletions(*_args, **_kwargs) -> None:
         startup_order.append("recover")
@@ -70,7 +74,15 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
         AsyncMock(return_value=Settings(secret_key="test-secret")),
     )
     monkeypatch.setattr(main, "recover_approved_downloads", AsyncMock(return_value=0))
-    monkeypatch.setattr(main, "cleanup_imported_sources", AsyncMock())
+
+    def schedule_blocked_cleanup(*_args, **_kwargs):
+        async def blocked_cleanup() -> None:
+            cleanup_started.set()
+            await asyncio.Event().wait()
+
+        return asyncio.create_task(blocked_cleanup())
+
+    monkeypatch.setattr(main, "schedule_imported_source_cleanup", schedule_blocked_cleanup)
     monkeypatch.setattr(main, "reconcile_deezer_catalog_ownership", blocked_reconciliation)
     monkeypatch.setattr(main, "DiscographyRefreshScheduler", _Service)
     monkeypatch.setattr(main, "MaintenanceScheduler", _Service)
@@ -89,8 +101,12 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
     async with asyncio.timeout(1):
         async with main.lifespan(app):
             await started.wait()
+            await cleanup_started.wait()
             task = app.state.catalog_ownership_reconciliation_task
+            cleanup_task = app.state.startup_imported_source_cleanup_task
             assert task.done() is False
+            assert cleanup_task.done() is False
 
     assert task.cancelled()
+    assert cleanup_task.cancelled() or cleanup_task.done()
     assert startup_order == ["recover", "reconcile", "prune"]

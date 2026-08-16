@@ -42,9 +42,9 @@ from app.routers import (
 from app.routers import catalog as catalog_router
 from app.routers import settings as settings_router
 from app.services.acquisition_cleanup import (
-    cleanup_imported_sources,
     pending_imported_source_cleanups,
     prune_orphaned_terminal_records,
+    schedule_imported_source_cleanup,
     wait_for_imported_source_cleanups,
 )
 from app.services.acquisition_recovery import recover_approved_downloads
@@ -177,11 +177,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         name="catalog-ownership-startup-reconciliation",
     )
     app.state.catalog_ownership_reconciliation_task = ownership_task
-    await cleanup_imported_sources(
+    startup_cleanup_task = schedule_imported_source_cleanup(
         pending_cleanups,
         complete_root=effective_settings.slskd_complete_root,
         incomplete_root=effective_settings.slskd_incomplete_root,
     )
+    app.state.startup_imported_source_cleanup_task = startup_cleanup_task
     await job_dispatcher.recover()
     settings = get_settings()
     await job_dispatcher.start_watchdog(
@@ -204,6 +205,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await review_automation_scheduler.stop()
         await library_adoption_runner.stop()
         await library_reconciliation.stop()
+        startup_cleanup_task = getattr(app.state, "startup_imported_source_cleanup_task", None)
+        if startup_cleanup_task is not None and not startup_cleanup_task.done():
+            startup_cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            if startup_cleanup_task is not None:
+                await startup_cleanup_task
         if not ownership_task.done():
             ownership_task.cancel()
         with suppress(asyncio.CancelledError):

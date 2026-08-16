@@ -2501,10 +2501,17 @@ def _finish_imported_source_cleanup(task: asyncio.Task[None]) -> None:
 
 def schedule_imported_source_cleanup(
     items: tuple[ImportedSourceCleanup, ...],
+    *,
+    complete_root: Path | None = None,
+    incomplete_root: Path | None = None,
 ) -> asyncio.Task[None] | None:
     if not items:
         return None
-    task = asyncio.get_running_loop().create_task(cleanup_imported_sources(items))
+    task = asyncio.get_running_loop().create_task(
+        cleanup_imported_sources(
+            items, complete_root=complete_root, incomplete_root=incomplete_root
+        )
+    )
     _IMPORTED_SOURCE_CLEANUP_TASKS.add(task)
     task.add_done_callback(_finish_imported_source_cleanup)
     return task
