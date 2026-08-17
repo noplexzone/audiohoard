@@ -13,6 +13,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Delay startup imported-source cleanup work briefly after readiness so it cannot monopolize the event loop before Uvicorn starts serving.
 - Stop scheduling imported-source cleanup during the startup lifespan; periodic cleanup handles it after the WebUI is live.
 - Run startup library-file reconciliation in the background so large libraries cannot block the WebUI port.
+- Run startup database maintenance and job recovery in background tasks so they cannot block WebUI readiness.
 
 ## [0.25.0] - 2026-08-10
 

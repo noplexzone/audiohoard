@@ -104,6 +104,53 @@ async def _run_library_reconciliation_at_startup(
         logger.exception("Library file reconciliation failed at startup")
 
 
+async def _run_startup_database_maintenance(settings: Settings) -> None:
+    try:
+        async with get_session_factory()() as db:
+            pruned = await prune_orphaned_terminal_records(db)
+            if pruned.tracks or pruned.releases or pruned.jobs:
+                logger.info(
+                    "Pruned orphaned acquisition history at startup: "
+                    "%d track(s), %d release(s), %d job(s)",
+                    pruned.tracks,
+                    pruned.releases,
+                    pruned.jobs,
+                )
+            n = await reconcile_duplicate_catalog_artists(db)
+            release_snapshots = await reconcile_deezer_release_snapshots(db)
+            release_monitoring = await reconcile_release_monitoring(db)
+            await db.commit()
+            if n:
+                logger.info("Reconciled %d duplicate catalog artist(s) at startup", n)
+            if release_snapshots:
+                logger.info(
+                    "Reconciled %d superseded Deezer release snapshot(s) at startup",
+                    release_snapshots,
+                )
+            if release_monitoring:
+                logger.info(
+                    "Reconciled %d provider release monitoring state(s) at startup",
+                    release_monitoring,
+                )
+            repaired = await recover_approved_downloads(db, settings)
+            await db.commit()
+            if repaired:
+                logger.info("Recovered and imported %d approved release(s) at startup", repaired)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Startup database maintenance failed")
+
+
+async def _run_job_recovery_at_startup() -> None:
+    try:
+        await job_dispatcher.recover()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Job recovery failed at startup")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     scheduler = DiscographyRefreshScheduler()
@@ -154,43 +201,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         name="library-startup-reconciliation",
     )
     app.state.library_reconciliation_startup_task = library_reconciliation_startup_task
-    async with get_session_factory()() as db:
-        pruned = await prune_orphaned_terminal_records(db)
-        if pruned.tracks or pruned.releases or pruned.jobs:
-            logger.info(
-                "Pruned orphaned acquisition history at startup: "
-                "%d track(s), %d release(s), %d job(s)",
-                pruned.tracks,
-                pruned.releases,
-                pruned.jobs,
-            )
-        n = await reconcile_duplicate_catalog_artists(db)
-        release_snapshots = await reconcile_deezer_release_snapshots(db)
-        release_monitoring = await reconcile_release_monitoring(db)
-        await db.commit()
-        if n:
-            logger.info("Reconciled %d duplicate catalog artist(s) at startup", n)
-        if release_snapshots:
-            logger.info(
-                "Reconciled %d superseded Deezer release snapshot(s) at startup",
-                release_snapshots,
-            )
-        if release_monitoring:
-            logger.info(
-                "Reconciled %d provider release monitoring state(s) at startup",
-                release_monitoring,
-            )
-        repaired = await recover_approved_downloads(db, effective_settings)
-        await db.commit()
-        if repaired:
-            logger.info("Recovered and imported %d approved release(s) at startup", repaired)
+    startup_database_maintenance_task = asyncio.create_task(
+        _run_startup_database_maintenance(effective_settings),
+        name="startup-database-maintenance",
+    )
+    app.state.startup_database_maintenance_task = startup_database_maintenance_task
     ownership_task = asyncio.create_task(
         _reconcile_catalog_ownership_at_startup(effective_settings),
         name="catalog-ownership-startup-reconciliation",
     )
     app.state.catalog_ownership_reconciliation_task = ownership_task
     app.state.startup_imported_source_cleanup_task = None
-    await job_dispatcher.recover()
+    job_recovery_task = asyncio.create_task(
+        _run_job_recovery_at_startup(),
+        name="startup-job-recovery",
+    )
+    app.state.startup_job_recovery_task = job_recovery_task
     settings = get_settings()
     await job_dispatcher.start_watchdog(
         threshold_seconds=settings.job_watchdog_threshold_seconds,
@@ -217,10 +243,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ownership_task.cancel()
         with suppress(asyncio.CancelledError):
             await ownership_task
-        if not library_reconciliation_startup_task.done():
-            library_reconciliation_startup_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await library_reconciliation_startup_task
+        for startup_task in (
+            library_reconciliation_startup_task,
+            startup_database_maintenance_task,
+            job_recovery_task,
+        ):
+            if not startup_task.done():
+                startup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await startup_task
         await health_status.stop()
         await quality_upgrade_scheduler.stop()
         await maintenance_scheduler.stop()
