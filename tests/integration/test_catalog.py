@@ -536,6 +536,37 @@ async def test_wanted_queue_all_enqueues_every_listed_release(
     }
 
 
+async def test_wanted_queue_all_matching_enqueues_beyond_current_page(
+    client: AsyncClient, monkeypatch
+) -> None:
+    ids = await _seed_wanted_view_releases()
+    page = await client.get("/wanted?per_page=1")
+    assert page.status_code == 200
+    assert "Queue all 2 wanted" in page.text
+    dispatched: list[int] = []
+
+    async def fake_dispatch(job_id: int) -> None:
+        dispatched.append(job_id)
+
+    monkeypatch.setattr("app.routers.catalog.job_dispatcher.dispatch", fake_dispatch)
+
+    response = await client.post(
+        "/wanted/queue",
+        data={"queue_scope": "all_matching", "sort": "year"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        jobs = list((await session.execute(select(Job).where(Job.id.in_(dispatched)))).scalars())
+    assert {job.catalog_album_id for job in jobs} == {ids["partial"], ids["second_partial"]}
+    assert {job.catalog_track_id for job in jobs} == {
+        ids["partial_missing"],
+        ids["second_partial_missing"],
+    }
+
+
 async def test_settings_icon_is_a_conventional_gear(client: AsyncClient) -> None:
     resp = await client.get("/library")
     assert '<symbol id="i-settings"' in resp.text

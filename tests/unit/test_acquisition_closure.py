@@ -1494,3 +1494,29 @@ async def test_persisted_quarantine_with_replaced_inode_is_rejected(
     assert replacement == b"replacement"
     await db_session.refresh(plan)
     assert plan.staging_path == str(quarantine)
+
+
+def test_select_best_folder_rejects_disabled_formats_with_strict_profile() -> None:
+    from app.services.slskd_scoring import AlbumFolder, SlskdFile, select_best_folder
+
+    folders = [
+        AlbumFolder(
+            username="peer",
+            parent_dir="Artist/Album",
+            audio_format="ogg",
+            files=[SlskdFile("Artist/Album/01 - Track.ogg", None, None, None)],
+        )
+    ]
+
+    assert (
+        select_best_folder(
+            folders,
+            catalog_track_count=1,
+            catalog_artist="Artist",
+            catalog_album="Album",
+            format_preference=["flac", "mp3"],
+            min_mp3_bitrate=320,
+            allow_lower_quality_fallback=False,
+        )
+        is None
+    )

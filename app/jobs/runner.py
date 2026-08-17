@@ -1944,6 +1944,9 @@ async def _fetch_slskd_album_results(
 
     qp = getattr(runtime, "quality_profile", None)
     format_pref = list(qp.format_preference) if qp else ["flac", "mp3"]
+    enabled_formats = list(getattr(qp, "enabled_formats", format_pref)) if qp else format_pref
+    enabled_set = set(enabled_formats)
+    scoring_formats = [fmt for fmt in format_pref if fmt in enabled_set] or enabled_formats
     min_bitrate = int(qp.min_mp3_bitrate) if qp else 192
     allow_fallback = bool(qp.allow_lower_quality_fallback) if qp else True
 
@@ -1957,7 +1960,7 @@ async def _fetch_slskd_album_results(
         catalog_track_count=catalog_track_count,
         catalog_artist=catalog_artist,
         catalog_album=catalog_album.title,
-        format_preference=format_pref,
+        format_preference=scoring_formats,
         min_mp3_bitrate=min_bitrate,
         allow_lower_quality_fallback=allow_fallback,
     )

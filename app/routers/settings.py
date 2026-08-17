@@ -540,6 +540,15 @@ async def save_runtime_settings_page(
             "yes",
             "on",
         }
+        enabled_formats = [str(v) for v in form.getlist("enabled_formats")]
+        if not enabled_formats or not set(enabled_formats).issubset(
+            set(DEFAULT_FORMAT_PREFERENCE)
+        ):
+            return RedirectResponse(
+                "/settings/quality?error=Enable+at+least+one+supported+format",
+                status_code=303,
+            )
+        enabled_formats = [fmt for fmt in fmt_order if fmt in set(enabled_formats)]
         try:
             max_partial = int(str(form.get("max_partial_attempts", runtime.max_partial_attempts)))
         except ValueError:
@@ -555,6 +564,7 @@ async def save_runtime_settings_page(
             format_preference=fmt_order or list(DEFAULT_FORMAT_PREFERENCE),
             min_mp3_bitrate=min_mp3,
             allow_lower_quality_fallback=allow_fallback,
+            enabled_formats=enabled_formats,
         )
         max_partial_val: int = max_partial
     else:

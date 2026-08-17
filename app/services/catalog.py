@@ -68,7 +68,12 @@ def track_meets_quality(file_format: str | None, profile: QualityProfile) -> boo
     family = _format_family(file_format)
     if not family:
         return True
-    preferred = [_format_family(value) for value in profile.format_preference]
+    enabled = [_format_family(value) for value in profile.enabled_formats]
+    preferred = [
+        _format_family(value)
+        for value in profile.format_preference
+        if _format_family(value) in enabled
+    ]
     if family not in preferred:
         return False
     best_family = next((value for value in preferred if value), "")
@@ -1458,17 +1463,7 @@ async def get_library_artists_page(
     return Page(items=items, total=total, page=page, per_page=per_page)
 
 
-async def get_missing_releases_page(
-    db: AsyncSession,
-    *,
-    q: str = "",
-    sort: str = "year",
-    status: str = "all",
-    page: int = 1,
-    per_page: int = _DEFAULT_PAGE_SIZE,
-) -> Page[MissingReleaseRow]:
-    per_page = _clamp_per_page(per_page)
-    page = max(1, page)
+def _missing_releases_query(q: str = "", status: str = "all") -> Any:
     manifest_count = (
         select(func.count(CatalogAlbumTrack.id))
         .where(CatalogAlbumTrack.album_id == CatalogAlbum.id)
@@ -1530,7 +1525,7 @@ async def get_missing_releases_page(
                 or_(latest_job_status.is_(None), latest_job_status == JobStatus.done),
             )
         )
-    rows_query = (
+    return (
         select(
             CatalogAlbum.id.label("album_id"),
             CatalogArtist.name.label("artist_name"),
@@ -1543,17 +1538,47 @@ async def get_missing_releases_page(
         .join(CatalogArtist, CatalogArtist.id == CatalogAlbum.artist_id)
         .where(*filters)
     )
-    total = int((await db.scalar(select(func.count()).select_from(rows_query.subquery()))) or 0)
-    page = _clamp_page(page, total, per_page)
+
+
+def _sort_missing_releases_query(stmt: Any, sort: str) -> Any:
     valid_sort = sort if sort in {"year", "artist", "title"} else "year"
     if valid_sort == "artist":
-        rows_query = rows_query.order_by(CatalogArtist.name, CatalogAlbum.title, CatalogAlbum.id)
-    elif valid_sort == "title":
-        rows_query = rows_query.order_by(CatalogAlbum.title, CatalogArtist.name, CatalogAlbum.id)
-    else:
-        rows_query = rows_query.order_by(
-            CatalogAlbum.year.desc(), CatalogArtist.name, CatalogAlbum.title, CatalogAlbum.id
-        )
+        return stmt.order_by(CatalogArtist.name, CatalogAlbum.title, CatalogAlbum.id)
+    if valid_sort == "title":
+        return stmt.order_by(CatalogAlbum.title, CatalogArtist.name, CatalogAlbum.id)
+    return stmt.order_by(
+        CatalogAlbum.year.desc(), CatalogArtist.name, CatalogAlbum.title, CatalogAlbum.id
+    )
+
+
+async def get_missing_release_ids(
+    db: AsyncSession,
+    *,
+    q: str = "",
+    sort: str = "year",
+    status: str = "all",
+    limit: int = 10_000,
+) -> list[int]:
+    stmt = _sort_missing_releases_query(_missing_releases_query(q, status), sort)
+    rows = await db.scalars(select(stmt.subquery().c.album_id).limit(max(1, min(limit, 10_000))))
+    return [int(album_id) for album_id in rows.all()]
+
+
+async def get_missing_releases_page(
+    db: AsyncSession,
+    *,
+    q: str = "",
+    sort: str = "year",
+    status: str = "all",
+    page: int = 1,
+    per_page: int = _DEFAULT_PAGE_SIZE,
+) -> Page[MissingReleaseRow]:
+    per_page = _clamp_per_page(per_page)
+    page = max(1, page)
+    rows_query = _missing_releases_query(q, status)
+    total = int((await db.scalar(select(func.count()).select_from(rows_query.subquery()))) or 0)
+    page = _clamp_page(page, total, per_page)
+    rows_query = _sort_missing_releases_query(rows_query, sort)
     rows = (
         await db.execute(rows_query.offset(_page_offset(page, per_page)).limit(per_page))
     ).mappings()

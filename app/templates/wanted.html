@@ -43,7 +43,16 @@
     {% endfor %}
     <button type="submit" class="btn" data-queue-all data-confirm="Queue every release shown on this page?">Queue this page</button>
   </form>
+  <form id="wanted-all-matching-form" method="post" action="/wanted/queue">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="queue_scope" value="all_matching">
+    <input type="hidden" name="q" value="{{ q }}">
+    <input type="hidden" name="sort" value="{{ sort }}">
+    <input type="hidden" name="status" value="{{ status }}">
+    <button type="submit" class="btn danger" data-queue-all-matching data-confirm="Queue all {{ releases.total }} releases matching the current filters?">Queue all {{ releases.total }} wanted</button>
+  </form>
 </div>
+<div class="hint bulk-action-hint">Bulk requests only create pending jobs; the dispatcher still obeys the Parallel searches and downloads limit in Settings.</div>
 <div class="album-grid" role="list" aria-label="Wanted releases">
   {% for release in releases.items %}
   <article class="album-card" role="listitem">
