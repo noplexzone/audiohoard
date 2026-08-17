@@ -34,6 +34,7 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
     class _Reconciliation(_Service):
         async def startup_reconcile(self) -> int:
             startup_order.append("reconcile")
+            await asyncio.Event().wait()
             return 0
 
     async def blocked_reconciliation(*_args, **_kwargs) -> int:
@@ -97,10 +98,13 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
         async with main.lifespan(app):
             await started.wait()
             task = app.state.catalog_ownership_reconciliation_task
+            library_task = app.state.library_reconciliation_startup_task
             cleanup_task = app.state.startup_imported_source_cleanup_task
             assert task.done() is False
+            assert library_task.done() is False
             assert cleanup_task is None
             assert cleanup_started.is_set() is False
 
     assert task.cancelled()
-    assert startup_order == ["recover", "reconcile", "prune"]
+    assert library_task.cancelled()
+    assert startup_order == ["recover", "prune", "reconcile"]

@@ -93,6 +93,17 @@ async def _reconcile_catalog_ownership_at_startup(settings: Settings) -> None:
             )
 
 
+async def _run_library_reconciliation_at_startup(
+    library_reconciliation: LibraryReconciliationService,
+) -> None:
+    try:
+        await library_reconciliation.startup_reconcile()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Library file reconciliation failed at startup")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     scheduler = DiscographyRefreshScheduler()
@@ -138,7 +149,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         get_session_factory(), effective_settings.library_root
     )
     app.state.library_reconciliation_service = library_reconciliation
-    await library_reconciliation.startup_reconcile()
+    library_reconciliation_startup_task = asyncio.create_task(
+        _run_library_reconciliation_at_startup(library_reconciliation),
+        name="library-startup-reconciliation",
+    )
+    app.state.library_reconciliation_startup_task = library_reconciliation_startup_task
     async with get_session_factory()() as db:
         pruned = await prune_orphaned_terminal_records(db)
         if pruned.tracks or pruned.releases or pruned.jobs:
@@ -202,6 +217,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ownership_task.cancel()
         with suppress(asyncio.CancelledError):
             await ownership_task
+        if not library_reconciliation_startup_task.done():
+            library_reconciliation_startup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await library_reconciliation_startup_task
         await health_status.stop()
         await quality_upgrade_scheduler.stop()
         await maintenance_scheduler.stop()
