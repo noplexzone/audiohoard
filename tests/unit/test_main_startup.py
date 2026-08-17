@@ -55,10 +55,11 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
     )
 
     async def recover_deletions(*_args, **_kwargs) -> None:
-        startup_order.append("recover")
+        startup_order.append("recover-deletions")
 
     async def prune(_db):
         startup_order.append("prune")
+        await asyncio.Event().wait()
         return SimpleNamespace(tracks=0, releases=0, jobs=0)
 
     monkeypatch.setattr(main, "recover_deletion_operations", recover_deletions)
@@ -99,12 +100,15 @@ async def test_startup_ownership_reconciliation_does_not_delay_readiness(
             await started.wait()
             task = app.state.catalog_ownership_reconciliation_task
             library_task = app.state.library_reconciliation_startup_task
+            maintenance_task = app.state.startup_database_maintenance_task
             cleanup_task = app.state.startup_imported_source_cleanup_task
             assert task.done() is False
             assert library_task.done() is False
+            assert maintenance_task.done() is False
             assert cleanup_task is None
             assert cleanup_started.is_set() is False
 
     assert task.cancelled()
     assert library_task.cancelled()
-    assert startup_order == ["recover", "prune", "reconcile"]
+    assert maintenance_task.cancelled()
+    assert startup_order == ["recover-deletions", "reconcile", "prune"]
