@@ -752,6 +752,8 @@ async def test_quality_profile_renders_shipped_defaults_and_supported_controls(
     assert '<option value="256"' in body
     assert '<option value="320" selected' in body
     assert 'name="allow_lower_quality_fallback"' in body
+    assert 'name="enabled_formats" value="flac" checked' in body
+    assert "MP3-320 or better" in body
     assert "lyrics sidecars are always excluded" in body
 
 
@@ -766,6 +768,7 @@ async def test_quality_profile_form_persists_order_bitrate_and_fallback(
             "format_order": ["mp3", "flac", "m4a/aac", "ogg", "opus"],
             "min_mp3_bitrate": "256",
             "allow_lower_quality_fallback": "true",
+            "enabled_formats": ["mp3", "flac"],
             "max_partial_attempts": "3",
         },
         follow_redirects=False,
@@ -777,6 +780,8 @@ async def test_quality_profile_form_persists_order_bitrate_and_fallback(
     assert page.text.index('value="mp3"') < page.text.index('value="flac"')
     assert '<option value="256" selected' in page.text
     assert 'name="allow_lower_quality_fallback" value="true" checked' in page.text
+    assert 'name="enabled_formats" value="mp3" checked' in page.text
+    assert 'name="enabled_formats" value="ogg" checked' not in page.text
 
 
 @pytest.mark.asyncio
@@ -789,6 +794,7 @@ async def test_quality_profile_rejects_invalid_bitrate_instead_of_clamping(
             "section": "quality",
             "format_order": ["flac", "mp3", "m4a/aac", "ogg", "opus"],
             "min_mp3_bitrate": "255",
+            "enabled_formats": ["flac", "mp3"],
             "max_partial_attempts": "3",
         },
         follow_redirects=False,

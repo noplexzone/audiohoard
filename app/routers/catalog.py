@@ -45,6 +45,7 @@ from app.services.catalog import (
     get_artist_detail,
     get_library_artists_page,
     get_library_stats,
+    get_missing_release_ids,
     get_missing_releases_page,
     get_release_progress,
     list_distinct_formats,
@@ -1576,9 +1577,16 @@ async def queue_wanted_releases(
     settings: Annotated[Settings, Depends(effective_settings_dep)],
     _user: Annotated[object, Depends(require_mutation)],
     catalog_album_ids: Annotated[list[int] | None, Form()] = None,
+    queue_scope: Annotated[str, Form()] = "selected",
+    q: Annotated[str, Form()] = "",
+    sort: Annotated[str, Form()] = "year",
+    status: Annotated[str, Form()] = "all",
     request: Request = None,  # type: ignore[assignment]
 ) -> Response:
-    selected_ids = list(dict.fromkeys(catalog_album_ids or []))
+    if queue_scope == "all_matching":
+        selected_ids = await get_missing_release_ids(db, q=q, sort=sort, status=status)
+    else:
+        selected_ids = list(dict.fromkeys(catalog_album_ids or []))
     if not selected_ids:
         return _wanted_queue_response(request, queued=0, album_ids=[])
     runtime = await get_runtime_settings(db)

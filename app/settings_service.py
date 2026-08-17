@@ -64,6 +64,7 @@ DEFAULT_MAX_PARALLEL_ACQUISITIONS = 3
 SUPPORTED_FORMAT_PREFERENCES: tuple[str, ...] = ("flac", "mp3", "m4a/aac", "ogg", "opus")
 DEFAULT_FORMAT_PREFERENCE: list[str] = list(SUPPORTED_FORMAT_PREFERENCES)
 ALLOWED_MIN_MP3_BITRATES: frozenset[int] = frozenset({192, 256, 320})
+DEFAULT_ENABLED_FORMATS: list[str] = list(SUPPORTED_FORMAT_PREFERENCES)
 DEFAULT_MIN_MP3_BITRATE = 320
 DEFAULT_ALLOW_LOWER_QUALITY_FALLBACK = True
 DEFAULT_MAX_PARTIAL_ATTEMPTS = 3
@@ -77,6 +78,9 @@ class QualityProfile:
     format_preference: list[str]
     min_mp3_bitrate: int
     allow_lower_quality_fallback: bool
+    enabled_formats: list[str] = dataclasses_field(
+        default_factory=lambda: list(DEFAULT_ENABLED_FORMATS)
+    )
 
 
 def normalize_format_preference(raw: object) -> list[str]:
@@ -93,6 +97,25 @@ def normalize_format_preference(raw: object) -> list[str]:
         if value not in normalized:
             normalized.append(value)
     return normalized
+
+
+def normalize_enabled_formats(raw: object, preference: list[str]) -> list[str]:
+    """Return enabled canonical formats in preference order.
+
+    Legacy settings did not have an enabled-format list, so invalid or missing
+    input keeps every supported format enabled.
+    """
+    if not isinstance(raw, list):
+        return [value for value in preference if value in SUPPORTED_FORMAT_PREFERENCES]
+    enabled: set[str] = set()
+    for item in raw:
+        value = str(item).strip().casefold()
+        if value in {"m4a", "aac", "m4a/aac"}:
+            value = "m4a/aac"
+        if value in SUPPORTED_FORMAT_PREFERENCES:
+            enabled.add(value)
+    ordered = [value for value in preference if value in enabled]
+    return ordered or ["flac", "mp3"]
 
 
 @dataclass(frozen=True)
@@ -265,6 +288,7 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
     if not isinstance(quality_raw, dict):
         quality_raw = {}
     fmt_pref = normalize_format_preference(quality_raw.get("format_preference"))
+    enabled_formats = normalize_enabled_formats(quality_raw.get("enabled_formats"), fmt_pref)
     try:
         min_mp3 = int(quality_raw.get("min_mp3_bitrate", DEFAULT_MIN_MP3_BITRATE))
     except (TypeError, ValueError):
@@ -313,6 +337,7 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
             format_preference=fmt_pref,
             min_mp3_bitrate=min_mp3,
             allow_lower_quality_fallback=allow_fallback,
+            enabled_formats=enabled_formats,
         ),
         max_partial_attempts=max(1, min(max_partial, 10)),
         acoustid_acceptance_threshold=max(0.5, min(acoustid_threshold, 0.9999)),
@@ -381,6 +406,7 @@ async def save_runtime_settings(
     )
     if qp.min_mp3_bitrate not in ALLOWED_MIN_MP3_BITRATES:
         raise ValueError("Minimum MP3 bitrate must be 192, 256, or 320 kbps")
+    enabled_formats = normalize_enabled_formats(qp.enabled_formats, qp.format_preference)
     existing_region = await db.get(AppSetting, "discovery_region")
     region = discovery_region or (
         existing_region.value if existing_region is not None else DEFAULT_DISCOVERY_REGION
@@ -445,6 +471,7 @@ async def save_runtime_settings(
                 "format_preference": normalize_format_preference(qp.format_preference),
                 "min_mp3_bitrate": qp.min_mp3_bitrate,
                 "allow_lower_quality_fallback": qp.allow_lower_quality_fallback,
+                "enabled_formats": enabled_formats,
             }
         ),
         "max_partial_attempts": str(
