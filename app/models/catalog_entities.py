@@ -98,6 +98,11 @@ class CatalogAlbum(Base):
         String(16), nullable=False, default="unknown", server_default="unknown"
     )
     upc: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    album_artist_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    album_artist_provider_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    is_compilation: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
     providers_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     provenance_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     monitored: Mapped[bool] = mapped_column(
@@ -230,6 +235,8 @@ class CatalogAlbumTrack(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     duration_sec: Mapped[int | None] = mapped_column(Integer, nullable=True)
     recording_mbid: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    artist_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    artist_provider_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     content_rating: Mapped[str] = mapped_column(
         String(16), nullable=False, default="unknown", server_default="unknown"
     )

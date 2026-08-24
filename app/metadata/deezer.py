@@ -520,6 +520,9 @@ def _parse_album_track(data: dict[str, object]) -> AlbumTrack:
     artist_name = (
         str(artist.get("name") or "").strip() or None if isinstance(artist, dict) else None
     )
+    artist_provider_id = (
+        str(artist.get("id") or "").strip() or None if isinstance(artist, dict) else None
+    )
     return AlbumTrack(
         position=_to_int(data.get("track_position") or data.get("position")) or 1,
         disc=_to_int(data.get("disk_number")) or 1,
@@ -528,5 +531,6 @@ def _parse_album_track(data: dict[str, object]) -> AlbumTrack:
         provider_track_id=tid,
         preview_url=str(data.get("preview") or "") or None,
         artist_name=artist_name,
+        artist_provider_id=artist_provider_id,
         content_rating=deezer_content_rating(data),
     )

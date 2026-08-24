@@ -30,6 +30,7 @@ from app.models.staging_review import StagingReviewItem
 from app.models.track import Track
 from app.models.workflow import AcquisitionState, ImportWorkflowState, ReviewDecision
 from app.naming.convention import _sanitize_segment
+from app.services.catalog_artist_credits import catalog_track_artist_name
 from app.services.release_editions import project_release_families
 from app.settings_service import QualityProfile, get_runtime_settings
 
@@ -789,17 +790,11 @@ async def queue_catalog_album_missing_track_jobs(
         for track in tracks_to_queue
         if track.id is not None and (track.id not in imported_ids or track.id in subquality_ids)
     ]
-    artist_name = (
-        await db.scalar(
-            select(CatalogArtist.name)
-            .join(CatalogAlbum, CatalogAlbum.artist_id == CatalogArtist.id)
-            .where(CatalogAlbum.id == album.id)
-        )
-        or ""
-    )
     job_specs = [
         (
-            " ".join(part for part in (artist_name, track.title) if part),
+            " ".join(
+                part for part in (catalog_track_artist_name(album, track), track.title) if part
+            ),
             album.id,
             track.id,
         )

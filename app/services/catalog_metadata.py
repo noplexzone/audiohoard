@@ -544,6 +544,12 @@ def _apply_album_hit(
     ):
         album.content_rating = incoming_rating
     album.upc = album.upc or hit.upc
+    if hit.artist_name:
+        album.album_artist_name = hit.artist_name
+    if hit.artist_provider_id:
+        album.album_artist_provider_id = hit.artist_provider_id
+    if normalize_release_kind(hit) == "compilation":
+        album.is_compilation = True
     if hit.track_count and album.track_count is None:
         album.track_count = hit.track_count
     album.itunes_id = album.itunes_id or ids["itunes_id"]
@@ -683,6 +689,8 @@ async def fetch_and_store_album(
                     title=provider_track.title,
                     duration_sec=provider_track.duration_sec,
                     recording_mbid=provider_track.recording_mbid,
+                    artist_name=provider_track.artist_name,
+                    artist_provider_id=provider_track.artist_provider_id,
                     content_rating=normalize_content_rating(provider_track.content_rating),
                 )
             )
@@ -692,6 +700,10 @@ async def fetch_and_store_album(
         existing.title = provider_track.title
         existing.duration_sec = provider_track.duration_sec
         existing.recording_mbid = provider_track.recording_mbid or existing.recording_mbid
+        existing.artist_name = provider_track.artist_name or existing.artist_name
+        existing.artist_provider_id = (
+            provider_track.artist_provider_id or existing.artist_provider_id
+        )
         incoming_rating = normalize_content_rating(provider_track.content_rating)
         if (
             normalize_content_rating(existing.content_rating) == CONTENT_RATING_UNKNOWN
