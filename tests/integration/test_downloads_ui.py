@@ -33,10 +33,30 @@ async def test_downloads_show_state_details_and_valid_actions(client: AsyncClien
                 ),
             ),
             Job(source="priority", query="incomplete", status=JobStatus.partial),
+            Job(
+                source="slskd",
+                query="lost forever",
+                status=JobStatus.failed,
+                result_json=json.dumps(
+                    {
+                        "error": {
+                            "code": "dispatch_lost",
+                            "detail": "Dispatcher lost this job after recovery",
+                            "retryable": False,
+                        }
+                    }
+                ),
+            ),
+            Job(
+                source="slskd",
+                query="watchdog recovered",
+                status=JobStatus.running,
+                result_json=json.dumps({"watchdog_recovery": {"attempt": 1}}),
+            ),
         ]
         db.add_all(jobs)
         await db.commit()
-        running_id, failed_id, partial_id = (job.id for job in jobs)
+        running_id, failed_id, partial_id, nonretryable_id, watchdog_id = (job.id for job in jobs)
 
     response = await client.get("/downloads")
 
@@ -46,6 +66,10 @@ async def test_downloads_show_state_details_and_valid_actions(client: AsyncClien
     assert f'action="/downloads/{running_id}/cancel"' in response.text
     assert f'action="/downloads/{failed_id}/retry"' in response.text
     assert f'action="/downloads/{partial_id}/retry"' in response.text
+    assert f'action="/downloads/{nonretryable_id}/retry"' not in response.text
+    assert "Automatic retry disabled" in response.text
+    assert "Recovered after dispatcher stall; queued again by watchdog." in response.text
+    assert f'action="/downloads/{watchdog_id}/cancel"' in response.text
     assert 'aria-live="polite"' in response.text
 
     filtered = await client.get("/downloads?status=partial")

@@ -109,7 +109,11 @@
           <form method="post" action="/downloads/{{ group.action_attempt.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Cancel</button></form>
           {% elif group.action_attempt and group.action_attempt.status.value in ['failed', 'partial', 'cancelled'] %}
           <a class="btn secondary" href="/search?tab=advanced&amp;artist={{ (group.artist_name or '') | urlencode }}&amp;album={{ (group.album_title or group.label) | urlencode }}">Manual search</a>
+          {% if group.action_retryable %}
           <form method="post" action="/downloads/{{ group.action_attempt.id }}/retry"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Retry</button></form>
+          {% else %}
+          <span class="hint action-note">Automatic retry disabled</span>
+          {% endif %}
           {% endif %}
           {% if group.attempts | length == 1 and status in ['done', 'failed', 'partial', 'cancelled'] %}
           <form method="post" action="/downloads/{{ download.id }}/remove" data-confirm="Remove this download from the queue?"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><button class="btn secondary" type="submit">Remove</button></form>
@@ -126,7 +130,7 @@
             <section class="download-attempt" aria-label="Attempt {{ attempt_job.id }}">
             <p><code>#{{ attempt_job.id }}</code> · <span class="badge info">{{ attempt.source_display }}</span> · <strong>{{ attempt_job.status.value }}</strong><br><span class="hint">{{ attempt_job.query }}</span></p>
             {% if meta.error_summary %}<div class="download-error-chips" aria-label="Attempt errors">{% for error in meta.error_summary %}<span class="download-error-chip" title="{{ error.code }}"><strong>{{ error.label }}</strong>{% if error.count > 1 %}<span class="download-error-count">×{{ error.count }}</span>{% endif %}{% if error.detail %}<span class="download-error-detail">{{ error.detail }}</span>{% endif %}</span>{% endfor %}</div>{% endif %}
-            {% if meta.recovery %}<p class="alert compact">Recovered after {{ meta.recovery.code | replace('_', ' ') }}.</p>{% endif %}
+            {% if meta.recovery_notice %}<p class="alert compact">{{ meta.recovery_notice }}</p>{% endif %}
             {% if meta.tracks_created is defined %}<p class="hint">Tracks created: {{ meta.tracks_created }}</p>{% endif %}
             {% if meta.missing_tracks %}<p class="hint">Missing: {{ meta.missing_tracks | join(', ') }}</p>{% endif %}
             {% if attempt_job.tracks %}

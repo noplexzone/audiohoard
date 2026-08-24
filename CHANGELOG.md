@@ -12,6 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Hide automatic Retry controls for non-retryable download failures and show explicit restart/watchdog recovery notices in the Downloads queue.
 - Run imported-source cleanup from startup in the background so stale cleanup obligations cannot keep the WebUI port closed during application startup.
 - Defer startup cleanup scheduling until the app has finished starting so cleanup debt cannot run before the WebUI becomes reachable.
 - Delay startup imported-source cleanup work briefly after readiness so it cannot monopolize the event loop before Uvicorn starts serving.
