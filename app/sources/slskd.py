@@ -372,29 +372,39 @@ class SlskdAdapter:
     async def downloads(self, *, force_refresh: bool = False) -> list[dict[str, object]]:
         """Return a short-lived, configuration-isolated downloads snapshot."""
         key = self._download_snapshot_key()
-        snapshot = _download_snapshots.get(key)
-        if snapshot is None or (force_refresh and snapshot.in_flight is None):
-            snapshot = _DownloadSnapshot()
-            _download_snapshots[key] = snapshot
-        if snapshot.downloads is not None and _monotonic() < snapshot.expires_at:
-            return snapshot.downloads
+        while True:
+            snapshot = _download_snapshots.get(key)
+            if snapshot is None or (force_refresh and snapshot.in_flight is None):
+                snapshot = _DownloadSnapshot()
+                _download_snapshots[key] = snapshot
+            if snapshot.downloads is not None and _monotonic() < snapshot.expires_at:
+                return snapshot.downloads
 
-        task = snapshot.in_flight
-        if task is None:
-            task = asyncio.create_task(self._fetch_downloads())
-            snapshot.in_flight = task
-        try:
-            downloads = await asyncio.shield(task)
-        except BaseException:
-            if task.done() and _download_snapshots.get(key) is snapshot:
-                _download_snapshots.pop(key)
-            raise
+            task = snapshot.in_flight
+            if task is None:
+                task = asyncio.create_task(self._fetch_downloads())
+                snapshot.in_flight = task
+            try:
+                downloads = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if _download_snapshots.get(key) is not snapshot:
+                    force_refresh = True
+                    continue
+                if task.done():
+                    _download_snapshots.pop(key)
+                raise
 
-        if _download_snapshots.get(key) is snapshot:
+            if _download_snapshots.get(key) is not snapshot:
+                # An enqueue or removal displaced this generation while the GET was
+                # in flight. Retry so this caller cannot return a pre-mutation queue.
+                force_refresh = True
+                continue
             snapshot.downloads = downloads
             snapshot.expires_at = _monotonic() + _DOWNLOAD_SNAPSHOT_TTL_SEC
             snapshot.in_flight = None
-        return downloads
+            return downloads
 
     async def status(self, transfer_id: str, *, force_refresh: bool = False) -> CapabilityState:
         for item in await self.downloads(force_refresh=force_refresh):
