@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from importlib.resources import files
 from pathlib import Path
 from typing import Annotated
@@ -151,6 +151,56 @@ async def _run_job_recovery_at_startup() -> None:
         logger.exception("Job recovery failed at startup")
 
 
+async def _start_background_services(
+    starters: tuple[tuple[str, Callable[[], Awaitable[None]]], ...],
+) -> None:
+    for service_name, start_service in starters:
+        try:
+            await start_service()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to start background service %s", service_name)
+
+
+async def _run_startup_recovery_pipeline(
+    settings: Settings,
+    library_reconciliation: LibraryReconciliationService,
+    start_background_services: Callable[[], Awaitable[None]],
+) -> None:
+    """Serialize startup writers before recovery dispatch and periodic work begin."""
+    stages: tuple[tuple[str, Callable[[], Awaitable[None]]], ...] = (
+        ("database maintenance", lambda: _run_startup_database_maintenance(settings)),
+        (
+            "catalog ownership reconciliation",
+            lambda: _reconcile_catalog_ownership_at_startup(settings),
+        ),
+        (
+            "library reconciliation",
+            lambda: _run_library_reconciliation_at_startup(library_reconciliation),
+        ),
+    )
+    for stage_name, run_stage in stages:
+        try:
+            await run_stage()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Startup recovery stage failed: %s", stage_name)
+    try:
+        await start_background_services()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Background service startup failed")
+    try:
+        await _run_job_recovery_at_startup()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Startup recovery stage failed: job recovery")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     scheduler = DiscographyRefreshScheduler()
@@ -196,62 +246,84 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         get_session_factory(), effective_settings.library_root
     )
     app.state.library_reconciliation_service = library_reconciliation
-    library_reconciliation_startup_task = asyncio.create_task(
-        _run_library_reconciliation_at_startup(library_reconciliation),
-        name="library-startup-reconciliation",
-    )
-    app.state.library_reconciliation_startup_task = library_reconciliation_startup_task
-    startup_database_maintenance_task = asyncio.create_task(
-        _run_startup_database_maintenance(effective_settings),
-        name="startup-database-maintenance",
-    )
-    app.state.startup_database_maintenance_task = startup_database_maintenance_task
-    ownership_task = asyncio.create_task(
-        _reconcile_catalog_ownership_at_startup(effective_settings),
-        name="catalog-ownership-startup-reconciliation",
-    )
-    app.state.catalog_ownership_reconciliation_task = ownership_task
-    app.state.startup_imported_source_cleanup_task = None
-    job_recovery_task = asyncio.create_task(
-        _run_job_recovery_at_startup(),
-        name="startup-job-recovery",
-    )
-    app.state.startup_job_recovery_task = job_recovery_task
     settings = get_settings()
-    await job_dispatcher.start_watchdog(
-        threshold_seconds=settings.job_watchdog_threshold_seconds,
-        interval_seconds=settings.job_watchdog_interval_seconds,
-    )
-    await job_dispatcher.start_cleanup_reconciler(
-        interval_seconds=settings.terminal_cleanup_interval_seconds
-    )
-    await scheduler.start()
-    await library_adoption_runner.start()
-    await maintenance_scheduler.start()
-    await quality_upgrade_scheduler.start()
-    await review_automation_scheduler.start()
+
+    async def start_background_services() -> None:
+        await _start_background_services(
+            (
+                (
+                    "maintenance scheduler",
+                    lambda: maintenance_scheduler.start(wait_for_initial_cycle=True),
+                ),
+                (
+                    "quality upgrade scheduler",
+                    lambda: quality_upgrade_scheduler.start(wait_for_initial_cycle=True),
+                ),
+                (
+                    "discography refresh scheduler",
+                    lambda: scheduler.start(
+                        wait_for_initial_cycle=True, dispatch_initial_jobs=False
+                    ),
+                ),
+                (
+                    "library reconciliation watcher",
+                    lambda: library_reconciliation.start(wait_for_initial_cycle=True),
+                ),
+                (
+                    "review automation scheduler",
+                    lambda: review_automation_scheduler.start(wait_for_initial_cycle=True),
+                ),
+                (
+                    "library adoption runner",
+                    lambda: library_adoption_runner.start(wait_for_initial_cycle=True),
+                ),
+                (
+                    "job watchdog",
+                    lambda: job_dispatcher.start_watchdog(
+                        threshold_seconds=settings.job_watchdog_threshold_seconds,
+                        interval_seconds=settings.job_watchdog_interval_seconds,
+                    ),
+                ),
+                (
+                    "terminal cleanup reconciler",
+                    lambda: job_dispatcher.start_cleanup_reconciler(
+                        interval_seconds=settings.terminal_cleanup_interval_seconds
+                    ),
+                ),
+            )
+        )
+
     await health_status.start()
-    await library_reconciliation.start()
+    startup_recovery_pipeline_task = asyncio.create_task(
+        _run_startup_recovery_pipeline(
+            effective_settings,
+            library_reconciliation,
+            start_background_services,
+        ),
+        name="startup-recovery-pipeline",
+    )
+    app.state.startup_recovery_pipeline_task = startup_recovery_pipeline_task
+    # Compatibility aliases for runtime diagnostics during the transition to one
+    # serialized startup pipeline. All names intentionally reference one task.
+    app.state.library_reconciliation_startup_task = startup_recovery_pipeline_task
+    app.state.startup_database_maintenance_task = startup_recovery_pipeline_task
+    app.state.catalog_ownership_reconciliation_task = startup_recovery_pipeline_task
+    app.state.startup_job_recovery_task = startup_recovery_pipeline_task
     app.state.startup_imported_source_cleanup_task = None
     try:
         yield
     finally:
+        if not startup_recovery_pipeline_task.done():
+            startup_recovery_pipeline_task.cancel()
+        try:
+            await startup_recovery_pipeline_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Startup recovery pipeline failed")
         await review_automation_scheduler.stop()
         await library_adoption_runner.stop()
         await library_reconciliation.stop()
-        if not ownership_task.done():
-            ownership_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await ownership_task
-        for startup_task in (
-            library_reconciliation_startup_task,
-            startup_database_maintenance_task,
-            job_recovery_task,
-        ):
-            if not startup_task.done():
-                startup_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await startup_task
         await health_status.stop()
         await quality_upgrade_scheduler.stop()
         await maintenance_scheduler.stop()

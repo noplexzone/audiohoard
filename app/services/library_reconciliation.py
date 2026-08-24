@@ -219,6 +219,7 @@ class LibraryReconciliationService:
         self._watch_changes = watch_changes
         self._lock = asyncio.Lock()
         self._tasks: tuple[asyncio.Task[None], ...] = ()
+        self._initial_cycle_complete = asyncio.Event()
 
     @property
     def tasks(self) -> tuple[asyncio.Task[None], ...]:
@@ -402,15 +403,19 @@ class LibraryReconciliationService:
             except Exception:
                 logger.warning("Periodic library reconciliation failed; retrying later")
                 logger.debug("Periodic library reconciliation failure", exc_info=True)
+            finally:
+                self._initial_cycle_complete.set()
             await asyncio.sleep(self._periodic_interval)
 
-    async def start(self) -> None:
-        if any(not task.done() for task in self._tasks):
-            return
-        self._tasks = (
-            asyncio.create_task(self._watch_loop(), name="library-filesystem-watcher"),
-            asyncio.create_task(self._periodic_loop(), name="library-periodic-reconciliation"),
-        )
+    async def start(self, *, wait_for_initial_cycle: bool = False) -> None:
+        if not any(not task.done() for task in self._tasks):
+            self._initial_cycle_complete.clear()
+            self._tasks = (
+                asyncio.create_task(self._watch_loop(), name="library-filesystem-watcher"),
+                asyncio.create_task(self._periodic_loop(), name="library-periodic-reconciliation"),
+            )
+        if wait_for_initial_cycle:
+            await self._initial_cycle_complete.wait()
 
     async def stop(self) -> None:
         tasks = self._tasks

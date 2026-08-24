@@ -122,3 +122,20 @@ async def test_duplicate_scan_without_auto_clean_runs_dry_run_only(
 
     assert delay == 3600.0
     assert calls and calls[0]["dry_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_start_can_wait_for_initial_cycle(monkeypatch) -> None:
+    scheduler = MaintenanceScheduler(empty_maintenance_state())
+    cycles: list[str] = []
+
+    async def cycle() -> float:
+        cycles.append("initial")
+        return 3600.0
+
+    monkeypatch.setattr(scheduler, "_refresh_cycle", cycle)
+    await scheduler.start(wait_for_initial_cycle=True)
+    try:
+        assert cycles == ["initial"]
+    finally:
+        await scheduler.stop()

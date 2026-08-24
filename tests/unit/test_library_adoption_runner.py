@@ -49,3 +49,23 @@ async def test_runner_retries_after_transient_outer_loop_failure(
         await runner.stop()
 
     assert attempts >= 2
+
+
+async def test_start_can_wait_for_initial_cycle(monkeypatch) -> None:
+    cycles: list[str] = []
+
+    @asynccontextmanager
+    async def session_factory():
+        yield object()
+
+    async def recover(_db):
+        cycles.append("initial")
+        return []
+
+    monkeypatch.setattr(runner_module, "recover_library_adoption_scans", recover)
+    runner = LibraryAdoptionRunner(session_factory, interval_seconds=60)  # type: ignore[arg-type]
+    await asyncio.wait_for(runner.start(wait_for_initial_cycle=True), timeout=1)
+    try:
+        assert cycles == ["initial"]
+    finally:
+        await runner.stop()
