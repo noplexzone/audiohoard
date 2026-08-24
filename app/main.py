@@ -16,6 +16,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import Response
 
@@ -24,6 +25,7 @@ from app.config import Settings, get_settings
 from app.database import get_db, get_session_factory
 from app.display_names import display_name
 from app.jobs.dispatcher import job_dispatcher
+from app.models.job import Job, JobStatus
 from app.routers import (
     activity,
     artwork,
@@ -107,14 +109,25 @@ async def _run_library_reconciliation_at_startup(
 async def _run_startup_database_maintenance(settings: Settings) -> None:
     try:
         async with get_session_factory()() as db:
-            pruned = await prune_orphaned_terminal_records(db)
-            if pruned.tracks or pruned.releases or pruned.jobs:
+            active_job_id = await db.scalar(
+                select(Job.id)
+                .where(Job.status.in_((JobStatus.pending, JobStatus.running)))
+                .limit(1)
+            )
+            if active_job_id is None:
+                pruned = await prune_orphaned_terminal_records(db)
+                if pruned.tracks or pruned.releases or pruned.jobs:
+                    logger.info(
+                        "Pruned orphaned acquisition history at startup: "
+                        "%d track(s), %d release(s), %d job(s)",
+                        pruned.tracks,
+                        pruned.releases,
+                        pruned.jobs,
+                    )
+            else:
                 logger.info(
-                    "Pruned orphaned acquisition history at startup: "
-                    "%d track(s), %d release(s), %d job(s)",
-                    pruned.tracks,
-                    pruned.releases,
-                    pruned.jobs,
+                    "Skipping startup orphan pruning while acquisition jobs are queued "
+                    "so job recovery is not delayed"
                 )
             n = await reconcile_duplicate_catalog_artists(db)
             release_snapshots = await reconcile_deezer_release_snapshots(db)

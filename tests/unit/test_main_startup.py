@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import main
 from app.config import Settings
+from app.models.job import Job, JobStatus
 
 
 class _Service:
@@ -112,6 +113,41 @@ async def test_serialized_startup_recovery_does_not_delay_readiness(
 
     assert task.cancelled()
     assert startup_order == ["recover-deletions", "prune"]
+
+
+async def test_startup_database_maintenance_skips_orphan_prune_with_active_jobs(
+    db_session: AsyncSession, monkeypatch
+) -> None:
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    job = Job(source="priority", query="queued", status=JobStatus.pending)
+    db_session.add(job)
+    await db_session.commit()
+
+    prune = AsyncMock(return_value=SimpleNamespace(tracks=0, releases=0, jobs=0))
+    reconcile_artists = AsyncMock(return_value=0)
+    reconcile_snapshots = AsyncMock(return_value=0)
+    reconcile_monitoring = AsyncMock(return_value=0)
+    recover_downloads = AsyncMock(return_value=0)
+    monkeypatch.setattr(main, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(main, "prune_orphaned_terminal_records", prune)
+    monkeypatch.setattr(main, "reconcile_duplicate_catalog_artists", reconcile_artists)
+    monkeypatch.setattr(main, "reconcile_deezer_release_snapshots", reconcile_snapshots)
+    monkeypatch.setattr(main, "reconcile_release_monitoring", reconcile_monitoring)
+    monkeypatch.setattr(main, "recover_approved_downloads", recover_downloads)
+
+    await main._run_startup_database_maintenance(Settings(secret_key="test-secret"))
+    job.status = JobStatus.running
+    await db_session.commit()
+    await main._run_startup_database_maintenance(Settings(secret_key="test-secret"))
+
+    prune.assert_not_awaited()
+    for reconciliation in (
+        reconcile_artists,
+        reconcile_snapshots,
+        reconcile_monitoring,
+        recover_downloads,
+    ):
+        assert reconciliation.await_count == 2
 
 
 async def test_startup_recovery_pipeline_serializes_database_writers(monkeypatch) -> None:
