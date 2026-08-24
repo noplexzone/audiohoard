@@ -83,6 +83,12 @@ class DownloadGroup:
     def active(self) -> bool:
         return any(attempt.job.status in _ACTIVE for attempt in self.attempts)
 
+    @property
+    def action_retryable(self) -> bool:
+        if self.action_attempt is None or self.action_attempt.status not in _RETRYABLE:
+            return False
+        return _metadata_retryable(_metadata(self.action_attempt))
+
 
 def _metadata(job: Job) -> dict[str, Any]:
     try:
@@ -104,7 +110,37 @@ def _metadata(job: Job) -> dict[str, Any]:
         normalized_errors.extend(metadata["errors"])
     if normalized_errors:
         metadata["error_summary"] = summarize_errors(normalized_errors)
+    notice = recovery_notice(metadata)
+    if notice:
+        metadata["recovery_notice"] = notice
     return metadata
+
+
+def _metadata_retryable(metadata: dict[str, Any]) -> bool:
+    """Return False only when the failure payload explicitly forbids retry."""
+    errors: list[object] = []
+    if "error" in metadata:
+        errors.append(metadata["error"])
+    raw_errors = metadata.get("errors")
+    if isinstance(raw_errors, list):
+        errors.extend(raw_errors)
+    elif raw_errors is not None:
+        errors.append(raw_errors)
+    return not any(isinstance(error, dict) and error.get("retryable") is False for error in errors)
+
+
+def recovery_notice(metadata: dict[str, Any]) -> str | None:
+    if isinstance(metadata.get("watchdog_recovery"), dict):
+        return "Recovered after dispatcher stall; queued again by watchdog."
+    recovery = metadata.get("recovery")
+    if not isinstance(recovery, dict):
+        return None
+    code = str(recovery.get("code") or "")
+    if code == "interrupted_by_restart":
+        return "Recovered after app restart; queued again."
+    if code:
+        return f"Recovered after {code.replace('_', ' ')}."
+    return "Recovered and queued again."
 
 
 def error_label(code: object) -> str:
