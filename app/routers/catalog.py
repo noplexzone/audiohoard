@@ -53,6 +53,7 @@ from app.services.catalog import (
     list_library_tracks,
     queue_catalog_album_missing_track_jobs,
 )
+from app.services.catalog_artist_credits import catalog_track_artist_name
 from app.services.catalog_metadata import (
     VALID_METADATA_PROVIDERS,
     album_providers,
@@ -212,9 +213,34 @@ async def _ensure_catalog_tracks(
         or 0
     )
     expected_before_hydration = album.track_count or 0
-    if expected_before_hydration and existing >= expected_before_hydration:
+    manifest_complete = bool(expected_before_hydration and existing >= expected_before_hydration)
+    missing_artist_credits = False
+    if album.is_compilation or (album.release_type or "").casefold() in {
+        "compile",
+        "compilation",
+    }:
+        missing_track_artists = int(
+            await db.scalar(
+                select(func.count(CatalogAlbumTrack.id)).where(
+                    CatalogAlbumTrack.album_id == album.id,
+                    CatalogAlbumTrack.artist_name.is_(None),
+                )
+            )
+            or 0
+        )
+        missing_artist_credits = not album.album_artist_name or missing_track_artists > 0
+    if manifest_complete and not missing_artist_credits:
         return
-    await fetch_and_store_album(db, settings, album)
+    try:
+        await fetch_and_store_album(db, settings, album)
+    except Exception:
+        if manifest_complete:
+            logger.warning(
+                "Catalog artist-credit refresh failed for album %d; preserving acquisition",
+                album.id,
+            )
+            return
+        raise
     after = int(
         await db.scalar(
             select(func.count(CatalogAlbumTrack.id)).where(CatalogAlbumTrack.album_id == album.id)
@@ -1961,6 +1987,7 @@ async def download_catalog_track(
     album_id: int,
     track_id: int,
     db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
     _user: Annotated[object, Depends(require_mutation)],
     request: Request = None,  # type: ignore[assignment]
 ) -> Response:
@@ -1972,10 +1999,26 @@ async def download_catalog_track(
     album = result.scalar_one_or_none()
     if album is None:
         raise HTTPException(status_code=404, detail="Catalog album not found")
+    try:
+        await _ensure_catalog_tracks(db, settings, album)
+    except Exception:
+        logger.warning("Pre-dispatch catalog hydration failed for album %d", album_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not load album tracklist from provider; download not started",
+        ) from None
+    album = (
+        await db.execute(
+            select(CatalogAlbum)
+            .where(CatalogAlbum.id == album_id)
+            .options(selectinload(CatalogAlbum.artist), selectinload(CatalogAlbum.tracks))
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
     track = next((t for t in album.tracks if t.id == track_id), None)
     if track is None:
         raise HTTPException(status_code=404, detail="Catalog track not found")
-    query = f"{album.artist.name} {track.title}".strip()
+    query = f"{catalog_track_artist_name(album, track)} {track.title}".strip()
     job = Job(
         source="priority",
         query=query,

@@ -57,6 +57,15 @@ from app.models.workflow import (
 from app.naming.convention import NamingError, render_path
 from app.schemas.search import SearchRequest, SearchResult
 from app.services.acquisition_attempts import canonical_provider_uuid
+from app.services.catalog_artist_credits import (
+    catalog_album_artist_name as _catalog_album_artist_name,
+)
+from app.services.catalog_artist_credits import (
+    catalog_track_artist_name as _catalog_track_artist_name,
+)
+from app.services.catalog_artist_credits import (
+    is_compilation_album,
+)
 from app.services.monitoring import map_slskd_transfer_state
 from app.services.rejected_sources import (
     RejectionClass,
@@ -724,6 +733,29 @@ async def _run_job_in_session(
         cfg = cfg.model_copy(
             update={"slskd_poll_timeout": float(runtime_settings.slskd_download_timeout_seconds)}
         )
+        catalog_album = await _load_catalog_album(db, job.catalog_album_id)
+        if (
+            catalog_album is not None
+            and is_compilation_album(catalog_album)
+            and (
+                not catalog_album.album_artist_name
+                or any(not track.artist_name for track in catalog_album.tracks)
+            )
+        ):
+            try:
+                from app.services.catalog_metadata import (
+                    fetch_and_store_album as _fetch_and_store_album,
+                )
+
+                catalog_album = await _fetch_and_store_album(db, cfg, catalog_album)
+                if commit_progress:
+                    await db.commit()
+            except Exception:
+                logger.warning(
+                    "Compilation artist-credit hydration failed for album %d (job %d)",
+                    job.catalog_album_id,
+                    job_id,
+                )
         selected_results = _selected_result(job)
         if selected_results:
             selected_results = await _without_blocked_slskd_results(selected_results, db)
@@ -892,7 +924,9 @@ async def _run_job_in_session(
                 continue
             try:
                 release_key = (
-                    catalog_album.artist.name if catalog_album is not None else result.artist,
+                    _catalog_album_artist_name(catalog_album)
+                    if catalog_album is not None
+                    else result.artist,
                     catalog_album.title
                     if catalog_album is not None
                     else result.album or result.title,
@@ -907,7 +941,7 @@ async def _run_job_in_session(
                         title=catalog_album.title
                         if catalog_album is not None
                         else result.album or result.title,
-                        album_artist=catalog_album.artist.name
+                        album_artist=_catalog_album_artist_name(catalog_album)
                         if catalog_album is not None
                         else result.artist,
                         year=catalog_album.year if catalog_album is not None else None,
@@ -931,10 +965,10 @@ async def _run_job_in_session(
                         catalog_album_id=catalog_album.id if catalog_album is not None else None,
                         catalog_track_id=catalog_track.id if catalog_track is not None else None,
                         title=track_title,
-                        artist=catalog_album.artist.name
+                        artist=_catalog_track_artist_name(catalog_album, catalog_track)
                         if catalog_album is not None
                         else result.artist,
-                        album_artist=catalog_album.artist.name
+                        album_artist=_catalog_album_artist_name(catalog_album)
                         if catalog_album is not None
                         else result.artist,
                         album=track_album,
@@ -963,6 +997,12 @@ async def _run_job_in_session(
                     track.disc = catalog_track.disc
                     track.disc_total = catalog_disc_total
                     track.track_no = catalog_track.position
+                    if (
+                        catalog_album is not None
+                        and track.import_state != ImportWorkflowState.imported
+                    ):
+                        track.artist = _catalog_track_artist_name(catalog_album, catalog_track)
+                        track.album_artist = _catalog_album_artist_name(catalog_album)
                 attempt.track_id = track.id
                 if commit_progress:
                     job.updated_at = _now()
@@ -1708,7 +1748,7 @@ async def _queries_for_job(job: Job, album: CatalogAlbum | None, cfg: Settings) 
     track = next((item for item in album.tracks if item.id == job.catalog_track_id), None)
     if track is None:
         return [_provider_safe_text(job.query)]
-    artist = album.artist.name if album.artist is not None else ""
+    artist = _catalog_track_artist_name(album, track)
     required_terms = await _targeted_required_identity_terms(track, album, cfg)
     return _targeted_query_variants(
         artist, album.title, track.title, required_terms=required_terms
@@ -1721,7 +1761,7 @@ async def _targeted_required_identity_terms(
     cfg: Settings,
 ) -> list[str]:
     """Return collaborator/version terms required by the target recording identity."""
-    primary_artist = album.artist.name if album is not None and album.artist is not None else ""
+    primary_artist = _catalog_track_artist_name(album, track) if album is not None else ""
     terms = _required_identity_terms_from_text(track.title, primary_artist)
     if track.recording_mbid and cfg.musicbrainz_user_agent:
         try:
@@ -2525,7 +2565,6 @@ async def _spawn_continuation_jobs(
             committed_ids.clear()
             return
 
-        artist = catalog_album.artist.name if catalog_album.artist else ""
         tracks_by_id = {track.id: track for track in catalog_album.tracks}
         next_attempt = parent_job.partial_attempt + 1
         for track_id in requested_track_ids:
@@ -2549,9 +2588,11 @@ async def _spawn_continuation_jobs(
                 continue
             continuation = Job(
                 source="priority",
-                query=_targeted_query_variants(artist, catalog_album.title, catalog_track.title)[
-                    0
-                ],
+                query=_targeted_query_variants(
+                    _catalog_track_artist_name(catalog_album, catalog_track),
+                    catalog_album.title,
+                    catalog_track.title,
+                )[0],
                 status=JobStatus.pending,
                 catalog_album_id=catalog_album_id,
                 catalog_track_id=track_id,

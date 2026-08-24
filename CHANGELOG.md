@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve provider-native album and track artist credits for compilation releases, use each performer in targeted searches, and write performer/album-artist tags without skipping compilation tracks.
+
 ### Added
 
 - Add Wanted-page queue-all-matching bulk dispatch and quality-profile enabled-format controls for strict MP3-320-or-better acquisition.

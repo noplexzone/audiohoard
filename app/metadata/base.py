@@ -94,6 +94,7 @@ class AlbumTrack:
     provider_track_id: str | None = None
     preview_url: str | None = None
     artist_name: str | None = None
+    artist_provider_id: str | None = None
     content_rating: str = "unknown"
 
 
