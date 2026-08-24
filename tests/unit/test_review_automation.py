@@ -1085,3 +1085,19 @@ async def test_scheduler_start_is_nonblocking_and_stop_cancels_work(
     await asyncio.wait_for(entered.wait(), timeout=1)
     await scheduler.stop()
     assert cancelled.is_set()
+
+
+async def test_scheduler_start_can_wait_for_initial_cycle() -> None:
+    cycles: list[int] = []
+
+    class _Service:
+        async def run_cycle(self, *, limit: int) -> int:
+            cycles.append(limit)
+            return 0
+
+    scheduler = ReviewAutomationScheduler(_Service(), interval_seconds=60, batch_size=3)  # type: ignore[arg-type]
+    await scheduler.start(wait_for_initial_cycle=True)
+    try:
+        assert cycles == [3]
+    finally:
+        await scheduler.stop()

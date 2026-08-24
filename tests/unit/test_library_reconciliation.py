@@ -400,3 +400,24 @@ async def test_real_watcher_promptly_reconciles_external_unlink(
                 await asyncio.sleep(0.02)
     finally:
         await service.stop()
+
+
+async def test_start_can_wait_for_initial_periodic_cycle(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    service = LibraryReconciliationService(factory, root, periodic_interval=60)
+    cycles: list[str] = []
+
+    async def sweep(*, max_batches=None) -> int:
+        cycles.append("initial")
+        return 0
+
+    monkeypatch.setattr(service, "reconcile_sweep", sweep)
+    await service.start(wait_for_initial_cycle=True)
+    try:
+        assert cycles == ["initial"]
+    finally:
+        await service.stop()

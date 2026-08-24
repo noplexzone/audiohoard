@@ -317,11 +317,22 @@ class DiscographyRefreshScheduler:
     def __init__(self) -> None:
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
+        self._initial_cycle_complete = asyncio.Event()
 
-    async def start(self) -> None:
+    async def start(
+        self,
+        *,
+        wait_for_initial_cycle: bool = False,
+        dispatch_initial_jobs: bool = True,
+    ) -> None:
         if self._task is None:
             self._stop.clear()
-            self._task = asyncio.create_task(self._run())
+            self._initial_cycle_complete.clear()
+            self._task = asyncio.create_task(
+                self._run(dispatch_initial_jobs=dispatch_initial_jobs)
+            )
+        if wait_for_initial_cycle:
+            await self._initial_cycle_complete.wait()
 
     async def stop(self) -> None:
         self._stop.set()
@@ -331,7 +342,7 @@ class DiscographyRefreshScheduler:
                 await self._task
             self._task = None
 
-    async def _refresh_cycle(self) -> float:
+    async def _refresh_cycle(self, *, dispatch_jobs: bool = True) -> float:
         factory = get_session_factory()
         async with factory() as db:
             cfg = await build_effective_settings(db, get_settings())
@@ -388,20 +399,27 @@ class DiscographyRefreshScheduler:
             except Exception:
                 logger.exception("Discography refresh failed for artist %s", artist_id)
                 continue
-            for job_id in job_ids:
-                await job_dispatcher.dispatch(job_id)
+            if dispatch_jobs:
+                for job_id in job_ids:
+                    await job_dispatcher.dispatch(job_id)
 
         return runtime.discography_refresh_hours * 3600
 
-    async def _run(self) -> None:
+    async def _run(self, *, dispatch_initial_jobs: bool = True) -> None:
+        first_cycle = True
         while not self._stop.is_set():
             delay = 3600.0
             try:
-                delay = await self._refresh_cycle()
+                delay = await self._refresh_cycle(
+                    dispatch_jobs=dispatch_initial_jobs or not first_cycle
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Discography refresh cycle failed")
+            finally:
+                self._initial_cycle_complete.set()
+                first_cycle = False
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)
             except TimeoutError:

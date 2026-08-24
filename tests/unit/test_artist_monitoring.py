@@ -91,9 +91,11 @@ async def test_auto_download_deduplicates_active_album_jobs(
     assert len(jobs) == 1
 
 
+@pytest.mark.parametrize("dispatch_jobs", [True, False])
 async def test_scheduler_isolates_artist_failures_and_dispatches_after_commit(
     monitoring_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
+    dispatch_jobs: bool,
 ) -> None:
     failing_id = await _create_artist(monitoring_factory, "Failing", album=False)
     successful_id = await _create_artist(monitoring_factory, "Successful", album=False)
@@ -154,11 +156,14 @@ async def test_scheduler_isolates_artist_failures_and_dispatches_after_commit(
     monkeypatch.setattr(artist_monitoring, "queue_wanted_artist_releases", fake_queue)
     monkeypatch.setattr(artist_monitoring.job_dispatcher, "dispatch", probe_dispatch)
 
-    delay = await DiscographyRefreshScheduler()._refresh_cycle()
+    delay = await DiscographyRefreshScheduler()._refresh_cycle(dispatch_jobs=dispatch_jobs)
 
     assert processed == [successful_id]
-    assert events == ["refresh", "reconcile", "queue", "dispatch"]
-    assert visible_when_dispatched == [True]
+    expected = ["refresh", "reconcile", "queue"]
+    if dispatch_jobs:
+        expected.append("dispatch")
+    assert events == expected
+    assert visible_when_dispatched == ([True] if dispatch_jobs else [])
     assert delay == 3600
 
 
@@ -207,7 +212,7 @@ async def test_scheduler_does_not_queue_when_reconciliation_fails(
 async def test_scheduler_can_restart_after_stop(monkeypatch: pytest.MonkeyPatch) -> None:
     scheduler = DiscographyRefreshScheduler()
 
-    async def wait_until_cancelled() -> None:
+    async def wait_until_cancelled(**_kwargs) -> None:
         await scheduler._stop.wait()
 
     monkeypatch.setattr(scheduler, "_run", wait_until_cancelled)
@@ -587,3 +592,20 @@ async def test_refresh_invokes_upgrade_projection_after_monitor_policy(
     sync.assert_awaited_once()
     releases = sync.await_args.args[2]
     assert sum(release.monitored for release in releases) == 1
+
+
+async def test_scheduler_can_wait_for_initial_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    scheduler = DiscographyRefreshScheduler()
+    cycles: list[str] = []
+
+    async def cycle(*, dispatch_jobs: bool = True) -> float:
+        assert dispatch_jobs is True
+        cycles.append("initial")
+        return 3600.0
+
+    monkeypatch.setattr(scheduler, "_refresh_cycle", cycle)
+    await scheduler.start(wait_for_initial_cycle=True)
+    try:
+        assert cycles == ["initial"]
+    finally:
+        await scheduler.stop()

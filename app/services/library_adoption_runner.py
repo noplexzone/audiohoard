@@ -27,10 +27,14 @@ class LibraryAdoptionRunner:
         self._interval_seconds = interval_seconds
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._initial_cycle_complete = asyncio.Event()
 
-    async def start(self) -> None:
+    async def start(self, *, wait_for_initial_cycle: bool = False) -> None:
         if self._task is None or self._task.done():
+            self._initial_cycle_complete.clear()
             self._task = asyncio.create_task(self._loop(), name="library-adoption-runner")
+        if wait_for_initial_cycle:
+            await self._initial_cycle_complete.wait()
 
     def wake(self) -> None:
         self._wake.set()
@@ -65,6 +69,8 @@ class LibraryAdoptionRunner:
                 raise
             except Exception:
                 logger.exception("library adoption runner iteration failed; will retry")
+            finally:
+                self._initial_cycle_complete.set()
             self._wake.clear()
             with suppress(TimeoutError):
                 await asyncio.wait_for(self._wake.wait(), timeout=self._interval_seconds)

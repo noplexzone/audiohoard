@@ -106,3 +106,20 @@ async def test_upgrade_check_hours_runs_active_record_and_persists_result(
 
     assert calls == [(record.id, {"codec": "", "lossless": False, "reliability": 1.0})]
     assert refreshed.status == MonitoringStatus.failed
+
+
+@pytest.mark.asyncio
+async def test_start_can_wait_for_initial_cycle(monkeypatch) -> None:
+    scheduler = QualityUpgradeCycleScheduler()
+    cycles: list[str] = []
+
+    async def cycle() -> float:
+        cycles.append("initial")
+        return 3600.0
+
+    monkeypatch.setattr(scheduler, "_refresh_cycle", cycle)
+    await scheduler.start(wait_for_initial_cycle=True)
+    try:
+        assert cycles == ["initial"]
+    finally:
+        await scheduler.stop()

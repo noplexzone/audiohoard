@@ -23,13 +23,17 @@ class MaintenanceScheduler:
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._state = maintenance_state
+        self._initial_cycle_complete = asyncio.Event()
         self._last_library_scan: float | None = None
         self._last_duplicate_scan: float | None = None
 
-    async def start(self) -> None:
+    async def start(self, *, wait_for_initial_cycle: bool = False) -> None:
         if self._task is None:
             self._stop.clear()
+            self._initial_cycle_complete.clear()
             self._task = asyncio.create_task(self._run())
+        if wait_for_initial_cycle:
+            await self._initial_cycle_complete.wait()
 
     async def stop(self) -> None:
         self._stop.set()
@@ -92,6 +96,8 @@ class MaintenanceScheduler:
                 raise
             except Exception:
                 logger.exception("Maintenance cycle failed")
+            finally:
+                self._initial_cycle_complete.set()
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)
             except TimeoutError:
