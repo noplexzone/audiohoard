@@ -9,6 +9,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - Serialize startup database maintenance, catalog ownership, library reconciliation, and each scheduler's initial cycle before recovering queued jobs, preventing post-update SQLite writer storms from failing recovered work.
+- Skip expensive orphan-history pruning when startup finds queued or interrupted acquisitions, allowing serialized job recovery to resume downloads promptly after an update.
 - Invalidate cached slskd download snapshots after a successful enqueue so accepted transfers are not immediately misclassified as missing and redundantly downloaded from every candidate.
 - Retry callers awaiting a displaced slskd snapshot generation so concurrent queue mutations cannot return a stale pre-enqueue result.
 - Preserve provider-native album and track artist credits for compilation releases, use each performer in targeted searches, and write performer/album-artist tags without skipping compilation tracks.
