@@ -250,8 +250,12 @@ class TestSlskdTransfers:
         assert [request.method for request in httpx_mock.get_requests()] == ["GET", "POST", "GET"]
 
     @pytest.mark.parametrize("stale_get_fails", [False, True])
+    @pytest.mark.parametrize("replacement_completes_first", [False, True])
     async def test_inflight_pre_enqueue_snapshot_retries_current_generation(
-        self, monkeypatch: pytest.MonkeyPatch, stale_get_fails: bool
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        stale_get_fails: bool,
+        replacement_completes_first: bool,
     ) -> None:
         adapter = SlskdAdapter("http://slskd.local", "key123")
         filename = "music/01 Song.flac"
@@ -296,6 +300,9 @@ class TestSlskdTransfers:
         await first_get_started.wait()
 
         assert await adapter.enqueue("peer1", filename, 30_000_000) == f"peer1:{filename}"
+        if replacement_completes_first:
+            fresh_downloads = await adapter.downloads()
+            assert fresh_downloads[0]["id"] == "4dd4add9-96ce-4ab2-80d4-5b171b324e3e"
         release_stale_get.set()
         downloads = await stale_waiter
 

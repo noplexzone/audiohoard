@@ -390,7 +390,7 @@ class SlskdAdapter:
                 raise
             except Exception:
                 if _download_snapshots.get(key) is not snapshot:
-                    force_refresh = True
+                    force_refresh = False
                     continue
                 if task.done():
                     _download_snapshots.pop(key)
@@ -398,8 +398,9 @@ class SlskdAdapter:
 
             if _download_snapshots.get(key) is not snapshot:
                 # An enqueue or removal displaced this generation while the GET was
-                # in flight. Retry so this caller cannot return a pre-mutation queue.
-                force_refresh = True
+                # in flight. Join the replacement generation rather than returning
+                # pre-mutation data or forcing a redundant third request.
+                force_refresh = False
                 continue
             snapshot.downloads = downloads
             snapshot.expires_at = _monotonic() + _DOWNLOAD_SNAPSHOT_TTL_SEC
