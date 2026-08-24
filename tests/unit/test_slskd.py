@@ -209,6 +209,46 @@ class TestSlskdTransfers:
         ]
         assert transfer_id == "peer1:music/01 Song.flac"
 
+    async def test_enqueue_invalidates_pre_enqueue_download_snapshot(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        adapter = SlskdAdapter("http://slskd.local", "key123")
+        filename = "music/01 Song.flac"
+        fallback_id = f"peer1:{filename}"
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[],
+        )
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads/peer1",
+            method="POST",
+            status_code=201,
+            json={},
+        )
+        httpx_mock.add_response(
+            url="http://slskd.local/api/v0/transfers/downloads",
+            json=[
+                {
+                    "username": "peer1",
+                    "files": [
+                        {
+                            "id": "4dd4add9-96ce-4ab2-80d4-5b171b324e3e",
+                            "filename": filename,
+                            "state": "Queued",
+                        }
+                    ],
+                }
+            ],
+        )
+
+        assert await adapter.downloads() == []
+        assert await adapter.enqueue("peer1", filename, 30_000_000) == fallback_id
+        state = await adapter.status(fallback_id)
+
+        assert state.available is True
+        assert state.reason == "queued"
+        assert [request.method for request in httpx_mock.get_requests()] == ["GET", "POST", "GET"]
+
     async def test_enqueue_preserves_slskd_error_detail(self, httpx_mock: HTTPXMock) -> None:
         httpx_mock.add_response(
             url="http://slskd.local/api/v0/transfers/downloads/peer1",

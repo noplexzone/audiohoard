@@ -326,6 +326,9 @@ class SlskdAdapter:
                 raise ProviderError(
                     f"slskd_http_{resp.status_code}", message, "acquire", resp.status_code >= 500
                 )
+        # The queue changed after a successful POST. Drop any pre-enqueue snapshot so
+        # the first poll cannot falsely report the accepted transfer as missing.
+        _download_snapshots.pop(self._download_snapshot_key(), None)
         data = resp.json() if resp.content else {}
         response_id = (
             (data.get("id") or data.get("transferId")) if isinstance(data, dict) else None

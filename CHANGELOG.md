@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Invalidate cached slskd download snapshots after a successful enqueue so accepted transfers are not immediately misclassified as missing and redundantly downloaded from every candidate.
 - Preserve provider-native album and track artist credits for compilation releases, use each performer in targeted searches, and write performer/album-artist tags without skipping compilation tracks.
 
 ### Added
