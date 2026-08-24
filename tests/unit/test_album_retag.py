@@ -1049,3 +1049,79 @@ async def test_retag_catalog_album_close_failure_does_not_remove_committed_files
     assert result.files_retagged == 2
     assert all(path.is_file() for path in paths)
     assert all(FLAC(path)["albumartist"] == [album.artist.name] for path in paths)
+
+
+async def test_retag_compilation_projects_track_and_album_credits_without_relocating_folder(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, tracks = await _seed_imported_album(db_session, library_root)
+    album.release_type = "compilation"
+    album.is_compilation = True
+    album.album_artist_name = "Various Artists"
+    performers = ["Olivia Rodrigo", "Rachel Zegler"]
+    for catalog_track, track, performer, path in zip(
+        album.tracks, tracks, performers, paths, strict=True
+    ):
+        catalog_track.artist_name = performer
+        track.artist = album.artist.name
+        track.album_artist = album.artist.name
+        tagged = FLAC(path)
+        tagged["replaygain_track_gain"] = "-7.0 dB"
+        tagged.save()
+    first = FLAC(paths[0])
+    picture = Picture()
+    picture.type = 3
+    picture.mime = "image/jpeg"
+    picture.data = b"existing-cover"
+    first.add_picture(picture)
+    first.save()
+    original_folder = paths[0].parent
+
+    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert result.files_retagged == 2
+    assert result.files_renamed == 0
+    assert result.folder == original_folder
+    assert all(path.parent == original_folder and path.exists() for path in paths)
+    for path, performer in zip(paths, performers, strict=True):
+        repaired = FLAC(path)
+        assert repaired["artist"] == [performer]
+        assert repaired["album_artist"] == ["Various Artists"]
+        assert repaired["albumartist"] == ["Various Artists"]
+        assert repaired["replaygain_track_gain"] == ["-7.0 dB"]
+    assert FLAC(paths[0]).pictures[0].data == b"existing-cover"
+
+
+async def test_retag_compilation_discovers_album_artist_legacy_folder(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    library_root = tmp_path / "library"
+    owner = CatalogArtist(name="Olivia Rodrigo")
+    album = CatalogAlbum(
+        artist=owner,
+        title="Soundtrack",
+        year="2023",
+        release_type="compilation",
+        is_compilation=True,
+        album_artist_name="Various Artists",
+        track_count=1,
+    )
+    catalog_track = CatalogAlbumTrack(
+        disc=1, position=1, title="The Hanging Tree", artist_name="Rachel Zegler"
+    )
+    album.tracks.append(catalog_track)
+    db_session.add(owner)
+    await db_session.flush()
+    folder = library_root / "Various Artists" / "Soundtrack (2023)"
+    folder.mkdir(parents=True)
+    path = folder / "01 - The Hanging Tree.flac"
+    path.write_bytes(_minimal_flac_bytes())
+
+    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert result.files_retagged == 1
+    assert result.files_renamed == 0
+    assert path.exists()
+    assert FLAC(path)["artist"] == ["Rachel Zegler"]
+    assert FLAC(path)["albumartist"] == ["Various Artists"]

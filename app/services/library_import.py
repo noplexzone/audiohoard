@@ -61,6 +61,7 @@ from app.services.acquisition_cleanup import (
     ImportedSourceCleanup,
     schedule_imported_source_cleanup,
 )
+from app.services.catalog_artist_credits import project_catalog_artist_credits
 from app.services.pinned_destination import PinnedDestination
 from app.services.quality_upgrade import reconcile_album_quality_duplicates
 from app.settings_service import QualityProfile, get_runtime_settings
@@ -792,11 +793,12 @@ def _catalog_track_total_values(album: CatalogAlbum, disc: int) -> dict[str, str
 def _catalog_tags(
     album: CatalogAlbum, catalog_track: CatalogAlbumTrack, track: Track | None
 ) -> dict[str, str]:
+    credits = project_catalog_artist_credits(album, catalog_track, track)
     values = {
         "title": catalog_track.title,
-        "artist": (track.artist if track is not None else None) or album.artist.name,
+        "artist": credits.track_artist,
         "album": album.title,
-        "album_artist": album.artist.name,
+        "album_artist": credits.album_artist,
         "date": album.year or "",
         "releasedate": album.year or "",
         "release_date": album.year or "",
@@ -822,10 +824,11 @@ def _sync_track_from_catalog(
 ) -> None:
     disc_total = _catalog_disc_total(album)
     track.catalog_album_id = album.id
+    credits = project_catalog_artist_credits(album, catalog_track, track)
     track.catalog_track_id = catalog_track.id
     track.title = catalog_track.title
-    track.artist = album.artist.name
-    track.album_artist = album.artist.name
+    track.artist = credits.track_artist
+    track.album_artist = credits.album_artist
     track.album = album.title
     track.year = album.year
     track.disc = catalog_track.disc
@@ -847,10 +850,11 @@ def _sync_track_numbering_from_catalog(
 def _canonical_destination_for_catalog_track(
     root: Path, album: CatalogAlbum, catalog_track: CatalogAlbumTrack, current_path: Path
 ) -> Path:
+    credits = project_catalog_artist_credits(album, catalog_track)
     rendered = render_path(
         title=catalog_track.title,
-        artist=album.artist.name,
-        album_artist=album.artist.name,
+        artist=credits.track_artist,
+        album_artist=credits.album_artist,
         album=album.title,
         year=album.year,
         disc=catalog_track.disc,
@@ -866,38 +870,47 @@ def _canonical_destination_for_catalog_track(
 def _discover_legacy_album_files(
     album: CatalogAlbum, library_root: Path
 ) -> list[tuple[Path, None, CatalogAlbumTrack]]:
-    folder = library_root.resolve() / album.artist.name / f"{album.title} ({album.year or ''})"
-    if not folder.is_dir() or folder.is_symlink():
+    root = library_root.resolve()
+    credits = project_catalog_artist_credits(album)
+    artist_folders = dict.fromkeys((album.artist.name, credits.album_artist))
+    folders = [
+        root / artist_name / f"{album.title} ({album.year or ''})"
+        for artist_name in artist_folders
+        if artist_name
+    ]
+    folders = [folder for folder in folders if folder.is_dir() and not folder.is_symlink()]
+    if not folders:
         return []
     catalog_by_position = {(track.disc, track.position): track for track in album.tracks}
     catalog_by_title = {_normalized_title(track.title): track for track in album.tracks}
     targets: list[tuple[Path, None, CatalogAlbumTrack]] = []
     used_catalog_ids: set[int] = set()
-    for path in sorted(folder.rglob("*")):
-        if path.is_symlink() or not path.is_file() or not is_importable_audio(path):
-            continue
-        track_key = _track_key_from_filename(path, folder)
-        stripped = path.stem
-        prefix = _TRACK_NUMBER_PREFIX.match(path.stem.strip())
-        if prefix is not None:
-            stripped = stripped[prefix.end() :].lstrip(" .-_")
-        title_match = catalog_by_title.get(_normalized_title(stripped))
-        catalog_track = catalog_by_position.get(track_key or (0, 0))
-        if (
-            title_match is not None
-            and track_key is not None
-            and title_match.position == track_key[1]
-            and title_match is not catalog_track
-        ):
-            catalog_track = title_match
-        if catalog_track is None:
-            catalog_track = title_match
-        if catalog_track is None or catalog_track.id in used_catalog_ids:
-            raise ImportExecutionError(
-                "album folder contains audio not linked to stored track metadata"
-            )
-        used_catalog_ids.add(catalog_track.id)
-        targets.append((path, None, catalog_track))
+    for folder in folders:
+        for path in sorted(folder.rglob("*")):
+            if path.is_symlink() or not path.is_file() or not is_importable_audio(path):
+                continue
+            track_key = _track_key_from_filename(path, folder)
+            stripped = path.stem
+            prefix = _TRACK_NUMBER_PREFIX.match(path.stem.strip())
+            if prefix is not None:
+                stripped = stripped[prefix.end() :].lstrip(" .-_")
+            title_match = catalog_by_title.get(_normalized_title(stripped))
+            catalog_track = catalog_by_position.get(track_key or (0, 0))
+            if (
+                title_match is not None
+                and track_key is not None
+                and title_match.position == track_key[1]
+                and title_match is not catalog_track
+            ):
+                catalog_track = title_match
+            if catalog_track is None:
+                catalog_track = title_match
+            if catalog_track is None or catalog_track.id in used_catalog_ids:
+                raise ImportExecutionError(
+                    "album folder contains audio not linked to stored track metadata"
+                )
+            used_catalog_ids.add(catalog_track.id)
+            targets.append((path, None, catalog_track))
     return targets
 
 
@@ -935,11 +948,15 @@ async def retag_catalog_album(
         )
     ).all()
     latest: dict[int, tuple[Track, ImportPlan]] = {}
+    projected_album_artist = project_catalog_artist_credits(album).album_artist
+    legacy_album_artists = {
+        value.casefold() for value in (album.artist.name, projected_album_artist) if value
+    }
     for track, plan in rows:
         if track.catalog_album_id is None:
             legacy_artist = track.album_artist or track.artist or ""
             if (track.album or "").casefold() != album.title.casefold() or (
-                legacy_artist.casefold() != album.artist.name.casefold()
+                legacy_artist.casefold() not in legacy_album_artists
             ):
                 continue
         latest[track.id] = (track, plan)
