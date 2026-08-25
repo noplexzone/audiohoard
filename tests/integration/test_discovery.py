@@ -121,6 +121,29 @@ async def test_dedicated_discovery_routes_bound_page_and_genre(client, monkeypat
     assert (await client.get("/discover/popular?page=21")).status_code == 422
 
 
+async def test_genre_next_link_uses_explicit_continuation_contract(client, monkeypatch) -> None:
+    from app.routers import search as search_router
+
+    async def get(feed, region, *, page=1, limit=12, genre_id=None):
+        assert feed == "genre"
+        return DiscoverySection(
+            feed,
+            "Genre artists",
+            region,
+            "GLOBAL",
+            True,
+            tuple(ArtistHit("deezer", str(index), f"Artist {index}") for index in range(1, 13)),
+            has_next=False,
+        )
+
+    monkeypatch.setattr(search_router.discovery_service, "get", get)
+
+    response = await client.get("/discover/genres/132")
+
+    assert response.status_code == 200
+    assert 'href="?page=2"' not in response.text
+
+
 async def test_advanced_search_skips_discovery_network(client, monkeypatch) -> None:
     from app.routers import search as search_router
 

@@ -100,7 +100,11 @@ def validate_artist_detail(
 
 
 async def validated_artist_hits(
-    provider: MetadataProvider, name: str, artists: list[ArtistHit]
+    provider: MetadataProvider,
+    name: str,
+    artists: list[ArtistHit],
+    *,
+    preserve_order: bool = False,
 ) -> list[ArtistHit]:
     expected_field = {
         "musicbrainz": "mbid",
@@ -145,7 +149,8 @@ async def validated_artist_hits(
 
     checked = await asyncio.gather(*(validate(hit) for hit in structurally_valid))
     filtered = [hit for hit in checked if hit is not None]
-    filtered.sort(key=lambda hit: (hit.fan_count is None, -(hit.fan_count or 0)))
+    if not preserve_order:
+        filtered.sort(key=lambda hit: (hit.fan_count is None, -(hit.fan_count or 0)))
     return filtered
 
 

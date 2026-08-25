@@ -62,6 +62,7 @@ class DiscoverySection:
     state: str = "ready"
     message: str | None = None
     stale: bool = False
+    has_next: bool | None = None
 
 
 @dataclass(frozen=True)

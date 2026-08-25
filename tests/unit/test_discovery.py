@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -31,6 +33,25 @@ class FakeDiscoveryProvider:
             deezer_id=provider_id,
             name="Validated artist",
         )
+
+
+class GenreCandidateProvider(FakeDiscoveryProvider):
+    def __init__(self, candidate_ids: list[str], invalid_ids: set[str] | None = None) -> None:
+        super().__init__()
+        self.candidate_ids = candidate_ids
+        self.invalid_ids = invalid_ids or set()
+
+    async def genre_artist_candidates(self, genre_id: str) -> list[ArtistHit]:
+        assert genre_id == "132"
+        return [
+            ArtistHit("deezer", artist_id, f"Artist {artist_id}", deezer_id=artist_id)
+            for artist_id in self.candidate_ids
+        ]
+
+    async def get_artist(self, provider_id: str) -> ArtistDetail:
+        if provider_id in self.invalid_ids:
+            raise ValueError("invalid exact artist")
+        return await super().get_artist(provider_id)
 
 
 async def test_cache_is_partitioned_by_region_page_and_can_invalidate() -> None:
@@ -152,15 +173,15 @@ async def test_deezer_genre_discovery_uses_exact_radio_tracks_and_deduplicates(
 ) -> None:
     requests: list[str] = []
     radio_tracks = {
-        "pop-a": [
+        "1": [
             {"artist": {"id": 10, "name": "Pop One"}},
             {"artist": {"id": 11, "name": "Pop Two"}},
         ],
-        "pop-b": [
+        "2": [
             {"artist": {"id": 11, "name": "Pop Two duplicate"}},
             {"artist": {"id": 12, "name": "Pop Three"}},
         ],
-        "rap-a": [
+        "3": [
             {"artist": {"id": 20, "name": "Rap One"}},
             {"artist": {"id": 21, "name": "Rap Two"}},
         ],
@@ -172,9 +193,9 @@ async def test_deezer_genre_discovery_uses_exact_radio_tracks_and_deduplicates(
             genre_id = int(request.url.path.rsplit("/", 1)[1])
             return httpx.Response(200, json={"id": genre_id, "name": "Exact genre"})
         if request.url.path == "/genre/132/radios":
-            return httpx.Response(200, json={"data": [{"id": "pop-a"}, {"id": "pop-b"}]})
+            return httpx.Response(200, json={"data": [{"id": 1}, {"id": "2"}]})
         if request.url.path == "/genre/116/radios":
-            return httpx.Response(200, json={"data": [{"id": "rap-a"}]})
+            return httpx.Response(200, json={"data": [{"id": 3}]})
         if request.url.path.startswith("/radio/") and request.url.path.endswith("/tracks"):
             radio_id = request.url.path.split("/")[2]
             return httpx.Response(200, json={"data": radio_tracks[radio_id]})
@@ -200,7 +221,7 @@ async def test_deezer_genre_discovery_uses_exact_radio_tracks_and_deduplicates(
     )
     assert "/genre/132" in requests
     assert "/genre/132/radios" in requests
-    assert "/radio/pop-a/tracks" in requests
+    assert "/radio/1/tracks" in requests
     assert not any(path.endswith("/artists") for path in requests)
     assert not any(path.startswith("/chart/") for path in requests)
 
@@ -250,6 +271,135 @@ async def test_deezer_genre_discovery_pagination_is_deterministic(monkeypatch) -
     assert [artist.provider_id for artist in first] == ["1", "2"]
     assert [artist.provider_id for artist in second] == ["3", "4"]
     assert repeated == second
+
+
+async def test_genre_pagination_validates_before_slicing_and_reports_truthful_next() -> None:
+    provider = GenreCandidateProvider(
+        [str(artist_id) for artist_id in range(1, 17)], invalid_ids={"2", "4", "6"}
+    )
+    service = DiscoveryService(provider)  # type: ignore[arg-type]
+
+    first = await service.get("genre", "US", genre_id="132", limit=12)
+    second = await service.get("genre", "US", genre_id="132", page=2, limit=12)
+
+    assert [artist.provider_id for artist in first.items] == [
+        "1",
+        "3",
+        "5",
+        "7",
+        "8",
+        "9",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "15",
+    ]
+    assert first.has_next is True
+    assert [artist.provider_id for artist in second.items] == ["16"]
+    assert second.has_next is False
+    assert set(first.items).isdisjoint(second.items)
+
+
+@pytest.mark.parametrize("count,expected_next", [(12, False), (13, True)])
+async def test_genre_pagination_probes_one_valid_candidate_for_next(
+    count: int, expected_next: bool
+) -> None:
+    provider = GenreCandidateProvider([str(artist_id) for artist_id in range(1, count + 1)])
+
+    section = await DiscoveryService(provider).get(  # type: ignore[arg-type]
+        "genre", "US", genre_id="132", limit=12
+    )
+
+    assert len(section.items) == 12
+    assert section.has_next is expected_next
+
+
+async def test_duplicate_heavy_genre_tracks_backfill_from_full_bounded_pool(monkeypatch) -> None:
+    tracks = [{"artist": {"id": 1, "name": "Artist 1"}} for _ in range(12)]
+    tracks.extend(
+        {"artist": {"id": artist_id, "name": f"Artist {artist_id}"}} for artist_id in range(2, 15)
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/genre/132":
+            return httpx.Response(200, json={"id": 132, "name": "Pop"})
+        if request.url.path == "/genre/132/radios":
+            return httpx.Response(200, json={"data": [{"id": 1}]})
+        if request.url.path == "/radio/1/tracks":
+            return httpx.Response(200, json={"data": tracks})
+        if request.url.path.startswith("/artist/"):
+            artist_id = request.url.path.rsplit("/", 1)[1]
+            return httpx.Response(200, json={"id": int(artist_id), "name": f"Artist {artist_id}"})
+        raise AssertionError(f"unexpected URL: {request.url}")
+
+    provider = DeezerClient()
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com", transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    section = await DiscoveryService(provider).get("genre", "US", genre_id="132", limit=12)
+
+    assert [artist.provider_id for artist in section.items] == [
+        str(index) for index in range(1, 13)
+    ]
+    assert section.has_next is True
+
+
+async def test_genre_page_twenty_stays_bounded_and_never_advertises_page_twenty_one() -> None:
+    provider = GenreCandidateProvider([str(artist_id) for artist_id in range(1, 501)])
+
+    section = await DiscoveryService(provider).get(  # type: ignore[arg-type]
+        "genre", "US", genre_id="132", page=20, limit=12
+    )
+
+    assert [artist.provider_id for artist in section.items] == [
+        str(artist_id) for artist_id in range(229, 241)
+    ]
+    assert section.has_next is False
+
+
+async def test_deezer_genre_candidates_keep_radio_order_when_later_response_finishes_first(
+    monkeypatch,
+) -> None:
+    completed: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/genre/132":
+            return httpx.Response(200, json={"id": 132, "name": "Pop"})
+        if request.url.path == "/genre/132/radios":
+            return httpx.Response(200, json={"data": [{"id": 1}, {"id": 2}]})
+        if request.url.path == "/radio/1/tracks":
+            await asyncio.sleep(0.02)
+            completed.append("1")
+            return httpx.Response(
+                200, json={"data": [{"artist": {"id": 10, "name": "First radio"}}]}
+            )
+        if request.url.path == "/radio/2/tracks":
+            completed.append("2")
+            return httpx.Response(
+                200, json={"data": [{"artist": {"id": 20, "name": "Second radio"}}]}
+            )
+        raise AssertionError(f"unexpected URL: {request.url}")
+
+    provider = DeezerClient()
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com", transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    artists = await provider.genre_artist_candidates("132")
+
+    assert completed == ["2", "1"]
+    assert [artist.provider_id for artist in artists] == ["10", "20"]
 
 
 async def test_deezer_genre_discovery_caps_radio_fanout_and_track_depth(monkeypatch) -> None:
@@ -327,6 +477,102 @@ async def test_deezer_genre_discovery_fails_closed_on_invalid_or_malformed_envel
     genre_id = "999999" if failing_path == "/genre/999999" else "132"
     with pytest.raises(ValueError, match="genre"):
         await provider.discovery_feed("genre", genre_id=genre_id)
+
+
+@pytest.mark.parametrize(
+    "failing_path,payload",
+    [
+        ("/genre/132", {"id": 132, "name": "Pop", "error": {}}),
+        ("/genre/132/radios", {"data": [{"id": 1}], "error": {}}),
+        ("/radio/1/tracks", {"data": [], "error": {}}),
+    ],
+)
+async def test_deezer_genre_discovery_rejects_error_key_regardless_of_truthiness(
+    monkeypatch, failing_path: str, payload: object
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == failing_path:
+            return httpx.Response(200, json=payload)
+        if request.url.path == "/genre/132":
+            return httpx.Response(200, json={"id": 132, "name": "Pop"})
+        if request.url.path == "/genre/132/radios":
+            return httpx.Response(200, json={"data": [{"id": 1}]})
+        if request.url.path == "/radio/1/tracks":
+            return httpx.Response(200, json={"data": [{"artist": {"id": 10, "name": "Artist"}}]})
+        raise AssertionError(f"unexpected URL: {request.url}")
+
+    provider = DeezerClient()
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com", transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="genre"):
+        await provider.genre_artist_candidates("132")
+
+
+@pytest.mark.parametrize("bad_id", [{"unsafe": 1}, [1], True, 1.5, "", "0", 0])
+@pytest.mark.parametrize("location", ["radio", "artist"])
+async def test_deezer_genre_discovery_rejects_non_positive_scalar_ids_before_use(
+    monkeypatch, bad_id: object, location: str
+) -> None:
+    requested_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.url.path == "/genre/132":
+            return httpx.Response(200, json={"id": 132, "name": "Pop"})
+        if request.url.path == "/genre/132/radios":
+            radio_id: object = bad_id if location == "radio" else 1
+            return httpx.Response(200, json={"data": [{"id": radio_id}]})
+        if request.url.path == "/radio/1/tracks":
+            return httpx.Response(
+                200, json={"data": [{"artist": {"id": bad_id, "name": "Artist"}}]}
+            )
+        raise AssertionError(f"unsafe or unexpected URL: {request.url}")
+
+    provider = DeezerClient()
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com", transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="genre"):
+        await provider.genre_artist_candidates("132")
+    if location == "radio":
+        assert not any(path.startswith("/radio/") for path in requested_paths)
+
+
+@pytest.mark.parametrize("bad_id", [{"unsafe": 1}, [132], True, 132.0, "", "0", 0])
+async def test_deezer_genre_discovery_rejects_invalid_exact_genre_ids(
+    monkeypatch, bad_id: object
+) -> None:
+    requested_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.url.path == "/genre/132":
+            return httpx.Response(200, json={"id": bad_id, "name": "Pop"})
+        raise AssertionError(f"unsafe or unexpected URL: {request.url}")
+
+    provider = DeezerClient()
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com", transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="genre"):
+        await provider.genre_artist_candidates("132")
+    assert requested_paths == ["/genre/132"]
 
 
 async def test_discovery_filters_definitively_invalid_artist_identity() -> None:

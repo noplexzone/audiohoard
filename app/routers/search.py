@@ -337,7 +337,7 @@ async def discover_genre(
     db: Annotated[AsyncSession, Depends(get_db)],
     page: Annotated[int, Query(ge=1, le=20)] = 1,
 ) -> HTMLResponse:
-    if not genre_id.isdigit() or len(genre_id) > 12:
+    if not genre_id.isdigit() or len(genre_id) > 12 or int(genre_id) < 1:
         raise HTTPException(status_code=404, detail="Unknown genre")
     return await _discover_page(request, db, "genre", page, genre_id)
 

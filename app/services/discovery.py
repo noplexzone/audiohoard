@@ -4,7 +4,7 @@ import asyncio
 import time
 from dataclasses import replace
 
-from app.metadata.base import ArtistHit, DiscoveryRelease, DiscoverySection
+from app.metadata.base import ArtistHit, DiscoveryGenre, DiscoveryRelease, DiscoverySection
 from app.metadata.deezer import DeezerClient
 from app.services.catalog_metadata import validated_artist_hits
 
@@ -47,7 +47,7 @@ class DiscoveryService:
     ) -> DiscoverySection:
         page = max(1, min(page, 20))
         limit = max(1, min(limit, 25))
-        key = f"deezer:{feed}:{region}:{page}:{genre_id or ''}"
+        key = f"deezer:{feed}:{region}:{page}:{limit}:{genre_id or ''}"
         now = time.monotonic()
         self._cache = {
             cache_key: value
@@ -60,10 +60,34 @@ class DiscoveryService:
             self._cache[key] = cached
             return cached[1]
         try:
-            items = await self.provider.discovery_feed(
-                feed, page=page, limit=limit, genre_id=genre_id
-            )
-            if feed in {"popular", "genre"}:
+            has_next: bool | None = None
+            items: list[ArtistHit | DiscoveryGenre | DiscoveryRelease] = []
+            if feed == "genre":
+                if genre_id is None:
+                    raise ValueError("Genre discovery requires an ID")
+                candidates = await self.provider.genre_artist_candidates(genre_id)
+                index = (page - 1) * limit
+                target = index + limit + 1
+                validated: list[ArtistHit] = []
+                batch_size = max(25, limit + 1)
+                for start in range(0, len(candidates), batch_size):
+                    validated.extend(
+                        await validated_artist_hits(
+                            self.provider,
+                            "deezer",
+                            candidates[start : start + batch_size],
+                            preserve_order=True,
+                        )
+                    )
+                    if len(validated) >= target:
+                        break
+                items.extend(validated[index : index + limit])
+                has_next = page < 20 and len(validated) > index + limit
+            else:
+                items = await self.provider.discovery_feed(
+                    feed, page=page, limit=limit, genre_id=genre_id
+                )
+            if feed == "popular":
                 artists = [item for item in items if isinstance(item, ArtistHit)]
                 validated = await validated_artist_hits(self.provider, "deezer", artists)
                 items.clear()
@@ -100,6 +124,7 @@ class DiscoveryService:
                 fallback_global=True,
                 state="error",
                 message="Discovery provider is temporarily unavailable",
+                has_next=False if feed == "genre" else None,
             )
         section = DiscoverySection(
             feed=feed,
@@ -108,6 +133,7 @@ class DiscoveryService:
             effective_region="GLOBAL",
             fallback_global=True,
             items=tuple(items),
+            has_next=has_next,
         )
         self._cache[key] = (now + self.ttl_seconds, section)
         while len(self._cache) > self.max_entries:

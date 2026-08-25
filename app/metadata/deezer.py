@@ -4,7 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, replace
 from typing import cast
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -77,11 +77,12 @@ class DeezerClient:
         elif feed == "genres":
             path, local_start = "/genre", index
         elif feed == "genre":
-            if not genre_id or not genre_id.isdigit():
+            normalized_genre_id = _positive_scalar_id(genre_id)
+            if normalized_genre_id is None:
                 raise ValueError("Invalid Deezer genre")
             return cast(
                 list[ArtistHit | DiscoveryGenre | DiscoveryRelease],
-                await self._genre_artists(genre_id, index=index, limit=limit),
+                (await self.genre_artist_candidates(normalized_genre_id))[index : index + limit],
             )
         elif feed == "new":
             path = "/editorial/0/releases"
@@ -94,7 +95,7 @@ class DeezerClient:
             response = await request_with_retry(client, "GET", path, params=params)
             response.raise_for_status()
         payload = response.json()
-        if isinstance(payload, dict) and payload.get("error"):
+        if isinstance(payload, dict) and "error" in payload:
             raise ValueError("Deezer returned an error envelope")
         rows = payload.get("data", []) if isinstance(payload, dict) else []
         if not isinstance(rows, list):
@@ -118,44 +119,47 @@ class DeezerClient:
             and release.artist_provider_id
         ]
 
-    async def _genre_artists(self, genre_id: str, *, index: int, limit: int) -> list[ArtistHit]:
-        """Derive genre artists from exact genre-radio tracks with bounded fanout."""
+    async def genre_artist_candidates(self, genre_id: str) -> list[ArtistHit]:
+        """Return the complete bounded, ordered candidate pool for an exact genre."""
+        normalized_genre_id = _positive_scalar_id(genre_id)
+        if normalized_genre_id is None:
+            raise ValueError("Invalid Deezer genre")
         async with asyncio.timeout(12), self._client() as client:
-            genre_response = await request_with_retry(client, "GET", f"/genre/{genre_id}")
+            genre_response = await request_with_retry(
+                client, "GET", f"/genre/{normalized_genre_id}"
+            )
             genre_response.raise_for_status()
             genre = genre_response.json()
             if (
                 not isinstance(genre, dict)
-                or genre.get("error")
-                or str(genre.get("id") or "") != genre_id
-                or not str(genre.get("name") or "").strip()
+                or "error" in genre
+                or _positive_scalar_id(genre.get("id")) != normalized_genre_id
+                or not isinstance(genre.get("name"), str)
+                or not genre["name"].strip()
             ):
                 raise ValueError("Deezer returned an invalid exact genre")
 
             radios_response = await request_with_retry(
                 client,
                 "GET",
-                f"/genre/{genre_id}/radios",
+                f"/genre/{normalized_genre_id}/radios",
                 params={"limit": _GENRE_RADIO_LIMIT},
             )
             radios_response.raise_for_status()
             radio_rows = _genre_collection(radios_response.json(), "genre radios")
             radio_ids: list[str] = []
             for row in radio_rows[:_GENRE_RADIO_LIMIT]:
-                radio_id = str(row.get("id") or "").strip()
-                if not radio_id:
+                radio_id = _positive_scalar_id(row.get("id"))
+                if radio_id is None:
                     raise ValueError("Deezer returned malformed genre radios")
                 radio_ids.append(radio_id)
 
-            tracks_per_radio = min(_GENRE_TRACK_LIMIT, index + limit)
-
             async def get_radio_tracks(radio_id: str) -> list[dict[str, object]]:
-                safe_radio_id = quote(radio_id, safe="")
                 response = await request_with_retry(
                     client,
                     "GET",
-                    f"/radio/{safe_radio_id}/tracks",
-                    params={"limit": tracks_per_radio},
+                    f"/radio/{radio_id}/tracks",
+                    params={"limit": _GENRE_TRACK_LIMIT},
                 )
                 response.raise_for_status()
                 return _genre_collection(response.json(), "genre radio tracks")
@@ -171,15 +175,13 @@ class DeezerClient:
                 artist_row = track.get("artist")
                 if not isinstance(artist_row, dict):
                     raise ValueError("Deezer returned malformed genre radio tracks")
-                artist = _parse_artist(artist_row)
-                if not artist.provider_id or not artist.name.strip():
-                    raise ValueError("Deezer returned malformed genre radio artists")
+                artist = _parse_genre_radio_artist(artist_row)
                 if artist.provider_id in seen_artist_ids:
                     continue
                 seen_artist_ids.add(artist.provider_id)
                 artists.append(artist)
 
-        return artists[index : index + limit]
+        return artists
 
     async def search_artists(self, query: str) -> list[ArtistHit]:
         cache_key = f"artist-search:{query}"
@@ -421,12 +423,31 @@ async def _backfill_artist_search_evidence(client: DeezerClient, hits: list[Arti
 
 
 def _genre_collection(payload: object, context: str) -> list[dict[str, object]]:
-    if not isinstance(payload, dict) or payload.get("error"):
+    if not isinstance(payload, dict) or "error" in payload:
         raise ValueError(f"Deezer returned an invalid {context} envelope")
     rows = payload.get("data")
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
         raise ValueError(f"Deezer returned malformed {context}")
     return cast(list[dict[str, object]], rows)
+
+
+def _positive_scalar_id(value: object) -> str | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value) if value > 0 else None
+    if isinstance(value, str) and value.isdigit():
+        normalized = value.lstrip("0")
+        return normalized or None
+    return None
+
+
+def _parse_genre_radio_artist(data: dict[str, object]) -> ArtistHit:
+    artist_id = _positive_scalar_id(data.get("id"))
+    name = data.get("name")
+    if artist_id is None or not isinstance(name, str) or not name.strip():
+        raise ValueError("Deezer returned malformed genre radio artists")
+    return replace(_parse_artist(data), provider_id=artist_id, deezer_id=artist_id, name=name)
 
 
 def _to_float(value: object) -> float | None:
@@ -524,9 +545,12 @@ def _parse_artist_detail(data: dict[str, object]) -> ArtistDetail:
 
 
 def _parse_genre(data: dict[str, object]) -> DiscoveryGenre:
+    genre_id = _positive_scalar_id(data.get("id"))
+    if genre_id is None:
+        raise ValueError("Deezer returned an invalid genre ID")
     return DiscoveryGenre(
         provider="deezer",
-        provider_id=str(data.get("id") or ""),
+        provider_id=genre_id,
         name=str(data.get("name") or ""),
         artwork_url=str(data.get("picture_big") or data.get("picture_medium") or "") or None,
     )
