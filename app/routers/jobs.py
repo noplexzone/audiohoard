@@ -227,7 +227,10 @@ async def _assemble_downloads_context(
 
     download_groups = project_download_groups(downloads, parents)
     if status is not None:
-        download_groups = [group for group in download_groups if group.status == status]
+        visible_statuses = {status}
+        if status == JobStatus.running:
+            visible_statuses.add(JobStatus.pending)
+        download_groups = [group for group in download_groups if group.status in visible_statuses]
     download_groups = download_groups[:100]
     review_result = await db.execute(
         select(StagingReviewItem)

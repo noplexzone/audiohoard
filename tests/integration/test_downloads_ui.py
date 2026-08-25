@@ -14,8 +14,10 @@ from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, Catalog
 from app.models.discography_batch import (
     DiscographyBatch,
     DiscographyBatchItem,
+    DiscographyBatchItemJob,
     DiscographyBatchItemState,
     DiscographyBatchState,
+    DiscographyJobOwnership,
     DiscographyScopeKind,
 )
 from app.models.job import Job, JobStatus
@@ -125,6 +127,42 @@ async def test_downloads_show_deduplicated_batch_work_while_jobs_are_preparing(
 
     completed = await client.get("/downloads?status=done")
     assert "Queue Album" not in completed.text
+
+
+async def test_running_downloads_keep_pending_job_visible_during_batch_takeover(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        job = Job(source="priority", query="Takeover Album", status=JobStatus.pending)
+        batch = DiscographyBatch(
+            scope_kind=DiscographyScopeKind.wanted_selected,
+            scope_json="{}",
+            scope_hash="downloads-created-takeover",
+            state=DiscographyBatchState.running,
+            estimated_job_count=1,
+        )
+        item = DiscographyBatchItem(
+            release_identity="catalog_album:takeover",
+            artist_name="Takeover Artist",
+            release_title="Takeover Album",
+            state=DiscographyBatchItemState.expanding,
+            target_count=1,
+            estimated_job_count=1,
+        )
+        item.job_links.append(
+            DiscographyBatchItemJob(job=job, ownership=DiscographyJobOwnership.created)
+        )
+        batch.items.append(item)
+        db.add(batch)
+        await db.commit()
+
+    response = await client.get("/downloads?status=running")
+
+    assert response.status_code == 200
+    assert "Takeover Album" in response.text
+    assert 'data-preparing-download="catalog_album:takeover"' not in response.text
+    assert "No downloads yet" not in response.text
 
 
 async def test_downloads_hides_stale_review_release_without_actionable_items(
