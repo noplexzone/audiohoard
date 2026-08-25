@@ -11,6 +11,15 @@ from httpx import AsyncClient
 from app.database import get_session_factory
 from app.jobs.dispatcher import job_dispatcher
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
+from app.models.discography_batch import (
+    DiscographyBatch,
+    DiscographyBatchItem,
+    DiscographyBatchItemJob,
+    DiscographyBatchItemState,
+    DiscographyBatchState,
+    DiscographyJobOwnership,
+    DiscographyScopeKind,
+)
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.staging_review import StagingReviewItem
@@ -79,6 +88,81 @@ async def test_downloads_show_state_details_and_valid_actions(client: AsyncClien
     assert f"/downloads/{running_id}/cancel" not in filtered.text
     assert f"/downloads/{failed_id}/retry" not in filtered.text
     assert "Showing partial jobs" in filtered.text
+
+
+async def test_downloads_show_deduplicated_batch_work_while_jobs_are_preparing(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        for suffix, estimate in (("one", 3), ("two", 2)):
+            batch = DiscographyBatch(
+                scope_kind=DiscographyScopeKind.wanted_selected,
+                scope_json="{}",
+                scope_hash=f"downloads-preparing-{suffix}",
+                state=DiscographyBatchState.queued,
+                estimated_job_count=estimate,
+            )
+            batch.items.append(
+                DiscographyBatchItem(
+                    release_identity="catalog_album:preparing",
+                    artist_name="Queue Artist",
+                    release_title="Queue Album",
+                    state=DiscographyBatchItemState.pending,
+                    target_count=estimate,
+                    estimated_job_count=estimate,
+                )
+            )
+            db.add(batch)
+        await db.commit()
+
+    response = await client.get("/downloads?status=running")
+
+    assert response.status_code == 200
+    assert response.text.count('data-preparing-download="catalog_album:preparing"') == 1
+    assert "Queue Album" in response.text
+    assert "Queue Artist" in response.text
+    assert "3 tracks preparing" in response.text
+    assert "No downloads yet" not in response.text
+
+    completed = await client.get("/downloads?status=done")
+    assert "Queue Album" not in completed.text
+
+
+async def test_running_downloads_keep_pending_job_visible_during_batch_takeover(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        job = Job(source="priority", query="Takeover Album", status=JobStatus.pending)
+        batch = DiscographyBatch(
+            scope_kind=DiscographyScopeKind.wanted_selected,
+            scope_json="{}",
+            scope_hash="downloads-created-takeover",
+            state=DiscographyBatchState.running,
+            estimated_job_count=1,
+        )
+        item = DiscographyBatchItem(
+            release_identity="catalog_album:takeover",
+            artist_name="Takeover Artist",
+            release_title="Takeover Album",
+            state=DiscographyBatchItemState.expanding,
+            target_count=1,
+            estimated_job_count=1,
+        )
+        item.job_links.append(
+            DiscographyBatchItemJob(job=job, ownership=DiscographyJobOwnership.created)
+        )
+        batch.items.append(item)
+        db.add(batch)
+        await db.commit()
+
+    response = await client.get("/downloads?status=running")
+
+    assert response.status_code == 200
+    assert "Takeover Album" in response.text
+    assert 'data-preparing-download="catalog_album:takeover"' not in response.text
+    assert "No downloads yet" not in response.text
 
 
 async def test_downloads_hides_stale_review_release_without_actionable_items(
@@ -252,6 +336,7 @@ async def test_downloads_shows_elapsed_and_external_transfer_wait(client: AsyncC
     # Auto-refresh is implemented by the external CSP-compatible script.
     assert re.search(r'src="/static/js/downloads\.js\?v=[0-9a-f]{12}"', text)
     assert "POLL_INTERVAL_MS = 10000" in DOWNLOADS_JS
+    assert "data-preparing-download" in DOWNLOADS_JS
 
     # Elapsed and last-activity columns are present
     assert "Elapsed" in text

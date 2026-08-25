@@ -15,22 +15,61 @@ def test_discography_batch_direct_queue_desktop_and_mobile(
     page.goto(f"{browser_base_url}/wanted")
     page.get_by_role("checkbox", name="Select Browser Context Album").check()
     page.get_by_role("button", name="Queue selected").click()
-    page.wait_for_url("**/discography-batches/*?notice=queued")
+    page.wait_for_url("**/activity?notice=queued")
 
-    assert page.get_by_role("heading", name="Batch status").is_visible()
-    assert page.get_by_role("button", name="Confirm and queue").count() == 0
+    assert page.get_by_role("heading", name="Activity").is_visible()
+    assert page.get_by_text("Downloads queued", exact=False).is_visible()
+    assert page.locator('[data-activity-count="active-downloads"]').inner_text() != "0"
+    assert page.get_by_role("heading", name="Batch status").count() == 0
+    page.get_by_role("link", name="Active downloads").click()
+    page.wait_for_url("**/downloads?status=running")
     assert page.get_by_text("Browser Context Album", exact=True).is_visible()
+    page.screenshot(
+        path=str(SCREENSHOT_ROOT / "audiohoard-preparing-downloads-desktop.png"),
+        full_page=True,
+    )
+    page.route(
+        "**/downloads/queue?status=running",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="text/html",
+            body=(
+                '<div data-materialized-job="1">'
+                "<strong>Browser Context Album</strong>"
+                '<span class="badge">pending</span>'
+                "</div>"
+            ),
+        ),
+    )
+    page.reload()
+    assert page.get_by_text("Browser Context Album", exact=True).is_visible()
+    page.locator('[data-materialized-job="1"]').wait_for(state="visible", timeout=15_000)
+    assert page.locator("[data-preparing-download]").count() == 0
+    page.unroute("**/downloads/queue?status=running")
+    page.go_back()
+    page.wait_for_url("**/activity?notice=queued")
     assert page.evaluate(
         "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
     )
-    assert page.evaluate("document.querySelectorAll('article.batch-item').length") == 1
-    page.screenshot(path=str(SCREENSHOT_ROOT / "audiohoard-batch-desktop.png"), full_page=True)
+    assert page.evaluate("document.querySelectorAll('article.batch-item').length") == 0
+    page.screenshot(
+        path=str(SCREENSHOT_ROOT / "audiohoard-queue-activity-desktop.png"), full_page=True
+    )
 
     page.set_viewport_size({"width": 390, "height": 844})
     page.reload()
-    assert page.get_by_role("heading", name="Batch status").is_visible()
-    assert page.get_by_role("button", name="Confirm and queue").count() == 0
+    assert page.get_by_role("heading", name="Activity").is_visible()
+    assert page.get_by_text("Downloads queued", exact=False).is_visible()
     assert page.evaluate(
         "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
     )
-    page.screenshot(path=str(SCREENSHOT_ROOT / "audiohoard-batch-mobile.png"), full_page=True)
+    page.screenshot(
+        path=str(SCREENSHOT_ROOT / "audiohoard-queue-activity-mobile.png"), full_page=True
+    )
+    page.get_by_role("link", name="Active downloads").click()
+    page.wait_for_url("**/downloads?status=running")
+    assert page.get_by_text("Browser Context Album", exact=True).is_visible()
+    page.screenshot(
+        path=str(SCREENSHOT_ROOT / "audiohoard-preparing-downloads-mobile.png"),
+        full_page=True,
+    )

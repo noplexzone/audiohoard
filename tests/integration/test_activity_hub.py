@@ -2,6 +2,15 @@ from __future__ import annotations
 
 from httpx import AsyncClient
 
+from app.database import get_session_factory
+from app.models.discography_batch import (
+    DiscographyBatch,
+    DiscographyBatchItem,
+    DiscographyBatchItemState,
+    DiscographyBatchState,
+    DiscographyScopeKind,
+)
+
 _ACTIVITY_TABS = (
     ('href="/wanted"', "Wanted"),
     ('href="/downloads"', "Downloads"),
@@ -28,6 +37,87 @@ async def test_activity_hub_renders_counts_tabs_and_empty_guidance(client: Async
     ):
         assert f'data-activity-count="{count_name}">0<' in response.text
     assert "Nothing needs your attention" in response.text
+
+
+async def test_activity_hub_acknowledges_direct_download_queue(client: AsyncClient) -> None:
+    response = await client.get("/activity?notice=queued")
+
+    assert response.status_code == 200
+    assert 'role="status"' in response.text
+    assert "Downloads queued" in response.text
+    assert "Active downloads" in response.text
+    assert "Batch status" not in response.text
+
+
+async def test_activity_surfaces_pre_materialization_batch_failures(client: AsyncClient) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        batch = DiscographyBatch(
+            scope_kind=DiscographyScopeKind.artist,
+            scope_json="{}",
+            scope_hash="activity-failure",
+            state=DiscographyBatchState.completed_with_failures,
+        )
+        batch.items.append(
+            DiscographyBatchItem(
+                release_identity="catalog_album:failure",
+                artist_name="Failure Artist",
+                release_title="Failure Album",
+                state=DiscographyBatchItemState.failed,
+                error_detail="Provider hydration failed",
+            )
+        )
+        db.add(batch)
+        await db.commit()
+        batch_id = batch.id
+
+    response = await client.get("/activity")
+
+    assert response.status_code == 200
+    assert "Queue preparation failed" in response.text
+    assert "Failure Album" in response.text
+    assert "Provider hydration failed" in response.text
+    assert f'href="/discography-batches/{batch_id}"' in response.text
+    assert "Review and retry" in response.text
+
+
+async def test_all_batch_failures_remain_discoverable_beyond_activity_preview(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        for index in range(21):
+            batch = DiscographyBatch(
+                scope_kind=DiscographyScopeKind.artist,
+                scope_json="{}",
+                scope_hash=f"activity-failure-page-{index}",
+                state=DiscographyBatchState.completed_with_failures,
+            )
+            batch.items.append(
+                DiscographyBatchItem(
+                    release_identity=f"catalog_album:failure-{index}",
+                    artist_name="Failure Artist",
+                    release_title=f"Failure Album {index:02d}",
+                    state=DiscographyBatchItemState.failed,
+                    error_detail=f"Failure detail {index:02d}",
+                )
+            )
+            db.add(batch)
+        await db.commit()
+
+    activity = await client.get("/activity")
+    assert 'href="/activity/queue-failures"' in activity.text
+    assert "View all 21 queue failures" in activity.text
+
+    first_page = await client.get("/activity/queue-failures")
+    assert first_page.status_code == 200
+    assert "Failure Album 20" in first_page.text
+    assert 'href="/activity/queue-failures?page=2"' in first_page.text
+
+    second_page = await client.get("/activity/queue-failures?page=2")
+    assert second_page.status_code == 200
+    assert "Failure Album 00" in second_page.text
+    assert "Review and retry" in second_page.text
 
 
 async def test_desktop_and_mobile_navigation_use_task_destinations(client: AsyncClient) -> None:

@@ -23,6 +23,7 @@ from app.models.release import Release
 from app.models.staging_review import StagingReviewItem
 from app.models.workflow import ImportWorkflowState, ReviewDecision
 from app.schemas.job import JobCreate, JobRead, SelectedResultPayload
+from app.services.activity import get_preparing_downloads
 from app.services.download_queue import project_download_groups
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -226,7 +227,10 @@ async def _assemble_downloads_context(
 
     download_groups = project_download_groups(downloads, parents)
     if status is not None:
-        download_groups = [group for group in download_groups if group.status == status]
+        visible_statuses = {status}
+        if status == JobStatus.running:
+            visible_statuses.add(JobStatus.pending)
+        download_groups = [group for group in download_groups if group.status in visible_statuses]
     download_groups = download_groups[:100]
     review_result = await db.execute(
         select(StagingReviewItem)
@@ -292,11 +296,17 @@ async def _assemble_downloads_context(
                 "review_items": items,
             }
         )
+    preparing_downloads = (
+        await get_preparing_downloads(db)
+        if status is None or status in (JobStatus.pending, JobStatus.running)
+        else []
+    )
     now = dt.now(UTC)
     return {
         "downloads": downloads,
         "jobs": downloads,
         "download_groups": download_groups,
+        "preparing_downloads": preparing_downloads,
         "pending_review_items": pending_review_items,
         "release_reviews": release_reviews,
         "selected_status": status.value if status is not None else None,

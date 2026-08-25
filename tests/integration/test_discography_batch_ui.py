@@ -128,7 +128,7 @@ async def test_primary_artist_and_wanted_actions_queue_directly_without_preview_
     assert "Queue all 1 matches" in wanted_page.text
 
 
-async def test_direct_queue_commits_before_runner_wake_and_redirects_to_status(
+async def test_direct_queue_commits_before_runner_wake_and_redirects_to_activity(
     client: AsyncClient, monkeypatch
 ) -> None:
     _, album_id = await _seed_wanted_album("Committed before wake")
@@ -157,11 +157,11 @@ async def test_direct_queue_commits_before_runner_wake_and_redirects_to_status(
     )
 
     assert response.status_code == 303
-    assert response.headers["location"].startswith("/discography-batches/")
-    assert "notice=queued" in response.headers["location"]
+    assert response.headers["location"] == "/activity?notice=queued"
     assert events == ["committed", "wake"]
     page = await client.get(response.headers["location"])
-    assert "Queued missing releases" in page.text
+    assert "Downloads queued" in page.text
+    assert "Batch status" not in page.text
 
 
 async def test_direct_queue_empty_selected_and_page_create_no_batch(client: AsyncClient) -> None:

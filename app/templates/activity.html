@@ -11,6 +11,34 @@
 
 {% include "partials/_activity_tabs.html" %}
 
+{% if request.query_params.get("notice") == "queued" %}
+<div class="alert ok" role="status">
+  <strong>Downloads queued.</strong>
+  They are being prepared and will appear under Active downloads.
+</div>
+{% elif request.query_params.get("notice") == "complete" %}
+<div class="alert ok" role="status">
+  <strong>Nothing new to queue.</strong>
+  The selected releases are already complete or active.
+</div>
+{% endif %}
+
+{% if batch_failures %}
+<section aria-labelledby="queue-failures-heading">
+  <h2 id="queue-failures-heading">Queue preparation failed</h2>
+  {% for failure in batch_failures %}
+  <div class="alert error">
+    <strong>{{ failure.release_title }}</strong> · {{ failure.artist_name }}<br>
+    {{ failure.error_detail }}
+    <a class="btn secondary" href="/discography-batches/{{ failure.batch_id }}">Review and retry</a>
+  </div>
+  {% endfor %}
+  {% if batch_failure_total > (batch_failures | length) %}
+  <p><a class="btn secondary" href="/activity/queue-failures">View all {{ batch_failure_total }} queue failures</a></p>
+  {% endif %}
+</section>
+{% endif %}
+
 {% if activity_summary %}
 <section class="activity-overview" aria-label="Activity overview" data-activity-attention="{{ activity_summary.attention }}">
   <a class="activity-summary-card" href="/wanted">

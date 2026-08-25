@@ -8,6 +8,7 @@ window.AudiohoardNavigation.registerPage('downloads', function (region) {
 
   function queueContainer() { return region.querySelector('#downloads-queue'); }
   function hasActiveGroup(container) {
+    if (container && container.querySelector('[data-preparing-download]')) return true;
     return container && Array.from(container.querySelectorAll('.badge')).some(function (element) {
       return ['pending', 'running'].includes(element.textContent.trim());
     });

@@ -1,5 +1,5 @@
 {% set queue = namespace(active=false) %}
-{% if download_groups %}
+{% if preparing_downloads or download_groups %}
 <div class="table-wrap downloads-table">
   <table>
     <thead>
@@ -14,6 +14,27 @@
       </tr>
     </thead>
     <tbody>
+    {% for preparing in preparing_downloads %}
+      {% set queue.active = true %}
+      <tr class="download-summary-row" data-preparing-download="{{ preparing.release_identity }}">
+        <td data-label="Release / download">
+          <div class="download-release">
+            {% set initials = preparing.release_title[:2] | upper %}
+            {% if preparing.catalog_album_id %}<a href="/albums/{{ preparing.catalog_album_id }}">{% endif %}<div class="cover-tile download-thumb">{{ initials }}</div>{% if preparing.catalog_album_id %}</a>{% endif %}
+            <div>
+              {% if preparing.catalog_album_id %}<a href="/albums/{{ preparing.catalog_album_id }}">{% endif %}<strong>{{ preparing.release_title }}</strong>{% if preparing.catalog_album_id %}</a>{% endif %}
+              <br><span class="hint">{{ preparing.estimated_job_count }} track{% if preparing.estimated_job_count != 1 %}s{% endif %} preparing</span>
+            </div>
+          </div>
+        </td>
+        <td data-label="Artist">{{ preparing.artist_name }}</td>
+        <td data-label="Source"><span class="badge info">Priority</span></td>
+        <td data-label="Status"><span class="badge warn"><span class="dot"></span>preparing</span><progress class="queue-progress" value="0" max="{{ preparing.estimated_job_count }}">0 / {{ preparing.estimated_job_count }}</progress></td>
+        <td class="queue-time" data-label="Elapsed">—</td>
+        <td class="queue-time" data-label="Last activity">queued</td>
+        <td class="action-cell" data-label="Actions"><span class="hint action-note">Creating download jobs</span></td>
+      </tr>
+    {% endfor %}
     {% for group in download_groups %}
       {% set download = group.attempts[0].job %}
       {% set status = group.status.value %}
