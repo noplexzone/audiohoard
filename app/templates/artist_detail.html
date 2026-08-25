@@ -2,7 +2,7 @@
 {% block title %}{{ detail.display_name }} — Library — Audiohoard{% endblock %}
 {% block content %}
 {% set csrf_token = request.cookies.get('csrf', '') | e %}
-<script defer src="/static/js/album.js?v={{ app_version }}" data-page-module="album"></script>
+<script defer src="/static/js/album.js?v={{ asset_version }}" data-page-module="album"></script>
 <nav class="breadcrumb" aria-label="Breadcrumb"><a href="/library">Library</a> / <span aria-current="page">{{ detail.display_name }}</span></nav>
 <section class="artist-view-hero card">
   <div class="artist-view-art" aria-hidden="true"><span>{{ detail.display_name[:2] | upper }}</span></div>

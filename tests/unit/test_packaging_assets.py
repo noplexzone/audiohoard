@@ -33,7 +33,7 @@ def test_discovery_artist_card_assets_are_registered() -> None:
     assert partial.exists()
     assert script.exists()
     assert '{% include "partials/_artist_card.html" %}' in search
-    assert 'src="/static/js/discovery.js?v={{ app_version }}"' in search
+    assert 'src="/static/js/discovery.js?v={{ asset_version }}"' in search
     assert 'data-page-module="discovery"' in search
 
 

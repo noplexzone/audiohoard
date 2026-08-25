@@ -12,8 +12,8 @@
   {% elif item.downloaded_track_count %}{% set ownership.partial = ownership.partial + 1 %}{% set ownership.wanted = ownership.wanted + 1 %}
   {% else %}{% set ownership.wanted = ownership.wanted + 1 %}{% endif %}
 {% endfor %}
-<script defer src="/static/js/artist-watchlist.js?v={{ app_version }}" data-page-module="artist-watchlist"></script>
-<script defer src="/static/js/album.js?v={{ app_version }}" data-page-module="album"></script>
+<script defer src="/static/js/artist-watchlist.js?v={{ asset_version }}" data-page-module="artist-watchlist"></script>
+<script defer src="/static/js/album.js?v={{ asset_version }}" data-page-module="album"></script>
 <nav class="breadcrumb"><a href="/library">Library</a> / {{ artist.name }}</nav>
 <section class="artist-view-hero card">
   <div class="artist-view-art" aria-hidden="true">
