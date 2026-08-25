@@ -845,3 +845,37 @@ async def test_non_genre_pagination_uses_display_offset_and_validated_continuati
         item.provider_id for item in second.items
     )
     assert first.has_next is second.has_next is True
+
+
+async def test_non_genre_dedupe_ignores_stray_cross_type_ids() -> None:
+    class Provider(FakeDiscoveryProvider):
+        async def discovery_feed(
+            self,
+            feed: str,
+            *,
+            page: int = 1,
+            limit: int = 12,
+            genre_id: str | None = None,
+            offset: int | None = None,
+        ) -> list[ArtistHit | DiscoveryRelease]:
+            assert feed == "new"
+            if offset != 0:
+                return []
+            return [
+                ArtistHit("deezer", "release-1", "Stray artist", deezer_id="release-1"),
+                DiscoveryRelease(
+                    "deezer", "release-1", "Valid release", "Valid artist", "artist-1"
+                ),
+                DiscoveryRelease(
+                    "deezer", "release-1", "Duplicate release", "Valid artist", "artist-1"
+                ),
+            ]
+
+        async def get_artist(self, provider_id: str) -> ArtistDetail:
+            return ArtistDetail("deezer", provider_id, "Valid artist", deezer_id=provider_id)
+
+    section = await DiscoveryService(Provider()).get("new", "US", limit=12)  # type: ignore[arg-type]
+
+    assert [item.title for item in section.items if isinstance(item, DiscoveryRelease)] == [
+        "Valid release"
+    ]

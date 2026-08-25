@@ -271,11 +271,9 @@ class DiscoveryService:
                         offset=offset,
                     )
                     unique_items: list[ArtistHit | DiscoveryRelease] = []
+                    expected_type = ArtistHit if feed == "popular" else DiscoveryRelease
                     for item in raw_items:
-                        if (
-                            isinstance(item, (ArtistHit, DiscoveryRelease))
-                            and item.provider_id not in seen_ids
-                        ):
+                        if isinstance(item, expected_type) and item.provider_id not in seen_ids:
                             seen_ids.add(item.provider_id)
                             unique_items.append(item)
                     if feed == "popular":
