@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Release SQLite writer locks between startup orphan-pruning batches so valid logins can create sessions while background maintenance continues.
 - Queue artist-watchlist and Wanted selection, page, and all-matching discography scopes directly as durable batches without a preview/confirmation materialization pass.
 - Restore truthful provider-wide Discover feeds by skipping Deezer taxonomy sentinels, using a bounded chart fallback for empty editorial releases, and removing misleading global-fallback claims.
 - Remove the duplicate monitored-artist rail from Discover and tighten the poster-first hierarchy, responsive states, navigation, and Manual search separation.

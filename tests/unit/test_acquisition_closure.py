@@ -931,8 +931,9 @@ async def test_prune_orphaned_terminal_records_removes_only_rows_without_files(
         "active_track": active_track.id,
     }
 
-    result = await prune_orphaned_terminal_records(db_session, batch_size=1)
+    result = await prune_orphaned_terminal_records(db_session, batch_size=1, commit_batches=True)
 
+    assert db_session.in_transaction() is False
     assert result.tracks == 2
     assert result.releases == 1
     assert result.jobs == 1
