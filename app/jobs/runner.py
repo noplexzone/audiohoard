@@ -63,6 +63,7 @@ from app.services.catalog_artist_credits import (
 from app.services.catalog_artist_credits import (
     is_compilation_album,
 )
+from app.services.catalog_manifest import catalog_manifest_issue as _catalog_manifest_issue
 from app.services.monitoring import map_slskd_transfer_state
 from app.services.rejected_sources import (
     RejectionClass,
@@ -1326,24 +1327,6 @@ def _catalog_disc_total(tracks: list[CatalogAlbumTrack]) -> int | None:
     discs = [track.disc for track in tracks if track.disc and track.disc > 0]
     total = max(discs, default=1)
     return total if total > 1 else None
-
-
-def _catalog_manifest_issue(
-    tracks: list[CatalogAlbumTrack], expected_count: int | None
-) -> str | None:
-    if not tracks:
-        return "catalog_tracks_empty"
-    identities: set[tuple[int, int]] = set()
-    for track in tracks:
-        identity = (track.disc, track.position)
-        if track.disc < 1 or track.position < 1 or identity in identities:
-            return "catalog_tracks_invalid_positions"
-        identities.add(identity)
-    if expected_count and len(tracks) < expected_count:
-        return "catalog_tracks_incomplete"
-    if expected_count and len(tracks) > expected_count:
-        return "catalog_tracks_overfull"
-    return None
 
 
 def _catalog_track_for_result(

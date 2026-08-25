@@ -1555,7 +1555,7 @@ async def get_missing_release_ids(
     limit: int = 10_000,
 ) -> list[int]:
     stmt = _sort_missing_releases_query(_missing_releases_query(q, status), sort)
-    rows = await db.scalars(select(stmt.subquery().c.album_id).limit(max(1, min(limit, 10_000))))
+    rows = await db.scalars(select(stmt.subquery().c.album_id).limit(max(1, min(limit, 10_001))))
     return [int(album_id) for album_id in rows.all()]
 
 
