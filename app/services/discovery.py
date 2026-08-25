@@ -3,9 +3,24 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import replace
+from pathlib import Path
+from typing import Any
 
-from app.metadata.base import ArtistHit, DiscoveryGenre, DiscoveryRelease, DiscoverySection
+from sqlalchemy import and_, select, tuple_
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.metadata.base import (
+    ArtistHit,
+    DiscoveryCardState,
+    DiscoveryGenre,
+    DiscoveryRelease,
+    DiscoverySection,
+)
 from app.metadata.deezer import DeezerClient
+from app.models.catalog_entities import CatalogAlbum, CatalogArtist, CatalogArtistIdentity
+from app.models.import_plan import ImportPlan, LibraryFileState
+from app.models.track import Track
+from app.models.workflow import AcquisitionState, ImportWorkflowState
 from app.services.catalog_metadata import validated_artist_hits
 
 _TITLES = {
@@ -15,6 +30,75 @@ _TITLES = {
     "new": "New releases",
     "trending": "Trending releases",
 }
+
+
+async def project_discovery_card_states(
+    db: AsyncSession, identities: set[tuple[str, str]]
+) -> dict[tuple[str, str], DiscoveryCardState]:
+    """Load exact visible identities and verified artifacts with one DB statement."""
+    if not identities:
+        return {}
+    rows = (
+        await db.execute(
+            select(
+                CatalogArtistIdentity.provider,
+                CatalogArtistIdentity.provider_artist_id,
+                CatalogArtist.id.label("catalog_artist_id"),
+                CatalogArtist.monitored,
+                CatalogArtist.watchlist_release_albums,
+                CatalogArtist.watchlist_release_singles,
+                CatalogArtist.watchlist_release_eps,
+                CatalogArtist.watchlist_monitor_upgrades,
+                ImportPlan.destination_path,
+            )
+            .join(CatalogArtist, CatalogArtist.id == CatalogArtistIdentity.artist_id)
+            .outerjoin(CatalogAlbum, CatalogAlbum.artist_id == CatalogArtist.id)
+            .outerjoin(
+                Track,
+                and_(
+                    Track.catalog_album_id == CatalogAlbum.id,
+                    Track.acquisition_state == AcquisitionState.downloaded,
+                    Track.import_state == ImportWorkflowState.imported,
+                    Track.file_size_bytes.is_not(None),
+                    Track.file_size_bytes > 0,
+                ),
+            )
+            .outerjoin(
+                ImportPlan,
+                and_(
+                    ImportPlan.track_id == Track.id,
+                    ImportPlan.status == ImportWorkflowState.imported,
+                    ImportPlan.file_state == LibraryFileState.present,
+                    ImportPlan.destination_path != "",
+                ),
+            )
+            .where(
+                tuple_(
+                    CatalogArtistIdentity.provider, CatalogArtistIdentity.provider_artist_id
+                ).in_(identities)
+            )
+        )
+    ).all()
+    grouped: dict[tuple[str, str], tuple[Any, list[str]]] = {}
+    for row in rows:
+        key = (str(row.provider), str(row.provider_artist_id))
+        _state, paths = grouped.setdefault(key, (row, []))
+        if row.destination_path:
+            paths.append(str(row.destination_path))
+    result: dict[tuple[str, str], DiscoveryCardState] = {}
+    for key, (row, paths) in grouped.items():
+        result[key] = DiscoveryCardState(
+            catalog_artist_id=int(row.catalog_artist_id),
+            monitored=bool(row.monitored),
+            local_library=any(
+                await asyncio.gather(*(asyncio.to_thread(Path(path).is_file) for path in paths))
+            ),
+            watchlist_release_albums=bool(row.watchlist_release_albums),
+            watchlist_release_singles=bool(row.watchlist_release_singles),
+            watchlist_release_eps=bool(row.watchlist_release_eps),
+            watchlist_monitor_upgrades=bool(row.watchlist_monitor_upgrades),
+        )
+    return result
 
 
 class DiscoveryService:

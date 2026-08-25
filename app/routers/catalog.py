@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import posixpath
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -368,6 +369,22 @@ def _sanitize_error_class(exc: BaseException) -> str:
 
 def _form_bool(value: object) -> bool:
     return str(value or "").lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_discover_return_path(value: str) -> str | None:
+    if not value or any(ord(char) < 32 or char == "\\" for char in value):
+        return None
+    decoded = unquote(value)
+    if any(ord(char) < 32 or char == "\\" for char in decoded):
+        return None
+    parsed = urlsplit(decoded)
+    if parsed.scheme or parsed.netloc or decoded.startswith("//"):
+        return None
+    if posixpath.normpath(parsed.path) != parsed.path:
+        return None
+    if parsed.path != "/search" and not parsed.path.startswith("/discover/"):
+        return None
+    return value
 
 
 def _apply_runtime_watchlist_defaults(artist: CatalogArtist, runtime: RuntimeSettings) -> None:
@@ -839,6 +856,29 @@ async def delete_imported_release_files(
     return RedirectResponse(location, status_code=303)
 
 
+@router.get("/artists/provider-preview", response_class=HTMLResponse)
+async def provider_artist_preview(
+    provider: str,
+    provider_id: str,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    return_to: str = "",
+) -> Response:
+    await db.rollback()
+    try:
+        detail = await fetch_catalog_artist_detail(settings, provider, provider_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Provider artist not found") from None
+    except (httpx.HTTPError, TimeoutError, RetryError):
+        raise HTTPException(status_code=502, detail="Metadata provider unavailable") from None
+    return _templates(request).TemplateResponse(
+        request,
+        "provider_artist_preview.html",
+        {"artist": detail, "return_to": _safe_discover_return_path(return_to) or ""},
+    )
+
+
 @router.get("/artists/catalog/open", response_class=HTMLResponse)
 async def open_catalog_artist_page(
     provider: str,
@@ -922,8 +962,9 @@ async def open_catalog_artist_post(
     provider: Annotated[str, Form()],
     provider_id: Annotated[str, Form()],
     monitor: Annotated[str, Form()] = "",
+    return_to: Annotated[str, Form()] = "",
 ) -> Response:
-    return await open_catalog_artist_page(
+    response = await open_catalog_artist_page(
         provider,
         provider_id,
         request,
@@ -932,6 +973,9 @@ async def open_catalog_artist_post(
         settings,
         monitor=monitor.lower() in {"1", "true", "yes", "on"},
     )
+    if not _wants_json(request) and (location := _safe_discover_return_path(return_to)):
+        return RedirectResponse(location, status_code=303)
+    return response
 
 
 @router.get("/artists/catalog/{artist_id}", response_class=HTMLResponse)

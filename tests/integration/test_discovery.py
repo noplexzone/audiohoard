@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
-from app.metadata.base import ArtistHit, DiscoveryGenre, DiscoveryRelease, DiscoverySection
+from app.metadata.base import (
+    ArtistDetail,
+    ArtistHit,
+    DiscoveryGenre,
+    DiscoveryRelease,
+    DiscoverySection,
+)
 from app.models.catalog_entities import CatalogArtist
 
 
@@ -11,17 +17,7 @@ async def test_empty_search_renders_neutral_discovery_without_persisting_rows(
 ) -> None:
     from app.routers import search as search_router
 
-    captured_session = None
-    original_watched = search_router._watched_catalog_artists
-
-    async def capture_watched(db):
-        nonlocal captured_session
-        captured_session = db
-        return await original_watched(db)
-
     async def landing(region: str):
-        assert captured_session is not None
-        assert captured_session.in_transaction() is False
         return [
             DiscoverySection(
                 "popular",
@@ -75,7 +71,6 @@ async def test_empty_search_renders_neutral_discovery_without_persisting_rows(
             ),
         ]
 
-    monkeypatch.setattr(search_router, "_watched_catalog_artists", capture_watched)
     monkeypatch.setattr(search_router.discovery_service, "landing", landing)
 
     response = await client.get("/search")
@@ -86,6 +81,8 @@ async def test_empty_search_renders_neutral_discovery_without_persisting_rows(
     assert "Global fallback" in response.text
     assert 'action="/artists/catalog/open"' in response.text
     assert 'name="provider_id" value="artist-2"' in response.text
+    assert "/artists/provider-preview?" in response.text
+    assert "/artists/catalog/open?" not in response.text
     assert 'action="/downloads/create"' not in response.text
     assert "data-download-form" not in response.text
     assert "/discover/genres/132" in response.text
@@ -156,3 +153,93 @@ async def test_advanced_search_skips_discovery_network(client, monkeypatch) -> N
 
     assert response.status_code == 200
     assert "Manual search" in response.text
+
+
+async def test_provider_preview_is_read_only_and_has_csrf_watch_form(client, monkeypatch) -> None:
+    from app.routers import catalog as catalog_router
+
+    async def detail(_settings, provider: str, provider_id: str):
+        return ArtistDetail(
+            provider=provider,
+            provider_id=provider_id,
+            name="Exact Preview Artist",
+            country="US",
+            disambiguation="not the namesake",
+        )
+
+    def unexpected_task(*_args):
+        raise AssertionError("read-only preview must not start discography work")
+
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", detail)
+    monkeypatch.setattr(catalog_router, "_start_discography_task", unexpected_task)
+    response = await client.get(
+        "/artists/provider-preview?provider=deezer&provider_id=artist-preview"
+        "&return_to=/discover/popular?page=2%23discover-results"
+    )
+    assert response.status_code == 200
+    assert "Exact Preview Artist" in response.text
+    assert "artist-preview" in response.text
+    assert "not the namesake" in response.text
+    assert 'method="post" action="/artists/catalog/open"' in response.text
+    assert 'name="csrf_token"' in response.text
+
+    from app.database import get_session_factory
+
+    async with get_session_factory()() as db:
+        assert list(await db.scalars(select(CatalogArtist))) == []
+
+
+def test_discover_return_path_allowlist() -> None:
+    from app.routers.catalog import _safe_discover_return_path
+
+    assert _safe_discover_return_path("/search?q=a#card") == "/search?q=a#card"
+    assert (
+        _safe_discover_return_path("/discover/popular?page=2#card")
+        == "/discover/popular?page=2#card"
+    )
+    for unsafe in (
+        "https://evil.example/discover/popular",
+        "//evil.example/discover/popular",
+        "/library",
+        "/discover\\popular",
+        "/discover/%0apopular",
+        "/discover/../settings",
+        "/discover/%2e%2e/settings",
+    ):
+        assert _safe_discover_return_path(unsafe) is None
+
+
+async def test_native_watch_returns_exact_safe_path_and_fetch_json_is_unchanged(
+    client, monkeypatch
+) -> None:
+    from app.routers import catalog as catalog_router
+
+    async def detail(_settings, provider: str, provider_id: str):
+        return ArtistDetail(provider=provider, provider_id=provider_id, name="Return Artist")
+
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", detail)
+    monkeypatch.setattr(catalog_router, "_start_discography_task", lambda *_args: True)
+    payload = {
+        "csrf_token": client.cookies.get("csrf", ""),
+        "provider": "deezer",
+        "provider_id": "return-artist",
+        "monitor": "true",
+        "return_to": "/discover/popular?page=2#discover-results",
+    }
+    native = await client.post("/artists/catalog/open", data=payload, follow_redirects=False)
+    assert native.status_code == 303
+    assert native.headers["location"] == "/discover/popular?page=2#discover-results"
+
+    payload["return_to"] = "https://evil.example/discover/popular"
+    unsafe = await client.post("/artists/catalog/open", data=payload, follow_redirects=False)
+    assert unsafe.status_code == 303
+    assert unsafe.headers["location"].startswith("/artists/catalog/")
+
+    fetch = await client.post(
+        "/artists/catalog/open",
+        data=payload,
+        headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+    )
+    assert fetch.status_code == 200
+    assert fetch.json()["watched"] is True
+    assert "artist_id" in fetch.json()

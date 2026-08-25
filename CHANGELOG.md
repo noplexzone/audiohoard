@@ -19,6 +19,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Add read-only provider artist previews, exact provider-identity Discover card state, and safe in-context native watchlist returns without mutating navigation GETs.
 - Add durable scoped discography batch previews and native status controls for artist watchlists and Wanted selections, pages, and server-rerun matching scopes while reusing ordinary bounded acquisition jobs.
 - Add Wanted-page queue-all-matching bulk dispatch and quality-profile enabled-format controls for strict MP3-320-or-better acquisition.
 

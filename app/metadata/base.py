@@ -52,6 +52,23 @@ class DiscoveryRelease:
 
 
 @dataclass(frozen=True)
+class DiscoveryCardState:
+    """Persisted state for one exact provider artist identity."""
+
+    catalog_artist_id: int
+    monitored: bool
+    local_library: bool
+    watchlist_release_albums: bool = False
+    watchlist_release_singles: bool = False
+    watchlist_release_eps: bool = False
+    watchlist_monitor_upgrades: bool = False
+
+    @property
+    def artist_id(self) -> int:
+        return self.catalog_artist_id
+
+
+@dataclass(frozen=True)
 class DiscoverySection:
     feed: str
     title: str

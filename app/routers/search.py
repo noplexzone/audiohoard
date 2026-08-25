@@ -16,11 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import get_current_user
 from app.config import Settings
 from app.database import get_db
+from app.metadata.base import DiscoveryCardState
 from app.models.catalog_entities import CatalogArtist, CatalogArtistIdentity
 from app.schemas.health import SourceStatus
 from app.schemas.search import SearchRequest, SearchResponse, SearchResult
 from app.services.catalog_metadata import search_catalog_artists
-from app.services.discovery import discovery_service
+from app.services.discovery import discovery_service, project_discovery_card_states
 from app.services.manual_search import group_ranked_results, rank_manual_results
 from app.services.source_candidate_blocks import active_slskd_candidate_identities
 from app.services.source_candidate_identity import normalize_source_candidate_identity
@@ -72,6 +73,37 @@ async def _watched_catalog_artists(
             "watchlist_monitor_upgrades": bool(upgrades),
         }
     return watched
+
+
+def _visible_provider_identities(*collections: object) -> set[tuple[str, str]]:
+    identities: set[tuple[str, str]] = set()
+    for collection in collections:
+        for value in collection if isinstance(collection, (list, tuple)) else ():
+            items = getattr(value, "items", None)
+            if items is None:
+                items = getattr(value, "artists", None)
+            for item in items or ():
+                provider = getattr(item, "provider", "")
+                provider_id = getattr(item, "artist_provider_id", None) or getattr(
+                    item, "provider_id", ""
+                )
+                if provider and provider_id:
+                    identities.add((str(provider), str(provider_id)))
+    return identities
+
+
+def _group_card_states(
+    states: dict[tuple[str, str], DiscoveryCardState],
+) -> dict[str, dict[str, DiscoveryCardState]]:
+    grouped: dict[str, dict[str, DiscoveryCardState]] = {}
+    for (provider, provider_id), state in states.items():
+        grouped.setdefault(provider, {})[provider_id] = state
+    return grouped
+
+
+def _native_return_to(request: Request, anchor: str = "discover-results") -> str:
+    query = request.scope.get("query_string", b"").decode("ascii")
+    return request.url.path + (f"?{query}" if query else "") + f"#{anchor}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,7 +261,6 @@ async def search_page(
         requested = metadata_providers
     else:
         requested = [provider] if provider in metadata_providers else []
-    watched_catalog_artists = await _watched_catalog_artists(db)
     monitored_catalog_artists = await _monitored_catalog_artists(db)
     await db.rollback()
     catalog_outcomes = []
@@ -241,6 +272,11 @@ async def search_page(
             primary_error = catalog_outcomes[0].state.reason or "Primary provider unavailable"
     elif not q and tab == "catalog":
         discovery_sections = await discovery_service.landing(runtime.discovery_region)
+    card_states = await project_discovery_card_states(
+        db, _visible_provider_identities(catalog_outcomes, discovery_sections)
+    )
+    watched_catalog_artists = _group_card_states(card_states)
+    await db.rollback()
     return templates.TemplateResponse(
         request,
         "search.html",
@@ -255,6 +291,7 @@ async def search_page(
             "discovery_sections": discovery_sections,
             "discovery_region": runtime.discovery_region,
             "watched_catalog_artists": watched_catalog_artists,
+            "discover_return_to": _native_return_to(request),
             "monitored_catalog_artists": monitored_catalog_artists,
             "watchlist_defaults": {
                 "watchlist_release_albums": runtime.default_watchlist_release_albums,
@@ -289,11 +326,14 @@ async def _discover_page(
     genre_id: str | None = None,
 ) -> HTMLResponse:
     runtime = await get_runtime_settings(db)
-    watched = await _watched_catalog_artists(db)
     await db.rollback()
     section = await discovery_service.get(
         feed, runtime.discovery_region, page=page, limit=12, genre_id=genre_id
     )
+    watched = _group_card_states(
+        await project_discovery_card_states(db, _visible_provider_identities([section]))
+    )
+    await db.rollback()
     return _get_templates(request).TemplateResponse(
         request,
         "discover_list.html",
@@ -302,6 +342,7 @@ async def _discover_page(
             "page": page,
             "genre_id": genre_id,
             "watched_catalog_artists": watched,
+            "discover_return_to": _native_return_to(request),
             "watchlist_defaults": {
                 "watchlist_release_albums": runtime.default_watchlist_release_albums,
                 "watchlist_release_singles": runtime.default_watchlist_release_singles,

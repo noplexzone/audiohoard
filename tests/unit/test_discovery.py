@@ -640,3 +640,74 @@ async def test_deezer_exact_artist_rejects_error_key_even_when_null(monkeypatch)
 
     with pytest.raises(ValueError, match="valid matching artist identity"):
         await provider.get_artist("1")
+
+
+async def test_card_state_projection_is_exact_batched_and_requires_present_artifact(
+    db_session, tmp_path
+) -> None:
+    from sqlalchemy import event
+
+    from app.models.catalog_entities import CatalogAlbum, CatalogArtist, CatalogArtistIdentity
+    from app.models.import_plan import ImportPlan, LibraryFileState
+    from app.models.job import Job, JobStatus
+    from app.models.release import Release
+    from app.models.track import Track
+    from app.models.workflow import AcquisitionState, ImportWorkflowState
+    from app.services.discovery import project_discovery_card_states
+
+    present = tmp_path / "present.flac"
+    present.write_bytes(b"audio")
+    monitored = CatalogArtist(name="Same Name", monitored=True)
+    monitored.identities.append(
+        CatalogArtistIdentity(provider="deezer", provider_artist_id="one", name="Same Name")
+    )
+    album = CatalogAlbum(artist=monitored, title="Known Album")
+    job = Job(source="legacy", query="known", status=JobStatus.done, catalog_album=album)
+    release = Release(job=job, source="legacy", title="Known Album", album_artist="Same Name")
+    track = Track(
+        job=job,
+        release=release,
+        catalog_album=album,
+        source="legacy",
+        title="Song",
+        acquisition_state=AcquisitionState.downloaded,
+        import_state=ImportWorkflowState.imported,
+        file_size_bytes=5,
+    )
+    plan = ImportPlan(
+        release=release,
+        track=track,
+        source_path=str(present),
+        destination_path=str(present),
+        status=ImportWorkflowState.imported,
+        file_state=LibraryFileState.present,
+    )
+    unmonitored = CatalogArtist(name="Same Name", monitored=False)
+    unmonitored.identities.append(
+        CatalogArtistIdentity(provider="deezer", provider_artist_id="two", name="Same Name")
+    )
+    db_session.add_all([monitored, unmonitored, plan])
+    await db_session.commit()
+
+    statements = 0
+
+    def count(_conn, _cursor, statement, _parameters, _context, _many):
+        nonlocal statements
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements += 1
+
+    event.listen(db_session.bind.sync_engine, "before_cursor_execute", count)
+    try:
+        states = await project_discovery_card_states(
+            db_session,
+            {("deezer", "one"), ("deezer", "two"), ("deezer", "missing")},
+        )
+    finally:
+        event.remove(db_session.bind.sync_engine, "before_cursor_execute", count)
+
+    assert statements == 1
+    assert states[("deezer", "one")].monitored is True
+    assert states[("deezer", "one")].local_library is True
+    assert states[("deezer", "two")].monitored is False
+    assert states[("deezer", "two")].local_library is False
+    assert ("deezer", "missing") not in states
