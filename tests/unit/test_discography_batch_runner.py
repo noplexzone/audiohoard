@@ -99,8 +99,16 @@ async def test_runner_commits_created_jobs_before_dispatch_and_bounds_tick(tmp_p
         batch = await db.get(DiscographyBatch, batch_id)
         item = await db.get(DiscographyBatchItem, item_id)
         assert batch is not None and batch.state == DiscographyBatchState.running
-        assert item is not None and item.state == DiscographyBatchItemState.waiting
+        assert item is not None and item.state == DiscographyBatchItemState.pending
         assert await db.scalar(select(func.count(Job.id))) == 25
+    assert await runner.run_once()
+    assert len(observed) == 30
+    async with factory() as db:
+        batch = await db.get(DiscographyBatch, batch_id)
+        item = await db.get(DiscographyBatchItem, item_id)
+        assert item is not None and item.state == DiscographyBatchItemState.waiting
+        assert batch is not None and batch.state == DiscographyBatchState.running
+        assert await db.scalar(select(func.count(Job.id))) == 30
     await engine.dispose()
 
 
@@ -418,4 +426,39 @@ async def _assert_control_after_expansion(tmp_path: Path, monkeypatch, *, cancel
                 )
             )
             assert len(active) == 2
+    await engine.dispose()
+
+
+async def test_waiting_item_does_not_starve_later_pending(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'fair.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    _batch_id, waiting_id = await _seed(factory)
+    async with factory() as db:
+        waiting = await db.get(DiscographyBatchItem, waiting_id)
+        assert waiting is not None
+        waiting.state = DiscographyBatchItemState.waiting
+        source_album = await db.get(CatalogAlbum, waiting.catalog_album_id)
+        assert source_album is not None
+        album = CatalogAlbum(artist_id=source_album.artist_id, title="Later", track_count=1)
+        album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Later"))
+        later = DiscographyBatchItem(
+            batch_id=waiting.batch_id,
+            release_identity="later",
+            catalog_album=album,
+            artist_name="Runner",
+            release_title="Later",
+            state=DiscographyBatchItemState.pending,
+        )
+        db.add(later)
+        await db.commit()
+        later_id = later.id
+    dispatched: list[int] = []
+    runner = DiscographyBatchRunner(factory, dispatcher=dispatched.append, quality_profile=PROFILE)
+    assert await runner.run_once()
+    async with factory() as db:
+        later = await db.get(DiscographyBatchItem, later_id)
+        assert later is not None and later.state == DiscographyBatchItemState.waiting
+    assert len(dispatched) == 1
     await engine.dispose()

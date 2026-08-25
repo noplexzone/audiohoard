@@ -126,16 +126,16 @@ class DiscographyBatchRunner:
         """Recover and process at most one item and at most 25 new jobs."""
         now = datetime.now(UTC)
         await self._recover_expired(now)
-        waiting_id = await self._next_waiting_item()
-        if waiting_id is not None:
-            async with self._session_factory() as db:
-                await self._reconcile_item(db, waiting_id, attempted=True)
-                await self._finish_batch_for_item(db, waiting_id)
-                await db.commit()
-            return True
-
         claimed = await self._claim_pending(now)
         if claimed is None:
+            waiting_id = await self._next_waiting_item()
+            if waiting_id is not None:
+                async with self._session_factory() as db:
+                    changed = await self._reconcile_item(db, waiting_id, attempted=True)
+                    if changed:
+                        await self._finish_batch_for_item(db, waiting_id)
+                    await db.commit()
+                return changed
             return await self._reconcile_idle_batch()
         item_id, requires_hydration, lease_token = claimed
         try:
@@ -455,7 +455,7 @@ class DiscographyBatchRunner:
             item.state = DiscographyBatchItemState.skipped
             item.reason_code = "catalog_release_unbound"
             item.completed_at = now
-            return True
+            return db.is_modified(item, include_collections=False)
         expected = max(item.expected_track_count or 0, item.catalog_album.track_count or 0) or None
         if item.provider_release_id is not None:
             provider_expected = await db.scalar(
@@ -477,7 +477,7 @@ class DiscographyBatchRunner:
                 "catalog_tracks_overfull": "catalog_manifest_overfull",
                 "catalog_tracks_invalid_positions": "catalog_manifest_invalid_positions",
             }[issue]
-            return True
+            return db.is_modified(item, include_collections=False)
         profile = self._quality_profile or (await get_runtime_settings(db)).quality_profile
         projection = (
             await project_catalog_album_queue_targets(
@@ -513,9 +513,12 @@ class DiscographyBatchRunner:
             item.state = DiscographyBatchItemState.complete
             item.reason_code = "verified_complete"
             item.completed_at = now
-        elif active:
+        elif active and len(active) == len(targets):
             item.state = DiscographyBatchItemState.waiting
             item.reason_code = "active_jobs"
+        elif active:
+            item.state = DiscographyBatchItemState.pending
+            item.reason_code = "targets_remain"
         elif attempted:
             item.state = DiscographyBatchItemState.failed
             item.reason_code = "targets_remain_without_active_jobs"
@@ -524,7 +527,7 @@ class DiscographyBatchRunner:
         else:
             item.state = DiscographyBatchItemState.pending
             item.reason_code = None
-        return True
+        return db.is_modified(item, include_collections=False)
 
     async def _finish_batch_for_item(self, db: AsyncSession, item_id: int) -> None:
         batch_id = await db.scalar(

@@ -19,7 +19,10 @@ from app.models.catalog_entities import (
 from app.models.discography_batch import (
     DiscographyBatch,
     DiscographyBatchItem,
+    DiscographyBatchItemJob,
     DiscographyBatchItemState,
+    DiscographyBatchState,
+    DiscographyJobOwnership,
     DiscographyScopeKind,
 )
 from app.models.import_plan import ImportPlan, LibraryFileState
@@ -32,6 +35,7 @@ from app.services.catalog import queue_catalog_album_missing_track_jobs
 from app.services.discography_batches import (
     DiscographyScopeError,
     canonicalize_scope,
+    confirm_discography_batch,
     create_discography_batch_preview,
 )
 from app.settings_service import QualityProfile
@@ -529,3 +533,44 @@ async def test_scope_hash_is_deterministic(db_session: AsyncSession) -> None:
         first.scope_hash
         == hashlib.sha256(f"{first.scope_json}\n{identities}".encode()).hexdigest()
     )
+
+
+async def test_confirm_all_active_jobs_waits_with_observed_links(db_session: AsyncSession) -> None:
+    artist = CatalogArtist(name="Observed", monitored=True)
+    album = CatalogAlbum(artist=artist, title="Active", monitored=True, track_count=2)
+    album.tracks.extend(CatalogAlbumTrack(disc=1, position=i, title=f"T{i}") for i in (1, 2))
+    db_session.add(artist)
+    await db_session.flush()
+    jobs = [
+        Job(source="priority", query=f"active-{track.id}", status=JobStatus.running)
+        for track in album.tracks
+    ]
+    db_session.add_all(jobs)
+    await db_session.flush()
+    db_session.add_all(
+        AcquisitionDispatchClaim(
+            catalog_album_id=album.id, catalog_track_id=track.id, job_id=job.id
+        )
+        for track, job in zip(album.tracks, jobs, strict=True)
+    )
+    await db_session.flush()
+    preview = await create_discography_batch_preview(
+        db_session,
+        DiscographyScopeKind.wanted_selected,
+        {"album_ids": [album.id]},
+        quality_profile=PROFILE,
+    )
+    confirmed = await confirm_discography_batch(db_session, preview.id, quality_profile=PROFILE)
+    item = await db_session.scalar(
+        select(DiscographyBatchItem).where(DiscographyBatchItem.batch_id == preview.id)
+    )
+    links = list(
+        (
+            await db_session.execute(
+                select(DiscographyBatchItemJob.job_id, DiscographyBatchItemJob.ownership)
+            )
+        ).all()
+    )
+    assert item is not None and item.state == DiscographyBatchItemState.waiting
+    assert confirmed.batch.state == DiscographyBatchState.queued
+    assert set(links) == {(job.id, DiscographyJobOwnership.observed) for job in jobs}

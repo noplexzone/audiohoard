@@ -330,6 +330,10 @@ async def _populate_batch_items(
     quality_profile: QualityProfile,
 ) -> None:
     """Replace one batch's materialized preview from an exact server-side selection."""
+    item_ids = select(DiscographyBatchItem.id).where(DiscographyBatchItem.batch_id == batch.id)
+    await db.execute(
+        delete(DiscographyBatchItemJob).where(DiscographyBatchItemJob.item_id.in_(item_ids))
+    )
     await db.execute(delete(DiscographyBatchItem).where(DiscographyBatchItem.batch_id == batch.id))
     await db.flush()
     complete_count = active_count = hydration_count = missing_count = estimated = 0
@@ -376,23 +380,22 @@ async def _populate_batch_items(
         for track in release.album.tracks
         if track.id is not None
     }
-    active_track_ids = (
-        set(
-            int(value)
-            for value in (
-                await db.scalars(
-                    select(AcquisitionDispatchClaim.catalog_track_id)
-                    .join(Job, Job.id == AcquisitionDispatchClaim.job_id)
-                    .where(
-                        AcquisitionDispatchClaim.catalog_track_id.in_(all_track_ids),
-                        Job.status.in_((JobStatus.pending, JobStatus.running)),
-                    )
+    active_rows = (
+        (
+            await db.execute(
+                select(AcquisitionDispatchClaim.catalog_track_id, AcquisitionDispatchClaim.job_id)
+                .join(Job, Job.id == AcquisitionDispatchClaim.job_id)
+                .where(
+                    AcquisitionDispatchClaim.catalog_track_id.in_(all_track_ids),
+                    Job.status.in_((JobStatus.pending, JobStatus.running)),
                 )
-            ).all()
-        )
+            )
+        ).all()
         if all_track_ids
-        else set()
+        else []
     )
+    active_jobs_by_track = {int(track_id): int(job_id) for track_id, job_id in active_rows}
+    active_track_ids = set(active_jobs_by_track)
 
     for release in actionable:
         album = release.album
@@ -424,29 +427,37 @@ async def _populate_batch_items(
                 reason = "already_complete"
                 complete_count += 1
             elif item_active == target_count:
-                state = DiscographyBatchItemState.skipped
-                reason = "already_active"
-                skipped_count += 1
-        db.add(
-            DiscographyBatchItem(
-                batch_id=batch.id,
-                release_identity=release.release_identity,
-                provider_release_id=release.provider_release_id,
-                catalog_album_id=album.id,
-                artist_name=release.artist_name,
-                release_title=release.title,
-                release_year=release.year,
-                release_kind=release.release_kind,
-                provider=release.provider,
-                expected_track_count=release.expected_count,
-                state=state,
-                reason_code=reason,
-                target_count=target_count,
-                active_count=item_active,
-                skipped_count=1 if state == DiscographyBatchItemState.skipped else 0,
-                estimated_job_count=item_estimated,
-            )
+                state = DiscographyBatchItemState.waiting
+                reason = "active_jobs"
+        item = DiscographyBatchItem(
+            batch_id=batch.id,
+            release_identity=release.release_identity,
+            provider_release_id=release.provider_release_id,
+            catalog_album_id=album.id,
+            artist_name=release.artist_name,
+            release_title=release.title,
+            release_year=release.year,
+            release_kind=release.release_kind,
+            provider=release.provider,
+            expected_track_count=release.expected_count,
+            state=state,
+            reason_code=reason,
+            target_count=target_count,
+            active_count=item_active,
+            skipped_count=0,
+            estimated_job_count=item_estimated,
         )
+        db.add(item)
+        await db.flush()
+        if issue is None:
+            for track_id in targets & active_track_ids:
+                db.add(
+                    DiscographyBatchItemJob(
+                        item_id=item.id,
+                        job_id=active_jobs_by_track[track_id],
+                        ownership=DiscographyJobOwnership.observed,
+                    )
+                )
 
     batch.matching_count = len(releases)
     batch.complete_count = complete_count
