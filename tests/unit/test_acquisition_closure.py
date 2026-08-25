@@ -210,7 +210,10 @@ async def test_blocked_slskd_folder_is_not_selected(db_session: AsyncSession) ->
             album,
             job,
             SourceCandidateBlock(
-                provider="slskd", peer="blocked", filename="Album\\01 One.flac", reason="timeout"
+                provider="slskd",
+                peer="blocked",
+                filename="  \\Album\\.\\01 One.flac  ",
+                reason="timeout",
             ),
         ]
     )
@@ -224,7 +227,7 @@ async def test_blocked_slskd_folder_is_not_selected(db_session: AsyncSession) ->
                 {
                     "username": "blocked",
                     "files": [
-                        {"filename": "Album\\01 One.flac", "size": 1},
+                        {"filename": "/Album/01 One.flac", "size": 1},
                         {"filename": "Album\\02 Two.flac", "size": 1},
                     ],
                 },

@@ -10,6 +10,15 @@ from app.models.catalog_entities import (
     CatalogArtist,
     CatalogArtistIdentity,
 )
+from app.models.discography_batch import (
+    DiscographyBatch,
+    DiscographyBatchItem,
+    DiscographyBatchItemJob,
+    DiscographyBatchItemState,
+    DiscographyBatchState,
+    DiscographyJobOwnership,
+    DiscographyScopeKind,
+)
 from app.models.import_plan import ImportPlan
 from app.models.job import Job
 from app.models.library_adoption import (
@@ -42,6 +51,13 @@ __all__ = [
     "AdoptionCandidateState",
     "AdoptionScanState",
     "AdoptionScopeKind",
+    "DiscographyBatch",
+    "DiscographyBatchItem",
+    "DiscographyBatchItemJob",
+    "DiscographyBatchItemState",
+    "DiscographyBatchState",
+    "DiscographyJobOwnership",
+    "DiscographyScopeKind",
     "ImportPlan",
     "Job",
     "LibraryAdoptionCandidate",

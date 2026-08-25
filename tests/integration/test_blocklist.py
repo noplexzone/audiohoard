@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 from httpx import AsyncClient
 from sqlalchemy import select
 
 from app.database import get_session_factory
+from app.jobs.runner import _without_blocked_slskd_results
 from app.models.acquisition_attempt import AcquisitionAttempt
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
+from app.models.release import Release
 from app.models.source_candidate_block import SourceCandidateBlock
+from app.models.track import Track
+from app.models.workflow import AcoustIDVerificationState
+from app.schemas.search import SearchResult
 
 
 async def test_rejected_sources_page_lists_and_allows_source_again(client: AsyncClient) -> None:
@@ -21,9 +27,28 @@ async def test_rejected_sources_page_lists_and_allows_source_again(client: Async
             filename="music\\done\\country\\44 - Wrong Track.mp3",
             reason="denied",
         )
-        db.add(block)
+        job = Job(source="slskd", query="Wrong Track", status=JobStatus.done)
+        release = Release(job=job, source="slskd", title="Album")
+        provenance = json.dumps(
+            {
+                "filename": r"music\done\country\44 - Wrong Track.mp3",
+                "source": "slskd",
+                "username": "StarCaller",
+            },
+            separators=(",", ":"),
+        )
+        track = Track(
+            job=job,
+            release=release,
+            source="slskd",
+            title="Wrong Track",
+            acoustid_verification_state=AcoustIDVerificationState.denied,
+            acquisition_provenance_json=provenance,
+        )
+        db.add_all([block, job, release, track])
         await db.commit()
         block_id = block.id
+        track_id = track.id
 
     page = await client.get("/blocklist")
 
@@ -42,6 +67,19 @@ async def test_rejected_sources_page_lists_and_allows_source_again(client: Async
     async with factory() as db:
         rows = (await db.scalars(select(SourceCandidateBlock))).all()
         assert rows == []
+        track = await db.get(Track, track_id)
+        assert track is not None
+        assert track.acoustid_verification_state == AcoustIDVerificationState.denied
+        assert track.acquisition_provenance_json == provenance
+        candidate = SearchResult(
+            source="slskd",
+            title="Wrong Track",
+            metadata={
+                "username": "StarCaller",
+                "filename": "music/done/country/44 - Wrong Track.mp3",
+            },
+        )
+        assert await _without_blocked_slskd_results([candidate], db) == [candidate]
 
 
 async def test_rejected_sources_page_shows_related_attempt_context_and_retry(
@@ -80,10 +118,21 @@ async def test_rejected_sources_page_shows_related_attempt_context_and_retry(
             last_failure_at=failed_at,
             blocked_until=failed_at + timedelta(minutes=30),
         )
-        db.add_all([attempt, block])
+        provenance = (
+            '{"filename":"folder/Context Track.flac","source":"slskd","username":"RetryPeer"}'
+        )
+        denied_track = Track(
+            job=job,
+            source="slskd",
+            title="Context Track",
+            acoustid_verification_state=AcoustIDVerificationState.denied,
+            acquisition_provenance_json=provenance,
+        )
+        db.add_all([attempt, block, denied_track])
         await db.commit()
         block_id = block.id
         job_id = job.id
+        denied_track_id = denied_track.id
 
     page = await client.get("/blocklist?status=temporary&provider=slskd")
 
@@ -110,6 +159,19 @@ async def test_rejected_sources_page_shows_related_attempt_context_and_retry(
     assert retried == [job_id]
     async with factory() as db:
         assert await db.get(SourceCandidateBlock, block_id) is None
+        preserved_track = await db.get(Track, denied_track_id)
+        assert preserved_track is not None
+        assert preserved_track.acoustid_verification_state == AcoustIDVerificationState.denied
+        assert preserved_track.acquisition_provenance_json == provenance
+        candidate = SearchResult(
+            source="slskd",
+            title="Context Track",
+            metadata={
+                "username": "RetryPeer",
+                "filename": r"folder\Context Track.flac",
+            },
+        )
+        assert await _without_blocked_slskd_results([candidate], db) == [candidate]
 
 
 async def test_rejected_sources_page_is_paginated_and_expired_temporary_rows_are_usable(

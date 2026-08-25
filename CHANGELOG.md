@@ -8,14 +8,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Derive Deezer genre discovery artists from exact genre radio tracks instead of provider endpoints that silently return the same global chart for every genre, with strict provider ID parsing and truthful pagination after exact artist validation.
+- Defer SQLite-locked job admissions without crossing the provider boundary, and retain exact completed slskd transfers for retry when their staged artifact is temporarily missing.
+- Canonicalize namespace-aware exact slskd peer/path identities so review denial durably blocks the provider artifact before re-acquisition, legacy denied provenance is backfilled once, containing album folders are excluded, and Allow or Allow and retry truthfully makes the exact source selectable without rewriting denied history.
 - Serialize startup database maintenance, catalog ownership, library reconciliation, and each scheduler's initial cycle before recovering queued jobs, preventing post-update SQLite writer storms from failing recovered work.
 - Skip expensive orphan-history pruning when startup finds queued or interrupted acquisitions, allowing serialized job recovery to resume downloads promptly after an update.
 - Invalidate cached slskd download snapshots after a successful enqueue so accepted transfers are not immediately misclassified as missing and redundantly downloaded from every candidate.
 - Retry callers awaiting a displaced slskd snapshot generation so concurrent queue mutations cannot return a stale pre-enqueue result.
-- Preserve provider-native album and track artist credits for compilation releases, use each performer in targeted searches, and write performer/album-artist tags without skipping compilation tracks.
+- Preserve provider-native album and track artist credits for compilation releases through import planning, destination naming, tag write/readback, retagging, and conservative legacy-folder repair while leaving existing folders in place.
 
 ### Added
 
+- Add a shared poster-first Discover surface with responsive artist, release, and exact-genre cards, truthful state badges, safe native watch controls, and explicit feed continuation.
+- Add read-only provider artist previews, exact provider-identity Discover card state, and safe in-context native watchlist returns without mutating navigation GETs.
+- Load Discover landing feeds as independent authenticated fragments with truthful cached, pending, empty, stale, and error states so provider latency no longer blocks the page shell.
+- Add durable scoped discography batch previews and native status controls for artist watchlists and Wanted selections, pages, and server-rerun matching scopes while reusing ordinary bounded acquisition jobs.
 - Add Wanted-page queue-all-matching bulk dispatch and quality-profile enabled-format controls for strict MP3-320-or-better acquisition.
 
 ### Fixed

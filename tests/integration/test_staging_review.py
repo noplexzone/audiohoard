@@ -12,6 +12,8 @@ from sqlalchemy import select
 
 from app.config import Settings
 from app.database import get_session_factory
+from app.jobs.runner import _without_blocked_slskd_results
+from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.import_plan import CollisionState, ImportPlan, TagVerificationState
 from app.models.job import Job, JobStatus
 from app.models.release import Release
@@ -24,6 +26,7 @@ from app.models.workflow import (
     ImportWorkflowState,
     ReviewDecision,
 )
+from app.schemas.search import SearchResult
 from app.settings_service import DEFAULT_MAX_PARTIAL_ATTEMPTS
 
 
@@ -348,41 +351,106 @@ async def test_review_approve_stays_successful_when_auto_import_is_locked(
 
 
 async def test_deny_blocks_slskd_candidate_from_track_provenance(
-    client: AsyncClient, test_settings: Settings
+    client: AsyncClient, test_settings: Settings, monkeypatch
 ) -> None:
     item_id, track_id, denied_path = await _review_fixture(test_settings, "deny-slskd-block")
     blocked_filename = (
-        "music\\done\\country\\VA - Country Heat - 05.09.2026"
-        "\\44 - Ty Myers - Valerie (Amazon Music Original).mp3"
+        "  \\music\\\\done\\country\\.\\VA - Country Heat - 05.09.2026"
+        "\\44 - Ty Myers - Valerie (Amazon Music Original).mp3  "
     )
     factory = get_session_factory()
     async with factory() as db:
         track = await db.get(Track, track_id)
         assert track is not None
+        artist = CatalogArtist(name="Ty Myers")
+        album = CatalogAlbum(artist=artist, title="Country Heat", track_count=1)
+        catalog_track = CatalogAlbumTrack(album=album, position=44, disc=1, title=track.title)
+        db.add_all([artist, catalog_track])
+        await db.flush()
+        track.catalog_album_id = album.id
+        track.catalog_track_id = catalog_track.id
         track.acquisition_provenance_json = json.dumps(
-            {
-                "source": "slskd",
-                "username": "StarCaller",
-                "filename": blocked_filename,
-            }
+            {"source": "slskd", "username": "StarCaller", "filename": blocked_filename}
         )
+        await db.commit()
+
+    dispatched: list[int] = []
+
+    async def assert_committed_then_dispatch(job_id: int) -> None:
+        async with factory() as db:
+            block = (await db.scalars(select(SourceCandidateBlock))).one()
+            assert block.filename == (
+                "/music/done/country/VA - Country Heat - 05.09.2026/"
+                "44 - Ty Myers - Valerie (Amazon Music Original).mp3"
+            )
+            assert await db.get(StagingReviewItem, item_id) is None
+            assert await db.get(Job, job_id) is not None
+        dispatched.append(job_id)
+
+    monkeypatch.setattr(
+        "app.routers.staging.job_dispatcher.dispatch", assert_committed_then_dispatch
+    )
+    denied = await client.post(f"/staging/review/{item_id}/deny", follow_redirects=False)
+
+    assert denied.status_code == 303
+    assert denied.headers["location"] == "/downloads?notice=source_blocked"
+    assert dispatched
+    assert not denied_path.exists()
+    async with factory() as db:
+        blocked = (await db.scalars(select(SourceCandidateBlock))).one()
+        assert blocked.filename == (
+            "/music/done/country/VA - Country Heat - 05.09.2026/"
+            "44 - Ty Myers - Valerie (Amazon Music Original).mp3"
+        )
+        assert blocked.reason == "denied"
+        candidates = [
+            SearchResult(
+                source="slskd",
+                title="Valerie",
+                metadata={
+                    "username": "StarCaller",
+                    "filename": (
+                        "/music/done/country/VA - Country Heat - 05.09.2026/"
+                        "44 - Ty Myers - Valerie (Amazon Music Original).mp3"
+                    ),
+                },
+            ),
+            SearchResult(
+                source="slskd",
+                title="Valerie",
+                metadata={
+                    "username": "StarCaller",
+                    "filename": "/other/44 - Ty Myers - Valerie (Amazon Music Original).mp3",
+                },
+            ),
+        ]
+        assert await _without_blocked_slskd_results(candidates, db) == [candidates[1]]
+
+
+async def test_deny_without_exact_slskd_identity_reports_unavailable(
+    client: AsyncClient, test_settings: Settings
+) -> None:
+    item_id, track_id, _ = await _review_fixture(test_settings, "deny-no-identity")
+    provenance = json.dumps({"source": "slskd", "filename": "Album/01.flac"})
+    factory = get_session_factory()
+    async with factory() as db:
+        track = await db.get(Track, track_id)
+        assert track is not None
+        track.acquisition_provenance_json = provenance
         await db.commit()
 
     denied = await client.post(f"/staging/review/{item_id}/deny", follow_redirects=False)
 
     assert denied.status_code == 303
-    assert not denied_path.exists()
+    assert denied.headers["location"] == "/downloads?notice=source_identity_unavailable"
+    feedback = await client.get(denied.headers["location"])
+    assert "exact provider source identity was unavailable and was not blocked" in feedback.text
     async with factory() as db:
-        blocked = (
-            await db.scalars(
-                select(SourceCandidateBlock).where(
-                    SourceCandidateBlock.provider == "slskd",
-                    SourceCandidateBlock.peer == "StarCaller",
-                )
-            )
-        ).one()
-        assert blocked.filename == blocked_filename
-        assert blocked.reason == "denied"
+        assert (await db.scalars(select(SourceCandidateBlock))).all() == []
+        track = await db.get(Track, track_id)
+        assert track is not None
+        assert track.acoustid_verification_state == AcoustIDVerificationState.denied
+        assert track.acquisition_provenance_json == provenance
 
 
 async def test_deny_restores_staged_file_when_database_commit_fails(
@@ -401,6 +469,46 @@ async def test_deny_restores_staged_file_when_database_commit_fails(
 
     assert staged_path.exists()
     assert not list(staged_path.parent.glob(f".{staged_path.name}.denied-*"))
+
+
+async def test_deny_commit_failure_never_dispatches_continuation(
+    client: AsyncClient, test_settings: Settings, monkeypatch
+) -> None:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    item_id, track_id, staged_path = await _review_fixture(test_settings, "deny-no-dispatch")
+    factory = get_session_factory()
+    async with factory() as db:
+        track = await db.get(Track, track_id)
+        assert track is not None
+        artist = CatalogArtist(name="Artist")
+        album = CatalogAlbum(artist=artist, title="Album", track_count=1)
+        catalog_track = CatalogAlbumTrack(album=album, position=1, disc=1, title=track.title)
+        db.add_all([artist, catalog_track])
+        await db.flush()
+        track.catalog_album_id = album.id
+        track.catalog_track_id = catalog_track.id
+        track.acquisition_provenance_json = json.dumps(
+            {"source": "slskd", "username": "peer", "filename": "Album/01.flac"}
+        )
+        await db.commit()
+
+    dispatched: list[int] = []
+
+    async def record_dispatch(job_id: int) -> None:
+        dispatched.append(job_id)
+
+    async def fail_commit(self) -> None:
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr("app.routers.staging.job_dispatcher.dispatch", record_dispatch)
+    monkeypatch.setattr(AsyncSession, "commit", fail_commit)
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await client.post(f"/staging/review/{item_id}/deny", follow_redirects=False)
+
+    assert dispatched == []
+    assert staged_path.exists()
 
 
 async def test_deny_settles_commit_before_cleanup_when_request_is_cancelled(

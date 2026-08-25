@@ -20,6 +20,7 @@ from app.jobs import runner
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.release import Release
+from app.models.source_candidate_block import SourceCandidateBlock
 from app.models.track import IdentityResolutionState, Track
 from app.models.workflow import (
     AcoustIDVerificationState,
@@ -588,6 +589,109 @@ async def test_background_pending_to_running_retries_locked_commit(
     assert persisted is not None
     assert persisted.status == JobStatus.done
     assert "running_transition_error" not in (persisted.result_json or "")
+
+
+async def test_background_locked_admission_stays_pending_until_recovery(
+    tmp_path, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "locked-admission.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as session:
+        job = Job(source="youtube", query="locked admission", status=JobStatus.pending)
+        session.add(job)
+        await session.commit()
+        job_id = job.id
+
+    provider_calls = 0
+
+    async def complete_job(
+        current_job_id: int,
+        session: AsyncSession,
+        cfg: Settings,
+        *,
+        commit_progress: bool = False,
+    ) -> None:
+        nonlocal provider_calls
+        provider_calls += 1
+        current = await session.get(Job, current_job_id)
+        assert current is not None
+        current.status = JobStatus.done
+        current.result_json = json.dumps({"provider_calls": provider_calls})
+
+    monkeypatch.setattr(runner, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", complete_job)
+
+    lock = sqlite3.connect(database_path, timeout=0.1)
+    lock.execute("BEGIN IMMEDIATE")
+    try:
+        await runner.run_job(job_id, settings=test_settings)
+        async with factory() as observer:
+            persisted = await observer.get(Job, job_id)
+            assert persisted is not None
+            assert persisted.status is JobStatus.pending
+            assert persisted.result_json is None
+        assert provider_calls == 0
+    finally:
+        lock.rollback()
+        lock.close()
+
+    await runner.run_job(job_id, settings=test_settings)
+    async with factory() as observer:
+        persisted = await observer.get(Job, job_id)
+        assert persisted is not None
+        assert persisted.status is JobStatus.done
+        assert json.loads(persisted.result_json or "{}")["provider_calls"] == 1
+    assert provider_calls == 1
+    await engine.dispose()
+
+
+async def test_background_concurrent_claim_executes_provider_once(
+    tmp_path, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "concurrent-admission.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as session:
+        job = Job(source="youtube", query="concurrent admission", status=JobStatus.pending)
+        session.add(job)
+        await session.commit()
+        job_id = job.id
+
+    provider_calls = 0
+
+    async def complete_job(
+        current_job_id: int,
+        session: AsyncSession,
+        cfg: Settings,
+        *,
+        commit_progress: bool = False,
+    ) -> None:
+        nonlocal provider_calls
+        provider_calls += 1
+        await asyncio.sleep(0.05)
+        current = await session.get(Job, current_job_id)
+        assert current is not None
+        current.status = JobStatus.done
+
+    monkeypatch.setattr(runner, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", complete_job)
+
+    await asyncio.gather(
+        runner.run_job(job_id, settings=test_settings),
+        runner.run_job(job_id, settings=test_settings),
+    )
+
+    async with factory() as observer:
+        persisted = await observer.get(Job, job_id)
+        assert persisted is not None
+        assert persisted.status is JobStatus.done
+    assert provider_calls == 1
+    await engine.dispose()
 
 
 async def test_background_final_terminal_write_retries_without_repeating_work(
@@ -1785,7 +1889,11 @@ async def test_background_settings_exception_persists_failed_not_pending(
         assert loaded is not None
         assert loaded.status == JobStatus.failed
         assert loaded.result_json is not None
-        assert "settings_error" in loaded.result_json
+        assert json.loads(loaded.result_json)["error"] == {
+            "code": "settings_error",
+            "operation": "init",
+            "retryable": True,
+        }
 
 
 async def test_background_unexpected_exception_persists_failed_not_pending(
@@ -1857,7 +1965,11 @@ async def test_background_init_get_raises_persists_failed(
         assert loaded is not None
         assert loaded.status == JobStatus.failed
         assert loaded.result_json is not None
-        assert "init_error" in loaded.result_json
+        assert json.loads(loaded.result_json)["error"] == {
+            "code": "init_error",
+            "operation": "init",
+            "retryable": True,
+        }
 
 
 async def test_background_second_session_sees_running_and_acquiring_track_during_prepare(
@@ -1956,7 +2068,11 @@ async def test_background_phase2_get_raises_persists_failed(
         assert loaded is not None
         assert loaded.status == JobStatus.failed
         assert loaded.result_json is not None
-        assert "running_transition_error" in loaded.result_json
+        assert json.loads(loaded.result_json)["error"] == {
+            "code": "running_transition_error",
+            "operation": "init",
+            "retryable": True,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -2301,7 +2417,7 @@ async def test_background_enqueue_checkpoint_is_visible_before_poll(
         await run_task
 
 
-async def test_denied_slskd_provenance_filters_future_results(
+async def test_explicit_denied_slskd_block_filters_future_results(
     db_session: AsyncSession, test_settings: Settings
 ) -> None:
     job = await _create_job(db_session, source="slskd")
@@ -2320,7 +2436,17 @@ async def test_denied_slskd_provenance_filters_future_results(
             }
         ),
     )
-    db_session.add(denied)
+    db_session.add_all(
+        [
+            denied,
+            SourceCandidateBlock(
+                provider="slskd",
+                peer="StarCaller",
+                filename="music/done/country/44 - Ty Myers - Valerie (Amazon Music Original).mp3",
+                reason="denied",
+            ),
+        ]
+    )
     await db_session.flush()
 
     results = [

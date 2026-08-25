@@ -6,6 +6,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from functools import partial
 from importlib.resources import files
 from pathlib import Path
 from typing import Annotated
@@ -51,11 +52,13 @@ from app.services.acquisition_recovery import recover_approved_downloads
 from app.services.activity import get_activity_summary
 from app.services.artist_monitoring import DiscographyRefreshScheduler
 from app.services.catalog_metadata import (
+    hydrate_discography_batch_item,
     reconcile_deezer_release_snapshots,
     reconcile_duplicate_catalog_artists,
 )
 from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
 from app.services.dashboard import get_dashboard_data
+from app.services.discography_batch_runner import DiscographyBatchRunner
 from app.services.health_status import get_health_status_service
 from app.services.library_adoption_runner import LibraryAdoptionRunner
 from app.services.library_reconciliation import LibraryReconciliationService
@@ -250,6 +253,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.review_automation_scheduler = review_automation_scheduler
     library_adoption_runner = LibraryAdoptionRunner(get_session_factory())
     app.state.library_adoption_runner = library_adoption_runner
+    discography_batch_runner = DiscographyBatchRunner(
+        get_session_factory(),
+        dispatcher=job_dispatcher.dispatch,
+        hydration_callback=partial(
+            hydrate_discography_batch_item,
+            get_session_factory(),
+            settings=effective_settings,
+        ),
+    )
+    app.state.discography_batch_runner = discography_batch_runner
     await recover_deletion_operations(
         get_session_factory(),
         library_root=effective_settings.library_root,
@@ -289,6 +302,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 (
                     "library adoption runner",
                     lambda: library_adoption_runner.start(wait_for_initial_cycle=True),
+                ),
+                (
+                    "discography batch runner",
+                    lambda: discography_batch_runner.start(wait_for_initial_cycle=True),
                 ),
                 (
                     "job watchdog",
@@ -336,6 +353,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.exception("Startup recovery pipeline failed")
         await review_automation_scheduler.stop()
         await library_adoption_runner.stop()
+        await discography_batch_runner.stop()
         await library_reconciliation.stop()
         await health_status.stop()
         await quality_upgrade_scheduler.stop()

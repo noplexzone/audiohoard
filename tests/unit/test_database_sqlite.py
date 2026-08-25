@@ -2,7 +2,38 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.database import _make_engine
+from sqlalchemy.exc import OperationalError
+
+from app.database import _make_engine, is_sqlite_database_locked
+
+
+def test_sqlite_lock_classifier_finds_nested_operational_error() -> None:
+    try:
+        raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
+    except OperationalError as exc:
+        wrapped = RuntimeError("admission failed")
+        wrapped.__cause__ = exc
+
+    assert is_sqlite_database_locked(wrapped) is True
+
+
+def test_sqlite_lock_classifier_ignores_nested_non_lock_and_wrapper_text() -> None:
+    try:
+        raise OperationalError("UPDATE jobs", {}, Exception("disk I/O error"))
+    except OperationalError as exc:
+        wrapped = RuntimeError("database is locked")
+        wrapped.__cause__ = exc
+
+    assert is_sqlite_database_locked(wrapped) is False
+
+
+def test_sqlite_lock_classifier_is_cycle_safe() -> None:
+    first = RuntimeError("database is locked")
+    second = RuntimeError("still locked")
+    first.__cause__ = second
+    second.__context__ = first
+
+    assert is_sqlite_database_locked(first) is False
 
 
 async def test_file_sqlite_connections_enable_integrity_and_concurrency_pragmas(

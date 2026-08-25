@@ -1,0 +1,35 @@
+<section id="discovery-{{ section.feed }}" class="discovery-section" aria-labelledby="discovery-{{ section.feed }}-heading" data-discover-section data-discover-state="{{ section.state }}" data-discover-fragment-url="/discover/fragments/{{ section.feed }}">
+  <div class="page-header">
+    <div>
+      <h2 id="discovery-{{ section.feed }}-heading">{{ section.title }}</h2>
+      {% if section.fallback_global %}<span class="badge info">Global fallback</span>{% endif %}
+      {% if section.state == 'stale' or section.stale %}<span class="badge info">Cached</span>{% endif %}
+    </div>
+    <a class="btn secondary" href="/discover/{{ section.feed }}">View all</a>
+  </div>
+  <div data-discover-body>
+  {% if section.state == 'pending' %}
+    <div class="empty-state" role="status" aria-live="polite"><h3>Loading discovery feed…</h3><p>This section will appear independently when it is ready.</p></div>
+    <div class="discover-poster-grid" aria-hidden="true">
+      {% for _ in range(6) %}<div class="discovery-skeleton"><span class="hint">Loading…</span></div>{% endfor %}
+    </div>
+  {% elif section.state == 'error' %}
+    <div class="alert error" role="alert"><p>{{ section.message or 'Discovery provider is temporarily unavailable' }}</p><a class="btn secondary" href="/search#discovery-{{ section.feed }}" data-discover-retry>Retry this section</a></div>
+  {% elif not section.items %}
+    <div class="empty-state" role="status"><h3>No {{ section.title | lower }} available</h3><p>This feed is currently empty. Check again later.</p></div>
+  {% else %}
+    {% if section.message %}<p class="hint" role="status">{{ section.message }}</p>{% endif %}
+    <div class="discover-poster-grid">
+    {% for item in section.items %}
+      {% if section.feed == 'popular' %}
+        {% set artist_hit = item %}{% set watched_artist = watched_catalog_artists.get(item.provider, {}).get(item.provider_id) %}{% set artist_card_id = 'discover-' ~ section.feed ~ '-' ~ loop.index %}{% include "partials/_artist_card.html" %}
+      {% elif section.feed == 'genres' %}
+        {% include "partials/_genre_card.html" %}
+      {% else %}
+        {% include "partials/_release_card.html" %}
+      {% endif %}
+    {% endfor %}
+    </div>
+  {% endif %}
+  </div>
+</section>

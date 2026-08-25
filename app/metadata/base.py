@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import Literal, Protocol, TypeVar, runtime_checkable
 
 from app.sources.base import CapabilityState
 
@@ -52,6 +52,23 @@ class DiscoveryRelease:
 
 
 @dataclass(frozen=True)
+class DiscoveryCardState:
+    """Persisted state for one exact provider artist identity."""
+
+    catalog_artist_id: int
+    monitored: bool
+    local_library: bool | None
+    watchlist_release_albums: bool = False
+    watchlist_release_singles: bool = False
+    watchlist_release_eps: bool = False
+    watchlist_monitor_upgrades: bool = False
+
+    @property
+    def artist_id(self) -> int:
+        return self.catalog_artist_id
+
+
+@dataclass(frozen=True)
 class DiscoverySection:
     feed: str
     title: str
@@ -59,9 +76,10 @@ class DiscoverySection:
     effective_region: str
     fallback_global: bool
     items: tuple[ArtistHit | DiscoveryGenre | DiscoveryRelease, ...] = field(default_factory=tuple)
-    state: str = "ready"
+    state: Literal["pending", "ready", "stale", "error"] = "ready"
     message: str | None = None
     stale: bool = False
+    has_next: bool | None = None
 
 
 @dataclass(frozen=True)

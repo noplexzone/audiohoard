@@ -18,7 +18,13 @@ import app.models  # noqa: F401
 from app.config import Settings, get_settings, override_settings
 from app.database import Base, get_session_factory, reset_engine
 from app.main import create_app
-from app.metadata.base import ArtistDetail, ArtistHit
+from app.metadata.base import (
+    ArtistDetail,
+    ArtistHit,
+    DiscoveryGenre,
+    DiscoveryRelease,
+    DiscoverySection,
+)
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.release import Release
@@ -190,12 +196,32 @@ def browser_base_url(tmp_path_factory: pytest.TempPathFactory) -> Generator[str,
             )
         ]
 
-    async def artist_detail(*_args: object, **_kwargs: object) -> ArtistDetail:
+    discovery_artists = {
+        "browser-popular-1": "Browser Namesake",
+        "browser-popular-2": "Browser Namesake",
+        "browser-long-artist": (
+            "Browser Artist With An Exceptionally Long Name That Must Wrap Without Overflow"
+        ),
+        "browser-new-artist": "Browser New Release Artist",
+        "browser-trending-artist": "Browser Trending Artist",
+        "browser-genre-artist": "Browser Jazz Artist",
+    }
+
+    async def artist_detail(_settings: object, provider: str, provider_id: str) -> ArtistDetail:
+        if provider != "deezer" or provider_id not in {
+            "browser-artist-42",
+            *discovery_artists,
+        }:
+            raise ValueError("unknown deterministic browser artist identity")
         return ArtistDetail(
-            provider="deezer",
-            provider_id="browser-artist-42",
-            name="Browser Search Artist",
-            deezer_id="browser-artist-42",
+            provider=provider,
+            provider_id=provider_id,
+            name=(
+                "Browser Search Artist"
+                if provider_id == "browser-artist-42"
+                else discovery_artists[provider_id]
+            ),
+            deezer_id=provider_id,
         )
 
     async def healthy_provider(*_args: object, **_kwargs: object) -> CachedProviderStatus:
@@ -207,11 +233,100 @@ def browser_base_url(tmp_path_factory: pytest.TempPathFactory) -> Generator[str,
     async def no_dispatch(*_args: object, **_kwargs: object) -> None:
         return None
 
-    async def empty_discovery(*_args: object, **_kwargs: object) -> list[object]:
-        return []
+    async def deterministic_discovery(
+        feed: str,
+        region: str,
+        *,
+        page: int = 1,
+        limit: int = 12,
+        genre_id: str | None = None,
+    ) -> DiscoverySection:
+        del limit
+        titles = {
+            "popular": "Popular artists",
+            "genres": "Genres",
+            "new": "New releases",
+            "trending": "Trending releases",
+            "genre": "Browser Jazz",
+        }
+        if feed == "genre":
+            if genre_id != "132":
+                raise ValueError("unknown deterministic browser genre identity")
+            items = (
+                ArtistHit(
+                    "deezer",
+                    "browser-genre-artist",
+                    discovery_artists["browser-genre-artist"],
+                    artwork_url="https://images.browser.invalid/jazz-artist.jpg",
+                ),
+            )
+        elif feed == "popular":
+            items = (
+                ArtistHit(
+                    "deezer",
+                    "browser-popular-1",
+                    discovery_artists["browser-popular-1"],
+                    disambiguation="North America",
+                    artwork_url="https://images.browser.invalid/namesake.jpg",
+                ),
+                ArtistHit(
+                    "deezer",
+                    "browser-popular-2",
+                    discovery_artists["browser-popular-2"],
+                    disambiguation="Europe",
+                ),
+                ArtistHit(
+                    "deezer",
+                    "browser-long-artist",
+                    discovery_artists["browser-long-artist"],
+                ),
+            )
+        elif feed == "genres":
+            items = (
+                DiscoveryGenre(
+                    "deezer",
+                    "132",
+                    "Browser Jazz",
+                    artwork_url="https://images.browser.invalid/jazz.jpg",
+                ),
+                DiscoveryGenre("deezer", "116", "Browser Rap"),
+            )
+        elif feed == "new":
+            items = (
+                DiscoveryRelease(
+                    "deezer",
+                    "browser-new-release",
+                    "Browser New Release",
+                    discovery_artists["browser-new-artist"],
+                    "browser-new-artist",
+                    artwork_url="https://images.browser.invalid/new.jpg",
+                    release_date="2026-08-25",
+                ),
+            )
+        elif feed == "trending":
+            items = (
+                DiscoveryRelease(
+                    "deezer",
+                    "browser-trending-release",
+                    "Browser Trending Release",
+                    discovery_artists["browser-trending-artist"],
+                    "browser-trending-artist",
+                ),
+            )
+        else:
+            raise ValueError("unknown deterministic browser discovery feed")
+        return DiscoverySection(
+            feed,
+            titles[feed],
+            region,
+            "GLOBAL",
+            True,
+            items,
+            has_next=page == 1 and feed in {"popular", "genre"},
+        )
 
     monkeypatch.setattr("app.routers.search.search_catalog_artists", search_artists)
-    monkeypatch.setattr("app.routers.search.discovery_service.landing", empty_discovery)
+    monkeypatch.setattr("app.routers.search.discovery_service.get", deterministic_discovery)
     monkeypatch.setattr("app.routers.catalog.fetch_catalog_artist_detail", artist_detail)
     monkeypatch.setattr("app.routers.catalog._start_discography_task", lambda *_args: False)
     monkeypatch.setattr("app.routers.catalog.job_dispatcher.dispatch", no_dispatch)

@@ -28,31 +28,33 @@
 </form>
 {% if releases.items %}
 <div class="bulk-actions" aria-label="Wanted release bulk actions">
-  <form id="wanted-selected-form" method="post" action="/wanted/queue" class="wanted-bulk-form" data-wanted-bulk-form>
+  <form id="wanted-selected-form" method="post" action="/discography-batches/preview" class="wanted-bulk-form" data-wanted-bulk-form>
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="scope_kind" value="wanted_selected">
     <label class="checkbox-control" for="wanted-select-all">
       <input id="wanted-select-all" type="checkbox" data-wanted-select-all>
       <span>Select all</span>
     </label>
-    <button type="submit" class="btn secondary" data-queue-selected>Queue selected</button>
+    <button type="submit" class="btn secondary" data-queue-selected>Preview selected</button>
   </form>
-  <form id="wanted-all-form" method="post" action="/wanted/queue">
+  <form id="wanted-all-form" method="post" action="/discography-batches/preview">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="scope_kind" value="wanted_page">
     {% for release in releases.items %}
     <input type="hidden" name="catalog_album_ids" value="{{ release.id }}">
     {% endfor %}
-    <button type="submit" class="btn" data-queue-all data-confirm="Queue every release shown on this page?">Queue this page</button>
+    <button type="submit" class="btn" data-queue-all>Preview this page</button>
   </form>
-  <form id="wanted-all-matching-form" method="post" action="/wanted/queue">
+  <form id="wanted-all-matching-form" method="post" action="/discography-batches/preview">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <input type="hidden" name="queue_scope" value="all_matching">
+    <input type="hidden" name="scope_kind" value="wanted_all_matching">
     <input type="hidden" name="q" value="{{ q }}">
     <input type="hidden" name="sort" value="{{ sort }}">
     <input type="hidden" name="status" value="{{ status }}">
-    <button type="submit" class="btn danger" data-queue-all-matching data-confirm="Queue all {{ releases.total }} releases matching the current filters?">Queue all {{ releases.total }} wanted</button>
+    <button type="submit" class="btn secondary" data-queue-all-matching>Preview all {{ releases.total }} matches</button>
   </form>
 </div>
-<div class="hint bulk-action-hint">Bulk requests only create pending jobs; the dispatcher still obeys the Parallel searches and downloads limit in Settings.</div>
+<div class="hint bulk-action-hint">Preview shows exactly what would be acquired and creates no jobs until you confirm.</div>
 <div class="album-grid" role="list" aria-label="Wanted releases">
   {% for release in releases.items %}
   <article class="album-card" role="listitem">

@@ -21,7 +21,23 @@ logger = logging.getLogger(__name__)
 
 
 def is_sqlite_database_locked(exc: BaseException) -> bool:
-    return isinstance(exc, OperationalError) and "database is locked" in str(exc).casefold()
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(current, OperationalError) and (
+            "database is locked" in str(current).casefold()
+        ):
+            return True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return False
 
 
 async def run_with_sqlite_lock_retry(
@@ -76,6 +92,29 @@ def register_transaction_callbacks(
     sync_session = session.sync_session
     sync_session.info.setdefault(_AFTER_COMMIT_KEY, []).append(after_commit)
     sync_session.info.setdefault(_AFTER_ROLLBACK_KEY, []).append(after_rollback)
+
+
+def discard_transaction_callbacks(
+    session: AsyncSession,
+    *,
+    after_commit: Callable[[], None],
+    after_rollback: Callable[[], None],
+) -> None:
+    """Remove one callback pair after registration fails part-way."""
+    sync_session = session.sync_session
+    for key, target in (
+        (_AFTER_COMMIT_KEY, after_commit),
+        (_AFTER_ROLLBACK_KEY, after_rollback),
+    ):
+        callbacks = sync_session.info.get(key)
+        if not isinstance(callbacks, list):
+            continue
+        for index in range(len(callbacks) - 1, -1, -1):
+            if callbacks[index] is target:
+                callbacks.pop(index)
+                break
+        if not callbacks:
+            sync_session.info.pop(key, None)
 
 
 @event.listens_for(Session, "after_commit")

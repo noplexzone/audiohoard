@@ -11,7 +11,7 @@ from typing import Any
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings
@@ -37,6 +37,12 @@ from app.models.catalog_entities import (
     CatalogAlbumTrack,
     CatalogArtist,
     CatalogArtistIdentity,
+)
+from app.models.discography_batch import (
+    DiscographyBatch,
+    DiscographyBatchItem,
+    DiscographyBatchItemState,
+    DiscographyBatchState,
 )
 from app.models.job import Job
 from app.models.track import IdentityResolutionState, Track
@@ -94,7 +100,11 @@ def validate_artist_detail(
 
 
 async def validated_artist_hits(
-    provider: MetadataProvider, name: str, artists: list[ArtistHit]
+    provider: MetadataProvider,
+    name: str,
+    artists: list[ArtistHit],
+    *,
+    preserve_order: bool = False,
 ) -> list[ArtistHit]:
     expected_field = {
         "musicbrainz": "mbid",
@@ -139,7 +149,8 @@ async def validated_artist_hits(
 
     checked = await asyncio.gather(*(validate(hit) for hit in structurally_valid))
     filtered = [hit for hit in checked if hit is not None]
-    filtered.sort(key=lambda hit: (hit.fan_count is None, -(hit.fan_count or 0)))
+    if not preserve_order:
+        filtered.sort(key=lambda hit: (hit.fan_count is None, -(hit.fan_count or 0)))
     return filtered
 
 
@@ -625,11 +636,22 @@ async def fetch_and_store_album(
     provider = build_metadata_provider(provider_name, settings)
     if provider is None:
         return album
+    detail = await provider.get_album(provider_id)
+    return await store_album_detail(db, album, detail, provider_name=provider_name)
+
+
+async def store_album_detail(
+    db: AsyncSession,
+    album: CatalogAlbum,
+    detail: AlbumDetail,
+    *,
+    provider_name: str,
+) -> CatalogAlbum:
+    """Reconcile a previously fetched exact provider detail into one catalog album."""
     known_track_count = album.track_count or 0
     artist = await db.get(CatalogArtist, album.artist_id)
     if artist is None:
         raise RuntimeError(f"Catalog artist {album.artist_id} not found for album {album.id}")
-    detail = await provider.get_album(provider_id)
     album = await upsert_catalog_album(db, artist, detail)
     _store_track_previews(album, provider_name, detail.tracks)
     existing_tracks = list(
@@ -730,6 +752,96 @@ async def fetch_and_store_album(
     await db.flush()
     await db.refresh(album, ["tracks"])
     return album
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchHydrationSnapshot:
+    provider_release_id: int
+    catalog_album_id: int
+    artist_identity_id: int
+    provider: str
+    provider_artist_id: str
+    provider_album_id: str
+
+
+async def _load_batch_hydration_snapshot(
+    db: AsyncSession, item_id: int, lease_token: str
+) -> _BatchHydrationSnapshot:
+    row = (
+        await db.execute(
+            select(
+                DiscographyBatchItem.state,
+                DiscographyBatchItem.lease_token,
+                DiscographyBatchItem.provider_release_id,
+                DiscographyBatchItem.catalog_album_id,
+                DiscographyBatch.state,
+                CatalogAlbumProvider.artist_identity_id,
+                CatalogAlbumProvider.provider_album_id,
+                CatalogAlbumProvider.catalog_album_id,
+                CatalogArtistIdentity.provider,
+                CatalogArtistIdentity.provider_artist_id,
+            )
+            .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+            .join(
+                CatalogAlbumProvider,
+                CatalogAlbumProvider.id == DiscographyBatchItem.provider_release_id,
+            )
+            .join(
+                CatalogArtistIdentity,
+                CatalogArtistIdentity.id == CatalogAlbumProvider.artist_identity_id,
+            )
+            .where(DiscographyBatchItem.id == item_id)
+        )
+    ).one_or_none()
+    if row is None:
+        raise RuntimeError("batch hydration identity is no longer available")
+    if (
+        row.state != DiscographyBatchItemState.hydrating
+        or row.lease_token != lease_token
+        or row[4] not in (DiscographyBatchState.queued, DiscographyBatchState.running)
+        or row.provider_release_id is None
+        or row.catalog_album_id is None
+        or row[7] != row.catalog_album_id
+    ):
+        raise RuntimeError("batch hydration lease or catalog ownership changed")
+    return _BatchHydrationSnapshot(
+        provider_release_id=int(row.provider_release_id),
+        catalog_album_id=int(row.catalog_album_id),
+        artist_identity_id=int(row.artist_identity_id),
+        provider=str(row.provider),
+        provider_artist_id=str(row.provider_artist_id),
+        provider_album_id=str(row.provider_album_id),
+    )
+
+
+async def hydrate_discography_batch_item(
+    session_factory: async_sessionmaker[AsyncSession],
+    item_id: int,
+    lease_token: str,
+    settings: Settings,
+) -> None:
+    """Fetch provider metadata session-free, then reconcile behind the exact lease."""
+    async with session_factory() as db:
+        expected = await _load_batch_hydration_snapshot(db, item_id, lease_token)
+
+    provider = build_metadata_provider(expected.provider, settings)
+    if provider is None:
+        raise RuntimeError("batch hydration provider is unavailable")
+    detail = await provider.get_album(expected.provider_album_id)
+    if detail.provider != expected.provider or detail.provider_id != expected.provider_album_id:
+        raise RuntimeError("metadata provider returned a different album identity")
+
+    async with session_factory() as db:
+        current = await _load_batch_hydration_snapshot(db, item_id, lease_token)
+        if current != expected:
+            raise RuntimeError("batch hydration catalog ownership changed")
+        album = await db.get(CatalogAlbum, expected.catalog_album_id)
+        if album is None:
+            raise RuntimeError("batch hydration catalog album was deleted")
+        stored = await store_album_detail(db, album, detail, provider_name=expected.provider)
+        if stored.id != expected.catalog_album_id:
+            raise RuntimeError("metadata detail resolved to a different catalog album")
+        await db.commit()
 
 
 def _match_existing_catalog_track(

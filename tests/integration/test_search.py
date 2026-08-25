@@ -159,7 +159,7 @@ async def test_manual_search_marks_only_active_exact_rejections(client: AsyncCli
         await session.commit()
         active = SearchResult(
             source="slskd",
-            metadata={"username": "peer", "filename": "Artist/track.flac"},
+            metadata={"username": " peer ", "filename": r"Artist\album\..\track.flac"},
         )
         await _mark_active_rejected_results(session, [active])
         assert active.metadata["blocked"] is True

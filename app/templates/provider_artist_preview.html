@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}{{ artist.name }} preview – Audiohoard{% endblock %}
+{% block content %}
+<header class="page-header"><div><p class="eyebrow">Provider artist preview</p><h1>{{ artist.name }}</h1><p>This preview is read-only until you explicitly watch the artist.</p></div>{% if return_to %}<a class="btn secondary" href="{{ return_to | e }}">Back to Discover</a>{% endif %}</header>
+<section class="card"><p><span class="badge info">{{ display_name(artist.provider) }}</span></p>{% if artist.artwork_url %}<img src="/artwork?url={{ artist.artwork_url | urlencode }}" alt="" class="catalog-result-art">{% endif %}
+<dl class="catalog-evidence-list"><div><dt>Provider ID</dt><dd>{{ artist.provider_id }}</dd></div>{% if artist.country %}<div><dt>Country</dt><dd>{{ artist.country }}</dd></div>{% endif %}{% if artist.disambiguation %}<div><dt>Disambiguation</dt><dd>{{ artist.disambiguation }}</dd></div>{% endif %}{% if artist.fan_count is not none %}<div><dt>Fans</dt><dd>{{ artist.fan_count }}</dd></div>{% endif %}</dl>
+<form method="post" action="/artists/catalog/open"><input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><input type="hidden" name="provider" value="{{ artist.provider | e }}"><input type="hidden" name="provider_id" value="{{ artist.provider_id | e }}"><input type="hidden" name="monitor" value="true"><input type="hidden" name="return_to" value="{{ return_to | e }}"><button class="btn" type="submit">Watch artist</button></form></section>
+{% endblock %}

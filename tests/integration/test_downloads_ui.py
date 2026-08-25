@@ -513,7 +513,8 @@ async def test_downloads_group_album_jobs_and_target_active_attempt(client: Asyn
 
 def test_downloads_is_single_column_and_review_deck_stacks_on_mobile() -> None:
     css = Path("app/static/css/pages.css").read_text()
-    mobile = css.rsplit("@media (max-width: 760px)", 1)[1]
+    review_css = css[css.index(".review-empty-state") :]
+    mobile = review_css.split("@media (max-width: 760px)", 1)[1]
 
     assert ".downloads-layout" in css
     assert "grid-template-columns: minmax(0, 1fr);" in css

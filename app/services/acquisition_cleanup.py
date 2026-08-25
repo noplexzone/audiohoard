@@ -35,6 +35,7 @@ from app.models.acquisition_attempt import (
     RetentionDisposition,
 )
 from app.models.catalog_entities import CatalogAlbumTrack
+from app.models.discography_batch import DiscographyBatchItemJob
 from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
 from app.models.release import Release
@@ -1842,6 +1843,7 @@ async def prune_orphaned_terminal_records(
                         Job.status.in_(terminal),
                         ~Job.tracks.any(),
                         ~Job.releases.any(),
+                        ~Job.id.in_(select(DiscographyBatchItemJob.job_id)),
                         ~Job.acquisition_attempts.any(
                             or_(
                                 AcquisitionAttempt.provider_cleanup_state.not_in(

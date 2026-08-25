@@ -52,15 +52,16 @@ def test_search_monitor_artist_and_open_contextual_manual_search(
     expect(page.get_by_label("Album")).to_have_value("Browser Context Album")
 
 
-def test_queue_wanted_filter_page(authenticated_page: Page, browser_base_url: str) -> None:
+def test_preview_wanted_filter_page(authenticated_page: Page, browser_base_url: str) -> None:
     page = authenticated_page
     page.goto(f"{browser_base_url}/wanted?status=needs-search")
     expect(page.get_by_label("State", exact=True)).to_have_value("needs-search")
     expect(page.get_by_text("Browser Context Album", exact=True)).to_be_visible()
-    page.once("dialog", lambda dialog: dialog.accept())
-    page.get_by_role("button", name="Queue this page").click()
-    expect(page).to_have_url(f"{browser_base_url}/downloads")
-    expect(page.get_by_role("link", name="Browser Context Album", exact=True)).to_be_visible()
+    page.get_by_role("button", name="Preview this page").click()
+    page.wait_for_url("**/discography-batches/*")
+    expect(page.get_by_role("heading", name="Review batch")).to_be_visible()
+    expect(page.get_by_text("Browser Context Album", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="Confirm and queue")).to_be_visible()
 
 
 def test_review_skip_approve_deny_and_no_itunes_reference(
@@ -82,7 +83,8 @@ def test_review_skip_approve_deny_and_no_itunes_reference(
 
     page.once("dialog", lambda dialog: dialog.accept())
     page.get_by_role("button", name="Deny", exact=False).click()
-    expect(page).to_have_url(f"{browser_base_url}/review?notice=denied")
+    expect(page).to_have_url(f"{browser_base_url}/review?notice=source_blocked")
+    expect(page.get_by_text("exact provider source was blocked", exact=False)).to_be_visible()
     expect(page.get_by_text("tracks remaining", exact=False)).to_be_visible()
 
 

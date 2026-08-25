@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import ParseResult, urlparse
 
-from sqlalchemy import or_, select, text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -39,6 +39,7 @@ from app.models.acquisition_attempt import (
     AcquisitionAttempt,
     ArtifactState,
     AttemptOutcome,
+    CleanupState,
     ProviderTransferState,
     RetentionDisposition,
 )
@@ -49,11 +50,7 @@ from app.models.path_preview import PathPreview
 from app.models.release import Release
 from app.models.source_candidate_block import SourceCandidateBlock
 from app.models.track import FingerprintState, IdentityResolutionState, Track
-from app.models.workflow import (
-    AcoustIDVerificationState,
-    AcquisitionState,
-    ImportWorkflowState,
-)
+from app.models.workflow import AcquisitionState, ImportWorkflowState
 from app.naming.convention import NamingError, render_path
 from app.schemas.search import SearchRequest, SearchResult
 from app.services.acquisition_attempts import canonical_provider_uuid
@@ -66,12 +63,15 @@ from app.services.catalog_artist_credits import (
 from app.services.catalog_artist_credits import (
     is_compilation_album,
 )
+from app.services.catalog_manifest import catalog_manifest_issue as _catalog_manifest_issue
 from app.services.monitoring import map_slskd_transfer_state
 from app.services.rejected_sources import (
     RejectionClass,
     calculate_blocked_until,
     classify_rejection_reason,
 )
+from app.services.source_candidate_blocks import active_slskd_candidate_identities
+from app.services.source_candidate_identity import normalize_source_candidate_identity
 from app.settings_service import (
     DEFAULT_FREE_TEXT_RESULT_LIMIT,
     build_effective_settings,
@@ -236,6 +236,23 @@ async def _candidate_attempt(
         .limit(1)
     )
     if attempt is None:
+        recoverable = await db.scalar(
+            select(AcquisitionAttempt)
+            .where(
+                AcquisitionAttempt.job_id == job.id,
+                AcquisitionAttempt.provider == result.source,
+                AcquisitionAttempt.peer == peer,
+                AcquisitionAttempt.remote_path == remote_path,
+                AcquisitionAttempt.terminal_at.is_not(None),
+                AcquisitionAttempt.provider_state == ProviderTransferState.completed,
+                AcquisitionAttempt.artifact_state == ArtifactState.missing,
+                AcquisitionAttempt.outcome == AttemptOutcome.failed,
+                AcquisitionAttempt.error_code == "artifact_missing",
+                AcquisitionAttempt.provider_uuid.is_not(None),
+            )
+            .order_by(AcquisitionAttempt.id.desc())
+            .limit(1)
+        )
         attempt = AcquisitionAttempt(
             job_id=job.id,
             catalog_album_id=job.catalog_album_id,
@@ -243,6 +260,24 @@ async def _candidate_attempt(
             provider=result.source,
             peer=peer,
             remote_path=remote_path,
+            provisional_transfer_id=(
+                recoverable.provisional_transfer_id if recoverable is not None else None
+            ),
+            provider_uuid=recoverable.provider_uuid if recoverable is not None else None,
+            provider_state=(
+                ProviderTransferState.completed
+                if recoverable is not None
+                else ProviderTransferState.pending
+            ),
+            provider_enqueued_at=(
+                recoverable.provider_enqueued_at if recoverable is not None else None
+            ),
+            provider_uuid_discovered_at=(
+                recoverable.provider_uuid_discovered_at if recoverable is not None else None
+            ),
+            provider_terminal_at=(
+                recoverable.provider_terminal_at if recoverable is not None else None
+            ),
         )
         db.add(attempt)
         await db.flush()
@@ -561,7 +596,7 @@ async def run_job(
                         job_id,
                         expected_statuses={JobStatus.pending},
                         status=JobStatus.failed,
-                        result_json=_job_error_result(phase1_error, "init", retryable=False),
+                        result_json=_job_error_result(phase1_error, "init", retryable=True),
                     )
         return
 
@@ -580,17 +615,21 @@ async def run_job(
             return
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception("Job %d phase-2 running transition failed", job_id)
+        if is_sqlite_database_locked(exc):
+            # Admission never committed and no provider boundary was crossed. Keep
+            # pending state intact so startup/watchdog recovery can redispatch it.
+            return
         with contextlib.suppress(Exception):
             async with factory() as session:
                 await _persist_job_envelope(
                     session,
                     job_id,
-                    expected_statuses={JobStatus.pending, JobStatus.running},
+                    expected_statuses={JobStatus.pending},
                     status=JobStatus.failed,
                     result_json=_job_error_result(
-                        "running_transition_error", "init", retryable=False
+                        "running_transition_error", "init", retryable=True
                     ),
                 )
         return
@@ -860,6 +899,7 @@ async def _run_job_in_session(
             results = results[:1]
         tracks_created = 0
         failures: list[dict[str, object]] = []
+        artifact_missing_gate: dict[str, object] | None = None
         root_job = await _root_job(job, db)
         existing_releases = list(
             (await db.scalars(select(Release).where(Release.job_id == root_job.id))).all()
@@ -1036,6 +1076,27 @@ async def _run_job_in_session(
 
                 tracks_created += 1
             except ProviderError as exc:
+                if exc.code == "artifact_missing" and result.source == "slskd":
+                    now = _now()
+                    attempt.provider_state = ProviderTransferState.completed
+                    attempt.provider_terminal_at = attempt.provider_terminal_at or now
+                    attempt.artifact_state = ArtifactState.missing
+                    attempt.staged_path = None
+                    attempt.partial_path = None
+                    attempt.artifact_device = None
+                    attempt.artifact_inode = None
+                    attempt.artifact_mtime_ns = None
+                    attempt.artifact_size = None
+                    attempt.artifact_sha256 = None
+                    attempt.file_cleanup_eligible = False
+                    attempt.provider_cleanup_state = CleanupState.not_required
+                    attempt.file_cleanup_state = CleanupState.not_required
+                    attempt.retention_disposition = RetentionDisposition.retain_recovery
+                    artifact_missing_gate = {
+                        "code": "artifact_missing",
+                        "operation": "acquire",
+                        "retryable": True,
+                    }
                 attempt.outcome = AttemptOutcome.failed
                 attempt.error_code = exc.code
                 attempt.error_detail = str(exc)
@@ -1054,9 +1115,13 @@ async def _run_job_in_session(
                     track.acquisition_state = AcquisitionState.failed
                     track.source_status = exc.code
                 if exc.code == "transfer_timeout" and result.source == "slskd":
-                    peer = str(result.metadata.get("username") or "")
-                    filename = str(result.metadata.get("filename") or "")
-                    if peer and filename:
+                    identity = normalize_source_candidate_identity(
+                        result.source,
+                        result.metadata.get("username"),
+                        result.metadata.get("filename"),
+                    )
+                    if identity is not None:
+                        _provider, peer, filename = identity
                         existing_block = await db.scalar(
                             select(SourceCandidateBlock).where(
                                 SourceCandidateBlock.provider == "slskd",
@@ -1096,6 +1161,8 @@ async def _run_job_in_session(
                         if commit_progress:
                             await db.commit()
                 logger.warning("Provider result processing failed with code %s", exc.code)
+                if artifact_missing_gate is not None:
+                    break
                 failures.append(exc.details())
             except Exception:
                 attempt.outcome = AttemptOutcome.failed
@@ -1113,7 +1180,13 @@ async def _run_job_in_session(
                 job.updated_at = _now()
                 await db.commit()
 
-        if catalog_tracks and catalog_album is not None:
+        if artifact_missing_gate is not None:
+            job.status = JobStatus.failed
+            payload = _job_payload(job)
+            payload.update({"tracks_created": tracks_created, "error": artifact_missing_gate})
+            job.result_json = json.dumps(payload, sort_keys=True)
+            continuation_request = None
+        elif catalog_tracks and catalog_album is not None:
             acquired_rows = (
                 await db.execute(
                     select(Track.catalog_track_id, ImportPlan.destination_path)
@@ -1254,24 +1327,6 @@ def _catalog_disc_total(tracks: list[CatalogAlbumTrack]) -> int | None:
     discs = [track.disc for track in tracks if track.disc and track.disc > 0]
     total = max(discs, default=1)
     return total if total > 1 else None
-
-
-def _catalog_manifest_issue(
-    tracks: list[CatalogAlbumTrack], expected_count: int | None
-) -> str | None:
-    if not tracks:
-        return "catalog_tracks_empty"
-    identities: set[tuple[int, int]] = set()
-    for track in tracks:
-        identity = (track.disc, track.position)
-        if track.disc < 1 or track.position < 1 or identity in identities:
-            return "catalog_tracks_invalid_positions"
-        identities.add(identity)
-    if expected_count and len(tracks) < expected_count:
-        return "catalog_tracks_incomplete"
-    if expected_count and len(tracks) > expected_count:
-        return "catalog_tracks_overfull"
-    return None
 
 
 def _catalog_track_for_result(
@@ -1493,48 +1548,8 @@ def _selected_result(job: Job) -> list[SearchResult] | None:
     return [SearchResult.model_validate(json.loads(job.selected_result_json))]
 
 
-def _slskd_identity_from_provenance(provenance_json: str | None) -> tuple[str, str] | None:
-    if not provenance_json:
-        return None
-    try:
-        provenance = json.loads(provenance_json)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(provenance, dict) or provenance.get("source") != "slskd":
-        return None
-    peer = str(provenance.get("username") or "")
-    filename = str(provenance.get("filename") or "")
-    return (peer, filename) if peer and filename else None
-
-
 async def _blocked_slskd_identities(db: AsyncSession) -> set[tuple[str, str]]:
-    now = _now()
-    block_rows = (
-        await db.execute(
-            select(SourceCandidateBlock.peer, SourceCandidateBlock.filename).where(
-                SourceCandidateBlock.provider == "slskd",
-                or_(
-                    SourceCandidateBlock.blocked_until.is_(None),
-                    SourceCandidateBlock.blocked_until > now,
-                ),
-            )
-        )
-    ).all()
-    blocked = {(str(peer), str(filename)) for peer, filename in block_rows}
-    denied_rows = (
-        await db.scalars(
-            select(Track.acquisition_provenance_json).where(
-                Track.source == "slskd",
-                Track.acoustid_verification_state == AcoustIDVerificationState.denied,
-                Track.acquisition_provenance_json.is_not(None),
-            )
-        )
-    ).all()
-    for provenance_json in denied_rows:
-        identity = _slskd_identity_from_provenance(provenance_json)
-        if identity is not None:
-            blocked.add(identity)
-    return blocked
+    return {identity[1:] for identity in await active_slskd_candidate_identities(db, now=_now())}
 
 
 async def _without_blocked_slskd_results(
@@ -1548,8 +1563,16 @@ async def _without_blocked_slskd_results(
         for result in results
         if result.source != "slskd"
         or (
-            str(result.metadata.get("username") or ""),
-            str(result.metadata.get("filename") or ""),
+            identity[1:]
+            if (
+                identity := normalize_source_candidate_identity(
+                    result.source,
+                    result.metadata.get("username"),
+                    result.metadata.get("filename"),
+                )
+            )
+            is not None
+            else None
         )
         not in blocked
     ]
@@ -1977,7 +2000,16 @@ async def _fetch_slskd_album_results(
     folders = [
         folder
         for folder in folders
-        if not any((folder.username, item.filename) in blocked for item in folder.files)
+        if not any(
+            identity[1:] in blocked
+            for item in folder.files
+            if (
+                identity := normalize_source_candidate_identity(
+                    "slskd", folder.username, item.filename
+                )
+            )
+            is not None
+        )
     ]
     if not folders:
         return []
@@ -2069,6 +2101,23 @@ async def _cancellation_safe_checkpoint(checkpoint: Callable[[], Awaitable[None]
         raise
 
 
+def _track_slskd_source_matches_candidate(track: Track, username: str, filename: str) -> bool:
+    """Return whether legacy Track provenance identifies this exact candidate."""
+    if not track.acquisition_provenance_json:
+        return False
+    try:
+        provenance = json.loads(track.acquisition_provenance_json)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(provenance, dict):
+        return False
+    persisted_identity = normalize_source_candidate_identity(
+        provenance.get("source"), provenance.get("username"), provenance.get("filename")
+    )
+    candidate_identity = normalize_source_candidate_identity("slskd", username, filename)
+    return persisted_identity is not None and persisted_identity == candidate_identity
+
+
 async def _prepare_acquisition(
     result: SearchResult,
     source: str,
@@ -2114,7 +2163,12 @@ async def _prepare_acquisition(
         transfer_id: str | None = None
         if attempt is not None:
             transfer_id = attempt.provider_uuid or attempt.provisional_transfer_id
-        if transfer_id is None and track is not None and track.source_job_id:
+        if (
+            transfer_id is None
+            and track is not None
+            and track.source_job_id
+            and _track_slskd_source_matches_candidate(track, username, filename)
+        ):
             if track.acquisition_state == AcquisitionState.acquiring:
                 transfer_id = track.source_job_id
             else:

@@ -39,6 +39,7 @@ from app.models.workflow import (
 )
 from app.services.audio_alignment import COMMON_PREVIEW_OFFSET_SECONDS, align_deezer_preview
 from app.services.review_automation import _source_identity
+from app.services.source_candidate_identity import normalize_source_candidate_identity
 from app.settings_service import effective_settings_dep, get_runtime_settings
 
 router = APIRouter(prefix="/staging", dependencies=[Depends(get_current_user)])
@@ -452,23 +453,25 @@ async def approve_review_item(
     return RedirectResponse(_review_result_location(return_to, "approved"), status_code=303)
 
 
-async def _block_denied_slskd_candidate(db: AsyncSession, track: Track) -> None:
-    """Block the exact slskd artifact that produced a denied review item."""
+async def _block_denied_slskd_candidate(db: AsyncSession, track: Track) -> bool:
+    """Permanently block the exact slskd artifact, if provenance identifies it."""
     if track.source != "slskd" or not track.acquisition_provenance_json:
-        return
+        return False
     try:
         provenance = json.loads(track.acquisition_provenance_json)
     except (json.JSONDecodeError, TypeError):
-        return
-    if not isinstance(provenance, dict) or provenance.get("source") != "slskd":
-        return
-    peer = str(provenance.get("username") or "")
-    filename = str(provenance.get("filename") or "")
-    if not peer or not filename:
-        return
+        return False
+    if not isinstance(provenance, dict):
+        return False
+    identity = normalize_source_candidate_identity(
+        provenance.get("source"), provenance.get("username"), provenance.get("filename")
+    )
+    if identity is None:
+        return False
+    provider, peer, filename = identity
     existing_block = await db.scalar(
-        select(SourceCandidateBlock.id).where(
-            SourceCandidateBlock.provider == "slskd",
+        select(SourceCandidateBlock).where(
+            SourceCandidateBlock.provider == provider,
             SourceCandidateBlock.peer == peer,
             SourceCandidateBlock.filename == filename,
         )
@@ -476,12 +479,16 @@ async def _block_denied_slskd_candidate(db: AsyncSession, track: Track) -> None:
     if existing_block is None:
         db.add(
             SourceCandidateBlock(
-                provider="slskd",
+                provider=provider,
                 peer=peer,
                 filename=filename,
                 reason="denied",
             )
         )
+    else:
+        existing_block.reason = "denied"
+        existing_block.blocked_until = None
+    return True
 
 
 @router.post("/review/{item_id}/deny", include_in_schema=False)
@@ -520,6 +527,7 @@ async def deny_review_item(
             )
 
     track = await db.get(Track, item.track_id)
+    source_blocked = False
     continuation_id: int | None = None
     if track is not None:
         staged_path = track.staging_path
@@ -540,7 +548,7 @@ async def deny_review_item(
             track.staging_path = None
             if track.source_path == staged_path:
                 track.source_path = None
-        await _block_denied_slskd_candidate(db, track)
+        source_blocked = await _block_denied_slskd_candidate(db, track)
         track.acoustid_verification_state = AcoustIDVerificationState.denied
         track.acquisition_state = AcquisitionState.failed
         release = await db.get(Release, item.release_id)
@@ -641,7 +649,8 @@ async def deny_review_item(
     delete_quarantine()  # noqa: ASYNC240
     if continuation_id is not None:
         await job_dispatcher.dispatch(continuation_id)
-    return RedirectResponse(_review_result_location(return_to, "denied"), status_code=303)
+    notice = "source_blocked" if source_blocked else "source_identity_unavailable"
+    return RedirectResponse(_review_result_location(return_to, notice), status_code=303)
 
 
 @router.post("/release/{release_id}/dismiss", include_in_schema=False)

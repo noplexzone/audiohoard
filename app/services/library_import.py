@@ -13,7 +13,7 @@ import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import BinaryIO, no_type_check
 from urllib.parse import urljoin, urlparse
 
@@ -39,11 +39,15 @@ from mutagen.id3 import (
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
-from app.database import register_transaction_callbacks, run_with_sqlite_lock_retry
+from app.database import (
+    discard_transaction_callbacks,
+    register_transaction_callbacks,
+    run_with_sqlite_lock_retry,
+)
 from app.http import stream_with_retry
 from app.media_formats import is_importable_audio, supported_audio_formats_display
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
@@ -61,6 +65,7 @@ from app.services.acquisition_cleanup import (
     ImportedSourceCleanup,
     schedule_imported_source_cleanup,
 )
+from app.services.catalog_artist_credits import project_catalog_artist_credits
 from app.services.pinned_destination import PinnedDestination
 from app.services.quality_upgrade import reconcile_album_quality_duplicates
 from app.settings_service import QualityProfile, get_runtime_settings
@@ -767,6 +772,13 @@ class AlbumRetagResult:
     files_renamed: int = 0
 
 
+@dataclass(frozen=True)
+class _RetagFilesystemTransaction:
+    result: AlbumRetagResult
+    after_commit: Callable[[], None]
+    after_rollback: Callable[[], None]
+
+
 def _catalog_disc_total(album: CatalogAlbum) -> int | None:
     discs = [track.disc for track in album.tracks if track.disc and track.disc > 0]
     total = max(discs, default=1)
@@ -792,11 +804,12 @@ def _catalog_track_total_values(album: CatalogAlbum, disc: int) -> dict[str, str
 def _catalog_tags(
     album: CatalogAlbum, catalog_track: CatalogAlbumTrack, track: Track | None
 ) -> dict[str, str]:
+    credits = project_catalog_artist_credits(album, catalog_track)
     values = {
         "title": catalog_track.title,
-        "artist": (track.artist if track is not None else None) or album.artist.name,
+        "artist": credits.track_artist,
         "album": album.title,
-        "album_artist": album.artist.name,
+        "album_artist": credits.album_artist,
         "date": album.year or "",
         "releasedate": album.year or "",
         "release_date": album.year or "",
@@ -822,10 +835,11 @@ def _sync_track_from_catalog(
 ) -> None:
     disc_total = _catalog_disc_total(album)
     track.catalog_album_id = album.id
+    credits = project_catalog_artist_credits(album, catalog_track)
     track.catalog_track_id = catalog_track.id
     track.title = catalog_track.title
-    track.artist = album.artist.name
-    track.album_artist = album.artist.name
+    track.artist = credits.track_artist
+    track.album_artist = credits.album_artist
     track.album = album.title
     track.year = album.year
     track.disc = catalog_track.disc
@@ -847,10 +861,11 @@ def _sync_track_numbering_from_catalog(
 def _canonical_destination_for_catalog_track(
     root: Path, album: CatalogAlbum, catalog_track: CatalogAlbumTrack, current_path: Path
 ) -> Path:
+    credits = project_catalog_artist_credits(album, catalog_track)
     rendered = render_path(
         title=catalog_track.title,
-        artist=album.artist.name,
-        album_artist=album.artist.name,
+        artist=credits.track_artist,
+        album_artist=credits.album_artist,
         album=album.title,
         year=album.year,
         disc=catalog_track.disc,
@@ -863,41 +878,71 @@ def _canonical_destination_for_catalog_track(
     return current_path.parent / Path(rendered).name
 
 
+def _validated_legacy_folder_segment(value: str) -> str:
+    if (
+        not value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or "\x00" in value
+        or Path(value).is_absolute()
+        or PureWindowsPath(value).is_absolute()
+    ):
+        raise ImportExecutionError("unsafe legacy album folder segment")
+    return value
+
+
 def _discover_legacy_album_files(
     album: CatalogAlbum, library_root: Path
 ) -> list[tuple[Path, None, CatalogAlbumTrack]]:
-    folder = library_root.resolve() / album.artist.name / f"{album.title} ({album.year or ''})"
-    if not folder.is_dir() or folder.is_symlink():
+    root = library_root.resolve()
+    credits = project_catalog_artist_credits(album)
+    artist_folders = dict.fromkeys((album.artist.name, credits.album_artist))
+    album_folder = _validated_legacy_folder_segment(f"{album.title} ({album.year or ''})")
+    folders: list[Path] = []
+    for artist_name in artist_folders:
+        if not artist_name:
+            continue
+        folder = root / _validated_legacy_folder_segment(artist_name) / album_folder
+        if _existing_parent_symlink(root, folder / ".legacy-discovery-probe") is not None:
+            raise ImportExecutionError("album folder contains a symlinked path")
+        resolved_folder = folder.resolve(strict=False)
+        if resolved_folder != root and root not in resolved_folder.parents:
+            raise ImportExecutionError("legacy album folder escapes library root")
+        if folder.is_dir():
+            folders.append(folder)
+    if not folders:
         return []
     catalog_by_position = {(track.disc, track.position): track for track in album.tracks}
     catalog_by_title = {_normalized_title(track.title): track for track in album.tracks}
     targets: list[tuple[Path, None, CatalogAlbumTrack]] = []
     used_catalog_ids: set[int] = set()
-    for path in sorted(folder.rglob("*")):
-        if path.is_symlink() or not path.is_file() or not is_importable_audio(path):
-            continue
-        track_key = _track_key_from_filename(path, folder)
-        stripped = path.stem
-        prefix = _TRACK_NUMBER_PREFIX.match(path.stem.strip())
-        if prefix is not None:
-            stripped = stripped[prefix.end() :].lstrip(" .-_")
-        title_match = catalog_by_title.get(_normalized_title(stripped))
-        catalog_track = catalog_by_position.get(track_key or (0, 0))
-        if (
-            title_match is not None
-            and track_key is not None
-            and title_match.position == track_key[1]
-            and title_match is not catalog_track
-        ):
-            catalog_track = title_match
-        if catalog_track is None:
-            catalog_track = title_match
-        if catalog_track is None or catalog_track.id in used_catalog_ids:
-            raise ImportExecutionError(
-                "album folder contains audio not linked to stored track metadata"
-            )
-        used_catalog_ids.add(catalog_track.id)
-        targets.append((path, None, catalog_track))
+    for folder in folders:
+        for path in sorted(folder.rglob("*")):
+            if path.is_symlink() or not path.is_file() or not is_importable_audio(path):
+                continue
+            track_key = _track_key_from_filename(path, folder)
+            stripped = path.stem
+            prefix = _TRACK_NUMBER_PREFIX.match(path.stem.strip())
+            if prefix is not None:
+                stripped = stripped[prefix.end() :].lstrip(" .-_")
+            title_match = catalog_by_title.get(_normalized_title(stripped))
+            catalog_track = catalog_by_position.get(track_key or (0, 0))
+            if (
+                title_match is not None
+                and track_key is not None
+                and title_match.position == track_key[1]
+                and title_match is not catalog_track
+            ):
+                catalog_track = title_match
+            if catalog_track is None:
+                catalog_track = title_match
+            if catalog_track is None or catalog_track.id in used_catalog_ids:
+                raise ImportExecutionError(
+                    "album folder contains audio not linked to stored track metadata"
+                )
+            used_catalog_ids.add(catalog_track.id)
+            targets.append((path, None, catalog_track))
     return targets
 
 
@@ -918,60 +963,99 @@ async def retag_catalog_album(
     if album is None:
         raise ImportExecutionError("catalog album not found")
 
+    catalog_tracks = {item.id: item for item in album.tracks}
     rows = (
         await db.execute(
             select(Track, ImportPlan)
             .join(ImportPlan, ImportPlan.track_id == Track.id)
             .where(
-                or_(
-                    Track.catalog_album_id == album_id,
-                    Track.catalog_album_id.is_(None),
-                ),
+                Track.catalog_album_id == album_id,
+                Track.catalog_track_id.in_(catalog_tracks),
                 Track.import_state == ImportWorkflowState.imported,
                 ImportPlan.status == ImportWorkflowState.imported,
                 ImportPlan.destination_path != "",
             )
-            .order_by(ImportPlan.id)
+            .order_by(Track.id, ImportPlan.id)
         )
     ).all()
-    latest: dict[int, tuple[Track, ImportPlan]] = {}
+    claims_by_track: dict[int, list[tuple[Track, ImportPlan]]] = {}
     for track, plan in rows:
-        if track.catalog_album_id is None:
-            legacy_artist = track.album_artist or track.artist or ""
-            if (track.album or "").casefold() != album.title.casefold() or (
-                legacy_artist.casefold() != album.artist.name.casefold()
-            ):
-                continue
-        latest[track.id] = (track, plan)
+        claims_by_track.setdefault(track.id, []).append((track, plan))
+
+    current: dict[int, tuple[Track, ImportPlan]] = {}
+    for track_id, claims in claims_by_track.items():
+        present = [claim for claim in claims if claim[1].file_state == LibraryFileState.present]
+        if len(present) > 1:
+            raise ImportExecutionError(f"track {track_id} has duplicate present claims")
+        if present:
+            current[track_id] = present[0]
+            continue
+        unknown = [claim for claim in claims if claim[1].file_state == LibraryFileState.unknown]
+        if len(unknown) > 1:
+            raise ImportExecutionError(f"track {track_id} has ambiguous unknown claims")
+        if unknown:
+            # Legacy rows predate durable file-state tracking. Execution performs the
+            # contained, regular, non-symlink audio checks before touching any file.
+            current[track_id] = unknown[0]
+
     artwork = await _fetch_canonical_artwork(album.artwork_url)
-    catalog_tracks = {item.id: item for item in album.tracks}
-    catalog_tracks_by_position = {(item.disc, item.position): item for item in album.tracks}
-    for track, _plan in latest.values():
+    for track, _plan in current.values():
         catalog_track = catalog_tracks.get(track.catalog_track_id or 0)
         if catalog_track is None:
-            catalog_track = catalog_tracks_by_position.get((track.disc or 1, track.track_no or 0))
-        if catalog_track is not None:
-            _sync_track_numbering_from_catalog(track, album, catalog_track)
-    legacy_targets = _discover_legacy_album_files(album, library_root)
-    if latest:
-        imported_destinations = {plan.destination_path for _track, plan in latest.values()}
-        legacy_targets = [
-            (path, track, catalog_track)
-            for path, track, catalog_track in legacy_targets
-            if str(path) not in imported_destinations
-        ]
-    if not latest and not legacy_targets:
+            raise ImportExecutionError("imported file is not linked to stored track metadata")
+        _sync_track_numbering_from_catalog(track, album, catalog_track)
+    if not current:
         raise ImportExecutionError("album has no imported files to retag")
 
-    return await asyncio.to_thread(
+    transaction = await asyncio.to_thread(
         _retag_catalog_album_files,
         album,
-        list(latest.values()),
+        list(current.values()),
         library_root=library_root,
         tag_writer=tag_writer,
         artwork=artwork,
-        legacy_targets=legacy_targets,
     )
+    callback_finished = False
+
+    def commit_once() -> None:
+        nonlocal callback_finished
+        if callback_finished:
+            return
+        callback_finished = True
+        transaction.after_commit()
+
+    def rollback_once() -> None:
+        nonlocal callback_finished
+        if callback_finished:
+            return
+        callback_finished = True
+        transaction.after_rollback()
+
+    try:
+        register_transaction_callbacks(
+            db,
+            after_commit=commit_once,
+            after_rollback=rollback_once,
+        )
+    except Exception:
+        try:
+            discard_transaction_callbacks(
+                db,
+                after_commit=commit_once,
+                after_rollback=rollback_once,
+            )
+        except Exception:
+            logger.exception("retag callback discard failed after registration error")
+        try:
+            rollback_once()
+        except Exception:
+            logger.exception("retag rollback cleanup failed after callback registration error")
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception("database rollback failed after callback registration error")
+        raise
+    return transaction.result
 
 
 def _retag_catalog_album_files(
@@ -981,31 +1065,15 @@ def _retag_catalog_album_files(
     library_root: Path,
     tag_writer: MutagenTagWriter | None,
     artwork: CanonicalArtwork | None = None,
-    legacy_targets: list[tuple[Path, None, CatalogAlbumTrack]] | None = None,
-) -> AlbumRetagResult:
+) -> _RetagFilesystemTransaction:
     catalog_tracks = {item.id: item for item in album.tracks}
-    catalog_tracks_by_position = {(item.disc, item.position): item for item in album.tracks}
     root = library_root.resolve()
     targets: list[tuple[Path, Path, Track | None, ImportPlan | None, CatalogAlbumTrack]] = []
-    for path, track, catalog_track in legacy_targets or []:
-        targets.append(
-            (
-                path,
-                _canonical_destination_for_catalog_track(root, album, catalog_track, path),
-                track,
-                None,
-                catalog_track,
-            )
-        )
     folders: set[Path] = set()
     mapped_destinations: set[Path] = set()
     current_destinations: set[Path] = set()
     for track, plan in imported:
         imported_catalog_track = catalog_tracks.get(track.catalog_track_id or 0)
-        if imported_catalog_track is None:
-            imported_catalog_track = catalog_tracks_by_position.get(
-                (track.disc or 1, track.track_no or 0)
-            )
         if imported_catalog_track is None:
             raise ImportExecutionError("imported file is not linked to stored track metadata")
         destination = Path(plan.destination_path)
@@ -1141,21 +1209,47 @@ def _retag_catalog_album_files(
                 pinned.fsync()
                 if target_plan is not None:
                     target_plan.destination_path = str(canonical_destination)
-        for pinned, _destination_name, backup_name in backup_paths:
+        committed_backups = tuple(backup_paths)
+        committed_destinations = tuple(created_destinations)
+        committed_handles = tuple(pinned_destinations)
+
+        def finalize_filesystem_commit() -> None:
             try:
-                pinned.unlink(backup_name)
-                pinned.fsync()
-            except OSError:
-                logger.warning("retag succeeded but a temporary backup could not be removed")
-        if created_destinations:
-            scanner_pinned, scanner_name = created_destinations[0]
+                for pinned, _destination_name, backup_name in committed_backups:
+                    try:
+                        pinned.unlink(backup_name)
+                        pinned.fsync()
+                    except OSError:
+                        logger.exception(
+                            "retag succeeded but a temporary backup could not be removed"
+                        )
+                if committed_destinations:
+                    scanner_pinned, scanner_name = committed_destinations[0]
+                    try:
+                        scanner_pinned.notify_changed(scanner_name)
+                        scanner_pinned.fsync()
+                    except OSError:
+                        logger.exception(
+                            "retag succeeded but the library scanner notification failed"
+                        )
+            finally:
+                _close_pinned_destinations_safely(list(committed_handles))
+
+        def rollback_filesystem_commit() -> None:
             try:
-                scanner_pinned.notify_changed(scanner_name)
-                scanner_pinned.fsync()
-            except OSError:
-                logger.warning("retag succeeded but the library scanner notification failed")
-        _close_pinned_destinations_safely(pinned_destinations)
-        return AlbumRetagResult(files_retagged=len(targets), folder=folder, files_renamed=renamed)
+                _rollback_pinned_filesystem(
+                    [], list(committed_destinations), list(committed_backups)
+                )
+            finally:
+                _close_pinned_destinations_safely(list(committed_handles))
+
+        return _RetagFilesystemTransaction(
+            result=AlbumRetagResult(
+                files_retagged=len(targets), folder=folder, files_renamed=renamed
+            ),
+            after_commit=finalize_filesystem_commit,
+            after_rollback=rollback_filesystem_commit,
+        )
     except Exception as exc:
         _rollback_pinned_filesystem(temp_paths, created_destinations, backup_paths)
         _close_pinned_destinations_safely(pinned_destinations)

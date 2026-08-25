@@ -7,6 +7,7 @@ artifact, traversal rejection, and cancellation propagation.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -201,6 +202,9 @@ async def test_slskd_retry_adopts_existing_completed_transfer(
         source="slskd",
         source_job_id=f"peer1:{filename}",
         acquisition_state=runner.AcquisitionState.failed,
+        acquisition_provenance_json=json.dumps(
+            {"source": "slskd", "username": "peer1", "filename": filename}
+        ),
     )
     result = runner.SearchResult(
         source="slskd",
@@ -887,6 +891,9 @@ async def test_prepare_acquisition_resumes_slskd_without_enqueue(
         source_job_id="existing-transfer",
         source_status="acquiring",
         acquisition_state=AcquisitionState.acquiring,
+        acquisition_provenance_json=json.dumps(
+            {"source": "slskd", "username": "peer", "filename": "music/song.flac"}
+        ),
     )
     result = SearchResult(
         source="slskd",
@@ -903,6 +910,95 @@ async def test_prepare_acquisition_resumes_slskd_without_enqueue(
     assert source_job_id == "existing-transfer"
     assert status == "downloaded"
     assert track.acquisition_state == AcquisitionState.downloaded
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        None,
+        "{not-json",
+        {"source": "slskd", "username": "old-peer", "filename": "New/01 Song.flac"},
+        {"source": "slskd", "username": "new-peer", "filename": "Old/01 Song.flac"},
+    ],
+    ids=["missing-provenance", "malformed-provenance", "mismatched-peer", "mismatched-path"],
+)
+async def test_prepare_acquisition_does_not_adopt_stale_slskd_transfer(
+    fast_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provenance: dict[str, str] | str | None,
+) -> None:
+    from app.models.track import Track
+    from app.models.workflow import AcquisitionState
+    from app.schemas.search import SearchResult
+
+    audio_file = fast_settings.staging_root / "new-transfer.flac"
+    audio_file.write_bytes(b"audio")
+    status_calls: list[str] = []
+    enqueue_calls: list[tuple[str, str, int | None]] = []
+    poll_calls: list[str] = []
+
+    class FakeSlskd:
+        def __init__(self, url: str, key: str) -> None:
+            pass
+
+        async def status(self, transfer_id: str) -> CapabilityState:
+            status_calls.append(transfer_id)
+            return CapabilityState(True, "Completed")
+
+        async def enqueue(self, username: str, filename: str, size: int | None = None) -> str:
+            enqueue_calls.append((username, filename, size))
+            return "new-transfer"
+
+    async def fake_poll(
+        transfer_id: str,
+        username: str,
+        filename: str,
+        adapter: Any,
+        staging_root: Path,
+        poll_interval: float,
+        poll_timeout: float,
+        on_provider_id: object | None = None,
+    ) -> tuple[Path, str]:
+        poll_calls.append(transfer_id)
+        return audio_file, transfer_id
+
+    monkeypatch.setattr(runner, "SlskdAdapter", FakeSlskd)
+    monkeypatch.setattr(runner, "_poll_slskd_transfer", fake_poll)
+    track = Track(
+        job_id=1,
+        source="slskd",
+        source_job_id="old-transfer",
+        source_status="failed",
+        acquisition_state=AcquisitionState.failed,
+        acquisition_provenance_json=(
+            provenance
+            if isinstance(provenance, str)
+            else json.dumps(provenance)
+            if provenance is not None
+            else None
+        ),
+    )
+    result = SearchResult(
+        source="slskd",
+        title="Song",
+        metadata={"username": "new-peer", "filename": "New/01 Song.flac"},
+    )
+
+    source_job_id, status = await runner._prepare_acquisition(
+        result, "slskd", fast_settings, track
+    )
+
+    assert status_calls == []
+    assert enqueue_calls == [("new-peer", "New/01 Song.flac", None)]
+    assert poll_calls == ["new-transfer"]
+    assert source_job_id == "new-transfer"
+    assert status == "downloaded"
+    assert track.source_job_id == "new-transfer"
+    assert json.loads(track.acquisition_provenance_json or "{}") == {
+        "filename": "New/01 Song.flac",
+        "source": "slskd",
+        "username": "new-peer",
+    }
 
 
 async def test_prepare_acquisition_checkpoints_enqueue_before_poll(

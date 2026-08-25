@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import posixpath
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -30,6 +31,13 @@ from app.models.catalog_entities import (
     CatalogAlbumTrack,
     CatalogArtist,
     CatalogArtistIdentity,
+)
+from app.models.discography_batch import (
+    DiscographyBatch,
+    DiscographyBatchItem,
+    DiscographyBatchItemJob,
+    DiscographyBatchItemState,
+    DiscographyScopeKind,
 )
 from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
@@ -68,6 +76,16 @@ from app.services.catalog_metadata import (
     upsert_provider_release,
 )
 from app.services.catalog_ownership import reconcile_deezer_catalog_ownership
+from app.services.discography_batches import (
+    DiscographyScopeError,
+    cancel_discography_batch,
+    confirm_discography_batch,
+    create_discography_batch_preview,
+    is_discography_batch_item_retryable,
+    pause_discography_batch,
+    resume_discography_batch,
+    retry_discography_batch_items,
+)
 from app.services.library_import import ImportExecutionError, retag_catalog_album
 from app.services.library_removal import (
     LibraryRemovalError,
@@ -351,6 +369,32 @@ def _sanitize_error_class(exc: BaseException) -> str:
 
 def _form_bool(value: object) -> bool:
     return str(value or "").lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_discover_return_path(value: str) -> str | None:
+    if not value:
+        return None
+    decoded = value
+    for _ in range(4):
+        if any(ord(char) < 32 or char == "\\" for char in decoded):
+            return None
+        next_value = unquote(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+    else:
+        if unquote(decoded) != decoded:
+            return None
+    if any(ord(char) < 32 or char == "\\" for char in decoded):
+        return None
+    parsed = urlsplit(decoded)
+    if parsed.scheme or parsed.netloc or decoded.startswith("//"):
+        return None
+    if posixpath.normpath(parsed.path) != parsed.path:
+        return None
+    if parsed.path != "/search" and not parsed.path.startswith("/discover/"):
+        return None
+    return value
 
 
 def _apply_runtime_watchlist_defaults(artist: CatalogArtist, runtime: RuntimeSettings) -> None:
@@ -822,6 +866,29 @@ async def delete_imported_release_files(
     return RedirectResponse(location, status_code=303)
 
 
+@router.get("/artists/provider-preview", response_class=HTMLResponse)
+async def provider_artist_preview(
+    provider: str,
+    provider_id: str,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(effective_settings_dep)],
+    return_to: str = "",
+) -> Response:
+    await db.rollback()
+    try:
+        detail = await fetch_catalog_artist_detail(settings, provider, provider_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Provider artist not found") from None
+    except (httpx.HTTPError, TimeoutError, RetryError):
+        raise HTTPException(status_code=502, detail="Metadata provider unavailable") from None
+    return _templates(request).TemplateResponse(
+        request,
+        "provider_artist_preview.html",
+        {"artist": detail, "return_to": _safe_discover_return_path(return_to) or ""},
+    )
+
+
 @router.get("/artists/catalog/open", response_class=HTMLResponse)
 async def open_catalog_artist_page(
     provider: str,
@@ -905,8 +972,9 @@ async def open_catalog_artist_post(
     provider: Annotated[str, Form()],
     provider_id: Annotated[str, Form()],
     monitor: Annotated[str, Form()] = "",
+    return_to: Annotated[str, Form()] = "",
 ) -> Response:
-    return await open_catalog_artist_page(
+    response = await open_catalog_artist_page(
         provider,
         provider_id,
         request,
@@ -915,6 +983,13 @@ async def open_catalog_artist_post(
         settings,
         monitor=monitor.lower() in {"1", "true", "yes", "on"},
     )
+    if (
+        response.status_code < 400
+        and not _wants_json(request)
+        and (location := _safe_discover_return_path(return_to))
+    ):
+        return RedirectResponse(location, status_code=303)
+    return response
 
 
 @router.get("/artists/catalog/{artist_id}", response_class=HTMLResponse)
@@ -1558,6 +1633,269 @@ async def _wanted_release_context(
             review_count=int(row.review_count or 0),
         )
     return result
+
+
+def _discography_error(message: str) -> HTMLResponse:
+    """Return a native, escaped validation page without exposing exception internals."""
+    import html
+
+    detail = html.escape(message)
+    return HTMLResponse(
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        "<title>Batch scope needs review</title></head><body>"
+        "<main><h1>Review the batch scope</h1>"
+        f'<p>{detail}</p><p><a href="/wanted">Return to Wanted and correct the form</a>.'
+        "</p></main></body></html>",
+        status_code=400,
+    )
+
+
+def _discography_notice(value: str) -> str | None:
+    return {
+        "confirmed": "Batch confirmed and queued.",
+        "paused": "Batch paused. Running downloads were left alone.",
+        "resumed": "Batch resumed.",
+        "cancelled": "Batch cancelled. Pending batch-owned jobs were cancelled.",
+        "retried": "Selected releases were queued for retry.",
+        "no-eligible-retries": "No selected releases were eligible for retry.",
+    }.get(value)
+
+
+async def _render_discography_batch(
+    request: Request,
+    db: AsyncSession,
+    batch_id: int,
+    *,
+    scope_changed: bool = False,
+) -> HTMLResponse:
+    batch = (
+        await db.execute(
+            select(DiscographyBatch)
+            .where(DiscographyBatch.id == batch_id)
+            .options(
+                selectinload(DiscographyBatch.items)
+                .selectinload(DiscographyBatchItem.catalog_album)
+                .selectinload(CatalogAlbum.artist),
+                selectinload(DiscographyBatch.items)
+                .selectinload(DiscographyBatchItem.provider_release)
+                .selectinload(CatalogAlbumProvider.artist_identity)
+                .selectinload(CatalogArtistIdentity.artist),
+                selectinload(DiscographyBatch.items)
+                .selectinload(DiscographyBatchItem.job_links)
+                .selectinload(DiscographyBatchItemJob.job),
+            )
+        )
+    ).scalar_one_or_none()
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Discography batch not found")
+    try:
+        scope = json.loads(batch.scope_json)
+    except (TypeError, json.JSONDecodeError):
+        scope = {}
+    items = sorted(
+        batch.items,
+        key=lambda item: (
+            item.artist_name.casefold(),
+            item.release_year or "",
+            item.release_title.casefold(),
+            item.id,
+        ),
+    )
+    item_rows: list[dict[str, object]] = []
+    hydration_reasons = {
+        "catalog_manifest_missing",
+        "catalog_manifest_incomplete",
+        "catalog_manifest_overfull",
+        "catalog_manifest_invalid_positions",
+        "hydration_failed",
+    }
+    display_counts = {
+        "matching": len(items),
+        "complete": sum(item.state == DiscographyBatchItemState.complete for item in items),
+        "active": sum(item.active_count for item in items),
+        "hydration": sum(
+            item.state == DiscographyBatchItemState.hydrating
+            or item.reason_code in hydration_reasons
+            for item in items
+        ),
+        "missing": sum(item.target_count for item in items),
+        "estimated": sum(item.estimated_job_count for item in items),
+    }
+    for item in items:
+        album = item.catalog_album
+        provider_release = item.provider_release
+        artist_id = album.artist_id if album is not None else None
+        if artist_id is None and provider_release is not None:
+            artist_id = provider_release.artist_identity.artist_id
+        statuses: dict[str, int] = {}
+        for link in item.job_links:
+            key = link.job.status.value
+            statuses[key] = statuses.get(key, 0) + 1
+        item_rows.append(
+            {
+                "item": item,
+                "artist_id": artist_id,
+                "album_id": album.id if album is not None else None,
+                "artwork_url": album.artwork_url if album is not None else None,
+                "job_count": len(item.job_links),
+                "job_statuses": statuses,
+                "retryable": is_discography_batch_item_retryable(item.state, item.reason_code),
+            }
+        )
+    return _templates(request).TemplateResponse(
+        request,
+        "discography_batch.html",
+        {
+            "batch": batch,
+            "items": item_rows,
+            "scope": scope if isinstance(scope, dict) else {},
+            "scope_changed": scope_changed,
+            "display_counts": display_counts,
+            "notice": _discography_notice(request.query_params.get("notice", "")),
+        },
+    )
+
+
+@router.post("/discography-batches/preview", include_in_schema=False)
+async def preview_discography_batch_page(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> Response:
+    form = await request.form()
+    scope_kind = str(form.get("scope_kind", ""))
+    payload: dict[str, object]
+    if scope_kind == DiscographyScopeKind.artist:
+        payload = {
+            "artist_id": form.get("artist_id"),
+            "provider": form.get("provider", ""),
+            "release_type": form.get("release_type", "all"),
+            "year_from": form.get("year_from"),
+            "year_to": form.get("year_to"),
+            "monitoring_status": form.get("monitoring_status", "monitored"),
+        }
+    elif scope_kind in {
+        DiscographyScopeKind.wanted_selected,
+        DiscographyScopeKind.wanted_page,
+    }:
+        album_ids = list(form.getlist("catalog_album_ids"))
+        if not album_ids:
+            return _discography_error("Select at least one release to preview.")
+        payload = {"album_ids": album_ids}
+    elif scope_kind == DiscographyScopeKind.wanted_all_matching:
+        payload = {
+            "q": form.get("q", ""),
+            "sort": form.get("sort", "year"),
+            "status": form.get("status", "all"),
+        }
+    else:
+        return _discography_error("Choose a supported preview scope and try again.")
+    try:
+        preview = await create_discography_batch_preview(db, scope_kind, payload)
+    except DiscographyScopeError as exc:
+        return _discography_error(str(exc))
+    return RedirectResponse(f"/discography-batches/{preview.id}", status_code=303)
+
+
+@router.get("/discography-batches/{batch_id}", response_class=HTMLResponse)
+async def discography_batch_page(
+    request: Request,
+    batch_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> HTMLResponse:
+    return await _render_discography_batch(request, db, batch_id)
+
+
+def _wake_discography_batch_runner(request: Request) -> None:
+    runner = getattr(request.app.state, "discography_batch_runner", None)
+    if runner is not None:
+        runner.wake()
+
+
+@router.post("/discography-batches/{batch_id}/confirm", include_in_schema=False)
+async def confirm_discography_batch_page(
+    request: Request,
+    batch_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> Response:
+    try:
+        result = await confirm_discography_batch(db, batch_id)
+    except DiscographyScopeError as exc:
+        return _discography_error(str(exc))
+    if result.scope_changed:
+        return await _render_discography_batch(request, db, batch_id, scope_changed=True)
+    _wake_discography_batch_runner(request)
+    return RedirectResponse(f"/discography-batches/{batch_id}?notice=confirmed", status_code=303)
+
+
+@router.post("/discography-batches/{batch_id}/pause", include_in_schema=False)
+async def pause_discography_batch_page(
+    batch_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> Response:
+    try:
+        await pause_discography_batch(db, batch_id)
+    except DiscographyScopeError as exc:
+        return _discography_error(str(exc))
+    return RedirectResponse(f"/discography-batches/{batch_id}?notice=paused", status_code=303)
+
+
+@router.post("/discography-batches/{batch_id}/resume", include_in_schema=False)
+async def resume_discography_batch_page(
+    request: Request,
+    batch_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> Response:
+    try:
+        await resume_discography_batch(db, batch_id)
+    except DiscographyScopeError as exc:
+        return _discography_error(str(exc))
+    _wake_discography_batch_runner(request)
+    return RedirectResponse(f"/discography-batches/{batch_id}?notice=resumed", status_code=303)
+
+
+@router.post("/discography-batches/{batch_id}/cancel", include_in_schema=False)
+async def cancel_discography_batch_page(
+    batch_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> Response:
+    try:
+        result = await cancel_discography_batch(db, batch_id)
+    except DiscographyScopeError as exc:
+        return _discography_error(str(exc))
+    for job_id in result.cancel_job_ids:
+        job_dispatcher.cancel(job_id)
+    return RedirectResponse(f"/discography-batches/{batch_id}?notice=cancelled", status_code=303)
+
+
+@router.post("/discography-batches/{batch_id}/retry", include_in_schema=False)
+async def retry_discography_batch_page(
+    request: Request,
+    batch_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> Response:
+    form = await request.form()
+    raw_ids = [str(value) for value in form.getlist("item_ids")]
+    if not raw_ids or any(not value.isdigit() for value in raw_ids):
+        return _discography_error("Select at least one failed release to retry.")
+    try:
+        result = await retry_discography_batch_items(
+            db, batch_id, [int(value) for value in raw_ids]
+        )
+    except (DiscographyScopeError, ValueError) as exc:
+        return _discography_error(str(exc))
+    if result.reset_item_ids:
+        _wake_discography_batch_runner(request)
+        notice = "retried"
+    else:
+        notice = "no-eligible-retries"
+    return RedirectResponse(f"/discography-batches/{batch_id}?notice={notice}", status_code=303)
 
 
 @router.get("/wanted", response_class=HTMLResponse)
