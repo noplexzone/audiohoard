@@ -32,7 +32,7 @@ def test_discover_poster_first_workflows_desktop_mobile_and_recovery(
     fragment_requests: list[str] = []
     console_errors: list[str] = []
     failed_requests: list[str] = []
-    expected_failed_requests: list[str] = []
+    intercepted_failures: list[str] = []
     page.on(
         "request",
         lambda request: (
@@ -62,8 +62,17 @@ def test_discover_poster_first_workflows_desktop_mobile_and_recovery(
     _assert_each_fragment_once(fragment_requests)
     _assert_no_document_overflow(page)
     expect(page.get_by_role("link", name="Manual search", exact=True)).to_be_visible()
-    expect(page.get_by_text("Browser New Release", exact=True)).to_be_visible()
-    expect(page.get_by_text("Browser Trending Release", exact=True)).to_be_visible()
+    release_cards = {
+        "new": ("browser-new-artist", "Browser New Release"),
+        "trending": ("browser-trending-artist", "Browser Trending Release"),
+    }
+    for feed, (artist_id, title) in release_cards.items():
+        card = page.locator(f'#discovery-{feed} [data-provider-id="{artist_id}"]')
+        expect(card.get_by_role("heading", name=title)).to_be_visible()
+        expect(card.locator('input[name="provider_id"]')).to_have_value(artist_id)
+        expect(card.locator('form[action="/artists/catalog/open"]')).to_have_attribute(
+            "method", "post"
+        )
     expect(page.get_by_role("link", name="Explore Browser Jazz genre").last).to_have_attribute(
         "href", "/discover/genres/132"
     )
@@ -114,8 +123,14 @@ def test_discover_poster_first_workflows_desktop_mobile_and_recovery(
         expect(page.get_by_role("navigation", name="Breadcrumb")).to_be_visible()
         expect(page.get_by_role("heading", name=title, level=1)).to_be_visible()
         _assert_no_document_overflow(page)
-    expect(page.get_by_text("Actions apply to the artist.", exact=True)).to_be_visible()
-    expect(page.get_by_role("button", name="Watch artist")).to_be_visible()
+        feed = path.rsplit("/", 1)[-1]
+        if feed in release_cards:
+            artist_id, release_title = release_cards[feed]
+            card = page.locator(f'[data-provider-id="{artist_id}"]')
+            expect(card.get_by_role("heading", name=release_title)).to_be_visible()
+            expect(card.locator('input[name="provider_id"]')).to_have_value(artist_id)
+            expect(card.get_by_text("Actions apply to the artist.", exact=True)).to_be_visible()
+            expect(card.get_by_role("button", name="Watch artist")).to_be_visible()
 
     page.goto(f"{browser_base_url}/discover/popular")
     expect(page.get_by_role("link", name="Next")).to_have_attribute("href", "?page=2")
@@ -141,23 +156,29 @@ def test_discover_poster_first_workflows_desktop_mobile_and_recovery(
     fragment_requests.clear()
     failed_pattern = "**/discover/fragments/new"
 
-    def abort_expected(route: Route) -> None:
-        expected_failed_requests.append(route.request.url)
-        route.abort()
+    def fail_expected(route: Route) -> None:
+        intercepted_failures.append(route.request.url)
+        route.fulfill(status=503, content_type="text/plain", body="expected test failure")
 
-    page.route(failed_pattern, abort_expected)
+    page.route(failed_pattern, fail_expected)
     page.reload()
     failed = page.locator("#discovery-new")
     expect(failed).to_have_attribute("data-discover-state", "error")
     expect(failed.get_by_role("alert")).to_contain_text("This discovery feed could not be loaded")
     expect(page.locator("#discovery-popular")).to_have_attribute("data-discover-state", "ready")
     _assert_each_fragment_once(fragment_requests)
+    retry = failed.get_by_role("link", name="Retry this section")
+    expect(retry).to_have_attribute("href", "/search#discovery-new")
     page.unroute(failed_pattern)
     fragment_requests.clear()
-    failed.get_by_role("link", name="Retry this section").click()
+    retry.click()
+    expect(page).to_have_url(f"{browser_base_url}/search")
     expect(failed).to_have_attribute("data-discover-state", "ready")
     assert [url.rsplit("/", 1)[-1] for url in fragment_requests] == ["new"]
-    assert all("Failed to load resource" in message for message in console_errors)
+    assert intercepted_failures == [f"{browser_base_url}/discover/fragments/new"]
+    assert console_errors == [
+        "Failed to load resource: the server responded with a status of 503 (Service Unavailable)"
+    ]
     console_errors.clear()
 
     # A full page containing a matching-looking section is still rejected.
@@ -182,6 +203,10 @@ def test_discover_poster_first_workflows_desktop_mobile_and_recovery(
     # Mobile: real two-column layout, touch target geometry, wrapping, and reachable tail controls.
     page.set_viewport_size({"width": 390, "height": 844})
     page.goto(f"{browser_base_url}/search")
+    for feed in _FEEDS:
+        expect(page.locator(f"#discovery-{feed}")).to_have_attribute(
+            "data-discover-state", "ready"
+        )
     _assert_no_document_overflow(page)
     assert (
         page.locator("#discovery-popular .discover-poster-grid").evaluate(
@@ -218,6 +243,5 @@ def test_discover_poster_first_workflows_desktop_mobile_and_recovery(
     assert manual_search.evaluate("node => getComputedStyle(node).outlineStyle") != "none"
     assert page.evaluate("matchMedia('(prefers-reduced-motion: reduce)').matches")
 
-    unexpected_failures = [url for url in failed_requests if url not in expected_failed_requests]
-    assert unexpected_failures == []
+    assert failed_requests == []
     assert console_errors == []
