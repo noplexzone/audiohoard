@@ -39,7 +39,7 @@ from mutagen.id3 import (
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -768,6 +768,13 @@ class AlbumRetagResult:
     files_renamed: int = 0
 
 
+@dataclass(frozen=True)
+class _RetagFilesystemTransaction:
+    result: AlbumRetagResult
+    after_commit: Callable[[], None]
+    after_rollback: Callable[[], None]
+
+
 def _catalog_disc_total(album: CatalogAlbum) -> int | None:
     discs = [track.disc for track in album.tracks if track.disc and track.disc > 0]
     total = max(discs, default=1)
@@ -952,15 +959,14 @@ async def retag_catalog_album(
     if album is None:
         raise ImportExecutionError("catalog album not found")
 
+    catalog_tracks = {item.id: item for item in album.tracks}
     rows = (
         await db.execute(
             select(Track, ImportPlan)
             .join(ImportPlan, ImportPlan.track_id == Track.id)
             .where(
-                or_(
-                    Track.catalog_album_id == album_id,
-                    Track.catalog_album_id.is_(None),
-                ),
+                Track.catalog_album_id == album_id,
+                Track.catalog_track_id.in_(catalog_tracks),
                 Track.import_state == ImportWorkflowState.imported,
                 ImportPlan.status == ImportWorkflowState.imported,
                 ImportPlan.destination_path != "",
@@ -968,48 +974,34 @@ async def retag_catalog_album(
             .order_by(ImportPlan.id)
         )
     ).all()
-    latest: dict[int, tuple[Track, ImportPlan]] = {}
-    projected_album_artist = project_catalog_artist_credits(album).album_artist
-    legacy_album_artists = {
-        value.casefold() for value in (album.artist.name, projected_album_artist) if value
-    }
-    for track, plan in rows:
-        if track.catalog_album_id is None:
-            legacy_artist = track.album_artist or track.artist or ""
-            if (track.album or "").casefold() != album.title.casefold() or (
-                legacy_artist.casefold() not in legacy_album_artists
-            ):
-                continue
-        latest[track.id] = (track, plan)
+    latest: dict[int, tuple[Track, ImportPlan]] = {track.id: (track, plan) for track, plan in rows}
     artwork = await _fetch_canonical_artwork(album.artwork_url)
-    catalog_tracks = {item.id: item for item in album.tracks}
-    catalog_tracks_by_position = {(item.disc, item.position): item for item in album.tracks}
     for track, _plan in latest.values():
         catalog_track = catalog_tracks.get(track.catalog_track_id or 0)
         if catalog_track is None:
-            catalog_track = catalog_tracks_by_position.get((track.disc or 1, track.track_no or 0))
-        if catalog_track is not None:
-            _sync_track_numbering_from_catalog(track, album, catalog_track)
-    legacy_targets = _discover_legacy_album_files(album, library_root)
-    if latest:
-        imported_destinations = {plan.destination_path for _track, plan in latest.values()}
-        legacy_targets = [
-            (path, track, catalog_track)
-            for path, track, catalog_track in legacy_targets
-            if str(path) not in imported_destinations
-        ]
-    if not latest and not legacy_targets:
+            raise ImportExecutionError("imported file is not linked to stored track metadata")
+        _sync_track_numbering_from_catalog(track, album, catalog_track)
+    if not latest:
         raise ImportExecutionError("album has no imported files to retag")
 
-    return await asyncio.to_thread(
+    transaction = await asyncio.to_thread(
         _retag_catalog_album_files,
         album,
         list(latest.values()),
         library_root=library_root,
         tag_writer=tag_writer,
         artwork=artwork,
-        legacy_targets=legacy_targets,
     )
+    try:
+        register_transaction_callbacks(
+            db,
+            after_commit=transaction.after_commit,
+            after_rollback=transaction.after_rollback,
+        )
+    except Exception:
+        transaction.after_rollback()
+        raise
+    return transaction.result
 
 
 def _retag_catalog_album_files(
@@ -1019,31 +1011,15 @@ def _retag_catalog_album_files(
     library_root: Path,
     tag_writer: MutagenTagWriter | None,
     artwork: CanonicalArtwork | None = None,
-    legacy_targets: list[tuple[Path, None, CatalogAlbumTrack]] | None = None,
-) -> AlbumRetagResult:
+) -> _RetagFilesystemTransaction:
     catalog_tracks = {item.id: item for item in album.tracks}
-    catalog_tracks_by_position = {(item.disc, item.position): item for item in album.tracks}
     root = library_root.resolve()
     targets: list[tuple[Path, Path, Track | None, ImportPlan | None, CatalogAlbumTrack]] = []
-    for path, track, catalog_track in legacy_targets or []:
-        targets.append(
-            (
-                path,
-                _canonical_destination_for_catalog_track(root, album, catalog_track, path),
-                track,
-                None,
-                catalog_track,
-            )
-        )
     folders: set[Path] = set()
     mapped_destinations: set[Path] = set()
     current_destinations: set[Path] = set()
     for track, plan in imported:
         imported_catalog_track = catalog_tracks.get(track.catalog_track_id or 0)
-        if imported_catalog_track is None:
-            imported_catalog_track = catalog_tracks_by_position.get(
-                (track.disc or 1, track.track_no or 0)
-            )
         if imported_catalog_track is None:
             raise ImportExecutionError("imported file is not linked to stored track metadata")
         destination = Path(plan.destination_path)
@@ -1179,21 +1155,47 @@ def _retag_catalog_album_files(
                 pinned.fsync()
                 if target_plan is not None:
                     target_plan.destination_path = str(canonical_destination)
-        for pinned, _destination_name, backup_name in backup_paths:
+        committed_backups = tuple(backup_paths)
+        committed_destinations = tuple(created_destinations)
+        committed_handles = tuple(pinned_destinations)
+
+        def finalize_filesystem_commit() -> None:
             try:
-                pinned.unlink(backup_name)
-                pinned.fsync()
-            except OSError:
-                logger.warning("retag succeeded but a temporary backup could not be removed")
-        if created_destinations:
-            scanner_pinned, scanner_name = created_destinations[0]
+                for pinned, _destination_name, backup_name in committed_backups:
+                    try:
+                        pinned.unlink(backup_name)
+                        pinned.fsync()
+                    except OSError:
+                        logger.exception(
+                            "retag succeeded but a temporary backup could not be removed"
+                        )
+                if committed_destinations:
+                    scanner_pinned, scanner_name = committed_destinations[0]
+                    try:
+                        scanner_pinned.notify_changed(scanner_name)
+                        scanner_pinned.fsync()
+                    except OSError:
+                        logger.exception(
+                            "retag succeeded but the library scanner notification failed"
+                        )
+            finally:
+                _close_pinned_destinations_safely(list(committed_handles))
+
+        def rollback_filesystem_commit() -> None:
             try:
-                scanner_pinned.notify_changed(scanner_name)
-                scanner_pinned.fsync()
-            except OSError:
-                logger.warning("retag succeeded but the library scanner notification failed")
-        _close_pinned_destinations_safely(pinned_destinations)
-        return AlbumRetagResult(files_retagged=len(targets), folder=folder, files_renamed=renamed)
+                _rollback_pinned_filesystem(
+                    [], list(committed_destinations), list(committed_backups)
+                )
+            finally:
+                _close_pinned_destinations_safely(list(committed_handles))
+
+        return _RetagFilesystemTransaction(
+            result=AlbumRetagResult(
+                files_retagged=len(targets), folder=folder, files_renamed=renamed
+            ),
+            after_commit=finalize_filesystem_commit,
+            after_rollback=rollback_filesystem_commit,
+        )
     except Exception as exc:
         _rollback_pinned_filesystem(temp_paths, created_destinations, backup_paths)
         _close_pinned_destinations_safely(pinned_destinations)

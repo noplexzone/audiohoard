@@ -13,6 +13,7 @@ import pytest
 from mutagen.flac import FLAC, Picture
 from mutagen.id3 import APIC, ID3, TXXX
 from mutagen.oggvorbis import OggVorbis
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.services.library_import as library_import_module
@@ -307,6 +308,69 @@ async def test_retag_catalog_album_synchronizes_release_tags_without_changing_da
     ] == original_db_values
 
 
+async def test_retag_catalog_album_rejects_name_only_track_from_same_title_edition(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, tracks = await _seed_imported_album(db_session, library_root)
+    wrong_edition = CatalogAlbum(
+        artist=album.artist,
+        title=album.title,
+        year="2019",
+        release_type="album",
+        mbid="different-release-group",
+        track_count=2,
+    )
+    wrong_edition.tracks.extend(
+        [
+            CatalogAlbumTrack(disc=1, position=17, title="The Bees Knees"),
+            CatalogAlbumTrack(disc=1, position=19, title="10 Feet"),
+        ]
+    )
+    db_session.add(wrong_edition)
+    for track in tracks:
+        track.catalog_album_id = None
+        track.catalog_track_id = None
+    await db_session.flush()
+    original_bytes = [path.read_bytes() for path in paths]
+
+    with pytest.raises(ImportExecutionError, match="no imported files"):
+        await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert [path.read_bytes() for path in paths] == original_bytes
+
+
+async def test_retag_catalog_album_restores_files_when_request_commit_fails(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, _tracks = await _seed_imported_album(db_session, library_root)
+    original_bytes = [path.read_bytes() for path in paths]
+
+    await retag_catalog_album(db_session, album.id, library_root=library_root)
+    assert list(paths[0].parent.glob(".*.retag-backup"))
+    db_session.add(CatalogArtist(name="duplicate", mbid=album.artist.mbid))
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
+    await db_session.rollback()
+
+    assert [path.read_bytes() for path in paths] == original_bytes
+    assert not list(paths[0].parent.glob(".*.retag-backup"))
+
+
+async def test_retag_catalog_album_removes_backups_only_after_request_commit(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, _tracks = await _seed_imported_album(db_session, library_root)
+
+    await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert list(paths[0].parent.glob(".*.retag-backup"))
+    await db_session.commit()
+    assert not list(paths[0].parent.glob(".*.retag-backup"))
+
+
 def test_mutagen_tag_writer_embeds_ogg_cover_art_and_clears_album_artist_aliases(
     tmp_path: Path,
 ) -> None:
@@ -397,50 +461,26 @@ async def test_retag_catalog_album_overwrites_flac_cover_art(
         assert repaired.pictures[0].data == b"\xff\xd8canonical-cover"
 
 
-async def test_retag_catalog_album_discovers_legacy_library_files_without_import_rows(
+async def test_retag_catalog_album_rejects_legacy_library_files_without_import_rows(
     db_session: AsyncSession, tmp_path: Path, monkeypatch
 ) -> None:
     library_root = tmp_path / "library"
     artist = CatalogArtist(name="Juice WRLD", mbid="artist-mbid")
-    album = CatalogAlbum(
-        title="Goodbye & Good Riddance",
-        year="2018",
-        release_type="album",
-        mbid="release-group",
-        track_count=2,
-    )
+    album = CatalogAlbum(title="Goodbye & Good Riddance", year="2018", release_type="album")
     artist.albums.append(album)
-    album.tracks.extend(
-        [
-            CatalogAlbumTrack(disc=1, position=1, title="Intro", recording_mbid="intro-mbid"),
-            CatalogAlbumTrack(
-                disc=1, position=2, title="All Girls Are the Same", recording_mbid="agats-mbid"
-            ),
-        ]
-    )
+    album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Intro"))
     db_session.add(artist)
     await db_session.flush()
     folder = library_root / artist.name / f"{album.title} ({album.year})"
     folder.mkdir(parents=True)
-    paths = [folder / "01 - Intro.flac", folder / "02 - All Girls Are the Same.flac"]
-    for path in paths:
-        path.write_bytes(_minimal_flac_bytes())
-        flac = FLAC(path)
-        flac["albumartist"] = "Juice Wrld"
-        flac["date"] = "2024"
-        flac.save()
+    path = folder / "01 - Intro.flac"
+    path.write_bytes(_minimal_flac_bytes())
+    original = path.read_bytes()
 
-    async def no_artwork(url: str | None) -> CanonicalArtwork | None:
-        return None
+    with pytest.raises(ImportExecutionError, match="no imported files"):
+        await retag_catalog_album(db_session, album.id, library_root=library_root)
 
-    monkeypatch.setattr(library_import_module, "_fetch_canonical_artwork", no_artwork)
-
-    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
-
-    assert result.files_retagged == 2
-    assert FLAC(paths[0])["albumartist"] == [artist.name]
-    assert FLAC(paths[0])["date"] == [album.year]
-    assert FLAC(paths[1])["musicbrainz_trackid"] == ["agats-mbid"]
+    assert path.read_bytes() == original
 
 
 async def test_retag_catalog_album_renames_multidisc_files_to_disc_track_template(
@@ -509,100 +549,48 @@ async def test_retag_catalog_album_renames_multidisc_files_to_disc_track_templat
     assert repaired["tracktotal"] == ["1"]
 
 
-async def test_retag_catalog_album_matches_flat_multidisc_files_by_title(
-    db_session: AsyncSession, tmp_path: Path, monkeypatch
-) -> None:
-    library_root = tmp_path / "library"
-    artist = CatalogArtist(name="Ty Myers", mbid="artist-mbid")
-    album = CatalogAlbum(
-        title="The Select (Deluxe)", year="2025", release_type="album", track_count=3
-    )
-    artist.albums.append(album)
-    album.tracks.extend(
-        [
-            CatalogAlbumTrack(
-                disc=1,
-                position=5,
-                title="Worry is a Sickness (Acoustic)",
-                recording_mbid="acoustic-mbid",
-            ),
-            CatalogAlbumTrack(
-                disc=2, position=1, title="Ends of the Earth", recording_mbid="ends-mbid"
-            ),
-            CatalogAlbumTrack(
-                disc=2,
-                position=5,
-                title="Love Is Two Faced",
-                recording_mbid="love-mbid",
-            ),
-        ]
-    )
-    db_session.add(artist)
-    await db_session.flush()
-    folder = library_root / artist.name / f"{album.title} ({album.year})"
-    folder.mkdir(parents=True)
-    acoustic = folder / "05 - Worry is a Sickness (Acoustic).flac"
-    ends = folder / "01 - Ends of the Earth.flac"
-    love = folder / "05 - Love Is Two Faced.flac"
-    for path in (acoustic, ends, love):
-        path.write_bytes(_minimal_flac_bytes())
-
-    async def no_artwork(url: str | None) -> CanonicalArtwork | None:
-        return None
-
-    monkeypatch.setattr(library_import_module, "_fetch_canonical_artwork", no_artwork)
-
-    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
-
-    assert result.files_retagged == 3
-    acoustic_new = folder / "1-05 - Worry is a Sickness (Acoustic).flac"
-    ends_new = folder / "2-01 - Ends of the Earth.flac"
-    love_new = folder / "2-05 - Love Is Two Faced.flac"
-    assert not acoustic.exists()
-    assert not ends.exists()
-    assert not love.exists()
-    assert FLAC(acoustic_new)["discnumber"] == ["1"]
-    assert FLAC(acoustic_new)["musicbrainz_trackid"] == ["acoustic-mbid"]
-    assert FLAC(ends_new)["discnumber"] == ["2"]
-    assert FLAC(ends_new)["musicbrainz_trackid"] == ["ends-mbid"]
-    assert FLAC(love_new)["discnumber"] == ["2"]
-    assert FLAC(love_new)["musicbrainz_trackid"] == ["love-mbid"]
-
-
-async def test_retag_catalog_album_maps_multidisc_legacy_filenames(
+async def test_retag_catalog_album_rejects_flat_multidisc_files_without_identity(
     db_session: AsyncSession, tmp_path: Path, monkeypatch
 ) -> None:
     library_root = tmp_path / "library"
     artist = CatalogArtist(name="Various Artist", mbid="artist-mbid")
-    album = CatalogAlbum(title="Double Album", year="2020", release_type="album", track_count=2)
+    album = CatalogAlbum(title="Double Album", year="2020", release_type="album")
     artist.albums.append(album)
-    album.tracks.extend(
-        [
-            CatalogAlbumTrack(disc=1, position=1, title="Disc One", recording_mbid="disc-one"),
-            CatalogAlbumTrack(disc=2, position=1, title="Disc Two", recording_mbid="disc-two"),
-        ]
-    )
+    album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Disc One"))
     db_session.add(artist)
     await db_session.flush()
     folder = library_root / artist.name / f"{album.title} ({album.year})"
     folder.mkdir(parents=True)
-    disc_one = folder / "1-01 - Disc One.flac"
-    disc_two = folder / "2-01 - Disc Two.flac"
-    for path in (disc_one, disc_two):
-        path.write_bytes(_minimal_flac_bytes())
+    path = folder / "1-01 - Disc One.flac"
+    path.write_bytes(_minimal_flac_bytes())
+    original = path.read_bytes()
 
-    async def no_artwork(url: str | None) -> CanonicalArtwork | None:
-        return None
+    with pytest.raises(ImportExecutionError, match="no imported files"):
+        await retag_catalog_album(db_session, album.id, library_root=library_root)
 
-    monkeypatch.setattr(library_import_module, "_fetch_canonical_artwork", no_artwork)
+    assert path.read_bytes() == original
 
-    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
 
-    assert result.files_retagged == 2
-    assert FLAC(disc_one)["musicbrainz_trackid"] == ["disc-one"]
-    assert FLAC(disc_one)["discnumber"] == ["1"]
-    assert FLAC(disc_two)["musicbrainz_trackid"] == ["disc-two"]
-    assert FLAC(disc_two)["discnumber"] == ["2"]
+async def test_retag_catalog_album_rejects_multidisc_legacy_filenames_without_identity(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch
+) -> None:
+    library_root = tmp_path / "library"
+    artist = CatalogArtist(name="Various Artist", mbid="artist-mbid")
+    album = CatalogAlbum(title="Double Album", year="2020", release_type="album")
+    artist.albums.append(album)
+    album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Disc One"))
+    db_session.add(artist)
+    await db_session.flush()
+    folder = library_root / artist.name / f"{album.title} ({album.year})"
+    folder.mkdir(parents=True)
+    path = folder / "1-01 - Disc One.flac"
+    path.write_bytes(_minimal_flac_bytes())
+    original = path.read_bytes()
+
+    with pytest.raises(ImportExecutionError, match="no imported files"):
+        await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert path.read_bytes() == original
 
 
 class _FailingSecondWriter(MutagenTagWriter):
@@ -843,41 +831,19 @@ def test_tag_writer_clears_nav_grouping_fields_from_ogg_vorbis(tmp_path: Path) -
     assert tags["tracknumber"] == ["3"]
 
 
-async def test_retag_catalog_album_repairs_mixed_imported_and_legacy_files(
+async def test_retag_catalog_album_rejects_mixed_imported_and_unidentified_files(
     db_session: AsyncSession, tmp_path: Path
 ) -> None:
     library_root = tmp_path / "library"
-    album, paths, tracks = await _seed_imported_album(db_session, library_root)
-    legacy_catalog = CatalogAlbumTrack(
-        disc=1,
-        position=12,
-        title="Syphilis",
-        recording_mbid="a274f59b-78b6-4ee4-91f7-153befea1600",
-    )
-    album.tracks.append(legacy_catalog)
-    legacy_path = paths[0].parent / "12 - Syphilis.flac"
-    legacy_path.write_bytes(_minimal_flac_bytes())
-    legacy = FLAC(legacy_path)
-    legacy["title"] = "Syphilis"
-    legacy["album"] = album.title
-    legacy["albumartist"] = "Juice WRLD"
-    legacy["date"] = "2019"
-    legacy["originalyear"] = "2019"
-    legacy["musicbrainz_albumtype"] = "album"
-    legacy.save()
-    await db_session.flush()
+    album, paths, _tracks = await _seed_imported_album(db_session, library_root)
+    unidentified = paths[0].parent / "12 - Syphilis.flac"
+    unidentified.write_bytes(_minimal_flac_bytes())
+    original = [path.read_bytes() for path in [*paths, unidentified]]
 
-    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+    with pytest.raises(ImportExecutionError, match="not linked to stored track metadata"):
+        await retag_catalog_album(db_session, album.id, library_root=library_root)
 
-    assert result.files_retagged == 3
-    repaired = {key.casefold(): values for key, values in FLAC(legacy_path).tags.items()}
-    assert repaired["date"] == [album.year]
-    assert repaired["releasedate"] == [album.year]
-    assert repaired["release_date"] == [album.year]
-    assert repaired["musicbrainz_trackid"] == [legacy_catalog.recording_mbid]
-    assert "originalyear" not in repaired
-    assert "musicbrainz_albumtype" not in repaired
-    assert all(path.exists() for path in paths)
+    assert [path.read_bytes() for path in [*paths, unidentified]] == original
 
 
 async def test_retag_catalog_album_emits_final_scanner_notification(
@@ -895,27 +861,26 @@ async def test_retag_catalog_album_emits_final_scanner_notification(
     result = await retag_catalog_album(db_session, album.id, library_root=library_root)
 
     assert result.files_retagged == 2
+    assert notifications == []
+    await db_session.commit()
     assert len(notifications) == 1
 
 
-async def test_retag_catalog_album_supports_legacy_unmapped_imports(
+async def test_retag_catalog_album_rejects_legacy_unmapped_imports(
     db_session: AsyncSession, tmp_path: Path
 ) -> None:
     library_root = tmp_path / "library"
     album, paths, tracks = await _seed_imported_album(db_session, library_root)
-    album.title = "Édition"
-    album.artist.name = "Beyoncé"
     for track in tracks:
         track.catalog_album_id = None
         track.catalog_track_id = None
-        track.album = "ÉDITION"
-        track.album_artist = "BEYONCÉ"
     await db_session.flush()
+    original = [path.read_bytes() for path in paths]
 
-    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+    with pytest.raises(ImportExecutionError, match="no imported files"):
+        await retag_catalog_album(db_session, album.id, library_root=library_root)
 
-    assert result.files_retagged == 2
-    assert all(FLAC(path)["albumartist"] == [album.artist.name] for path in paths)
+    assert [path.read_bytes() for path in paths] == original
 
 
 async def test_retag_catalog_album_rejects_duplicate_destination_mappings(
@@ -1094,7 +1059,7 @@ async def test_retag_compilation_projects_track_and_album_credits_without_reloca
     assert FLAC(paths[0]).pictures[0].data == b"existing-cover"
 
 
-async def test_retag_compilation_missing_child_artist_uses_owner_in_legacy_folder(
+async def test_retag_compilation_missing_child_artist_requires_durable_import_identity(
     db_session: AsyncSession, tmp_path: Path
 ) -> None:
     library_root = tmp_path / "library"
@@ -1108,24 +1073,19 @@ async def test_retag_compilation_missing_child_artist_uses_owner_in_legacy_folde
         album_artist_name="Various Artists",
         track_count=1,
     )
-    catalog_track = CatalogAlbumTrack(
-        disc=1, position=1, title="The Hanging Tree", artist_name=None
-    )
-    album.tracks.append(catalog_track)
+    album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="The Hanging Tree"))
     db_session.add(owner)
     await db_session.flush()
     folder = library_root / "Various Artists" / "Soundtrack (2023)"
     folder.mkdir(parents=True)
     path = folder / "01 - The Hanging Tree.flac"
     path.write_bytes(_minimal_flac_bytes())
+    original = path.read_bytes()
 
-    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+    with pytest.raises(ImportExecutionError, match="no imported files"):
+        await retag_catalog_album(db_session, album.id, library_root=library_root)
 
-    assert result.files_retagged == 1
-    assert result.files_renamed == 0
-    assert path.exists()
-    assert FLAC(path)["artist"] == [owner.name]
-    assert FLAC(path)["albumartist"] == ["Various Artists"]
+    assert path.read_bytes() == original
 
 
 @pytest.mark.parametrize(
