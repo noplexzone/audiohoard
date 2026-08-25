@@ -319,7 +319,15 @@ async def downloads_page(
         "not_found": ("Job not found.", "error"),
         "removed": ("Download removed from the queue.", "info"),
         "approved": ("Track approved — import pipeline resumed.", "ok"),
-        "denied": ("Track denied — staged file and review item removed.", "info"),
+        "source_blocked": (
+            "Track denied — its exact provider source was blocked before re-acquisition.",
+            "ok",
+        ),
+        "source_identity_unavailable": (
+            "Track denied, but its exact provider source identity was unavailable "
+            "and was not blocked.",
+            "warn",
+        ),
         "already_reviewed": ("That item has already been reviewed.", "info"),
         "review_dismissed": ("Review entry dismissed; staged files were retained.", "info"),
         "reacquired": ("Re-acquisition queued for the missing staged source.", "info"),

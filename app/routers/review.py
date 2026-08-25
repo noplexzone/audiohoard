@@ -110,6 +110,18 @@ async def review_page(
             (projected for release in releases if (projected := _release_recovery(release))),
             None,
         )
+    notices = {
+        "source_blocked": (
+            "Track denied — its exact provider source was blocked before re-acquisition.",
+            "ok",
+        ),
+        "source_identity_unavailable": (
+            "Track denied, but its exact provider source identity was unavailable "
+            "and was not blocked.",
+            "warn",
+        ),
+    }
+    notice, notice_type = notices.get(request.query_params.get("notice", ""), (None, "info"))
     templates: Jinja2Templates = request.app.state.templates
     return templates.TemplateResponse(
         request,
@@ -118,6 +130,8 @@ async def review_page(
             "review": review,
             "release_recovery": release_recovery,
             "pending_count": pending_count,
+            "notice": notice,
+            "notice_type": notice_type,
             "tag_fields": [(field, _TAG_LABELS[field]) for field in REVIEW_TAG_FIELDS],
         },
     )

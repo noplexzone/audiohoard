@@ -13,6 +13,8 @@
 
 {% include "partials/_activity_tabs.html" %}
 
+{% if notice %}<div class="alert {{ notice_type }}" role="status">{{ notice }}</div>{% endif %}
+
 {% if review %}
 <article class="review-deck-card" data-review-deck data-swipe-surface
   data-alignment-url="/staging/review/{{ review.item.id }}/alignment"

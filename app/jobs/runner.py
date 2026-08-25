@@ -72,6 +72,7 @@ from app.services.rejected_sources import (
     calculate_blocked_until,
     classify_rejection_reason,
 )
+from app.services.source_candidate_identity import normalize_source_candidate_identity
 from app.settings_service import (
     DEFAULT_FREE_TEXT_RESULT_LIMIT,
     build_effective_settings,
@@ -1054,9 +1055,13 @@ async def _run_job_in_session(
                     track.acquisition_state = AcquisitionState.failed
                     track.source_status = exc.code
                 if exc.code == "transfer_timeout" and result.source == "slskd":
-                    peer = str(result.metadata.get("username") or "")
-                    filename = str(result.metadata.get("filename") or "")
-                    if peer and filename:
+                    identity = normalize_source_candidate_identity(
+                        result.source,
+                        result.metadata.get("username"),
+                        result.metadata.get("filename"),
+                    )
+                    if identity is not None:
+                        _provider, peer, filename = identity
                         existing_block = await db.scalar(
                             select(SourceCandidateBlock).where(
                                 SourceCandidateBlock.provider == "slskd",
@@ -1500,11 +1505,12 @@ def _slskd_identity_from_provenance(provenance_json: str | None) -> tuple[str, s
         provenance = json.loads(provenance_json)
     except (json.JSONDecodeError, TypeError):
         return None
-    if not isinstance(provenance, dict) or provenance.get("source") != "slskd":
+    if not isinstance(provenance, dict):
         return None
-    peer = str(provenance.get("username") or "")
-    filename = str(provenance.get("filename") or "")
-    return (peer, filename) if peer and filename else None
+    identity = normalize_source_candidate_identity(
+        provenance.get("source"), provenance.get("username"), provenance.get("filename")
+    )
+    return identity[1:] if identity is not None else None
 
 
 async def _blocked_slskd_identities(db: AsyncSession) -> set[tuple[str, str]]:
@@ -1520,7 +1526,12 @@ async def _blocked_slskd_identities(db: AsyncSession) -> set[tuple[str, str]]:
             )
         )
     ).all()
-    blocked = {(str(peer), str(filename)) for peer, filename in block_rows}
+    blocked = {
+        normalized_block[1:]
+        for peer, filename in block_rows
+        if (normalized_block := normalize_source_candidate_identity("slskd", peer, filename))
+        is not None
+    }
     denied_rows = (
         await db.scalars(
             select(Track.acquisition_provenance_json).where(
@@ -1531,9 +1542,9 @@ async def _blocked_slskd_identities(db: AsyncSession) -> set[tuple[str, str]]:
         )
     ).all()
     for provenance_json in denied_rows:
-        identity = _slskd_identity_from_provenance(provenance_json)
-        if identity is not None:
-            blocked.add(identity)
+        provenance_identity = _slskd_identity_from_provenance(provenance_json)
+        if provenance_identity is not None:
+            blocked.add(provenance_identity)
     return blocked
 
 
@@ -1548,8 +1559,16 @@ async def _without_blocked_slskd_results(
         for result in results
         if result.source != "slskd"
         or (
-            str(result.metadata.get("username") or ""),
-            str(result.metadata.get("filename") or ""),
+            identity[1:]
+            if (
+                identity := normalize_source_candidate_identity(
+                    result.source,
+                    result.metadata.get("username"),
+                    result.metadata.get("filename"),
+                )
+            )
+            is not None
+            else None
         )
         not in blocked
     ]
@@ -1977,7 +1996,16 @@ async def _fetch_slskd_album_results(
     folders = [
         folder
         for folder in folders
-        if not any((folder.username, item.filename) in blocked for item in folder.files)
+        if not any(
+            identity[1:] in blocked
+            for item in folder.files
+            if (
+                identity := normalize_source_candidate_identity(
+                    "slskd", folder.username, item.filename
+                )
+            )
+            is not None
+        )
     ]
     if not folders:
         return []

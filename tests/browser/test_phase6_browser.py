@@ -82,7 +82,8 @@ def test_review_skip_approve_deny_and_no_itunes_reference(
 
     page.once("dialog", lambda dialog: dialog.accept())
     page.get_by_role("button", name="Deny", exact=False).click()
-    expect(page).to_have_url(f"{browser_base_url}/review?notice=denied")
+    expect(page).to_have_url(f"{browser_base_url}/review?notice=source_blocked")
+    expect(page.get_by_text("exact provider source was blocked", exact=False)).to_be_visible()
     expect(page.get_by_text("tracks remaining", exact=False)).to_be_visible()
 
 

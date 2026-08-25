@@ -9,7 +9,10 @@ from app.database import get_session_factory
 from app.models.acquisition_attempt import AcquisitionAttempt
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
+from app.models.release import Release
 from app.models.source_candidate_block import SourceCandidateBlock
+from app.models.track import Track
+from app.models.workflow import AcoustIDVerificationState
 
 
 async def test_rejected_sources_page_lists_and_allows_source_again(client: AsyncClient) -> None:
@@ -21,9 +24,24 @@ async def test_rejected_sources_page_lists_and_allows_source_again(client: Async
             filename="music\\done\\country\\44 - Wrong Track.mp3",
             reason="denied",
         )
-        db.add(block)
+        job = Job(source="slskd", query="Wrong Track", status=JobStatus.done)
+        release = Release(job=job, source="slskd", title="Album")
+        provenance = (
+            '{"filename":"music\\done\\country\\44 - Wrong Track.mp3",'
+            '"source":"slskd","username":"StarCaller"}'
+        )
+        track = Track(
+            job=job,
+            release=release,
+            source="slskd",
+            title="Wrong Track",
+            acoustid_verification_state=AcoustIDVerificationState.denied,
+            acquisition_provenance_json=provenance,
+        )
+        db.add_all([block, job, release, track])
         await db.commit()
         block_id = block.id
+        track_id = track.id
 
     page = await client.get("/blocklist")
 
@@ -42,6 +60,10 @@ async def test_rejected_sources_page_lists_and_allows_source_again(client: Async
     async with factory() as db:
         rows = (await db.scalars(select(SourceCandidateBlock))).all()
         assert rows == []
+        track = await db.get(Track, track_id)
+        assert track is not None
+        assert track.acoustid_verification_state == AcoustIDVerificationState.denied
+        assert track.acquisition_provenance_json == provenance
 
 
 async def test_rejected_sources_page_shows_related_attempt_context_and_retry(
