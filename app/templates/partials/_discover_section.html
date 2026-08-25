@@ -1,22 +1,21 @@
 <section id="discovery-{{ section.feed }}" class="discovery-section" aria-labelledby="discovery-{{ section.feed }}-heading" data-discover-section data-discover-state="{{ section.state }}" data-discover-fragment-url="/discover/fragments/{{ section.feed }}">
-  <div class="page-header">
+  <header class="discovery-section-header">
     <div>
-      <h2 id="discovery-{{ section.feed }}-heading">{{ section.title }}</h2>
-      {% if section.state != 'pending' and section.effective_region == 'GLOBAL' %}<span class="badge info">Provider-wide</span>{% endif %}
-      {% if section.state == 'stale' or section.stale %}<span class="badge info">Cached</span>{% endif %}
+      <div class="discovery-title-line"><h3 id="discovery-{{ section.feed }}-heading">{{ section.title }}</h3>{% if section.state != 'pending' and section.effective_region == 'GLOBAL' %}<span class="badge info">Provider-wide</span>{% endif %}{% if section.state == 'stale' or section.stale %}<span class="badge info">Cached</span>{% endif %}</div>
+      <p>{% if section.feed == 'popular' %}Artists listeners are returning to now.{% elif section.feed == 'genres' %}Start with a sound, then browse exact artists.{% elif section.feed == 'new' %}Fresh releases from the provider chart.{% else %}Releases gaining momentum across the catalog.{% endif %}</p>
     </div>
-    <a class="btn secondary" href="/discover/{{ section.feed }}">View all</a>
-  </div>
-  <div data-discover-body>
+    <a class="discovery-view-all" href="/discover/{{ section.feed }}">View all <span aria-hidden="true">→</span></a>
+  </header>
+  <div data-discover-body{% if section.state == 'pending' %} aria-busy="true"{% endif %}>
   {% if section.state == 'pending' %}
-    <div class="empty-state" role="status" aria-live="polite"><h3>Loading discovery feed…</h3><p>This section will appear independently when it is ready.</p></div>
-    <div class="discover-poster-grid" aria-hidden="true">
-      {% for _ in range(6) %}<div class="discovery-skeleton"><span class="hint">Loading…</span></div>{% endfor %}
+    <div class="discovery-state discovery-state-pending" role="status" aria-live="polite"><strong>Loading discovery feed…</strong><span>This section will update when it is ready.</span></div>
+    <div class="discover-poster-grid discovery-skeleton-grid" aria-hidden="true">
+      {% for _ in range(6) %}<div class="discovery-skeleton"><span></span><i></i><i></i></div>{% endfor %}
     </div>
   {% elif section.state == 'error' %}
-    <div class="alert error" role="alert"><p>{{ section.message or 'Discovery provider is temporarily unavailable' }}</p><a class="btn secondary" href="/search#discovery-{{ section.feed }}" data-discover-retry>Retry this section</a></div>
+    <div class="discovery-state discovery-state-error" role="alert"><div><strong>Feed unavailable</strong><span>{{ section.message or 'The discovery provider is temporarily unavailable.' }}</span></div><a class="btn secondary" href="/search#discovery-{{ section.feed }}" data-discover-retry>Retry this section</a></div>
   {% elif not section.items %}
-    <div class="empty-state" role="status"><h3>No {{ section.title | lower }} available</h3><p>This feed is currently empty. Check again later.</p></div>
+    <div class="discovery-state discovery-state-empty" role="status"><strong>No {{ section.title | lower }} available</strong><span>This feed is empty right now. Try Manual search or check again later.</span><a href="/search?tab=advanced">Open Manual search</a></div>
   {% else %}
     {% if section.message %}<p class="hint" role="status">{{ section.message }}</p>{% endif %}
     <div class="discover-poster-grid">

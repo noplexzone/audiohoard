@@ -1,18 +1,24 @@
 {% extends "base.html" %}
 {% block title %}Discover – Audiohoard{% endblock %}
 {% block content %}
-<div class="page-header">
+<header class="discover-hero">
+  <p class="eyebrow">Catalog explorer</p>
+  {% if tab == 'advanced' %}
+  <h1>Manual search</h1>
+  <p>Query enabled acquisition sources directly when you know exactly what you need.</p>
+  {% else %}
   <h1>Discover</h1>
-  <p>Find artists in configured catalogs, explore releases, and use Manual search—including a direct TIDAL track URL—when you need exact acquisition-source results.</p>
-</div>
-<nav class="tabs search-tabs">
-  <a class="btn {{ 'secondary' if tab == 'advanced' else '' }}" href="/search">Discover</a>
-  <a class="btn {{ '' if tab == 'advanced' else 'secondary' }}" href="/search?tab=advanced">Manual search</a>
+  <p>Browse artists and releases from your configured music catalogs.</p>
+  {% endif %}
+</header>
+<nav class="tabs search-tabs" aria-label="Search modes">
+  <a class="btn {{ 'secondary' if tab == 'advanced' else '' }}" href="/search"{% if tab != 'advanced' %} aria-current="page"{% endif %}>Discover</a>
+  <a class="btn {{ '' if tab == 'advanced' else 'secondary' }}" href="/search?tab=advanced"{% if tab == 'advanced' %} aria-current="page"{% endif %}>Manual search</a>
 </nav>
 
 {% if tab != 'advanced' %}
-<section class="card">
-  <h2>Search artists</h2><p class="hint">Catalog adapters currently expose reliable artist search here. Open an artist to browse its provider-backed releases; uncertain provider identities remain separate.</p>
+<section class="card discover-search-panel" aria-labelledby="catalog-search-heading">
+  <div class="discover-panel-heading"><div><p class="eyebrow">Catalog search</p><h2 id="catalog-search-heading">Find an artist</h2></div><p>Open an artist to browse provider-backed releases. Similar names remain separate until their provider identities match.</p></div>
   {% if not metadata_enabled %}
     <div class="empty-state" role="status"><h3>No metadata providers enabled</h3><p>Enable MusicBrainz, Deezer, or iTunes before catalog search can run.</p><a class="btn" href="/settings/metadata">Fix in Settings</a></div>
   {% else %}
@@ -53,14 +59,19 @@
   {% endif %}
 </section>
 {% if not catalog_query %}
-<div class="discovery-region-note" role="status">Deezer discovery feeds are provider-wide; requested scope: <strong>{{ discovery_region }}</strong>.</div>
-{% for section in discovery_sections %}
-{% include "partials/_discover_section.html" %}
-{% endfor %}
+<section class="discover-feed-collection" aria-labelledby="discover-feeds-heading" aria-label="Discovery feeds">
+  <header class="discover-feed-intro">
+    <div><p class="eyebrow">Browse</p><h2 id="discover-feeds-heading">Discovery feeds</h2></div>
+    <p>Deezer feeds are provider-wide. Requested scope: <strong>{{ discovery_region }}</strong>.</p>
+  </header>
+  {% for section in discovery_sections %}
+  {% include "partials/_discover_section.html" %}
+  {% endfor %}
+</section>
 {% endif %}
 {% else %}
-<section class="card">
-  <h2>Manual search</h2><p class="hint">Search enabled acquisition sources directly, including a direct TIDAL track URL when TIDAL is enabled. Context from a release, missing track, Wanted item, or failed acquisition is prefilled when available.</p>
+<section class="card manual-search-panel" aria-labelledby="manual-search-heading">
+  <div class="discover-panel-heading"><div><p class="eyebrow">Exact lookup</p><h2 id="manual-search-heading">Search acquisition sources</h2></div><p>Use artist, album, track, free text, or a direct TIDAL track URL. Context from Wanted and failed acquisitions is prefilled when available.</p></div>
   <form method="post" action="/search/ui" class="search-form advanced-search-form" role="search" aria-label="Manual source search">
     <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}">
     <div class="form-row">

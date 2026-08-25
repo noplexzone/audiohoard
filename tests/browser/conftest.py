@@ -245,7 +245,7 @@ def browser_base_url(tmp_path_factory: pytest.TempPathFactory) -> Generator[str,
         titles = {
             "popular": "Popular artists",
             "genres": "Genres",
-            "new": "New releases",
+            "new": "Fresh chart releases",
             "trending": "Trending releases",
             "genre": "Browser Jazz",
         }

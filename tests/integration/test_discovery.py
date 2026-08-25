@@ -46,6 +46,12 @@ async def test_empty_search_renders_pending_shell_without_calling_provider(
         assert text in response.text
     assert response.text.count('data-discover-state="pending"') == 4
     assert response.text.count("Loading discovery feed") == 4
+    assert '<header class="discover-hero">' in response.text
+    assert 'aria-label="Search modes"' in response.text
+    assert 'aria-current="page"' in response.text
+    assert '<section class="discover-feed-collection"' in response.text
+    assert response.text.count('class="discovery-state discovery-state-pending"') == 4
+    assert response.text.count('aria-busy="true"') == 4
     assert "Nothing to show" not in response.text
     assert provider_called.is_set() is False
 
@@ -109,7 +115,7 @@ async def test_empty_search_renders_cached_ready_and_stale_sections_without_prov
     assert 'data-discover-state="ready"' in response.text
     assert 'data-discover-state="stale"' in response.text
     assert "Cached" in response.text
-    assert "This feed is currently empty" in response.text
+    assert "This feed is empty right now" in response.text
 
 
 async def test_discovery_fragment_requires_authentication(unauthenticated_client) -> None:
@@ -314,6 +320,9 @@ async def test_advanced_search_skips_discovery_network(client, monkeypatch) -> N
 
     assert response.status_code == 200
     assert "Manual search" in response.text
+    assert '<section class="card manual-search-panel"' in response.text
+    assert '<section class="discover-feed-collection"' not in response.text
+    assert 'href="/search?tab=advanced" aria-current="page"' in response.text
 
 
 async def test_provider_preview_is_read_only_and_has_csrf_watch_form(client, monkeypatch) -> None:
