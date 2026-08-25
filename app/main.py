@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -77,6 +78,19 @@ from app.version import APP_VERSION
 
 _TEMPLATES_DIR = files("app") / "templates"
 _STATIC_DIR = files("app") / "static"
+
+
+def _static_asset_version(static_dir: Path) -> str:
+    digest = hashlib.sha256()
+    asset_paths = sorted(
+        path for path in static_dir.rglob("*") if path.is_file() and path.suffix in {".css", ".js"}
+    )
+    for path in asset_paths:
+        digest.update(path.relative_to(static_dir).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +380,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     settings = get_settings()
     app_version = APP_VERSION
+    asset_version = _static_asset_version(Path(str(_STATIC_DIR)))
 
     logging.basicConfig(
         level=getattr(logging, settings.log_level),
@@ -388,6 +403,7 @@ def create_app() -> FastAPI:
     app.state.templates.env.filters["display_name"] = display_name
     app.state.templates.env.globals["display_name"] = display_name
     app.state.templates.env.globals["app_version"] = app_version
+    app.state.templates.env.globals["asset_version"] = asset_version
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
     @app.middleware("http")

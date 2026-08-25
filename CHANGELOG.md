@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Fingerprint CSS and JavaScript URLs from their packaged content so browser caches cannot combine a newly deployed Discover template with stale pre-Discover styles.
 - Derive Deezer genre discovery artists from exact genre radio tracks instead of provider endpoints that silently return the same global chart for every genre, with strict provider ID parsing and truthful pagination after exact artist validation.
 - Defer SQLite-locked job admissions without crossing the provider boundary, and retain exact completed slskd transfers for retry when their staged artifact is temporarily missing.
 - Canonicalize namespace-aware exact slskd peer/path identities so review denial durably blocks the provider artifact before re-acquisition, legacy denied provenance is backfilled once, containing album folders are excluded, and Allow or Allow and retry truthfully makes the exact source selectable without rewriting denied history.

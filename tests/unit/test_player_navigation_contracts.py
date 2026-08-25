@@ -30,8 +30,8 @@ def test_authenticated_shell_keeps_one_global_audio_outside_page_region() -> Non
     assert 'aria-hidden="true"' in player_tag
     assert "Nothing playing" not in base
     assert "Choose a track from your library" not in base
-    assert "/static/js/player.js?v={{ app_version }}" in base
-    assert "/static/js/navigation.js?v={{ app_version }}" in base
+    assert "/static/js/player.js?v={{ asset_version }}" in base
+    assert "/static/js/navigation.js?v={{ asset_version }}" in base
     assert not re.search(r"<script(?![^>]*\bsrc=)[^>]*>\s*\S", base, re.IGNORECASE)
 
 

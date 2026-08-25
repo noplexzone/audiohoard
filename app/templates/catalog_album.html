@@ -2,7 +2,7 @@
 {% block title %}{{ album.title }} — {{ album.artist.name }} — Audiohoard{% endblock %}
 {% block content %}
 {% set csrf_token = request.cookies.get('csrf', '') | e %}
-<script src="/static/js/album.js?v={{ app_version }}" data-page-module="album" defer></script>
+<script src="/static/js/album.js?v={{ asset_version }}" data-page-module="album" defer></script>
 <nav class="breadcrumb" aria-label="Breadcrumb"><a href="/library">Library</a> / <a href="/artists/catalog/{{ album.artist.id }}">{{ album.artist.name }}</a> / <span aria-current="page">{{ album.title }}</span></nav>
 <header class="album-detail-hero">
   <div class="album-detail-art">{% if album.artwork_url %}<img src="/artwork?url={{ album.artwork_url | urlencode }}" alt="{{ album.title | e }} cover" width="320" height="320" decoding="async">{% else %}<span aria-hidden="true">{{ album.title[:2] | upper }}</span>{% endif %}</div>
