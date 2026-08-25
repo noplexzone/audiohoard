@@ -372,9 +372,19 @@ def _form_bool(value: object) -> bool:
 
 
 def _safe_discover_return_path(value: str) -> str | None:
-    if not value or any(ord(char) < 32 or char == "\\" for char in value):
+    if not value:
         return None
-    decoded = unquote(value)
+    decoded = value
+    for _ in range(4):
+        if any(ord(char) < 32 or char == "\\" for char in decoded):
+            return None
+        next_value = unquote(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+    else:
+        if unquote(decoded) != decoded:
+            return None
     if any(ord(char) < 32 or char == "\\" for char in decoded):
         return None
     parsed = urlsplit(decoded)
@@ -973,7 +983,11 @@ async def open_catalog_artist_post(
         settings,
         monitor=monitor.lower() in {"1", "true", "yes", "on"},
     )
-    if not _wants_json(request) and (location := _safe_discover_return_path(return_to)):
+    if (
+        response.status_code < 400
+        and not _wants_json(request)
+        and (location := _safe_discover_return_path(return_to))
+    ):
         return RedirectResponse(location, status_code=303)
     return response
 

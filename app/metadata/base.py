@@ -57,7 +57,7 @@ class DiscoveryCardState:
 
     catalog_artist_id: int
     monitored: bool
-    local_library: bool
+    local_library: bool | None
     watchlist_release_albums: bool = False
     watchlist_release_singles: bool = False
     watchlist_release_eps: bool = False

@@ -711,3 +711,21 @@ async def test_card_state_projection_is_exact_batched_and_requires_present_artif
     assert states[("deezer", "two")].monitored is False
     assert states[("deezer", "two")].local_library is False
     assert ("deezer", "missing") not in states
+
+
+async def test_discovery_library_probe_is_bounded_and_truthful_when_truncated(
+    monkeypatch,
+) -> None:
+    from app.services import discovery as discovery_service
+
+    calls: list[str] = []
+
+    def missing(path):
+        calls.append(str(path))
+        return False
+
+    monkeypatch.setattr(discovery_service.Path, "is_file", missing)
+    paths = [f"/library/{index}.flac" for index in range(100)]
+    result = await discovery_service._probe_discovery_library_paths(paths, total_count=100)
+    assert result is None
+    assert len(calls) == discovery_service._DISCOVERY_FILE_PROBE_LIMIT

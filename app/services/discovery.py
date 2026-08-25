@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import and_, select, tuple_
+from sqlalchemy import and_, func, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.metadata.base import (
@@ -23,6 +23,9 @@ from app.models.track import Track
 from app.models.workflow import AcquisitionState, ImportWorkflowState
 from app.services.catalog_metadata import validated_artist_hits
 
+_DISCOVERY_FILE_PROBE_LIMIT = 64
+_DISCOVERY_FILE_PROBE_CONCURRENCY = 8
+
 _TITLES = {
     "popular": "Popular artists",
     "genres": "Genres",
@@ -32,12 +35,57 @@ _TITLES = {
 }
 
 
+async def _probe_discovery_library_paths(paths: list[str], *, total_count: int) -> bool | None:
+    candidates = sorted(set(paths))[:_DISCOVERY_FILE_PROBE_LIMIT]
+    for start in range(0, len(candidates), _DISCOVERY_FILE_PROBE_CONCURRENCY):
+        present = await asyncio.gather(
+            *(
+                asyncio.to_thread(Path(path).is_file)
+                for path in candidates[start : start + _DISCOVERY_FILE_PROBE_CONCURRENCY]
+            )
+        )
+        if any(present):
+            return True
+    return None if total_count > len(candidates) else False
+
+
 async def project_discovery_card_states(
     db: AsyncSession, identities: set[tuple[str, str]]
 ) -> dict[tuple[str, str], DiscoveryCardState]:
-    """Load exact visible identities and verified artifacts with one DB statement."""
+    """Load exact visible identities and bounded verified artifact candidates."""
     if not identities:
         return {}
+    path_candidates = (
+        select(
+            CatalogAlbum.artist_id.label("artist_id"),
+            ImportPlan.destination_path.label("destination_path"),
+        )
+        .select_from(CatalogAlbum)
+        .join(Track, Track.catalog_album_id == CatalogAlbum.id)
+        .join(ImportPlan, ImportPlan.track_id == Track.id)
+        .where(
+            Track.acquisition_state == AcquisitionState.downloaded,
+            Track.import_state == ImportWorkflowState.imported,
+            Track.file_size_bytes.is_not(None),
+            Track.file_size_bytes > 0,
+            ImportPlan.status == ImportWorkflowState.imported,
+            ImportPlan.file_state == LibraryFileState.present,
+            ImportPlan.destination_path != "",
+        )
+        .distinct()
+        .subquery()
+    )
+    ranked_paths = select(
+        path_candidates.c.artist_id,
+        path_candidates.c.destination_path,
+        func.row_number()
+        .over(
+            partition_by=path_candidates.c.artist_id,
+            order_by=path_candidates.c.destination_path,
+        )
+        .label("path_rank"),
+        func.count().over(partition_by=path_candidates.c.artist_id).label("path_count"),
+    ).subquery()
     rows = (
         await db.execute(
             select(
@@ -49,27 +97,15 @@ async def project_discovery_card_states(
                 CatalogArtist.watchlist_release_singles,
                 CatalogArtist.watchlist_release_eps,
                 CatalogArtist.watchlist_monitor_upgrades,
-                ImportPlan.destination_path,
+                ranked_paths.c.destination_path,
+                ranked_paths.c.path_count,
             )
             .join(CatalogArtist, CatalogArtist.id == CatalogArtistIdentity.artist_id)
-            .outerjoin(CatalogAlbum, CatalogAlbum.artist_id == CatalogArtist.id)
             .outerjoin(
-                Track,
+                ranked_paths,
                 and_(
-                    Track.catalog_album_id == CatalogAlbum.id,
-                    Track.acquisition_state == AcquisitionState.downloaded,
-                    Track.import_state == ImportWorkflowState.imported,
-                    Track.file_size_bytes.is_not(None),
-                    Track.file_size_bytes > 0,
-                ),
-            )
-            .outerjoin(
-                ImportPlan,
-                and_(
-                    ImportPlan.track_id == Track.id,
-                    ImportPlan.status == ImportWorkflowState.imported,
-                    ImportPlan.file_state == LibraryFileState.present,
-                    ImportPlan.destination_path != "",
+                    ranked_paths.c.artist_id == CatalogArtist.id,
+                    ranked_paths.c.path_rank <= _DISCOVERY_FILE_PROBE_LIMIT,
                 ),
             )
             .where(
@@ -79,20 +115,19 @@ async def project_discovery_card_states(
             )
         )
     ).all()
-    grouped: dict[tuple[str, str], tuple[Any, list[str]]] = {}
+    grouped: dict[tuple[str, str], tuple[Any, list[str], int]] = {}
     for row in rows:
         key = (str(row.provider), str(row.provider_artist_id))
-        _state, paths = grouped.setdefault(key, (row, []))
+        state, paths, total_count = grouped.setdefault(key, (row, [], int(row.path_count or 0)))
         if row.destination_path:
             paths.append(str(row.destination_path))
+        grouped[key] = (state, paths, max(total_count, int(row.path_count or 0)))
     result: dict[tuple[str, str], DiscoveryCardState] = {}
-    for key, (row, paths) in grouped.items():
+    for key, (row, paths, total_count) in grouped.items():
         result[key] = DiscoveryCardState(
             catalog_artist_id=int(row.catalog_artist_id),
             monitored=bool(row.monitored),
-            local_library=any(
-                await asyncio.gather(*(asyncio.to_thread(Path(path).is_file) for path in paths))
-            ),
+            local_library=await _probe_discovery_library_paths(paths, total_count=total_count),
             watchlist_release_albums=bool(row.watchlist_release_albums),
             watchlist_release_singles=bool(row.watchlist_release_singles),
             watchlist_release_eps=bool(row.watchlist_release_eps),

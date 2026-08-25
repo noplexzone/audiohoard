@@ -205,6 +205,9 @@ def test_discover_return_path_allowlist() -> None:
         "/discover/%0apopular",
         "/discover/../settings",
         "/discover/%2e%2e/settings",
+        "/discover/%252e%252e/settings",
+        "/discover/%255csettings",
+        "/discover/%250asettings",
     ):
         assert _safe_discover_return_path(unsafe) is None
 
@@ -243,3 +246,28 @@ async def test_native_watch_returns_exact_safe_path_and_fetch_json_is_unchanged(
     assert fetch.status_code == 200
     assert fetch.json()["watched"] is True
     assert "artist_id" in fetch.json()
+
+
+async def test_native_watch_preserves_provider_error_instead_of_redirecting(
+    client, monkeypatch
+) -> None:
+    from app.routers import catalog as catalog_router
+
+    async def invalid_detail(*_args, **_kwargs):
+        raise ValueError("stale provider identity")
+
+    monkeypatch.setattr(catalog_router, "fetch_catalog_artist_detail", invalid_detail)
+    response = await client.post(
+        "/artists/catalog/open",
+        data={
+            "csrf_token": client.cookies.get("csrf", ""),
+            "provider": "deezer",
+            "provider_id": "stale",
+            "monitor": "true",
+            "return_to": "/discover/popular?page=2#discover-results",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 422
+    assert "Invalid artist identity" in response.text
+    assert "location" not in response.headers
