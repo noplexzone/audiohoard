@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Send direct discography queue actions to Activity instead of a batch-status page, acknowledge the queue immediately, and count not-yet-materialized batch work under Active downloads.
+
 ## [0.26.0] - 2026-08-25
 
 ### Added

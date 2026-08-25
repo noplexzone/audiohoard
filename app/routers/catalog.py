@@ -1845,7 +1845,7 @@ async def queue_discography_batch_page(
         notice = "queued"
     else:
         notice = "complete"
-    return RedirectResponse(f"/discography-batches/{batch.id}?notice={notice}", status_code=303)
+    return RedirectResponse(f"/activity?notice={notice}", status_code=303)
 
 
 @router.get("/discography-batches/{batch_id}", response_class=HTMLResponse)

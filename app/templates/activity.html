@@ -11,6 +11,18 @@
 
 {% include "partials/_activity_tabs.html" %}
 
+{% if request.query_params.get("notice") == "queued" %}
+<div class="alert ok" role="status">
+  <strong>Downloads queued.</strong>
+  They are being prepared and will appear under Active downloads.
+</div>
+{% elif request.query_params.get("notice") == "complete" %}
+<div class="alert ok" role="status">
+  <strong>Nothing new to queue.</strong>
+  The selected releases are already complete or active.
+</div>
+{% endif %}
+
 {% if activity_summary %}
 <section class="activity-overview" aria-label="Activity overview" data-activity-attention="{{ activity_summary.attention }}">
   <a class="activity-summary-card" href="/wanted">

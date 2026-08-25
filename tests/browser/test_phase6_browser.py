@@ -58,10 +58,10 @@ def test_queue_wanted_filter_page(authenticated_page: Page, browser_base_url: st
     expect(page.get_by_label("State", exact=True)).to_have_value("needs-search")
     expect(page.get_by_text("Browser Context Album", exact=True)).to_be_visible()
     page.get_by_role("button", name="Queue this page").click()
-    page.wait_for_url("**/discography-batches/*?notice=queued")
-    expect(page.get_by_role("heading", name="Batch status")).to_be_visible()
-    expect(page.get_by_text("Browser Context Album", exact=True)).to_be_visible()
-    expect(page.get_by_role("button", name="Confirm and queue")).to_have_count(0)
+    page.wait_for_url("**/activity?notice=queued")
+    expect(page.get_by_role("heading", name="Activity")).to_be_visible()
+    expect(page.get_by_text("Downloads queued", exact=False)).to_be_visible()
+    expect(page.get_by_role("heading", name="Batch status")).to_have_count(0)
 
 
 def test_review_skip_approve_deny_and_no_itunes_reference(

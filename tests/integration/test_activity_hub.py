@@ -30,6 +30,16 @@ async def test_activity_hub_renders_counts_tabs_and_empty_guidance(client: Async
     assert "Nothing needs your attention" in response.text
 
 
+async def test_activity_hub_acknowledges_direct_download_queue(client: AsyncClient) -> None:
+    response = await client.get("/activity?notice=queued")
+
+    assert response.status_code == 200
+    assert 'role="status"' in response.text
+    assert "Downloads queued" in response.text
+    assert "Active downloads" in response.text
+    assert "Batch status" not in response.text
+
+
 async def test_desktop_and_mobile_navigation_use_task_destinations(client: AsyncClient) -> None:
     response = await client.get("/activity")
     body = response.text

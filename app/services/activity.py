@@ -8,6 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.selectable import ScalarSelect
 
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
+from app.models.discography_batch import (
+    DiscographyBatch,
+    DiscographyBatchItem,
+    DiscographyBatchItemJob,
+    DiscographyBatchItemState,
+    DiscographyBatchState,
+    DiscographyJobOwnership,
+)
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.source_candidate_block import SourceCandidateBlock
@@ -65,7 +73,7 @@ def _wanted_count_query() -> ScalarSelect[int]:
 
 async def get_activity_summary(db: AsyncSession) -> ActivitySummary:
     """Return all Activity counts with one database round trip and no entity loading."""
-    active_downloads = (
+    active_jobs = (
         select(func.count(Job.id))
         .where(
             Job.queue_hidden.is_(False),
@@ -73,6 +81,28 @@ async def get_activity_summary(db: AsyncSession) -> ActivitySummary:
         )
         .scalar_subquery()
     )
+    preparing_downloads = (
+        select(func.coalesce(func.sum(DiscographyBatchItem.estimated_job_count), 0))
+        .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+        .where(
+            DiscographyBatch.state.in_(
+                (DiscographyBatchState.queued, DiscographyBatchState.running)
+            ),
+            DiscographyBatchItem.state.in_(
+                (
+                    DiscographyBatchItemState.pending,
+                    DiscographyBatchItemState.hydrating,
+                    DiscographyBatchItemState.expanding,
+                )
+            ),
+            DiscographyBatchItem.estimated_job_count > 0,
+            ~DiscographyBatchItem.job_links.any(
+                DiscographyBatchItemJob.ownership == DiscographyJobOwnership.created
+            ),
+        )
+        .scalar_subquery()
+    )
+    active_downloads = active_jobs + preparing_downloads
     acquisition_issues = (
         select(func.count(Job.id))
         .where(
