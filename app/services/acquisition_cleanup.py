@@ -1772,9 +1772,18 @@ def _track_has_file(track: Track) -> bool:
 
 
 async def prune_orphaned_terminal_records(
-    db: AsyncSession, *, batch_size: int = 500
+    db: AsyncSession,
+    *,
+    batch_size: int = 500,
+    commit_batches: bool = False,
 ) -> OrphanPruneResult:
-    """Remove all terminal acquisition history that has no surviving file artifact."""
+    """Remove terminal history without monopolizing SQLite during startup maintenance."""
+
+    async def release_batch_lock() -> None:
+        if commit_batches:
+            await db.commit()
+            await asyncio.sleep(0)
+
     terminal = {JobStatus.done, JobStatus.failed, JobStatus.partial, JobStatus.cancelled}
     removed_tracks = 0
     last_track_id = 0
@@ -1806,6 +1815,7 @@ async def prune_orphaned_terminal_records(
                 await db.delete(track)
                 removed_tracks += 1
         await db.flush()
+        await release_batch_lock()
         db.expire_all()
 
     removed_releases = 0
@@ -1831,6 +1841,7 @@ async def prune_orphaned_terminal_records(
             await db.delete(release)
         removed_releases += len(releases)
         await db.flush()
+        await release_batch_lock()
         db.expire_all()
 
     removed_jobs = 0
@@ -1866,7 +1877,10 @@ async def prune_orphaned_terminal_records(
             await db.delete(job)
         removed_jobs += len(jobs)
         await db.flush()
+        await release_batch_lock()
         db.expire_all()
+    if commit_batches:
+        await db.rollback()
     return OrphanPruneResult(removed_tracks, removed_releases, removed_jobs)
 
 

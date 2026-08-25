@@ -132,7 +132,7 @@ async def _run_startup_database_maintenance(settings: Settings) -> None:
                 .limit(1)
             )
             if active_job_id is None:
-                pruned = await prune_orphaned_terminal_records(db)
+                pruned = await prune_orphaned_terminal_records(db, commit_batches=True)
                 if pruned.tracks or pruned.releases or pruned.jobs:
                     logger.info(
                         "Pruned orphaned acquisition history at startup: "
