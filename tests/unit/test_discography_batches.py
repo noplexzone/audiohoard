@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select
@@ -16,11 +17,18 @@ from app.models.catalog_entities import (
     CatalogArtistIdentity,
 )
 from app.models.discography_batch import (
+    DiscographyBatch,
     DiscographyBatchItem,
     DiscographyBatchItemState,
     DiscographyScopeKind,
 )
+from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
+from app.models.release import Release
+from app.models.track import Track
+from app.models.workflow import AcquisitionState, ImportWorkflowState
+from app.services import discography_batches
+from app.services.catalog import queue_catalog_album_missing_track_jobs
 from app.services.discography_batches import (
     DiscographyScopeError,
     canonicalize_scope,
@@ -144,7 +152,7 @@ async def test_artist_filters_compose_provider_owned_unbound_and_dedup(
         quality_profile=PROFILE,
     )
     assert preview.matching_count == 3
-    assert preview.skipped_count == 1
+    assert preview.skipped_count == 2
     items = list(
         (
             await db_session.scalars(
@@ -156,15 +164,21 @@ async def test_artist_filters_compose_provider_owned_unbound_and_dedup(
     )
     assert [(item.release_title, item.state, item.reason_code) for item in items] == [
         ("Chosen", DiscographyBatchItemState.preview, None),
+        (
+            "Chosen duplicate",
+            DiscographyBatchItemState.skipped,
+            "duplicate_catalog_album",
+        ),
         ("Unbound EP", DiscographyBatchItemState.skipped, "catalog_release_unbound"),
     ]
     assert {item.release_identity for item in items} == {
         "provider:deezer:MiXeD-A",
+        "provider:deezer:b",
         "provider:deezer:unbound",
     }
 
 
-async def test_duplicate_release_identity_affects_hash_but_not_actionable_count(
+async def test_duplicate_release_identity_persists_snapshot_but_not_actionable_count(
     db_session: AsyncSession,
 ) -> None:
     artist, identity = await _artist(db_session)
@@ -181,14 +195,101 @@ async def test_duplicate_release_identity_affects_hash_but_not_actionable_count(
         db_session, DiscographyScopeKind.artist, _scope(artist.id), quality_profile=PROFILE
     )
     assert second.matching_count == 2 and second.scope_hash != first.scope_hash
-    assert (
-        await db_session.scalar(
-            select(func.count(DiscographyBatchItem.id)).where(
-                DiscographyBatchItem.batch_id == second.id
+    items = list(
+        (
+            await db_session.scalars(
+                select(DiscographyBatchItem)
+                .where(DiscographyBatchItem.batch_id == second.id)
+                .order_by(DiscographyBatchItem.provider_release_id)
             )
-        )
-        == 1
+        ).all()
     )
+    assert len(items) == second.matching_count == 2
+    assert [item.release_identity for item in items] == [
+        "provider:deezer:a",
+        "provider:deezer:b",
+    ]
+    assert [(item.state, item.reason_code) for item in items] == [
+        (DiscographyBatchItemState.preview, None),
+        (DiscographyBatchItemState.skipped, "duplicate_catalog_album"),
+    ]
+    assert second.skipped_count == 1
+    assert [item.estimated_job_count for item in items] == [1, 0]
+    assert second.estimated_job_count == 1
+
+
+@pytest.mark.parametrize(
+    ("file_format", "create_destination", "expected_targets"),
+    [
+        ("mp3 128kbps", False, 0),
+        ("mp3 128kbps", True, 1),
+        ("flac", True, 0),
+    ],
+)
+async def test_preview_target_projection_matches_catalog_queue(
+    db_session: AsyncSession,
+    tmp_path: Path,
+    file_format: str,
+    create_destination: bool,
+    expected_targets: int,
+) -> None:
+    artist, identity = await _artist(db_session)
+    album = CatalogAlbum(artist=artist, title="Quality", year="2024", track_count=1)
+    catalog_track = CatalogAlbumTrack(disc=1, position=1, title="Track")
+    album.tracks.append(catalog_track)
+    db_session.add(_release(identity, "quality", "Quality", "2024", "album", True, album, 1))
+    job = Job(source="slskd", query="quality", status=JobStatus.done)
+    release = Release(job=job, source="slskd", title="Quality")
+    destination = tmp_path / "library" / "track.mp3"
+    if create_destination:
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"audio")
+    track = Track(
+        job=job,
+        release=release,
+        catalog_album=album,
+        catalog_track=catalog_track,
+        title="Track",
+        artist=artist.name,
+        album=album.title,
+        source="slskd",
+        source_path="/staging/track.mp3",
+        acquisition_state=AcquisitionState.downloaded,
+        import_state=ImportWorkflowState.imported,
+        file_format=file_format,
+        file_size_bytes=5,
+    )
+    track.import_plans.append(
+        ImportPlan(
+            release=release,
+            source_path=track.source_path,
+            destination_path=str(destination),
+            status=ImportWorkflowState.imported,
+            file_state=LibraryFileState.present,
+        )
+    )
+    db_session.add(track)
+    await db_session.flush()
+
+    preview = await create_discography_batch_preview(
+        db_session,
+        DiscographyScopeKind.artist,
+        _scope(artist.id),
+        quality_profile=PROFILE,
+    )
+    item = await db_session.scalar(
+        select(DiscographyBatchItem).where(DiscographyBatchItem.batch_id == preview.id)
+    )
+    assert item is not None
+    assert (item.target_count, item.estimated_job_count) == (
+        expected_targets,
+        expected_targets,
+    )
+
+    job_ids = await queue_catalog_album_missing_track_jobs(
+        db_session, album, quality_profile=PROFILE
+    )
+    assert len(job_ids) == expected_targets
 
 
 async def test_wanted_scopes_intersect_server_missing_and_retain_semantics(
@@ -305,6 +406,57 @@ async def test_preview_counts_active_missing_and_estimates(db_session: AsyncSess
         preview.missing_count,
         preview.estimated_job_count,
     ) == (2, 1, 1, 2, 1)
+
+
+async def test_all_matching_scope_over_limit_fails_without_persisting_batch(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def too_many(*args: object, **kwargs: object) -> list[int]:
+        return list(range(1, 10_002))
+
+    monkeypatch.setattr(discography_batches, "get_missing_release_ids", too_many)
+
+    with pytest.raises(DiscographyScopeError, match="exceeds 10000"):
+        await create_discography_batch_preview(
+            db_session,
+            DiscographyScopeKind.wanted_all_matching,
+            {"q": "", "sort": "year", "status": "all"},
+            quality_profile=PROFILE,
+        )
+
+    assert await db_session.scalar(select(func.count(DiscographyBatch.id))) == 0
+
+
+async def test_create_preview_normalizes_invalid_scope_kind(
+    db_session: AsyncSession,
+) -> None:
+    with pytest.raises(DiscographyScopeError, match="unsupported scope kind"):
+        await create_discography_batch_preview(db_session, "invalid", {}, quality_profile=PROFILE)
+
+
+async def test_preview_classification_error_rolls_back_partial_batch(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artist = CatalogArtist(name="Rollback", monitored=True)
+    album = CatalogAlbum(artist=artist, title="Rollback", monitored=True, track_count=1)
+    album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Track"))
+    db_session.add(artist)
+    await db_session.flush()
+
+    def fail_classification(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("classification failed")
+
+    monkeypatch.setattr(discography_batches, "catalog_manifest_issue", fail_classification)
+
+    with pytest.raises(RuntimeError, match="classification failed"):
+        await create_discography_batch_preview(
+            db_session,
+            DiscographyScopeKind.wanted_selected,
+            {"album_ids": [album.id]},
+            quality_profile=PROFILE,
+        )
+
+    assert await db_session.scalar(select(func.count(DiscographyBatch.id))) == 0
 
 
 async def test_scope_hash_is_deterministic(db_session: AsyncSession) -> None:

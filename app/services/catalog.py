@@ -739,6 +739,100 @@ async def get_release_progress(
     return progress
 
 
+@dataclass(frozen=True, slots=True)
+class CatalogAlbumQueueProjection:
+    """Imported ownership and exact missing/sub-quality queue targets for one album."""
+
+    imported_track_ids: frozenset[int]
+    target_track_ids: tuple[int, ...]
+
+
+def _existing_destination_paths(paths: tuple[str, ...]) -> frozenset[str]:
+    return frozenset(path for path in paths if Path(path).is_file())
+
+
+async def project_catalog_album_queue_targets(
+    db: AsyncSession,
+    album_ids: Iterable[int],
+    *,
+    library_root: Path | None = None,
+    quality_profile: QualityProfile,
+) -> dict[int, CatalogAlbumQueueProjection]:
+    """Batch-project the exact track targets used by ordinary catalog expansion."""
+    ids = sorted(set(album_ids))
+    if not ids:
+        return {}
+
+    progress_by_album = await get_release_progress(db, ids, library_root=library_root)
+    imported_by_album = {
+        album_id: set(progress.downloaded_catalog_track_ids)
+        for album_id, progress in progress_by_album.items()
+    }
+    quality_rows = (
+        await db.execute(
+            select(
+                Track.catalog_album_id,
+                Track.catalog_track_id,
+                Track.file_format,
+                ImportPlan.destination_path,
+            )
+            .join(ImportPlan, ImportPlan.track_id == Track.id)
+            .where(
+                Track.catalog_album_id.in_(ids),
+                Track.catalog_track_id.is_not(None),
+                Track.import_state == ImportWorkflowState.imported,
+                ImportPlan.status == ImportWorkflowState.imported,
+                ImportPlan.destination_path != "",
+            )
+        )
+    ).all()
+    quality_candidates = [
+        (int(album_id), int(catalog_track_id), file_format, str(destination_path))
+        for album_id, catalog_track_id, file_format, destination_path in quality_rows
+        if album_id is not None
+        and catalog_track_id is not None
+        and int(catalog_track_id) in imported_by_album.get(int(album_id), set())
+        and not track_meets_quality(file_format, quality_profile)
+    ]
+    existing_paths = await asyncio.to_thread(
+        _existing_destination_paths,
+        tuple(sorted({row[3] for row in quality_candidates})),
+    )
+    subquality_by_album: dict[int, set[int]] = {}
+    for album_id, catalog_track_id, _file_format, destination_path in quality_candidates:
+        if destination_path in existing_paths:
+            subquality_by_album.setdefault(album_id, set()).add(catalog_track_id)
+
+    manifest_rows = (
+        await db.execute(
+            select(CatalogAlbumTrack.album_id, CatalogAlbumTrack.id)
+            .where(CatalogAlbumTrack.album_id.in_(ids))
+            .order_by(
+                CatalogAlbumTrack.album_id,
+                CatalogAlbumTrack.disc,
+                CatalogAlbumTrack.position,
+                CatalogAlbumTrack.id,
+            )
+        )
+    ).all()
+    manifest_by_album: dict[int, list[int]] = {album_id: [] for album_id in ids}
+    for album_id, track_id in manifest_rows:
+        manifest_by_album[int(album_id)].append(int(track_id))
+
+    return {
+        album_id: CatalogAlbumQueueProjection(
+            imported_track_ids=frozenset(imported_by_album.get(album_id, set())),
+            target_track_ids=tuple(
+                track_id
+                for track_id in manifest_by_album[album_id]
+                if track_id not in imported_by_album.get(album_id, set())
+                or track_id in subquality_by_album.get(album_id, set())
+            ),
+        )
+        for album_id in ids
+    }
+
+
 async def queue_catalog_album_missing_track_jobs(
     db: AsyncSession,
     album: CatalogAlbum,
@@ -751,45 +845,23 @@ async def queue_catalog_album_missing_track_jobs(
     This intentionally never creates an album-level job. Every queued job is scoped
     to a concrete ``catalog_track_id`` so partial releases do not reacquire complete albums.
     """
-    progress = (await get_release_progress(db, [album.id], library_root=library_root))[album.id]
-    imported_ids = set(progress.downloaded_catalog_track_ids)
-    quality_rows = (
-        await db.execute(
-            select(Track.catalog_track_id, Track.file_format, ImportPlan.destination_path)
-            .join(ImportPlan, ImportPlan.track_id == Track.id)
-            .where(
-                Track.catalog_album_id == album.id,
-                Track.catalog_track_id.is_not(None),
-                Track.import_state == ImportWorkflowState.imported,
-                ImportPlan.status == ImportWorkflowState.imported,
-                ImportPlan.destination_path != "",
-            )
+    projection = (
+        await project_catalog_album_queue_targets(
+            db,
+            [album.id],
+            library_root=library_root,
+            quality_profile=quality_profile,
         )
-    ).all()
-    subquality_ids: set[int] = set()
-    for catalog_track_id, file_format, destination_path in quality_rows:
-        if (
-            catalog_track_id is not None
-            and int(catalog_track_id) in imported_ids
-            and await asyncio.to_thread(Path(destination_path).is_file)
-            and not track_meets_quality(file_format, quality_profile)
-        ):
-            subquality_ids.add(int(catalog_track_id))
-
+    )[album.id]
     tracks_to_queue = list(
         (
             await db.scalars(
                 select(CatalogAlbumTrack)
-                .where(CatalogAlbumTrack.album_id == album.id)
+                .where(CatalogAlbumTrack.id.in_(projection.target_track_ids))
                 .order_by(CatalogAlbumTrack.disc, CatalogAlbumTrack.position, CatalogAlbumTrack.id)
             )
         ).all()
     )
-    tracks_to_queue = [
-        track
-        for track in tracks_to_queue
-        if track.id is not None and (track.id not in imported_ids or track.id in subquality_ids)
-    ]
     job_specs = [
         (
             " ".join(

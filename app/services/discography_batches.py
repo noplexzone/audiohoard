@@ -28,8 +28,7 @@ from app.models.job import Job, JobStatus
 from app.services.catalog import (
     _missing_releases_query,
     get_missing_release_ids,
-    get_release_progress,
-    track_meets_quality,
+    project_catalog_album_queue_targets,
 )
 from app.services.catalog_manifest import catalog_manifest_issue
 from app.settings_service import QualityProfile, get_runtime_settings
@@ -312,8 +311,8 @@ async def create_discography_batch_preview(
     quality_profile: QualityProfile | None = None,
 ) -> DiscographyBatchPreview:
     """Select, classify, and durably persist a provider-I/O-free preview."""
+    scope, scope_json = canonicalize_scope(scope_kind, payload)
     kind = DiscographyScopeKind(scope_kind)
-    scope, scope_json = canonicalize_scope(kind, payload)
     if isinstance(scope, ArtistDiscographyScope):
         releases = await _select_artist_releases(db, scope)
     else:
@@ -329,130 +328,133 @@ async def create_discography_batch_preview(
         state=DiscographyBatchState.preview,
         matching_count=len(releases),
     )
-    db.add(batch)
-    await db.flush()
-
-    actionable: list[_SelectedRelease] = []
-    seen_albums: set[int] = set()
+    complete_count = active_count = hydration_count = missing_count = estimated = 0
     skipped_count = 0
-    for release in releases:
-        if release.album is None:
-            skipped_count += 1
+
+    async with db.begin_nested():
+        db.add(batch)
+        await db.flush()
+
+        actionable: list[_SelectedRelease] = []
+        seen_albums: set[int] = set()
+        for release in releases:
+            reason: str | None = None
+            if release.album is None:
+                reason = "catalog_release_unbound"
+            elif release.album.id in seen_albums:
+                reason = "duplicate_catalog_album"
+            else:
+                seen_albums.add(release.album.id)
+                actionable.append(release)
+
+            if reason is not None:
+                skipped_count += 1
+                db.add(
+                    DiscographyBatchItem(
+                        batch_id=batch.id,
+                        release_identity=release.release_identity,
+                        provider_release_id=release.provider_release_id,
+                        catalog_album_id=release.album.id if release.album is not None else None,
+                        artist_name=release.artist_name,
+                        release_title=release.title,
+                        release_year=release.year,
+                        release_kind=release.release_kind,
+                        provider=release.provider,
+                        state=DiscographyBatchItemState.skipped,
+                        reason_code=reason,
+                        skipped_count=1,
+                    )
+                )
+
+        album_ids = [release.album.id for release in actionable if release.album is not None]
+        projections = await project_catalog_album_queue_targets(
+            db, album_ids, quality_profile=quality_profile
+        )
+        all_track_ids = {
+            track.id
+            for release in actionable
+            if release.album is not None
+            for track in release.album.tracks
+            if track.id is not None
+        }
+        active_track_ids = (
+            set(
+                int(value)
+                for value in (
+                    await db.scalars(
+                        select(AcquisitionDispatchClaim.catalog_track_id)
+                        .join(Job, Job.id == AcquisitionDispatchClaim.job_id)
+                        .where(
+                            AcquisitionDispatchClaim.catalog_track_id.in_(all_track_ids),
+                            Job.status.in_((JobStatus.pending, JobStatus.running)),
+                        )
+                    )
+                ).all()
+            )
+            if all_track_ids
+            else set()
+        )
+
+        for release in actionable:
+            album = release.album
+            assert album is not None
+            projection = projections[album.id]
+            issue = catalog_manifest_issue(album.tracks, release.expected_count)
+            state = DiscographyBatchItemState.preview
+            reason = None
+            target_count = item_active = item_estimated = 0
+            if issue is not None:
+                hydration_count += 1
+                reason = _MANIFEST_REASONS[issue]
+                target_count = max(
+                    (release.expected_count or 0) - len(projection.imported_track_ids), 0
+                )
+                missing_count += target_count
+                item_estimated = target_count
+                estimated += item_estimated
+            else:
+                targets = set(projection.target_track_ids)
+                target_count = len(targets)
+                item_active = len(targets & active_track_ids)
+                active_count += item_active
+                missing_count += target_count
+                item_estimated = target_count - item_active
+                estimated += item_estimated
+                if target_count == 0:
+                    state = DiscographyBatchItemState.complete
+                    reason = "already_complete"
+                    complete_count += 1
+                elif item_active == target_count:
+                    state = DiscographyBatchItemState.skipped
+                    reason = "already_active"
+                    skipped_count += 1
             db.add(
                 DiscographyBatchItem(
                     batch_id=batch.id,
                     release_identity=release.release_identity,
                     provider_release_id=release.provider_release_id,
+                    catalog_album_id=album.id,
                     artist_name=release.artist_name,
                     release_title=release.title,
                     release_year=release.year,
                     release_kind=release.release_kind,
                     provider=release.provider,
-                    state=DiscographyBatchItemState.skipped,
-                    reason_code="catalog_release_unbound",
-                    skipped_count=1,
+                    state=state,
+                    reason_code=reason,
+                    target_count=target_count,
+                    active_count=item_active,
+                    skipped_count=1 if state == DiscographyBatchItemState.skipped else 0,
+                    estimated_job_count=item_estimated,
                 )
             )
-        elif release.album.id not in seen_albums:
-            seen_albums.add(release.album.id)
-            actionable.append(release)
 
-    album_ids = [release.album.id for release in actionable if release.album is not None]
-    progress_by_album = await get_release_progress(db, album_ids)
-    all_track_ids = {
-        track.id
-        for release in actionable
-        if release.album is not None
-        for track in release.album.tracks
-        if track.id is not None
-    }
-    active_track_ids = (
-        set(
-            int(value)
-            for value in (
-                await db.scalars(
-                    select(AcquisitionDispatchClaim.catalog_track_id)
-                    .join(Job, Job.id == AcquisitionDispatchClaim.job_id)
-                    .where(
-                        AcquisitionDispatchClaim.catalog_track_id.in_(all_track_ids),
-                        Job.status.in_((JobStatus.pending, JobStatus.running)),
-                    )
-                )
-            ).all()
-        )
-        if all_track_ids
-        else set()
-    )
+        batch.complete_count = complete_count
+        batch.active_count = active_count
+        batch.hydration_required_count = hydration_count
+        batch.missing_count = missing_count
+        batch.skipped_count = skipped_count
+        batch.estimated_job_count = estimated
 
-    complete_count = active_count = hydration_count = missing_count = estimated = 0
-    for release in actionable:
-        album = release.album
-        assert album is not None
-        progress = progress_by_album[album.id]
-        issue = catalog_manifest_issue(album.tracks, release.expected_count)
-        state = DiscographyBatchItemState.preview
-        reason: str | None = None
-        target_count = item_active = item_estimated = 0
-        if issue is not None:
-            hydration_count += 1
-            reason = _MANIFEST_REASONS[issue]
-            target_count = max((release.expected_count or 0) - progress.downloaded_track_count, 0)
-            missing_count += target_count
-            item_estimated = target_count
-            estimated += item_estimated
-        else:
-            imported = set(progress.downloaded_catalog_track_ids)
-            files = {item.catalog_track_id: item for item in progress.library_files}
-            subquality = {
-                track_id
-                for track_id, item in files.items()
-                if not track_meets_quality(item.file_format, quality_profile)
-            }
-            targets = {
-                track.id
-                for track in album.tracks
-                if track.id is not None and (track.id not in imported or track.id in subquality)
-            }
-            target_count = len(targets)
-            item_active = len(targets & active_track_ids)
-            active_count += item_active
-            missing_count += target_count
-            item_estimated = target_count - item_active
-            estimated += item_estimated
-            if target_count == 0:
-                state = DiscographyBatchItemState.complete
-                reason = "already_complete"
-                complete_count += 1
-            elif item_active == target_count:
-                state = DiscographyBatchItemState.skipped
-                reason = "already_active"
-                skipped_count += 1
-        db.add(
-            DiscographyBatchItem(
-                batch_id=batch.id,
-                release_identity=release.release_identity,
-                provider_release_id=release.provider_release_id,
-                catalog_album_id=album.id,
-                artist_name=release.artist_name,
-                release_title=release.title,
-                release_year=release.year,
-                release_kind=release.release_kind,
-                provider=release.provider,
-                state=state,
-                reason_code=reason,
-                target_count=target_count,
-                active_count=item_active,
-                skipped_count=1 if state == DiscographyBatchItemState.skipped else 0,
-                estimated_job_count=item_estimated,
-            )
-        )
-
-    batch.complete_count = complete_count
-    batch.active_count = active_count
-    batch.hydration_required_count = hydration_count
-    batch.missing_count = missing_count
-    batch.skipped_count = skipped_count
-    batch.estimated_job_count = estimated
     await db.commit()
     return DiscographyBatchPreview(
         id=batch.id,
