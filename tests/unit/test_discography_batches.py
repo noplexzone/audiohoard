@@ -118,7 +118,7 @@ async def test_artist_filters_compose_provider_owned_unbound_and_dedup(
     album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Track"))
     db_session.add_all(
         [
-            _release(identity, "a", "Chosen", "2000", "single", True, album, 1),
+            _release(identity, "MiXeD-A", "Chosen", "2000", "single", True, album, 1),
             _release(identity, "b", "Chosen duplicate", "2000", "ep", True, album, 1),
             _release(identity, "unbound", "Unbound EP", "2001", "ep", True),
             _release(identity, "wrong-kind", "Album", "2000", "album", True),
@@ -158,6 +158,10 @@ async def test_artist_filters_compose_provider_owned_unbound_and_dedup(
         ("Chosen", DiscographyBatchItemState.preview, None),
         ("Unbound EP", DiscographyBatchItemState.skipped, "catalog_release_unbound"),
     ]
+    assert {item.release_identity for item in items} == {
+        "provider:deezer:MiXeD-A",
+        "provider:deezer:unbound",
+    }
 
 
 async def test_duplicate_release_identity_affects_hash_but_not_actionable_count(
@@ -259,6 +263,7 @@ async def test_preview_manifest_hydration_without_jobs(
         select(DiscographyBatchItem).where(DiscographyBatchItem.batch_id == preview.id)
     )
     assert item is not None and item.reason_code == reason
+    assert item.release_identity == f"catalog_album:{album.id}"
     assert preview.hydration_required_count == 1
     assert preview.missing_count == expected and preview.estimated_job_count == expected
     assert await db_session.scalar(select(func.count(Job.id))) == 0

@@ -130,8 +130,11 @@ class DiscographyBatchItem(Base):
     __tablename__ = "discography_batch_items"
     __table_args__ = (
         CheckConstraint(
-            "provider_release_id IS NOT NULL OR catalog_album_id IS NOT NULL",
+            "trim(release_identity) <> ''",
             name="ck_discography_batch_item_identity",
+        ),
+        UniqueConstraint(
+            "batch_id", "release_identity", name="uq_discography_batch_items_release_identity"
         ),
         CheckConstraint("target_count >= 0", name="ck_target_count_nonnegative"),
         CheckConstraint("active_count >= 0", name="ck_active_count_nonnegative"),
@@ -150,7 +153,10 @@ class DiscographyBatchItem(Base):
             "batch_id",
             "catalog_album_id",
             unique=True,
-            sqlite_where=text("provider_release_id IS NULL AND catalog_album_id IS NOT NULL"),
+            sqlite_where=text(
+                "provider_release_id IS NULL AND catalog_album_id IS NOT NULL "
+                "AND release_identity LIKE 'catalog_album:%'"
+            ),
         ),
     )
 
@@ -158,6 +164,7 @@ class DiscographyBatchItem(Base):
     batch_id: Mapped[int] = mapped_column(
         ForeignKey("discography_batches.id", ondelete="CASCADE"), nullable=False
     )
+    release_identity: Mapped[str] = mapped_column(String(256), nullable=False)
     provider_release_id: Mapped[int | None] = mapped_column(
         ForeignKey("catalog_album_providers.id", ondelete="SET NULL"), nullable=True
     )

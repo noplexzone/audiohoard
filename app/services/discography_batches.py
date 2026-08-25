@@ -172,7 +172,7 @@ def canonicalize_scope(
 @dataclass(frozen=True, slots=True)
 class _SelectedRelease:
     provider_release_id: int | None
-    provider_release_identity: str
+    release_identity: str
     album: CatalogAlbum | None
     artist_name: str
     title: str
@@ -227,7 +227,7 @@ async def _select_artist_releases(
     return [
         _SelectedRelease(
             provider_release_id=release.id,
-            provider_release_identity=f"{scope.provider}:{release.provider_album_id}",
+            release_identity=f"provider:{scope.provider}:{release.provider_album_id}",
             album=release.catalog_album,
             artist_name=artist.name,
             title=release.title,
@@ -285,7 +285,7 @@ async def _select_wanted_releases(
     return [
         _SelectedRelease(
             provider_release_id=None,
-            provider_release_identity=f"catalog_album:{album_id}",
+            release_identity=f"catalog_album:{album_id}",
             album=by_id[album_id],
             artist_name=by_id[album_id].artist.name,
             title=by_id[album_id].title,
@@ -318,7 +318,7 @@ async def create_discography_batch_preview(
         releases = await _select_artist_releases(db, scope)
     else:
         releases = await _select_wanted_releases(db, kind, scope)
-    identities = [release.provider_release_identity for release in releases]
+    identities = [release.release_identity for release in releases]
     if quality_profile is None:
         quality_profile = (await get_runtime_settings(db)).quality_profile
 
@@ -341,6 +341,7 @@ async def create_discography_batch_preview(
             db.add(
                 DiscographyBatchItem(
                     batch_id=batch.id,
+                    release_identity=release.release_identity,
                     provider_release_id=release.provider_release_id,
                     artist_name=release.artist_name,
                     release_title=release.title,
@@ -429,6 +430,7 @@ async def create_discography_batch_preview(
         db.add(
             DiscographyBatchItem(
                 batch_id=batch.id,
+                release_identity=release.release_identity,
                 provider_release_id=release.provider_release_id,
                 catalog_album_id=album.id,
                 artist_name=release.artist_name,

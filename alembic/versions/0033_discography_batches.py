@@ -110,6 +110,7 @@ def upgrade() -> None:
         "discography_batch_items",
         sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
         sa.Column("batch_id", sa.Integer(), nullable=False),
+        sa.Column("release_identity", sa.String(length=256), nullable=False),
         sa.Column("provider_release_id", sa.Integer(), nullable=True),
         sa.Column("catalog_album_id", sa.Integer(), nullable=True),
         sa.Column("artist_name", sa.Text(), nullable=False),
@@ -136,7 +137,7 @@ def upgrade() -> None:
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint(
-            "provider_release_id IS NOT NULL OR catalog_album_id IS NOT NULL",
+            "trim(release_identity) <> ''",
             name="ck_discography_batch_item_identity",
         ),
         *_nonnegative(
@@ -148,6 +149,9 @@ def upgrade() -> None:
         ),
         sa.ForeignKeyConstraint(["catalog_album_id"], ["catalog_albums.id"], ondelete="SET NULL"),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "batch_id", "release_identity", name="uq_discography_batch_items_release_identity"
+        ),
     )
     op.create_index(
         "uq_discography_batch_items_provider_release",
@@ -161,7 +165,10 @@ def upgrade() -> None:
         "discography_batch_items",
         ["batch_id", "catalog_album_id"],
         unique=True,
-        sqlite_where=sa.text("provider_release_id IS NULL AND catalog_album_id IS NOT NULL"),
+        sqlite_where=sa.text(
+            "provider_release_id IS NULL AND catalog_album_id IS NOT NULL "
+            "AND release_identity LIKE 'catalog_album:%'"
+        ),
     )
 
     op.create_table(

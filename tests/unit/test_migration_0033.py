@@ -98,6 +98,7 @@ def test_0033_schema_contract(tmp_path: Path) -> None:
         assert {c["name"] for c in inspector.get_columns("discography_batch_items")} == {
             "id",
             "batch_id",
+            "release_identity",
             "provider_release_id",
             "catalog_album_id",
             "artist_name",
@@ -195,16 +196,18 @@ def test_0033_schema_contract(tmp_path: Path) -> None:
             in ddl["discography_batches"]
         )
         assert "'completed_with_failures'" in ddl["discography_batches"]
-        assert (
-            "provider_release_id IS NOT NULL OR catalog_album_id IS NOT NULL"
-            in ddl["discography_batch_items"]
-        )
+        assert "trim(release_identity) <> ''" in ddl["discography_batch_items"]
         assert "ownership IN ('created', 'observed')" in ddl["discography_batch_item_jobs"]
         assert indexes["uq_discography_batch_items_provider_release"].endswith(
             "WHERE provider_release_id IS NOT NULL"
         )
         assert indexes["uq_discography_batch_items_catalog_album"].endswith(
-            "WHERE provider_release_id IS NULL AND catalog_album_id IS NOT NULL"
+            "WHERE provider_release_id IS NULL AND catalog_album_id IS NOT NULL "
+            "AND release_identity LIKE 'catalog_album:%'"
+        )
+        assert any(
+            u["column_names"] == ["batch_id", "release_identity"]
+            for u in inspector.get_unique_constraints("discography_batch_items")
         )
         assert any(
             u["column_names"] == ["item_id", "job_id"]
@@ -233,11 +236,15 @@ def test_0033_rejects_invalid_values_and_empty_identity(tmp_path: Path) -> None:
                 "INSERT INTO discography_batch_items(batch_id,artist_name,release_title) "
                 f"VALUES ({batch},'Artist','Album')",
                 "INSERT INTO discography_batch_items"
-                "(batch_id,catalog_album_id,artist_name,release_title,state) "
-                f"VALUES ({batch},{album},'Artist','Album','invalid')",
+                "(batch_id,release_identity,catalog_album_id,artist_name,release_title,state) "
+                f"VALUES ({batch},'catalog_album:{album}',{album},'Artist','Album','invalid')",
                 "INSERT INTO discography_batch_items"
-                "(batch_id,catalog_album_id,artist_name,release_title,target_count) "
-                f"VALUES ({batch},{album},'Artist','Album',-1)",
+                "(batch_id,release_identity,catalog_album_id,artist_name,release_title,"
+                "target_count) "
+                f"VALUES ({batch},'catalog_album:{album}',{album},'Artist','Album',-1)",
+                "INSERT INTO discography_batch_items"
+                "(batch_id,release_identity,catalog_album_id,artist_name,release_title) "
+                f"VALUES ({batch},'   ',{album},'Artist','Album')",
             ):
                 with pytest.raises(IntegrityError):
                     connection.execute(sa.text(sql))
@@ -254,18 +261,59 @@ def test_0033_overlap_uniqueness_and_job_ownership(tmp_path: Path) -> None:
             batch, album, provider_one, provider_two = _seed(connection)
             insert = sa.text(
                 "INSERT INTO discography_batch_items"
-                "(batch_id,provider_release_id,catalog_album_id,artist_name,release_title) "
-                "VALUES (:batch,:provider,:album,'Artist','Album')"
+                "(batch_id,release_identity,provider_release_id,catalog_album_id,"
+                "artist_name,release_title) "
+                "VALUES (:batch,:release_identity,:provider,:album,'Artist','Album')"
             )
             for provider in (provider_one, provider_two):
-                connection.execute(insert, {"batch": batch, "provider": provider, "album": album})
+                connection.execute(
+                    insert,
+                    {
+                        "batch": batch,
+                        "release_identity": f"provider:deezer:release-{provider}",
+                        "provider": provider,
+                        "album": album,
+                    },
+                )
             with pytest.raises(IntegrityError):
                 connection.execute(
-                    insert, {"batch": batch, "provider": provider_one, "album": album}
+                    insert,
+                    {
+                        "batch": batch,
+                        "release_identity": "provider:deezer:other-id",
+                        "provider": provider_one,
+                        "album": album,
+                    },
                 )
-            connection.execute(insert, {"batch": batch, "provider": None, "album": album})
+            connection.execute(
+                insert,
+                {
+                    "batch": batch,
+                    "release_identity": f"catalog_album:{album}",
+                    "provider": None,
+                    "album": album,
+                },
+            )
             with pytest.raises(IntegrityError):
-                connection.execute(insert, {"batch": batch, "provider": None, "album": album})
+                connection.execute(
+                    insert,
+                    {
+                        "batch": batch,
+                        "release_identity": f"catalog_album:{album}:duplicate",
+                        "provider": None,
+                        "album": album,
+                    },
+                )
+            with pytest.raises(IntegrityError):
+                connection.execute(
+                    insert,
+                    {
+                        "batch": batch,
+                        "release_identity": f"provider:deezer:release-{provider_two}",
+                        "provider": None,
+                        "album": None,
+                    },
+                )
             item = connection.scalar(sa.text("SELECT min(id) FROM discography_batch_items"))
             job = connection.execute(
                 sa.text("INSERT INTO jobs(source,query) VALUES ('test','owned')")
@@ -303,6 +351,95 @@ def test_0033_overlap_uniqueness_and_job_ownership(tmp_path: Path) -> None:
                 connection.scalar(sa.text("SELECT count(*) FROM discography_batch_item_jobs")) == 0
             )
             assert connection.scalar(sa.text("SELECT count(*) FROM jobs")) == 1
+    finally:
+        engine.dispose()
+
+
+def test_0033_catalog_cleanup_preserves_durable_item_identity(tmp_path: Path) -> None:
+    database = tmp_path / "catalog-cleanup.db"
+    command.upgrade(_config(database), "head")
+    engine = _engine(database)
+    try:
+        with engine.begin() as connection:
+            batch, album, provider_one, provider_two = _seed(connection)
+            insert = sa.text(
+                "INSERT INTO discography_batch_items"
+                "(batch_id,release_identity,provider_release_id,catalog_album_id,"
+                "artist_name,release_title) VALUES "
+                "(:batch,:identity,:provider,:album,'Artist','Album')"
+            )
+            provider_only = connection.execute(
+                insert,
+                {
+                    "batch": batch,
+                    "identity": "provider:deezer:release-1",
+                    "provider": provider_one,
+                    "album": None,
+                },
+            ).lastrowid
+            dual = connection.execute(
+                insert,
+                {
+                    "batch": batch,
+                    "identity": "provider:deezer:release-2",
+                    "provider": provider_two,
+                    "album": album,
+                },
+            ).lastrowid
+            canonical = connection.execute(
+                insert,
+                {
+                    "batch": batch,
+                    "identity": f"catalog_album:{album}",
+                    "provider": None,
+                    "album": album,
+                },
+            ).lastrowid
+
+            connection.execute(
+                sa.text("DELETE FROM catalog_album_providers WHERE id IN (:one,:two)"),
+                {"one": provider_one, "two": provider_two},
+            )
+            rows = {
+                row.id: row
+                for row in connection.execute(
+                    sa.text(
+                        "SELECT id,release_identity,provider_release_id,catalog_album_id "
+                        "FROM discography_batch_items"
+                    )
+                ).mappings()
+            }
+            assert rows[provider_only] == {
+                "id": provider_only,
+                "release_identity": "provider:deezer:release-1",
+                "provider_release_id": None,
+                "catalog_album_id": None,
+            }
+            assert rows[dual]["release_identity"] == "provider:deezer:release-2"
+            assert rows[dual]["provider_release_id"] is None
+            assert rows[dual]["catalog_album_id"] == album
+            assert rows[canonical]["catalog_album_id"] == album
+
+            connection.execute(
+                sa.text("DELETE FROM catalog_albums WHERE id=:album"), {"album": album}
+            )
+            remaining = (
+                connection.execute(
+                    sa.text(
+                        "SELECT id,release_identity,provider_release_id,catalog_album_id "
+                        "FROM discography_batch_items ORDER BY id"
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            assert [row["release_identity"] for row in remaining] == [
+                "provider:deezer:release-1",
+                "provider:deezer:release-2",
+                f"catalog_album:{album}",
+            ]
+            assert all(row["provider_release_id"] is None for row in remaining)
+            assert all(row["catalog_album_id"] is None for row in remaining)
     finally:
         engine.dispose()
 
