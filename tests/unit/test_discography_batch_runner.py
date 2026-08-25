@@ -464,38 +464,43 @@ async def test_waiting_item_does_not_starve_later_pending(tmp_path: Path) -> Non
     await engine.dispose()
 
 
-async def test_unchanged_waiting_item_does_not_starve_later_terminal_job(
+async def test_unchanged_waiting_page_does_not_starve_later_terminal_job(
     tmp_path: Path,
 ) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'waiting-fair.db'}")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    _batch_id, first_id = await _seed(factory)
+    batch_id, first_id = await _seed(factory)
     async with factory() as db:
         first = await db.get(DiscographyBatchItem, first_id)
         assert first is not None
         source_album = await db.get(CatalogAlbum, first.catalog_album_id)
         assert source_album is not None
-        album = CatalogAlbum(artist_id=source_album.artist_id, title="Later", track_count=1)
-        album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Later"))
-        later = DiscographyBatchItem(
-            batch_id=first.batch_id,
-            release_identity="later-waiting",
-            catalog_album=album,
-            artist_name="Runner",
-            release_title="Later",
-            state=DiscographyBatchItemState.pending,
-        )
-        db.add(later)
+        items = [first]
+        for index in range(2, 27):
+            title = f"Album {index:02d}"
+            album = CatalogAlbum(artist_id=source_album.artist_id, title=title, track_count=1)
+            album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title=title))
+            item = DiscographyBatchItem(
+                batch_id=batch_id,
+                release_identity=f"later-waiting-{index}",
+                catalog_album=album,
+                artist_name="Runner",
+                release_title=title,
+                state=DiscographyBatchItemState.pending,
+            )
+            db.add(item)
+            items.append(item)
         await db.commit()
-        later_id = later.id
+        waiting_ids = [item.id for item in items[:25]]
+        later_id = items[25].id
 
     runner = DiscographyBatchRunner(
         factory, dispatcher=lambda _job_id: None, quality_profile=PROFILE
     )
-    assert await runner.run_once()
-    assert await runner.run_once()
+    for _ in range(26):
+        assert await runner.run_once()
     async with factory() as db:
         links = list(
             (
@@ -506,16 +511,35 @@ async def test_unchanged_waiting_item_does_not_starve_later_terminal_job(
                 )
             ).all()
         )
-        assert [item_id for item_id, _job in links] == [first_id, later_id]
-        links[0][1].status = JobStatus.running
-        links[1][1].status = JobStatus.done
+        assert [item_id for item_id, _job in links] == waiting_ids + [later_id]
+        for _item_id, job in links[:25]:
+            job.status = JobStatus.running
+        links[25][1].status = JobStatus.done
+        old_timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+        later_timestamp = old_timestamp + timedelta(days=1)
+        await db.execute(
+            text("UPDATE discography_batch_items SET updated_at = :stamp WHERE id <= :last_id"),
+            {"stamp": old_timestamp, "last_id": waiting_ids[-1]},
+        )
+        await db.execute(
+            text("UPDATE discography_batch_items SET updated_at = :stamp WHERE id = :later_id"),
+            {"stamp": later_timestamp, "later_id": later_id},
+        )
         await db.commit()
 
+    # The first bounded page contains only unchanged rows; its rotation markers
+    # make the later terminal row visible to the next bounded pass.
+    assert not await runner.run_once()
     assert await runner.run_once()
     async with factory() as db:
-        first = await db.get(DiscographyBatchItem, first_id)
+        earlier = list(
+            await db.scalars(
+                select(DiscographyBatchItem).where(DiscographyBatchItem.id.in_(waiting_ids))
+            )
+        )
         later = await db.get(DiscographyBatchItem, later_id)
-        assert first is not None and first.state == DiscographyBatchItemState.waiting
+        assert len(earlier) == 25
+        assert all(item.state == DiscographyBatchItemState.waiting for item in earlier)
         assert later is not None and later.state == DiscographyBatchItemState.failed
         assert later.reason_code == "targets_remain_without_active_jobs"
     await engine.dispose()

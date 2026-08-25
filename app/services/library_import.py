@@ -1018,7 +1018,12 @@ async def retag_catalog_album(
             after_rollback=transaction.after_rollback,
         )
     except Exception:
-        transaction.after_rollback()
+        try:
+            transaction.after_rollback()
+        finally:
+            # The route converts unexpected failures into an error redirect, so
+            # roll back ORM mutations here before the dependency can commit them.
+            await db.rollback()
         raise
     return transaction.result
 
