@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from html.parser import HTMLParser
-
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 
@@ -22,36 +20,10 @@ from app.models.discography_batch import (
 from app.models.job import Job
 
 
-class _PreviewFormParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.fields: list[tuple[str, str]] | None = None
-        self._current: list[tuple[str, str]] | None = None
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attributes = {key: value or "" for key, value in attrs}
-        if tag == "form" and attributes.get("action") == "/discography-batches/preview":
-            self._current = []
-        elif tag == "input" and self._current is not None and attributes.get("name"):
-            self._current.append((attributes["name"], attributes.get("value", "")))
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "form" and self._current is not None:
-            self.fields = self._current
-            self._current = None
-
-
-def _preview_form_fields(body: str) -> list[tuple[str, str]]:
-    parser = _PreviewFormParser()
-    parser.feed(body)
-    assert parser.fields is not None
-    return parser.fields
-
-
 async def _seed_wanted_album(title: str = "Native Preview") -> tuple[int, int]:
     factory = db_module.get_session_factory()
     async with factory() as session:
-        artist = CatalogArtist(name="Preview Artist", monitored=True)
+        artist = CatalogArtist(name="Batch Artist", monitored=True)
         album = CatalogAlbum(
             artist=artist,
             title=title,
@@ -100,23 +72,25 @@ async def test_discography_batch_routes_require_auth(
     assert post_response.status_code in {302, 307, 401}
 
 
-async def test_discography_batch_preview_rejects_missing_csrf(client: AsyncClient) -> None:
+async def test_discography_batch_mutations_reject_missing_csrf(client: AsyncClient) -> None:
     client.headers.pop("X-CSRF-Token", None)
-    response = await client.post(
-        "/discography-batches/preview",
-        data={"scope_kind": "wanted_selected", "catalog_album_ids": "1"},
-    )
-    assert response.status_code == 403
+    for route in ("/discography-batches/preview", "/discography-batches/queue"):
+        response = await client.post(
+            route,
+            data={"scope_kind": "wanted_selected", "catalog_album_ids": "1"},
+        )
+        assert response.status_code == 403
 
 
-async def test_wanted_forms_preview_exact_native_scopes_and_keep_direct_action(
+async def test_wanted_forms_queue_exact_native_scopes_and_keep_single_release_action(
     client: AsyncClient,
 ) -> None:
     _, album_id = await _seed_wanted_album()
     response = await client.get("/wanted?q=Preview&sort=artist&status=needs-search")
     assert response.status_code == 200
     body = response.text
-    assert 'action="/discography-batches/preview"' in body
+    assert 'action="/discography-batches/queue"' in body
+    assert 'action="/discography-batches/preview"' not in body
     assert 'value="wanted_selected"' in body
     assert 'value="wanted_page"' in body
     assert 'value="wanted_all_matching"' in body
@@ -124,25 +98,99 @@ async def test_wanted_forms_preview_exact_native_scopes_and_keep_direct_action(
     assert 'name="q" value="Preview"' in body
     assert 'name="sort" value="artist"' in body
     assert 'name="status" value="needs-search"' in body
-    assert "Preview selected" in body
-    assert "Preview this page" in body
-    assert "Preview all" in body
+    assert "Queue selected" in body
+    assert "Queue this page" in body
+    assert "Queue all" in body
     assert f'formaction="/albums/{album_id}/download"' in body
     assert "Queue missing" in body
 
 
-async def test_default_artist_preview_form_posts_canonical_all_scope_without_jobs(
+async def test_primary_artist_and_wanted_actions_queue_directly_without_preview_language(
+    client: AsyncClient,
+) -> None:
+    artist_id, _ = await _seed_wanted_album("Direct queue")
+
+    artist_page = await client.get(f"/artists/catalog/{artist_id}")
+    wanted_page = await client.get("/wanted")
+
+    for body in (artist_page.text, wanted_page.text):
+        assert 'action="/discography-batches/queue"' in body
+        assert 'action="/discography-batches/preview"' not in body
+        assert "Preview watchlisted releases" not in body
+        assert "Preview selected" not in body
+        assert "Preview this page" not in body
+        assert "Preview all" not in body
+        assert "until you confirm" not in body.lower()
+        assert "Review batch" not in body
+    assert "Queue watchlisted releases" in artist_page.text
+    assert "Queue selected" in wanted_page.text
+    assert "Queue this page" in wanted_page.text
+    assert "Queue all 1 matches" in wanted_page.text
+
+
+async def test_direct_queue_commits_before_runner_wake_and_redirects_to_status(
+    client: AsyncClient, monkeypatch
+) -> None:
+    _, album_id = await _seed_wanted_album("Committed before wake")
+    transport = client._transport
+    assert isinstance(transport, ASGITransport)
+    import app.routers.catalog as catalog_router
+
+    events: list[str] = []
+    real_queue = catalog_router.queue_discography_batch
+
+    async def observed_queue(*args, **kwargs):
+        result = await real_queue(*args, **kwargs)
+        events.append("committed")
+        return result
+
+    class RunnerSpy:
+        def wake(self) -> None:
+            events.append("wake")
+
+    monkeypatch.setattr(catalog_router, "queue_discography_batch", observed_queue)
+    transport.app.state.discography_batch_runner = RunnerSpy()
+    response = await client.post(
+        "/discography-batches/queue",
+        data={"scope_kind": "wanted_selected", "catalog_album_ids": str(album_id)},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/discography-batches/")
+    assert "notice=queued" in response.headers["location"]
+    assert events == ["committed", "wake"]
+    page = await client.get(response.headers["location"])
+    assert "Queued missing releases" in page.text
+
+
+async def test_direct_queue_empty_selected_and_page_create_no_batch(client: AsyncClient) -> None:
+    before = await _batch_count()
+    for scope_kind in ("wanted_selected", "wanted_page"):
+        response = await client.post("/discography-batches/queue", data={"scope_kind": scope_kind})
+        assert response.status_code == 400
+        assert "Select at least one release" in response.text
+        assert await _batch_count() == before
+
+
+async def test_legacy_artist_preview_route_accepts_explicit_canonical_scope_without_jobs(
     client: AsyncClient,
 ) -> None:
     artist_id, _ = await _seed_wanted_album("Default artist preview")
-    page = await client.get(f"/artists/catalog/{artist_id}")
-    assert page.status_code == 200
-    fields = _preview_form_fields(page.text)
-    assert ("release_type", "all") in fields
     before = await _job_count()
 
     response = await client.post(
-        "/discography-batches/preview", data=dict(fields), follow_redirects=False
+        "/discography-batches/preview",
+        data={
+            "scope_kind": "artist",
+            "artist_id": str(artist_id),
+            "provider": "musicbrainz",
+            "release_type": "all",
+            "year_from": "",
+            "year_to": "",
+            "monitoring_status": "monitored",
+        },
+        follow_redirects=False,
     )
 
     assert response.status_code == 303, response.text

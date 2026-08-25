@@ -29,6 +29,7 @@ from app.models.discography_batch import (
 )
 from app.models.job import Job, JobStatus
 from app.services.catalog import (
+    CatalogAlbumQueueProjection,
     _missing_releases_query,
     get_missing_release_ids,
     project_catalog_album_queue_targets,
@@ -328,6 +329,8 @@ async def _populate_batch_items(
     batch: DiscographyBatch,
     releases: list[_SelectedRelease],
     quality_profile: QualityProfile,
+    *,
+    projections: dict[int, CatalogAlbumQueueProjection] | None = None,
 ) -> None:
     """Replace one batch's materialized preview from an exact server-side selection."""
     item_ids = select(DiscographyBatchItem.id).where(DiscographyBatchItem.batch_id == batch.id)
@@ -370,9 +373,10 @@ async def _populate_batch_items(
             )
 
     album_ids = [release.album.id for release in actionable if release.album is not None]
-    projections = await project_catalog_album_queue_targets(
-        db, album_ids, quality_profile=quality_profile
-    )
+    if projections is None:
+        projections = await project_catalog_album_queue_targets(
+            db, album_ids, quality_profile=quality_profile
+        )
     all_track_ids = {
         track.id
         for release in actionable
@@ -534,6 +538,94 @@ async def create_discography_batch_preview(
             db.add(batch)
             await db.flush()
             await _populate_batch_items(db, batch, releases, quality_profile)
+    except Exception:
+        await db.rollback()
+        raise
+    await db.commit()
+    return _preview_result(batch)
+
+
+async def queue_discography_batch(
+    db: AsyncSession,
+    scope_kind: DiscographyScopeKind | str,
+    payload: dict[str, object],
+    *,
+    quality_profile: QualityProfile | None = None,
+) -> DiscographyBatchPreview:
+    """Select and materialize one durable batch, then commit it ready for the runner."""
+    reject_pending_orm_changes(db)
+    scope, scope_json = canonicalize_scope(scope_kind, payload)
+    kind = DiscographyScopeKind(scope_kind)
+    if (
+        kind in {DiscographyScopeKind.wanted_selected, DiscographyScopeKind.wanted_page}
+        and isinstance(scope, WantedIdsDiscographyScope)
+        and not scope.album_ids
+    ):
+        raise DiscographyScopeError("Select at least one release to queue")
+    releases = (
+        await _select_artist_releases(db, scope)
+        if isinstance(scope, ArtistDiscographyScope)
+        else await _select_wanted_releases(db, kind, scope)
+    )
+    if quality_profile is None:
+        quality_profile = (await get_runtime_settings(db)).quality_profile
+    album_ids = list(
+        dict.fromkeys(release.album.id for release in releases if release.album is not None)
+    )
+    projections = await project_catalog_album_queue_targets(
+        db, album_ids, quality_profile=quality_profile
+    )
+    batch = DiscographyBatch(
+        scope_kind=kind,
+        scope_json=scope_json,
+        scope_hash=_hash(scope_json, [release.release_identity for release in releases]),
+        state=DiscographyBatchState.queued,
+    )
+    try:
+        async with db.begin_nested():
+            db.add(batch)
+            await db.flush()
+            await _populate_batch_items(
+                db,
+                batch,
+                releases,
+                quality_profile,
+                projections=projections,
+            )
+            await db.execute(
+                update(DiscographyBatchItem)
+                .where(
+                    DiscographyBatchItem.batch_id == batch.id,
+                    DiscographyBatchItem.state.in_(
+                        (DiscographyBatchItemState.preview, DiscographyBatchItemState.failed)
+                    ),
+                )
+                .values(state=DiscographyBatchItemState.pending)
+            )
+            states = list(
+                await db.scalars(
+                    select(DiscographyBatchItem.state).where(
+                        DiscographyBatchItem.batch_id == batch.id
+                    )
+                )
+            )
+            terminal = {
+                DiscographyBatchItemState.complete,
+                DiscographyBatchItemState.skipped,
+                DiscographyBatchItemState.failed,
+                DiscographyBatchItemState.cancelled,
+            }
+            if all(state in terminal for state in states):
+                batch.state = (
+                    DiscographyBatchState.completed_with_failures
+                    if any(
+                        state
+                        in (DiscographyBatchItemState.failed, DiscographyBatchItemState.cancelled)
+                        for state in states
+                    )
+                    else DiscographyBatchState.completed
+                )
+                batch.completed_at = datetime.now(UTC)
     except Exception:
         await db.rollback()
         raise

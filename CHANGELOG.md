@@ -8,6 +8,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Queue artist-watchlist and Wanted selection, page, and all-matching discography scopes directly as durable batches without a preview/confirmation materialization pass.
+- Restore truthful provider-wide Discover feeds by skipping Deezer taxonomy sentinels, using a bounded chart fallback for empty editorial releases, and removing misleading global-fallback claims.
+- Remove the duplicate monitored-artist rail from Discover and tighten the poster-first hierarchy, responsive states, navigation, and Manual search separation.
 - Fingerprint CSS and JavaScript URLs from their packaged content so browser caches cannot combine a newly deployed Discover template with stale pre-Discover styles.
 - Derive Deezer genre discovery artists from exact genre radio tracks instead of provider endpoints that silently return the same global chart for every genre, with strict provider ID parsing and truthful pagination after exact artist validation.
 - Defer SQLite-locked job admissions without crossing the provider boundary, and retain exact completed slskd transfers for retry when their staged artifact is temporarily missing.
@@ -23,7 +26,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Add a shared poster-first Discover surface with responsive artist, release, and exact-genre cards, truthful state badges, safe native watch controls, and explicit feed continuation.
 - Add read-only provider artist previews, exact provider-identity Discover card state, and safe in-context native watchlist returns without mutating navigation GETs.
 - Load Discover landing feeds as independent authenticated fragments with truthful cached, pending, empty, stale, and error states so provider latency no longer blocks the page shell.
-- Add durable scoped discography batch previews and native status controls for artist watchlists and Wanted selections, pages, and server-rerun matching scopes while reusing ordinary bounded acquisition jobs.
+- Add durable scoped discography batches and native status controls for artist watchlists and Wanted selections, pages, and server-rerun matching scopes while reusing ordinary bounded acquisition jobs.
 - Add Wanted-page queue-all-matching bulk dispatch and quality-profile enabled-format controls for strict MP3-320-or-better acquisition.
 
 ### Fixed

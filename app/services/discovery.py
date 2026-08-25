@@ -32,7 +32,7 @@ _TITLES = {
     "popular": "Popular artists",
     "genres": "Genres",
     "genre": "Genre artists",
-    "new": "New releases",
+    "new": "Fresh chart releases",
     "trending": "Trending releases",
 }
 
@@ -325,7 +325,7 @@ class DiscoveryService:
                 title=_TITLES[feed],
                 requested_region=region,
                 effective_region="GLOBAL",
-                fallback_global=True,
+                fallback_global=False,
                 state="error",
                 message="Discovery provider is temporarily unavailable",
                 has_next=False if feed == "genre" else None,
@@ -335,7 +335,7 @@ class DiscoveryService:
             title=resolved_title if feed == "genre" else _TITLES[feed],
             requested_region=region,
             effective_region="GLOBAL",
-            fallback_global=True,
+            fallback_global=False,
             items=tuple(items),
             has_next=has_next,
         )
@@ -357,7 +357,7 @@ class DiscoveryService:
                         _TITLES[feed],
                         region,
                         "GLOBAL",
-                        True,
+                        False,
                         state="error",
                         message="Discovery provider is temporarily unavailable",
                     )

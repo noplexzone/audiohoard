@@ -37,6 +37,7 @@ from app.services.discography_batches import (
     canonicalize_scope,
     confirm_discography_batch,
     create_discography_batch_preview,
+    queue_discography_batch,
 )
 from app.settings_service import QualityProfile
 
@@ -220,6 +221,78 @@ async def test_duplicate_release_identity_persists_snapshot_but_not_actionable_c
     assert second.skipped_count == 1
     assert [item.estimated_job_count for item in items] == [1, 0]
     assert second.estimated_job_count == 1
+
+
+async def test_direct_queue_selects_and_materializes_once_then_commits_pending(
+    db_session: AsyncSession, monkeypatch
+) -> None:
+    artist, identity = await _artist(db_session)
+    album = CatalogAlbum(artist=artist, title="Direct", year="2026", track_count=1)
+    album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Missing"))
+    db_session.add(_release(identity, "direct", "Direct", "2026", "album", True, album, 1))
+    await db_session.flush()
+    select_calls = 0
+    populate_calls = 0
+    real_select = discography_batches._select_artist_releases
+    real_populate = discography_batches._populate_batch_items
+    real_project = discography_batches.project_catalog_album_queue_targets
+    projection_before_batch_insert = False
+
+    async def counted_select(*args, **kwargs):
+        nonlocal select_calls
+        select_calls += 1
+        return await real_select(*args, **kwargs)
+
+    async def counted_populate(*args, **kwargs):
+        nonlocal populate_calls
+        populate_calls += 1
+        return await real_populate(*args, **kwargs)
+
+    async def observed_project(*args, **kwargs):
+        nonlocal projection_before_batch_insert
+        projection_before_batch_insert = not any(
+            isinstance(row, DiscographyBatch) for row in db_session.new
+        )
+        return await real_project(*args, **kwargs)
+
+    monkeypatch.setattr(discography_batches, "_select_artist_releases", counted_select)
+    monkeypatch.setattr(discography_batches, "_populate_batch_items", counted_populate)
+    monkeypatch.setattr(
+        discography_batches, "project_catalog_album_queue_targets", observed_project
+    )
+
+    queued = await queue_discography_batch(
+        db_session,
+        DiscographyScopeKind.artist,
+        _scope(artist.id, monitoring_status="monitored"),
+        quality_profile=PROFILE,
+    )
+
+    assert select_calls == populate_calls == 1
+    assert projection_before_batch_insert is True
+    assert queued.state == DiscographyBatchState.queued
+    assert db_session.in_transaction() is False
+    states = list(
+        await db_session.scalars(
+            select(DiscographyBatchItem.state).where(DiscographyBatchItem.batch_id == queued.id)
+        )
+    )
+    assert states == [DiscographyBatchItemState.pending]
+
+
+async def test_direct_queue_zero_actionable_work_is_terminal(db_session: AsyncSession) -> None:
+    artist, _identity = await _artist(db_session)
+
+    queued = await queue_discography_batch(
+        db_session,
+        DiscographyScopeKind.artist,
+        _scope(artist.id, monitoring_status="monitored"),
+        quality_profile=PROFILE,
+    )
+
+    assert queued.matching_count == 0
+    assert queued.state == DiscographyBatchState.completed
+    assert db_session.in_transaction() is False
 
 
 @pytest.mark.parametrize(

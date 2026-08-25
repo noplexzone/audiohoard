@@ -61,6 +61,13 @@ def test_discover_poster_first_workflows_desktop_mobile_and_recovery(
         )
     _assert_each_fragment_once(fragment_requests)
     _assert_no_document_overflow(page)
+    expect(page.get_by_role("navigation", name="Search modes")).to_be_visible()
+    expect(
+        page.get_by_role("navigation", name="Search modes").get_by_role(
+            "link", name="Discover", exact=True
+        )
+    ).to_have_attribute("aria-current", "page")
+    expect(page.get_by_role("region", name="Discovery feeds")).to_be_visible()
     expect(page.get_by_role("link", name="Manual search", exact=True)).to_be_visible()
     release_cards = {
         "new": ("browser-new-artist", "Browser New Release"),
@@ -115,7 +122,7 @@ def test_discover_poster_first_workflows_desktop_mobile_and_recovery(
     dedicated = {
         "/discover/popular": "Popular artists",
         "/discover/genres": "Genres",
-        "/discover/new": "New releases",
+        "/discover/new": "Fresh chart releases",
         "/discover/trending": "Trending releases",
     }
     for path, title in dedicated.items():
@@ -208,6 +215,7 @@ def test_discover_poster_first_workflows_desktop_mobile_and_recovery(
             "data-discover-state", "ready"
         )
     _assert_no_document_overflow(page)
+    page.screenshot(path=str(SCREENSHOT_ROOT / "audiohoard-discover-operate-mobile.png"))
     assert (
         page.locator("#discovery-popular .discover-poster-grid").evaluate(
             "grid => getComputedStyle(grid).gridTemplateColumns.split(' ').length"
@@ -231,7 +239,6 @@ def test_discover_poster_first_workflows_desktop_mobile_and_recovery(
     control_bottom = last_control.evaluate("node => node.getBoundingClientRect().bottom")
     assert control_bottom <= nav_top
     page.locator('[data-provider-id="browser-long-artist"]').scroll_into_view_if_needed()
-    page.screenshot(path=str(SCREENSHOT_ROOT / "audiohoard-discover-operate-mobile.png"))
 
     # 200% zoom equivalent and keyboard focus-visible behavior under reduced motion.
     page.set_viewport_size({"width": 720, "height": 450})

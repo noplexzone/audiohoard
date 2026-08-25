@@ -27,11 +27,11 @@ async def test_empty_search_renders_pending_shell_without_calling_provider(
 
     def landing_snapshot(region: str):
         return [
-            DiscoverySection(feed, title, region, "GLOBAL", True, state="pending")
+            DiscoverySection(feed, title, region, "GLOBAL", False, state="pending")
             for feed, title in (
                 ("popular", "Popular artists"),
                 ("genres", "Genres"),
-                ("new", "New releases"),
+                ("new", "Fresh chart releases"),
                 ("trending", "Trending releases"),
             )
         ]
@@ -42,10 +42,16 @@ async def test_empty_search_renders_pending_shell_without_calling_provider(
     response = await asyncio.wait_for(client.get("/search"), timeout=0.5)
 
     assert response.status_code == 200
-    for text in ("Popular artists", "Genres", "New releases", "Trending releases"):
+    for text in ("Popular artists", "Genres", "Fresh chart releases", "Trending releases"):
         assert text in response.text
     assert response.text.count('data-discover-state="pending"') == 4
     assert response.text.count("Loading discovery feed") == 4
+    assert '<header class="discover-hero">' in response.text
+    assert 'aria-label="Search modes"' in response.text
+    assert 'aria-current="page"' in response.text
+    assert '<section class="discover-feed-collection"' in response.text
+    assert response.text.count('class="discovery-state discovery-state-pending"') == 4
+    assert response.text.count('aria-busy="true"') == 4
     assert "Nothing to show" not in response.text
     assert provider_called.is_set() is False
 
@@ -53,6 +59,25 @@ async def test_empty_search_renders_pending_shell_without_calling_provider(
 
     async with get_session_factory()() as db:
         assert list(await db.scalars(select(CatalogArtist))) == []
+
+
+async def test_discover_landing_does_not_query_or_render_monitored_artist_continuation(
+    client, monkeypatch
+) -> None:
+    from app.routers import search as search_router
+
+    async def forbidden_monitored_query(_db):
+        raise AssertionError("Discover must not query monitored artists")
+
+    monkeypatch.setattr(
+        search_router, "_monitored_catalog_artists", forbidden_monitored_query, raising=False
+    )
+
+    response = await client.get("/search")
+
+    assert response.status_code == 200
+    assert "Continue building this discography" not in response.text
+    assert "Monitored artist" not in response.text
 
 
 async def test_empty_search_renders_cached_ready_and_stale_sections_without_provider(
@@ -66,12 +91,12 @@ async def test_empty_search_renders_cached_ready_and_stale_sections_without_prov
             "Popular artists",
             "US",
             "GLOBAL",
-            True,
+            False,
             (ArtistHit("deezer", "artist-1", "Cached Artist"),),
         ),
-        DiscoverySection("genres", "Genres", "US", "GLOBAL", True, state="stale", stale=True),
-        DiscoverySection("new", "New releases", "US", "GLOBAL", True, state="pending"),
-        DiscoverySection("trending", "Trending releases", "US", "GLOBAL", True, state="pending"),
+        DiscoverySection("genres", "Genres", "US", "GLOBAL", False, state="stale", stale=True),
+        DiscoverySection("new", "Fresh chart releases", "US", "GLOBAL", False, state="pending"),
+        DiscoverySection("trending", "Trending releases", "US", "GLOBAL", False, state="pending"),
     ]
 
     def landing_snapshot(_region: str):
@@ -90,7 +115,7 @@ async def test_empty_search_renders_cached_ready_and_stale_sections_without_prov
     assert 'data-discover-state="ready"' in response.text
     assert 'data-discover-state="stale"' in response.text
     assert "Cached" in response.text
-    assert "This feed is currently empty" in response.text
+    assert "This feed is empty right now" in response.text
 
 
 async def test_discovery_fragment_requires_authentication(unauthenticated_client) -> None:
@@ -114,10 +139,10 @@ async def test_discovery_fragment_allowlist_errors_empty_and_exact_card_state(
         if feed == "new":
             return DiscoverySection(
                 feed,
-                "New releases",
+                "Fresh chart releases",
                 region,
                 "GLOBAL",
-                True,
+                False,
                 state="error",
                 message="Discovery provider is temporarily unavailable",
             )
@@ -136,7 +161,7 @@ async def test_discovery_fragment_allowlist_errors_empty_and_exact_card_state(
                     "release-artist",
                 ),
             )
-        return DiscoverySection(feed, feed.title(), region, "GLOBAL", True, items)
+        return DiscoverySection(feed, feed.title(), region, "GLOBAL", False, items)
 
     async def project(_db, identities):
         projections.append(identities)
@@ -161,6 +186,8 @@ async def test_discovery_fragment_allowlist_errors_empty_and_exact_card_state(
     assert 'href="/search#discovery-new"' in failed.text
     assert "data-discover-retry" in failed.text
     assert "Exact Artist" in ready.text
+    assert "Provider-wide" in ready.text
+    assert "Global fallback" not in ready.text
     assert 'name="csrf_token"' in ready.text
     assert 'name="provider_id" value="exact-artist"' in ready.text
     assert 'name="return_to" value="/search#discovery-popular"' in ready.text
@@ -191,7 +218,7 @@ async def test_dedicated_discovery_routes_bound_page_and_genre(client, monkeypat
             if feed == "genres"
             else ArtistHit("deezer", "artist-page", "Paged Artist")
         )
-        return DiscoverySection(feed, feed.title(), region, "GLOBAL", True, (item,))
+        return DiscoverySection(feed, feed.title(), region, "GLOBAL", False, (item,))
 
     monkeypatch.setattr(search_router.discovery_service, "get", get)
 
@@ -214,7 +241,7 @@ async def test_genre_next_link_uses_explicit_continuation_contract(client, monke
             "Genre artists",
             region,
             "GLOBAL",
-            True,
+            False,
             tuple(ArtistHit("deezer", str(index), f"Artist {index}") for index in range(1, 13)),
             has_next=False,
         )
@@ -237,7 +264,7 @@ async def test_poster_cards_and_dedicated_genre_use_operate_contract(client, mon
                 "Jazz",
                 region,
                 "GLOBAL",
-                True,
+                False,
                 (
                     ArtistHit(
                         "deezer",
@@ -255,11 +282,11 @@ async def test_poster_cards_and_dedicated_genre_use_operate_contract(client, mon
                 "Genres",
                 region,
                 "GLOBAL",
-                True,
+                False,
                 (DiscoveryGenre("deezer", "132", "Pop"),),
                 has_next=False,
             )
-        return DiscoverySection(feed, feed.title(), region, "GLOBAL", True, (), has_next=False)
+        return DiscoverySection(feed, feed.title(), region, "GLOBAL", False, (), has_next=False)
 
     monkeypatch.setattr(search_router.discovery_service, "get", get)
     genre = await client.get("/discover/genres/132")
@@ -293,6 +320,9 @@ async def test_advanced_search_skips_discovery_network(client, monkeypatch) -> N
 
     assert response.status_code == 200
     assert "Manual search" in response.text
+    assert '<section class="card manual-search-panel"' in response.text
+    assert '<section class="discover-feed-collection"' not in response.text
+    assert 'href="/search?tab=advanced" aria-current="page"' in response.text
 
 
 async def test_provider_preview_is_read_only_and_has_csrf_watch_form(client, monkeypatch) -> None:
