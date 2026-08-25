@@ -43,7 +43,11 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
-from app.database import register_transaction_callbacks, run_with_sqlite_lock_retry
+from app.database import (
+    discard_transaction_callbacks,
+    register_transaction_callbacks,
+    run_with_sqlite_lock_retry,
+)
 from app.http import stream_with_retry
 from app.media_formats import is_importable_audio, supported_audio_formats_display
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
@@ -1018,12 +1022,19 @@ async def retag_catalog_album(
             after_rollback=transaction.after_rollback,
         )
     except Exception:
+        discard_transaction_callbacks(
+            db,
+            after_commit=transaction.after_commit,
+            after_rollback=transaction.after_rollback,
+        )
         try:
             transaction.after_rollback()
-        finally:
-            # The route converts unexpected failures into an error redirect, so
-            # roll back ORM mutations here before the dependency can commit them.
+        except Exception:
+            logger.exception("retag rollback cleanup failed after callback registration error")
+        try:
             await db.rollback()
+        except Exception:
+            logger.exception("database rollback failed after callback registration error")
         raise
     return transaction.result
 

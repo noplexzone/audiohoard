@@ -435,20 +435,45 @@ async def test_retag_catalog_album_restores_files_when_request_commit_fails(
     assert not list(paths[0].parent.glob(".*.retag-backup"))
 
 
+@pytest.mark.parametrize("cleanup_raises", [False, True])
 async def test_retag_catalog_album_restores_files_when_callback_registration_fails(
-    db_session: AsyncSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    db_session: AsyncSession,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_raises: bool,
 ) -> None:
     library_root = tmp_path / "library"
     album, paths, _tracks = await _seed_imported_album(db_session, library_root)
     original_bytes = [path.read_bytes() for path in paths]
+    rollback_calls: list[str] = []
+    original_retag = library_import_module._retag_catalog_album_files
+    original_register = library_import_module.register_transaction_callbacks
+
+    def counted_retag(*args, **kwargs):
+        transaction = original_retag(*args, **kwargs)
+
+        def rollback() -> None:
+            rollback_calls.append("rollback")
+            transaction.after_rollback()
+            if cleanup_raises:
+                raise OSError("rollback cleanup failed")
+
+        return library_import_module._RetagFilesystemTransaction(
+            result=transaction.result,
+            after_commit=transaction.after_commit,
+            after_rollback=rollback,
+        )
 
     def fail_registration(*args, **kwargs) -> None:
+        original_register(*args, **kwargs)
         raise RuntimeError("callback registration failed")
 
+    monkeypatch.setattr(library_import_module, "_retag_catalog_album_files", counted_retag)
     monkeypatch.setattr(library_import_module, "register_transaction_callbacks", fail_registration)
     with pytest.raises(RuntimeError, match="callback registration failed"):
         await retag_catalog_album(db_session, album.id, library_root=library_root)
 
+    assert rollback_calls == ["rollback"]
     assert [path.read_bytes() for path in paths] == original_bytes
     assert not list(paths[0].parent.glob(".*.retag-backup"))
     probe = paths[0].with_suffix(".probe")
