@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}Discography batch #{{ batch.id }} — Audiohoard{% endblock %}
+{% block content %}
+{% set csrf_token = request.cookies.get('csrf', '') | e %}
+{% set state_label = batch.state.value | replace('_', ' ') | title %}
+{% set reason_labels = {
+  'already_complete': 'Already complete',
+  'already_active': 'Acquisition already active',
+  'catalog_release_unbound': 'Release is not linked to the catalog',
+  'duplicate_catalog_album': 'Duplicate edition of the same catalog release',
+  'catalog_manifest_missing': 'Track list needs hydration',
+  'catalog_manifest_incomplete': 'Track list is incomplete',
+  'catalog_manifest_overfull': 'Track list needs reconciliation',
+  'catalog_manifest_invalid_positions': 'Track positions need reconciliation',
+  'hydration_failed': 'Track list hydration failed',
+  'batch_cancelled': 'Cancelled with this batch',
+  'active_jobs': 'Waiting for active acquisition jobs',
+  'verified_complete': 'Verified complete'
+} %}
+<nav class="breadcrumb"><a href="/wanted">Wanted</a> / Batch #{{ batch.id }}</nav>
+<header class="batch-header">
+  <div>
+    <p class="eyebrow">{{ 'Preview' if batch.state.value == 'preview' else 'Discography batch' }}</p>
+    <h1>{{ 'Review batch' if batch.state.value == 'preview' else 'Batch status' }}</h1>
+    <p class="batch-state-line"><span class="badge {% if batch.state.value in ['completed'] %}ok{% elif batch.state.value in ['completed_with_failures', 'cancelled'] %}warn{% elif batch.state.value == 'paused' %}pending{% else %}info{% endif %}">{{ state_label }}</span> <span>Batch #{{ batch.id }}</span></p>
+  </div>
+  <div class="batch-primary-actions" aria-label="Batch controls">
+    {% if batch.state.value == 'preview' %}
+    <form method="post" action="/discography-batches/{{ batch.id }}/confirm">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit">Confirm and queue</button>
+    </form>
+    {% elif batch.state.value in ['queued', 'running'] %}
+    <form method="post" action="/discography-batches/{{ batch.id }}/pause"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn" type="submit">Pause batch</button></form>
+    <form method="post" action="/discography-batches/{{ batch.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn danger" type="submit">Cancel pending</button></form>
+    {% elif batch.state.value == 'paused' %}
+    <form method="post" action="/discography-batches/{{ batch.id }}/resume"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn" type="submit">Resume batch</button></form>
+    <form method="post" action="/discography-batches/{{ batch.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn danger" type="submit">Cancel pending</button></form>
+    {% elif batch.state.value == 'completed_with_failures' %}
+    <form id="batch-retry-form" method="post" action="/discography-batches/{{ batch.id }}/retry">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit">Retry selected</button>
+    </form>
+    {% endif %}
+  </div>
+</header>
+
+{% if scope_changed %}<div class="alert warn" role="alert"><strong>Scope changed; review refreshed preview.</strong> No jobs were created. Confirm again when the refreshed list looks right.</div>{% endif %}
+{% if notice %}<div class="alert info" role="status">{{ notice }}</div>{% endif %}
+
+<section class="batch-scope" aria-labelledby="batch-scope-title">
+  <div>
+    <p class="eyebrow" id="batch-scope-title">Immutable scope</p>
+    {% if batch.scope_kind.value == 'artist' %}
+      <p><strong>Artist #{{ scope.artist_id }}</strong> · {{ scope.provider | title }} · {{ scope.release_type | replace('_', '/') | title }} · {{ scope.monitoring_status | title }}</p>
+      {% if scope.year_from or scope.year_to %}<p class="hint">Years {{ scope.year_from or 'earliest' }}–{{ scope.year_to or 'latest' }}</p>{% endif %}
+    {% elif batch.scope_kind.value == 'wanted_all_matching' %}
+      <p><strong>All Wanted matches</strong> · {{ scope.status | replace('-', ' ') | title }} · sorted by {{ scope.sort }}</p>
+      {% if scope.q %}<p class="hint">Search: “{{ scope.q }}”</p>{% endif %}
+    {% elif batch.scope_kind.value == 'wanted_page' %}
+      <p><strong>Wanted page snapshot</strong> · {{ scope.album_ids | length }} rendered release{% if scope.album_ids | length != 1 %}s{% endif %}</p>
+    {% else %}
+      <p><strong>Wanted selection</strong> · {{ scope.album_ids | length }} selected release{% if scope.album_ids | length != 1 %}s{% endif %}</p>
+    {% endif %}
+  </div>
+  {% if batch.state.value in ['queued', 'running'] %}<p class="batch-refresh-hint">Refresh this page for current progress.</p>{% endif %}
+</section>
+
+<div class="batch-count-rail" aria-label="Batch counts">
+  <div><strong>{{ display_counts.matching }}</strong><span>matching</span></div>
+  <div><strong>{{ display_counts.complete }}</strong><span>complete</span></div>
+  <div><strong>{{ display_counts.active }}</strong><span>active tracks</span></div>
+  <div><strong>{{ display_counts.hydration }}</strong><span>need track lists</span></div>
+  <div><strong>{{ display_counts.missing }}</strong><span>target tracks</span></div>
+  <div><strong>{{ display_counts.estimated }}</strong><span>estimated job{% if display_counts.estimated != 1 %}s{% endif %}</span></div>
+</div>
+
+{% if batch.error_detail %}<details class="batch-technical-error"><summary>Batch error details</summary><p>{{ batch.error_detail }}</p></details>{% endif %}
+
+<section class="batch-release-list" aria-labelledby="batch-release-title">
+  <div class="section-heading"><h2 id="batch-release-title">Releases</h2><span>{{ items | length }} item{% if items | length != 1 %}s{% endif %}</span></div>
+  {% if items %}
+  <div class="batch-items" role="list">
+    {% for row in items %}{% set item = row.item %}
+    <article class="batch-item" role="listitem">
+      {% if batch.state.value == 'completed_with_failures' and item.state in retryable_states %}
+      <label class="batch-item-select checkbox-control"><input type="checkbox" name="item_ids" value="{{ item.id }}" form="batch-retry-form"><span class="sr-only">Retry {{ item.release_title }}</span></label>
+      {% endif %}
+      <div class="batch-item-art" aria-hidden="true">
+        {% if row.artwork_url %}<img loading="lazy" src="/artwork?url={{ row.artwork_url | urlencode }}" alt="">{% else %}<span>{{ item.release_title[:2] | upper }}</span>{% endif %}
+      </div>
+      <div class="batch-item-main">
+        <div class="batch-item-heading">
+          <div>
+            <h3>{% if row.album_id %}<a href="/albums/{{ row.album_id }}">{{ item.release_title }}</a>{% else %}{{ item.release_title }}{% endif %}</h3>
+            <p class="muted-line">{% if row.artist_id %}<a href="/artists/catalog/{{ row.artist_id }}">{{ item.artist_name }}</a>{% else %}{{ item.artist_name }}{% endif %}{% if item.release_year %} · {{ item.release_year }}{% endif %}{% if item.release_kind %} · {{ item.release_kind | replace('_', '/') | title }}{% endif %}</p>
+          </div>
+          <span class="badge {% if item.state.value == 'complete' %}ok{% elif item.state.value in ['failed', 'cancelled'] %}warn{% elif item.state.value in ['pending', 'hydrating', 'expanding', 'waiting'] %}info{% else %}neutral{% endif %}">{{ item.state.value | replace('_', ' ') | title }}</span>
+        </div>
+        {% if item.reason_code %}<p class="batch-item-reason">{{ reason_labels.get(item.reason_code, item.reason_code | replace('_', ' ') | title) }}</p>{% endif %}
+        <dl class="batch-item-counts">
+          <div><dt>Target</dt><dd>{{ item.target_count }}</dd></div>
+          <div><dt>Active</dt><dd>{{ item.active_count }}</dd></div>
+          <div><dt>Estimated</dt><dd>{{ item.estimated_job_count }}</dd></div>
+          <div><dt>Linked jobs</dt><dd>{{ row.job_count }}</dd></div>
+        </dl>
+        {% if row.job_statuses %}<p class="hint">{% for status, count in row.job_statuses.items() %}{{ count }} {{ status | replace('_', ' ') }}{% if not loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
+        {% if item.error_detail %}<details class="batch-item-error"><summary>Error details</summary><p>{{ item.error_detail }}</p></details>{% endif %}
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}<div class="empty-state" role="status"><p>No releases currently match this immutable scope.</p></div>{% endif %}
+</section>
+{% endblock %}

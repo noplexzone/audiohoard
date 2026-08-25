@@ -2925,3 +2925,90 @@ a.metric-card:hover {
   .settings-nav { position: static; grid-auto-flow: column; grid-auto-columns: minmax(max-content, 1fr); overflow-x: auto; }
   .settings-save-bar { bottom: calc(var(--mobile-nav-height) + .5rem); }
 }
+
+/* Discography batch preview and status */
+.batch-header, .batch-scope, .batch-item-heading, .section-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+.batch-header { margin-block: var(--space-4) var(--space-5); }
+.batch-header h1, .batch-release-list h2 { margin: 0; }
+.batch-state-line { display: flex; align-items: center; gap: var(--space-2); color: var(--muted); }
+.batch-primary-actions, .batch-primary-actions form { display: flex; flex-wrap: wrap; gap: var(--space-2); margin: 0; }
+.batch-primary-actions .btn { min-height: 44px; }
+.batch-scope { padding: var(--space-4) 0; border-block: 1px solid var(--border); }
+.batch-scope p { margin: var(--space-1) 0; }
+.batch-refresh-hint { color: var(--muted); text-align: right; }
+.batch-count-rail {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 1px;
+  margin-block: var(--space-5);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--border);
+}
+.batch-count-rail div { min-width: 0; padding: var(--space-3); background: var(--surface); }
+.batch-count-rail strong, .batch-count-rail span { display: block; }
+.batch-count-rail strong { font-size: 1.35rem; }
+.batch-count-rail span { margin-top: var(--space-1); color: var(--muted); font-size: .78rem; line-height: 1.25; }
+.batch-technical-error, .batch-item-error { color: var(--muted); }
+.batch-technical-error p, .batch-item-error p { overflow-wrap: anywhere; color: var(--danger); white-space: pre-wrap; }
+.batch-release-list { min-width: 0; }
+.section-heading { align-items: baseline; margin-bottom: var(--space-3); color: var(--muted); }
+.batch-items { border-top: 1px solid var(--border); }
+.batch-item {
+  position: relative;
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: var(--space-4);
+  min-width: 0;
+  padding-block: var(--space-4);
+  border-bottom: 1px solid var(--border-soft);
+}
+.batch-item:has(.batch-item-select) { grid-template-columns: 28px 72px minmax(0, 1fr); }
+.batch-item-select { align-self: center; min-width: 28px; min-height: 44px; }
+.batch-item-art {
+  display: grid;
+  place-items: center;
+  width: 72px;
+  height: 72px;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--muted);
+  font-weight: 700;
+}
+.batch-item-art img { width: 100%; height: 100%; object-fit: cover; }
+.batch-item-main, .batch-item-heading > div { min-width: 0; }
+.batch-item h3 { margin: 0 0 var(--space-1); overflow-wrap: anywhere; }
+.batch-item-heading .badge { flex: 0 0 auto; }
+.batch-item-reason { margin-block: var(--space-2); color: var(--muted); }
+.batch-item-counts { display: flex; flex-wrap: wrap; gap: var(--space-3) var(--space-5); margin: var(--space-3) 0 0; }
+.batch-item-counts div { display: flex; gap: var(--space-2); }
+.batch-item-counts dt { color: var(--muted); }
+.batch-item-counts dd { margin: 0; font-weight: 650; }
+@media (max-width: 900px) {
+  .batch-count-rail { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .batch-header, .batch-scope { align-items: stretch; flex-direction: column; }
+  .batch-primary-actions, .batch-primary-actions form, .batch-primary-actions .btn { width: 100%; }
+  .batch-refresh-hint { text-align: left; }
+  .batch-count-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .batch-item, .batch-item:has(.batch-item-select) { grid-template-columns: 56px minmax(0, 1fr); gap: var(--space-3); }
+  .batch-item:has(.batch-item-select) .batch-item-select {
+    position: absolute;
+    z-index: 1;
+    top: var(--space-4);
+    left: 0;
+    padding: var(--space-2);
+    border-radius: 999px;
+    background: var(--surface);
+  }
+  .batch-item-art { width: 56px; height: 56px; }
+  .batch-item-heading { flex-direction: column-reverse; gap: var(--space-2); }
+}
