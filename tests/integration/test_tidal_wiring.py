@@ -73,7 +73,7 @@ async def test_tidal_health_search_job_and_settings_wiring(
     jobs_redirect = await client.get("/jobs/ui/list")
     assert jobs_redirect.status_code in {307, 308}
     jobs_page = await client.get(jobs_redirect.headers["location"])
-    search_page = await client.get("/search")
+    search_page = await client.get("/search?tab=advanced")
     assert 'data-test-provider="tidal"' in settings_page.text
     assert ".tidal-dl.json" in settings_page.text and ".tidal-dl.token.json" in settings_page.text
     assert "direct TIDAL track URL" in settings_page.text

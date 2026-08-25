@@ -322,8 +322,8 @@ async def test_wanted_page_shows_partial_release_and_hides_fully_owned_release(
     assert "Complete Wanted Album" not in response.text
     assert "Nonwatchlisted Missing Album" not in response.text
     assert "Explicitly Unwatched Album" not in response.text
-    assert "Preview this page" in response.text
-    assert ">Queue all<" not in response.text
+    assert "Queue this page" in response.text
+    assert "Queue all 2 matches" in response.text
     assert 'name="status"' in response.text
     assert "Needs search" in response.text
     assert "tab=advanced" in response.text
@@ -542,7 +542,7 @@ async def test_wanted_queue_all_matching_enqueues_beyond_current_page(
     ids = await _seed_wanted_view_releases()
     page = await client.get("/wanted?per_page=1")
     assert page.status_code == 200
-    assert "Preview all 2 matches" in page.text
+    assert "Queue all 2 matches" in page.text
     dispatched: list[int] = []
 
     async def fake_dispatch(job_id: int) -> None:
@@ -958,13 +958,13 @@ async def test_catalog_artist_unifies_release_progress_on_existing_cards(
     assert "0 / 2 downloaded" not in response.text
     assert "0 / 0 downloaded" not in response.text
     assert f'href="/albums/{partial_id}"' in response.text
-    assert 'action="/discography-batches/preview"' in response.text
+    assert 'action="/discography-batches/queue"' in response.text
     assert 'name="scope_kind" value="artist"' in response.text
     assert f'name="artist_id" value="{artist_id}"' in response.text
     assert 'name="provider" value="musicbrainz"' in response.text
     assert 'name="release_type" value="all"' in response.text
     assert 'name="monitoring_status" value="monitored"' in response.text
-    assert "Preview watchlisted releases" in response.text
+    assert "Queue watchlisted releases" in response.text
 
 
 async def test_catalog_artist_enrich_queues_without_running_inline(

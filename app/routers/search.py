@@ -241,6 +241,7 @@ async def search_page(
         requested = metadata_providers
     else:
         requested = [provider] if provider in metadata_providers else []
+    await db.rollback()
     catalog_outcomes = []
     primary_error = None
     discovery_sections = []

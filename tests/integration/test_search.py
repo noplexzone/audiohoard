@@ -129,7 +129,7 @@ async def test_manual_search_requires_visible_source_selection(client: AsyncClie
         "/search?tab=advanced&artist=Massive+Attack&album=Mezzanine&track=Teardrop&expected_duration_sec=331&preferred_format=flac"
     )
     assert page.status_code == 200
-    assert "<h1>Discover</h1>" in page.text
+    assert "<h1>Manual search</h1>" in page.text
     assert "Manual search" in page.text
     assert 'value="Massive Attack"' in page.text
     csrf = client.cookies.get("csrf")
