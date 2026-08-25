@@ -158,6 +158,7 @@ class DiscographyBatchRunner:
                         .values(
                             state=DiscographyBatchItemState.expanding,
                             heartbeat_at=datetime.now(UTC),
+                            reason_code=None,
                         )
                     )
                     if not isinstance(result, CursorResult) or result.rowcount != 1:
@@ -255,7 +256,6 @@ class DiscographyBatchRunner:
                     state=DiscographyBatchItemState.pending,
                     lease_token=None,
                     heartbeat_at=None,
-                    reason_code=None,
                 )
             )
             await db.commit()

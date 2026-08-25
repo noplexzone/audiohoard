@@ -280,6 +280,43 @@ async def test_stale_lease_token_cannot_transition_after_hydration(tmp_path: Pat
     await engine.dispose()
 
 
+async def test_expired_hydration_lease_retries_hydration(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'hydrate-reclaim.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    _batch_id, item_id = await _seed(factory)
+    async with factory() as db:
+        item = await db.get(DiscographyBatchItem, item_id)
+        assert item is not None
+        item.state = DiscographyBatchItemState.hydrating
+        item.reason_code = "catalog_manifest_missing"
+        item.lease_token = "expired-hydrator"
+        item.heartbeat_at = datetime.now(UTC) - timedelta(minutes=10)
+        await db.commit()
+
+    hydrated: list[tuple[int, str]] = []
+
+    async def hydrate(claimed_item_id: int, lease_token: str) -> None:
+        hydrated.append((claimed_item_id, lease_token))
+
+    runner = DiscographyBatchRunner(
+        factory,
+        dispatcher=lambda _job_id: None,
+        hydration_callback=hydrate,
+        quality_profile=PROFILE,
+    )
+    assert await runner.run_once()
+    assert len(hydrated) == 1
+    assert hydrated[0][0] == item_id
+    assert hydrated[0][1] != "expired-hydrator"
+    async with factory() as db:
+        current = await db.get(DiscographyBatchItem, item_id)
+        assert current is not None
+        assert current.reason_code == "active_jobs"
+    await engine.dispose()
+
+
 async def test_expired_lease_reclaim_fences_old_owner(tmp_path: Path) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'reclaim.db'}")
     async with engine.begin() as connection:
