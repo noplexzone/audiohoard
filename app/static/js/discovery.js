@@ -54,7 +54,11 @@
           if (!response.ok) throw new Error("fragment request failed");
           const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
           if (contentType !== "text/html") throw new Error("invalid fragment content type");
-          const documentFragment = new DOMParser().parseFromString(await response.text(), "text/html");
+          const markup = (await response.text()).trim();
+          if (!/^<section(?:\s|>)/i.test(markup) || !/<\/section\s*>$/i.test(markup)) {
+            throw new Error("invalid fragment document shape");
+          }
+          const documentFragment = new DOMParser().parseFromString(markup, "text/html");
           const topLevel = documentFragment.body.children;
           const fresh = topLevel.length === 1 && topLevel[0].matches("[data-discover-section]")
             ? topLevel[0]
