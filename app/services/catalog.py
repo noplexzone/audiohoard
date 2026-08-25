@@ -9,19 +9,27 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from sqlalchemy import String, and_, case, cast, exists, func, literal, or_, select
+from sqlalchemy import String, and_, case, cast, exists, func, literal, or_, select, text
 from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import run_with_sqlite_lock_retry
 from app.media_formats import IMPORTABLE_AUDIO_SUFFIXES
+from app.models.acquisition_claim import AcquisitionDispatchClaim
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
     CatalogAlbumTrack,
     CatalogArtist,
     CatalogArtistIdentity,
+)
+from app.models.discography_batch import (
+    DiscographyBatchItem,
+    DiscographyBatchItemJob,
+    DiscographyBatchItemState,
+    DiscographyJobOwnership,
 )
 from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
@@ -31,6 +39,7 @@ from app.models.track import Track
 from app.models.workflow import AcquisitionState, ImportWorkflowState, ReviewDecision
 from app.naming.convention import _sanitize_segment
 from app.services.catalog_artist_credits import catalog_track_artist_name
+from app.services.catalog_manifest import catalog_manifest_issue
 from app.services.release_editions import project_release_families
 from app.settings_service import QualityProfile, get_runtime_settings
 
@@ -840,59 +849,263 @@ async def queue_catalog_album_missing_track_jobs(
     library_root: Path | None = None,
     quality_profile: QualityProfile,
 ) -> list[int]:
-    """Create per-track priority jobs for missing or sub-quality catalog album tracks.
+    """Compatibility wrapper returning only newly committed ordinary job IDs."""
+    outcome = await expand_catalog_album_missing_track_jobs(
+        db, album, library_root=library_root, quality_profile=quality_profile
+    )
+    return list(outcome.created_job_ids)
 
-    This intentionally never creates an album-level job. Every queued job is scoped
-    to a concrete ``catalog_track_id`` so partial releases do not reacquire complete albums.
-    """
+
+@dataclass(frozen=True, slots=True)
+class CatalogQueueOutcome:
+    created_job_ids: tuple[int, ...]
+    observed_job_ids: tuple[int, ...]
+    complete_track_ids: frozenset[int]
+    hydration_required: bool
+    missing_count: int
+
+
+_EXPANSION_ELIGIBLE_ITEM_STATES = frozenset(
+    {
+        DiscographyBatchItemState.preview,
+        DiscographyBatchItemState.pending,
+        DiscographyBatchItemState.hydrating,
+        DiscographyBatchItemState.expanding,
+        DiscographyBatchItemState.waiting,
+        DiscographyBatchItemState.failed,
+    }
+)
+_ACTIVE_JOB_STATUSES = (JobStatus.pending, JobStatus.running)
+_TERMINAL_JOB_STATUSES = (
+    JobStatus.done,
+    JobStatus.failed,
+    JobStatus.partial,
+    JobStatus.cancelled,
+)
+
+
+def _item_is_expansion_eligible(item: DiscographyBatchItem) -> bool:
+    return item.state in _EXPANSION_ELIGIBLE_ITEM_STATES or (
+        item.state == DiscographyBatchItemState.skipped and item.reason_code == "already_active"
+    )
+
+
+async def _link_discography_job(
+    db: AsyncSession,
+    item_id: int | None,
+    job_id: int,
+    ownership: DiscographyJobOwnership,
+) -> None:
+    if item_id is None:
+        return
+    existing = await db.scalar(
+        select(DiscographyBatchItemJob.id).where(
+            DiscographyBatchItemJob.item_id == item_id,
+            DiscographyBatchItemJob.job_id == job_id,
+        )
+    )
+    if existing is None:
+        db.add(DiscographyBatchItemJob(item_id=item_id, job_id=job_id, ownership=ownership))
+
+
+async def expand_catalog_album_missing_track_jobs(
+    db: AsyncSession,
+    album: CatalogAlbum,
+    *,
+    quality_profile: QualityProfile,
+    batch_item_id: int | None = None,
+    max_new_jobs: int = 25,
+    library_root: Path | None = None,
+) -> CatalogQueueOutcome:
+    """Create or observe exact ordinary jobs behind the acquisition claim fence."""
+    album_id = album.id
+    if album_id is None:
+        raise ValueError("catalog album must be persisted")
+    new_job_limit = max(0, min(int(max_new_jobs), 25))
+
+    # The filesystem-sensitive quality projection precedes the short writer reservation.
     projection = (
         await project_catalog_album_queue_targets(
             db,
-            [album.id],
+            [album_id],
             library_root=library_root,
             quality_profile=quality_profile,
         )
-    )[album.id]
-    tracks_to_queue = list(
-        (
-            await db.scalars(
-                select(CatalogAlbumTrack)
-                .where(CatalogAlbumTrack.id.in_(projection.target_track_ids))
-                .order_by(CatalogAlbumTrack.disc, CatalogAlbumTrack.position, CatalogAlbumTrack.id)
-            )
-        ).all()
+    )[album_id]
+    projected_quality_targets = set(projection.target_track_ids) & set(
+        projection.imported_track_ids
     )
-    job_specs = [
-        (
-            " ".join(
-                part for part in (catalog_track_artist_name(album, track), track.title) if part
-            ),
-            album.id,
-            track.id,
-        )
-        for track in tracks_to_queue
-    ]
-    job_ids: list[int] = []
+    await db.commit()
 
-    async def insert_jobs() -> None:
-        nonlocal job_ids
-        attempt_ids: list[int] = []
-        for query, album_id, track_id in job_specs:
-            job = Job(
+    created: list[int] = []
+    observed: list[int] = []
+    complete_track_ids: frozenset[int] = frozenset()
+    hydration_required = False
+    missing_count = 0
+
+    async def reserve_and_expand() -> None:
+        nonlocal complete_track_ids, hydration_required, missing_count
+        created.clear()
+        observed.clear()
+        complete_track_ids = frozenset()
+        hydration_required = False
+        missing_count = 0
+        await db.execute(text("BEGIN IMMEDIATE"))
+        current_album = await db.scalar(
+            select(CatalogAlbum)
+            .where(CatalogAlbum.id == album_id)
+            .options(selectinload(CatalogAlbum.artist))
+        )
+        if current_album is None:
+            raise ValueError("catalog album does not exist")
+        tracks = list(
+            (
+                await db.scalars(
+                    select(CatalogAlbumTrack)
+                    .where(CatalogAlbumTrack.album_id == album_id)
+                    .order_by(
+                        CatalogAlbumTrack.disc,
+                        CatalogAlbumTrack.position,
+                        CatalogAlbumTrack.id,
+                    )
+                )
+            ).all()
+        )
+        expected_count = current_album.track_count
+        if batch_item_id is not None:
+            item = await db.get(DiscographyBatchItem, batch_item_id)
+            if item is None:
+                raise ValueError("discography batch item does not exist")
+            if item.catalog_album_id != album_id:
+                raise ValueError("discography batch item belongs to a different catalog album")
+            if not _item_is_expansion_eligible(item):
+                raise ValueError("discography batch item is not expansion-eligible")
+            if item.provider_release_id is not None:
+                provider_expected = await db.scalar(
+                    select(CatalogAlbumProvider.track_count).where(
+                        CatalogAlbumProvider.id == item.provider_release_id
+                    )
+                )
+                expected_count = max(expected_count or 0, provider_expected or 0) or None
+
+        if catalog_manifest_issue(tracks, expected_count) is not None:
+            hydration_required = True
+            complete_track_ids = frozenset(projection.imported_track_ids)
+            await db.commit()
+            return
+
+        progress = (await get_release_progress(db, [album_id]))[album_id]
+        imported_ids = set(progress.downloaded_catalog_track_ids)
+        manifest_ids = {track.id for track in tracks}
+        target_ids = {
+            track_id
+            for track_id in manifest_ids
+            if track_id not in imported_ids or track_id in projected_quality_targets
+        }
+        missing_count = len(target_ids)
+        complete_track_ids = frozenset(manifest_ids - target_ids)
+
+        for track in tracks:
+            if track.id not in target_ids:
+                continue
+            claim = (
+                await db.execute(
+                    select(AcquisitionDispatchClaim, Job)
+                    .outerjoin(Job, Job.id == AcquisitionDispatchClaim.job_id)
+                    .where(
+                        AcquisitionDispatchClaim.catalog_album_id == album_id,
+                        AcquisitionDispatchClaim.catalog_track_id == track.id,
+                    )
+                )
+            ).one_or_none()
+            if claim is not None:
+                claim_row, owner = claim
+                if owner is not None and owner.status in _ACTIVE_JOB_STATUSES:
+                    observed.append(owner.id)
+                    await _link_discography_job(
+                        db, batch_item_id, owner.id, DiscographyJobOwnership.observed
+                    )
+                    continue
+                if owner is None:
+                    await db.delete(claim_row)
+                    await db.flush()
+            if len(created) >= new_job_limit:
+                continue
+
+            query = " ".join(
+                part
+                for part in (catalog_track_artist_name(current_album, track), track.title)
+                if part
+            )
+            contender = Job(
                 source="priority",
                 query=query,
                 status=JobStatus.pending,
                 catalog_album_id=album_id,
-                catalog_track_id=track_id,
+                catalog_track_id=track.id,
             )
-            db.add(job)
+            db.add(contender)
             await db.flush()
-            attempt_ids.append(job.id)
-        await db.commit()
-        job_ids = attempt_ids
+            claimed_id = await db.scalar(
+                sqlite_insert(AcquisitionDispatchClaim)
+                .values(
+                    catalog_album_id=album_id,
+                    catalog_track_id=track.id,
+                    job_id=contender.id,
+                )
+                .on_conflict_do_update(
+                    index_elements=["catalog_album_id", "catalog_track_id"],
+                    set_={"job_id": contender.id},
+                    where=or_(
+                        AcquisitionDispatchClaim.job_id == contender.id,
+                        exists(
+                            select(Job.id).where(
+                                Job.id == AcquisitionDispatchClaim.job_id,
+                                Job.status.in_(_TERMINAL_JOB_STATUSES),
+                            )
+                        ),
+                    ),
+                )
+                .returning(AcquisitionDispatchClaim.job_id)
+            )
+            if claimed_id == contender.id:
+                created.append(contender.id)
+                await _link_discography_job(
+                    db, batch_item_id, contender.id, DiscographyJobOwnership.created
+                )
+                continue
 
-    await run_with_sqlite_lock_retry(db, insert_jobs, attempts=6, delay_seconds=0.2)
-    return job_ids
+            await db.delete(contender)
+            await db.flush()
+            winner_id = await db.scalar(
+                select(AcquisitionDispatchClaim.job_id)
+                .join(Job, Job.id == AcquisitionDispatchClaim.job_id)
+                .where(
+                    AcquisitionDispatchClaim.catalog_album_id == album_id,
+                    AcquisitionDispatchClaim.catalog_track_id == track.id,
+                    Job.status.in_(_ACTIVE_JOB_STATUSES),
+                )
+            )
+            if winner_id is None:
+                raise RuntimeError("exact acquisition claim lost without an active owner")
+            observed.append(int(winner_id))
+            await _link_discography_job(
+                db, batch_item_id, int(winner_id), DiscographyJobOwnership.observed
+            )
+        await db.commit()
+
+    try:
+        await run_with_sqlite_lock_retry(db, reserve_and_expand, attempts=6, delay_seconds=0.2)
+    except Exception:
+        await db.rollback()
+        raise
+    return CatalogQueueOutcome(
+        created_job_ids=tuple(created),
+        observed_job_ids=tuple(observed),
+        complete_track_ids=complete_track_ids,
+        hydration_required=hydration_required,
+        missing_count=missing_count,
+    )
 
 
 async def get_library_stats(db: AsyncSession) -> LibraryStats:
