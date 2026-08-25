@@ -140,7 +140,7 @@ class DeezerClient:
             ]
         if feed == "genres":
             return [genre for row in valid if (genre := _parse_genre(row)) is not None]
-        releases: list[DiscoveryRelease] = []
+        releases: list[ArtistHit | DiscoveryGenre | DiscoveryRelease] = []
         seen_release_ids: set[str] = set()
         for row in valid:
             release = _parse_discovery_release(row)
