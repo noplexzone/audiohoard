@@ -49,9 +49,10 @@ def test_discover_progressive_fragments_retry_and_identity_validation(
             status=200,
             content_type="text/html",
             body=(
-                '<section id="discovery-genres" data-discover-section '
+                '<main><section id="discovery-popular" data-discover-section '
                 'data-discover-state="ready" '
-                'data-discover-fragment-url="/discover/fragments/genres">wrong</section>'
+                'data-discover-fragment-url="/discover/fragments/popular">'
+                "matching section inside a full page</section></main>"
             ),
         )
 

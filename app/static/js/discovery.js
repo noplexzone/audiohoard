@@ -55,7 +55,10 @@
           const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
           if (contentType !== "text/html") throw new Error("invalid fragment content type");
           const documentFragment = new DOMParser().parseFromString(await response.text(), "text/html");
-          const fresh = documentFragment.querySelector("[data-discover-section]");
+          const topLevel = documentFragment.body.children;
+          const fresh = topLevel.length === 1 && topLevel[0].matches("[data-discover-section]")
+            ? topLevel[0]
+            : null;
           const expectedUrl = container.dataset.discoverFragmentUrl;
           if (!fresh ||
               !["pending", "ready", "stale", "error"].includes(fresh.dataset.discoverState) ||
