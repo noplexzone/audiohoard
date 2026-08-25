@@ -139,7 +139,7 @@ def test_progressive_discovery_script_has_bounded_navigation_safe_fragment_contr
     assert "setInterval" not in script
 
 
-async def test_landing_sections_fail_independently_and_report_global_fallback() -> None:
+async def test_landing_sections_fail_independently_without_false_global_fallback() -> None:
     class PartialProvider(FakeDiscoveryProvider):
         async def discovery_feed(
             self,
@@ -163,7 +163,7 @@ async def test_landing_sections_fail_independently_and_report_global_fallback() 
     assert sections[0].state == sections[2].state == sections[3].state == "ready"
     assert all(section.requested_region == "JP" for section in sections)
     assert all(section.effective_region == "GLOBAL" for section in sections)
-    assert all(section.fallback_global for section in sections)
+    assert all(section.fallback_global is False for section in sections)
 
 
 async def test_deezer_discovery_maps_rank_release_identity_and_genre_pages(monkeypatch) -> None:
@@ -213,6 +213,119 @@ async def test_deezer_discovery_maps_rank_release_identity_and_genre_pages(monke
     assert isinstance(releases[0], DiscoveryRelease)
     assert releases[0].artist_provider_id == "9"
     assert releases[0].release_date == "2026-08-01"
+
+
+async def test_deezer_genres_skip_live_global_and_malformed_rows(monkeypatch) -> None:
+    provider = DeezerClient()
+    live_payload = {
+        "data": [
+            {"id": 0, "name": "All", "picture": "https://example.test/all.jpg"},
+            {"id": 132, "name": "Pop"},
+            {"id": "not-an-id", "name": "Malformed"},
+            {"id": 116, "name": "Rap/Hip Hop"},
+            {"id": 152, "name": ""},
+        ]
+    }
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com",
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=live_payload)),
+        ),
+    )
+
+    genres = await provider.discovery_feed("genres")
+
+    assert [(genre.provider_id, genre.name) for genre in genres] == [
+        ("132", "Pop"),
+        ("116", "Rap/Hip Hop"),
+    ]
+
+
+async def test_deezer_new_feed_uses_primary_release_contract_without_chart_fallback(
+    monkeypatch,
+) -> None:
+    requests: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.url.path, request.url.params.get("index")))
+        assert request.url.path == "/editorial/0/releases"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": 8,
+                        "title": "Primary release",
+                        "artist": {"id": 9, "name": "Artist"},
+                    }
+                ]
+            },
+        )
+
+    provider = DeezerClient()
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com", transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    releases = await provider.discovery_feed("new", limit=12)
+
+    assert [release.provider_id for release in releases] == ["8"]
+    assert requests == [("/editorial/0/releases", "0")]
+
+
+async def test_deezer_new_feed_falls_back_once_to_distinct_deduplicated_chart_slice(
+    monkeypatch,
+) -> None:
+    requests: list[tuple[str, str | None, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(
+            (request.url.path, request.url.params.get("index"), request.url.params.get("limit"))
+        )
+        if request.url.path == "/editorial/0/releases":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/chart/0/albums":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": 80,
+                            "title": "Fresh chart release",
+                            "artist": {"id": 90, "name": "Chart Artist"},
+                        },
+                        {
+                            "id": "80",
+                            "title": "Duplicate stable identity",
+                            "artist": {"id": 90, "name": "Chart Artist"},
+                        },
+                    ]
+                },
+            )
+        raise AssertionError(f"unexpected URL: {request.url}")
+
+    provider = DeezerClient()
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com", transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    releases = await provider.discovery_feed("new", limit=12)
+
+    assert [release.provider_id for release in releases] == ["80"]
+    assert requests == [
+        ("/editorial/0/releases", "0", "12"),
+        ("/chart/0/albums", "25", "12"),
+    ]
 
 
 async def test_deezer_discovery_rejects_http_200_error_envelope(monkeypatch) -> None:

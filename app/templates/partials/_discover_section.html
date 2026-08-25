@@ -2,7 +2,7 @@
   <div class="page-header">
     <div>
       <h2 id="discovery-{{ section.feed }}-heading">{{ section.title }}</h2>
-      {% if section.fallback_global %}<span class="badge info">Global fallback</span>{% endif %}
+      {% if section.state != 'pending' and section.effective_region == 'GLOBAL' %}<span class="badge info">Provider-wide</span>{% endif %}
       {% if section.state == 'stale' or section.stale %}<span class="badge info">Cached</span>{% endif %}
     </div>
     <a class="btn secondary" href="/discover/{{ section.feed }}">View all</a>

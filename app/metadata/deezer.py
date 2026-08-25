@@ -107,17 +107,30 @@ class DeezerClient:
         else:
             raise ValueError("Unknown discovery feed")
         params = {} if feed == "genres" else {"limit": limit, "index": index}
-        async with asyncio.timeout(12), self._client() as client:
-            response = await request_with_retry(client, "GET", path, params=params)
+
+        async def fetch_rows(
+            client: httpx.AsyncClient, request_path: str, request_params: dict[str, int]
+        ) -> list[object]:
+            response = await request_with_retry(client, "GET", request_path, params=request_params)
             response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise ValueError("Deezer returned an invalid discovery feed envelope")
-        if "error" in payload:
-            raise ValueError("Deezer returned an error envelope")
-        rows = payload.get("data")
-        if not isinstance(rows, list):
-            raise ValueError("Deezer returned an invalid discovery feed")
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Deezer returned an invalid discovery feed envelope")
+            if "error" in payload:
+                raise ValueError("Deezer returned an error envelope")
+            rows = payload.get("data")
+            if not isinstance(rows, list):
+                raise ValueError("Deezer returned an invalid discovery feed")
+            return rows
+
+        async with asyncio.timeout(12), self._client() as client:
+            rows = await fetch_rows(client, path, params)
+            if feed == "new" and not rows:
+                rows = await fetch_rows(
+                    client,
+                    "/chart/0/albums",
+                    {"limit": limit, "index": min(index + 25, 500)},
+                )
         valid = [row for row in rows[local_start : local_start + limit] if isinstance(row, dict)]
         if feed == "popular":
             return [
@@ -126,16 +139,21 @@ class DeezerClient:
                 if (artist := _parse_discovery_artist(row)) is not None and artist.name
             ]
         if feed == "genres":
-            return [
-                genre for row in valid if (genre := _parse_genre(row)).provider_id and genre.name
-            ]
-        return [
-            release
-            for row in valid
-            if (release := _parse_discovery_release(row)) is not None
-            and release.title
-            and release.artist_provider_id
-        ]
+            return [genre for row in valid if (genre := _parse_genre(row)) is not None]
+        releases: list[DiscoveryRelease] = []
+        seen_release_ids: set[str] = set()
+        for row in valid:
+            release = _parse_discovery_release(row)
+            if (
+                release is None
+                or not release.title
+                or not release.artist_provider_id
+                or release.provider_id in seen_release_ids
+            ):
+                continue
+            seen_release_ids.add(release.provider_id)
+            releases.append(release)
+        return releases
 
     async def genre_artist_candidates(self, genre_id: str) -> GenreArtistCandidates:
         """Return the complete bounded, ordered candidate pool for an exact genre."""
@@ -569,14 +587,15 @@ def _parse_discovery_artist(data: dict[str, object]) -> ArtistHit | None:
     return replace(_parse_artist(data), provider_id=artist_id, deezer_id=artist_id)
 
 
-def _parse_genre(data: dict[str, object]) -> DiscoveryGenre:
+def _parse_genre(data: dict[str, object]) -> DiscoveryGenre | None:
     genre_id = _positive_scalar_id(data.get("id"))
-    if genre_id is None:
-        raise ValueError("Deezer returned an invalid genre ID")
+    name = data.get("name")
+    if genre_id is None or not isinstance(name, str) or not name.strip():
+        return None
     return DiscoveryGenre(
         provider="deezer",
         provider_id=genre_id,
-        name=str(data.get("name") or ""),
+        name=name.strip(),
         artwork_url=str(data.get("picture_big") or data.get("picture_medium") or "") or None,
     )
 

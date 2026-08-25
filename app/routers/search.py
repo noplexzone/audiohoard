@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -104,25 +103,6 @@ def _group_card_states(
 def _native_return_to(request: Request, anchor: str = "discover-results") -> str:
     query = request.scope.get("query_string", b"").decode("ascii")
     return request.url.path + (f"?{query}" if query else "") + f"#{anchor}"
-
-
-@dataclass(frozen=True, slots=True)
-class MonitoredArtistSummary:
-    id: int
-    name: str
-
-
-async def _monitored_catalog_artists(db: AsyncSession) -> list[MonitoredArtistSummary]:
-    query = (
-        select(CatalogArtist.id, CatalogArtist.name)
-        .where(CatalogArtist.monitored.is_(True))
-        .order_by(CatalogArtist.name)
-        .limit(12)
-    )
-    return [
-        MonitoredArtistSummary(id=int(row.id), name=str(row.name))
-        for row in (await db.execute(query))
-    ]
 
 
 def _build_adapter(
@@ -261,8 +241,6 @@ async def search_page(
         requested = metadata_providers
     else:
         requested = [provider] if provider in metadata_providers else []
-    monitored_catalog_artists = await _monitored_catalog_artists(db)
-    await db.rollback()
     catalog_outcomes = []
     primary_error = None
     discovery_sections = []
@@ -292,7 +270,6 @@ async def search_page(
             "discovery_region": runtime.discovery_region,
             "watched_catalog_artists": watched_catalog_artists,
             "discover_return_to": _native_return_to(request),
-            "monitored_catalog_artists": monitored_catalog_artists,
             "watchlist_defaults": {
                 "watchlist_release_albums": runtime.default_watchlist_release_albums,
                 "watchlist_release_singles": runtime.default_watchlist_release_singles,

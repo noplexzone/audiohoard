@@ -53,20 +53,7 @@
   {% endif %}
 </section>
 {% if not catalog_query %}
-{% if monitored_catalog_artists %}
-<section class="discovery-section" aria-labelledby="continue-discography">
-  <div class="page-header"><div><h2 id="continue-discography">Continue building this discography</h2><p>Artists you monitor, kept separate by Audiohoard's stable catalog identity.</p></div><a class="btn secondary" href="/library">Open library</a></div>
-  <div class="discover-poster-grid">
-    {% for artist in monitored_catalog_artists %}
-    <article class="discover-poster-card">
-      <a class="discover-poster-link" href="/artists/catalog/{{ artist.id }}" aria-label="View known releases for {{ artist.name | e }}"><span class="discover-poster discover-poster-missing" aria-hidden="true"><strong>AH</strong><small>Monitored artist</small></span><span class="discover-poster-overlay"><span class="badge ok">Monitored</span></span></a>
-      <div class="discover-card-body"><h3><a href="/artists/catalog/{{ artist.id }}">{{ artist.name }}</a></h3><a class="btn discover-primary" href="/artists/catalog/{{ artist.id }}">View known releases</a></div>
-    </article>
-    {% endfor %}
-  </div>
-</section>
-{% endif %}
-<div class="discovery-region-note" role="status">Discovery region: <strong>{{ discovery_region }}</strong>. Global fallback is labeled below.</div>
+<div class="discovery-region-note" role="status">Deezer discovery feeds are provider-wide; requested scope: <strong>{{ discovery_region }}</strong>.</div>
 {% for section in discovery_sections %}
 {% include "partials/_discover_section.html" %}
 {% endfor %}
