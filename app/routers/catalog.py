@@ -37,6 +37,7 @@ from app.models.discography_batch import (
     DiscographyBatchItem,
     DiscographyBatchItemJob,
     DiscographyBatchItemState,
+    DiscographyBatchState,
     DiscographyScopeKind,
 )
 from app.models.import_plan import ImportPlan
@@ -83,6 +84,7 @@ from app.services.discography_batches import (
     create_discography_batch_preview,
     is_discography_batch_item_retryable,
     pause_discography_batch,
+    queue_discography_batch,
     resume_discography_batch,
     retry_discography_batch_items,
 )
@@ -1654,6 +1656,8 @@ def _discography_error(message: str) -> HTMLResponse:
 def _discography_notice(value: str) -> str | None:
     return {
         "confirmed": "Batch confirmed and queued.",
+        "queued": "Queued missing releases.",
+        "complete": "No missing release jobs were needed; this batch is complete.",
         "paused": "Batch paused. Running downloads were left alone.",
         "resumed": "Batch resumed.",
         "cancelled": "Batch cancelled. Pending batch-owned jobs were cancelled.",
@@ -1796,6 +1800,52 @@ async def preview_discography_batch_page(
     except DiscographyScopeError as exc:
         return _discography_error(str(exc))
     return RedirectResponse(f"/discography-batches/{preview.id}", status_code=303)
+
+
+@router.post("/discography-batches/queue", include_in_schema=False)
+async def queue_discography_batch_page(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[object, Depends(require_mutation)],
+) -> Response:
+    form = await request.form()
+    scope_kind = str(form.get("scope_kind", ""))
+    payload: dict[str, object]
+    if scope_kind == DiscographyScopeKind.artist:
+        payload = {
+            "artist_id": form.get("artist_id"),
+            "provider": form.get("provider", ""),
+            "release_type": form.get("release_type", "all"),
+            "year_from": form.get("year_from"),
+            "year_to": form.get("year_to"),
+            "monitoring_status": form.get("monitoring_status", "monitored"),
+        }
+    elif scope_kind in {
+        DiscographyScopeKind.wanted_selected,
+        DiscographyScopeKind.wanted_page,
+    }:
+        album_ids = list(form.getlist("catalog_album_ids"))
+        if not album_ids:
+            return _discography_error("Select at least one release to queue.")
+        payload = {"album_ids": album_ids}
+    elif scope_kind == DiscographyScopeKind.wanted_all_matching:
+        payload = {
+            "q": form.get("q", ""),
+            "sort": form.get("sort", "year"),
+            "status": form.get("status", "all"),
+        }
+    else:
+        return _discography_error("Choose a supported queue scope and try again.")
+    try:
+        batch = await queue_discography_batch(db, scope_kind, payload)
+    except DiscographyScopeError as exc:
+        return _discography_error(str(exc))
+    if batch.state == DiscographyBatchState.queued:
+        _wake_discography_batch_runner(request)
+        notice = "queued"
+    else:
+        notice = "complete"
+    return RedirectResponse(f"/discography-batches/{batch.id}?notice={notice}", status_code=303)
 
 
 @router.get("/discography-batches/{batch_id}", response_class=HTMLResponse)

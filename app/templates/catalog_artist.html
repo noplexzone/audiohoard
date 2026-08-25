@@ -65,7 +65,7 @@
           <button class="btn" type="submit">{% if artist.monitored %}Watchlisted ✓{% else %}Add to watchlist{% endif %}</button>
         </form>
         {% if artist.monitored %}
-        <form method="post" action="/discography-batches/preview">
+        <form method="post" action="/discography-batches/queue">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="scope_kind" value="artist">
           <input type="hidden" name="artist_id" value="{{ artist.id }}">
@@ -75,7 +75,7 @@
           <input type="hidden" name="year_to" value="">
           <input type="hidden" name="monitoring_status" value="monitored">
           <input type="hidden" name="sort" value="{{ sort }}">
-          <button class="btn secondary" type="submit">Preview watchlisted releases</button>
+          <button class="btn secondary" type="submit">Queue watchlisted releases</button>
         </form>
         <button class="btn secondary" type="button" data-open-watchlist>Configure watchlist</button>
         {% endif %}
