@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Queue failures – Audiohoard{% endblock %}
+{% block content %}
+<header class="page-header">
+  <div>
+    <p class="eyebrow">Acquisition recovery</p>
+    <h1>Queue failures</h1>
+    <p>Releases that failed before download jobs could be created.</p>
+  </div>
+  <a class="btn secondary" href="/activity">Back to Activity</a>
+</header>
+
+{% if failures.items %}
+<section aria-label="Queue failures">
+  {% for failure in failures.items %}
+  <div class="alert error">
+    <strong>{{ failure.release_title }}</strong> · {{ failure.artist_name }}<br>
+    {{ failure.error_detail }}
+    <a class="btn secondary" href="/discography-batches/{{ failure.batch_id }}">Review and retry</a>
+  </div>
+  {% endfor %}
+</section>
+<nav class="pagination" aria-label="Queue failure pages">
+  {% if failures.page > 1 %}<a class="btn secondary" href="/activity/queue-failures?page={{ failures.page - 1 }}">Previous</a>{% endif %}
+  <span>Page {{ failures.page }} of {{ failures.pages }}</span>
+  {% if failures.page < failures.pages %}<a class="btn secondary" href="/activity/queue-failures?page={{ failures.page + 1 }}">Next</a>{% endif %}
+</nav>
+{% else %}
+<div class="empty-state mini" role="status">
+  <h2>No queue failures</h2>
+  <p>Nothing needs recovery before download creation.</p>
+</div>
+{% endif %}
+{% endblock %}

@@ -33,6 +33,9 @@
     <a class="btn secondary" href="/discography-batches/{{ failure.batch_id }}">Review and retry</a>
   </div>
   {% endfor %}
+  {% if batch_failure_total > (batch_failures | length) %}
+  <p><a class="btn secondary" href="/activity/queue-failures">View all {{ batch_failure_total }} queue failures</a></p>
+  {% endif %}
 </section>
 {% endif %}
 

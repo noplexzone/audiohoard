@@ -118,15 +118,33 @@ def _batch_failures_query() -> Select[tuple[int, int, str, str, str | None, date
     )
 
 
-async def get_batch_failures(db: AsyncSession, *, limit: int = 20) -> list[BatchFailure]:
+@dataclass(frozen=True, slots=True)
+class BatchFailurePage:
+    items: list[BatchFailure]
+    total: int
+    page: int
+    per_page: int
+
+    @property
+    def pages(self) -> int:
+        return max(1, (self.total + self.per_page - 1) // self.per_page)
+
+
+async def get_batch_failure_page(
+    db: AsyncSession, *, page: int = 1, per_page: int = 20
+) -> BatchFailurePage:
+    page = max(1, page)
+    per_page = max(1, min(per_page, 100))
+    query = _batch_failures_query()
+    total = int(await db.scalar(select(func.count()).select_from(query.subquery())) or 0)
     rows = (
         await db.execute(
-            _batch_failures_query()
-            .order_by(DiscographyBatchItem.updated_at.desc(), DiscographyBatchItem.id.desc())
-            .limit(limit)
+            query.order_by(DiscographyBatchItem.updated_at.desc(), DiscographyBatchItem.id.desc())
+            .offset((page - 1) * per_page)
+            .limit(per_page)
         )
     ).all()
-    return [
+    items = [
         BatchFailure(
             batch_id=int(row.batch_id),
             item_id=int(row.item_id),
@@ -136,6 +154,7 @@ async def get_batch_failures(db: AsyncSession, *, limit: int = 20) -> list[Batch
         )
         for row in rows
     ]
+    return BatchFailurePage(items=items, total=total, page=page, per_page=per_page)
 
 
 @dataclass(frozen=True, slots=True)

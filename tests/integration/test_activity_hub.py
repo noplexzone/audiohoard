@@ -81,6 +81,45 @@ async def test_activity_surfaces_pre_materialization_batch_failures(client: Asyn
     assert "Review and retry" in response.text
 
 
+async def test_all_batch_failures_remain_discoverable_beyond_activity_preview(
+    client: AsyncClient,
+) -> None:
+    factory = get_session_factory()
+    async with factory() as db:
+        for index in range(21):
+            batch = DiscographyBatch(
+                scope_kind=DiscographyScopeKind.artist,
+                scope_json="{}",
+                scope_hash=f"activity-failure-page-{index}",
+                state=DiscographyBatchState.completed_with_failures,
+            )
+            batch.items.append(
+                DiscographyBatchItem(
+                    release_identity=f"catalog_album:failure-{index}",
+                    artist_name="Failure Artist",
+                    release_title=f"Failure Album {index:02d}",
+                    state=DiscographyBatchItemState.failed,
+                    error_detail=f"Failure detail {index:02d}",
+                )
+            )
+            db.add(batch)
+        await db.commit()
+
+    activity = await client.get("/activity")
+    assert 'href="/activity/queue-failures"' in activity.text
+    assert "View all 21 queue failures" in activity.text
+
+    first_page = await client.get("/activity/queue-failures")
+    assert first_page.status_code == 200
+    assert "Failure Album 20" in first_page.text
+    assert 'href="/activity/queue-failures?page=2"' in first_page.text
+
+    second_page = await client.get("/activity/queue-failures?page=2")
+    assert second_page.status_code == 200
+    assert "Failure Album 00" in second_page.text
+    assert "Review and retry" in second_page.text
+
+
 async def test_desktop_and_mobile_navigation_use_task_destinations(client: AsyncClient) -> None:
     response = await client.get("/activity")
     body = response.text
