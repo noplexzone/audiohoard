@@ -20,6 +20,7 @@ from app.jobs import runner
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.release import Release
+from app.models.source_candidate_block import SourceCandidateBlock
 from app.models.track import IdentityResolutionState, Track
 from app.models.workflow import (
     AcoustIDVerificationState,
@@ -2416,7 +2417,7 @@ async def test_background_enqueue_checkpoint_is_visible_before_poll(
         await run_task
 
 
-async def test_denied_slskd_provenance_filters_future_results(
+async def test_explicit_denied_slskd_block_filters_future_results(
     db_session: AsyncSession, test_settings: Settings
 ) -> None:
     job = await _create_job(db_session, source="slskd")
@@ -2435,7 +2436,17 @@ async def test_denied_slskd_provenance_filters_future_results(
             }
         ),
     )
-    db_session.add(denied)
+    db_session.add_all(
+        [
+            denied,
+            SourceCandidateBlock(
+                provider="slskd",
+                peer="StarCaller",
+                filename="music/done/country/44 - Ty Myers - Valerie (Amazon Music Original).mp3",
+                reason="denied",
+            ),
+        ]
+    )
     await db_session.flush()
 
     results = [

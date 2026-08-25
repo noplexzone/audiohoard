@@ -380,7 +380,7 @@ async def test_deny_blocks_slskd_candidate_from_track_provenance(
         async with factory() as db:
             block = (await db.scalars(select(SourceCandidateBlock))).one()
             assert block.filename == (
-                "music/done/country/VA - Country Heat - 05.09.2026/"
+                "/music/done/country/VA - Country Heat - 05.09.2026/"
                 "44 - Ty Myers - Valerie (Amazon Music Original).mp3"
             )
             assert await db.get(StagingReviewItem, item_id) is None
@@ -399,7 +399,7 @@ async def test_deny_blocks_slskd_candidate_from_track_provenance(
     async with factory() as db:
         blocked = (await db.scalars(select(SourceCandidateBlock))).one()
         assert blocked.filename == (
-            "music/done/country/VA - Country Heat - 05.09.2026/"
+            "/music/done/country/VA - Country Heat - 05.09.2026/"
             "44 - Ty Myers - Valerie (Amazon Music Original).mp3"
         )
         assert blocked.reason == "denied"

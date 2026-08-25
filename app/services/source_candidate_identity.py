@@ -1,22 +1,53 @@
 from __future__ import annotations
 
+import re
+
 SourceCandidateIdentity = tuple[str, str, str]
+_DRIVE_PREFIX = re.compile(r"^([A-Za-z]:)(.*)$")
 
 
-def _normalize_slskd_remote_path(value: str) -> str:
-    """Canonicalize a Soulseek virtual path without changing case or basename scope."""
-    parts: list[str] = []
-    for part in value.strip().replace("\\", "/").split("/"):
+def _collapse_path_parts(parts: list[str], *, anchored: bool) -> list[str]:
+    normalized: list[str] = []
+    for part in parts:
         if not part or part == ".":
             continue
         if part == "..":
-            if parts and parts[-1] != "..":
-                parts.pop()
-            else:
-                parts.append(part)
+            if normalized and normalized[-1] != "..":
+                normalized.pop()
+            elif not anchored:
+                normalized.append(part)
             continue
-        parts.append(part)
-    return "/".join(parts)
+        normalized.append(part)
+    return normalized
+
+
+def _normalize_slskd_remote_path(value: str) -> str:
+    """Canonicalize separators/dots while preserving the path namespace and case."""
+    path = value.strip().replace("\\", "/")
+    if not path:
+        return ""
+
+    if path.startswith("//"):
+        components = [part for part in path[2:].split("/") if part and part != "."]
+        if len(components) < 2 or components[0] == ".." or components[1] == "..":
+            return ""
+        server, share, *tail = components
+        normalized_tail = _collapse_path_parts(tail, anchored=True)
+        return "//" + "/".join([server, share, *normalized_tail])
+
+    drive_match = _DRIVE_PREFIX.match(path)
+    if drive_match is not None:
+        drive, remainder = drive_match.groups()
+        absolute = remainder.startswith("/")
+        normalized = _collapse_path_parts(remainder.split("/"), anchored=absolute)
+        separator = "/" if absolute else ""
+        return drive + separator + "/".join(normalized)
+
+    if path.startswith("/"):
+        normalized = _collapse_path_parts(path.split("/"), anchored=True)
+        return "/" + "/".join(normalized)
+
+    return "/".join(_collapse_path_parts(path.split("/"), anchored=False))
 
 
 def normalize_source_candidate_identity(

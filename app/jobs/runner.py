@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import ParseResult, urlparse
 
-from sqlalchemy import or_, select, text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -50,11 +50,7 @@ from app.models.path_preview import PathPreview
 from app.models.release import Release
 from app.models.source_candidate_block import SourceCandidateBlock
 from app.models.track import FingerprintState, IdentityResolutionState, Track
-from app.models.workflow import (
-    AcoustIDVerificationState,
-    AcquisitionState,
-    ImportWorkflowState,
-)
+from app.models.workflow import AcquisitionState, ImportWorkflowState
 from app.naming.convention import NamingError, render_path
 from app.schemas.search import SearchRequest, SearchResult
 from app.services.acquisition_attempts import canonical_provider_uuid
@@ -73,6 +69,7 @@ from app.services.rejected_sources import (
     calculate_blocked_until,
     classify_rejection_reason,
 )
+from app.services.source_candidate_blocks import active_slskd_candidate_identities
 from app.services.source_candidate_identity import normalize_source_candidate_identity
 from app.settings_service import (
     DEFAULT_FREE_TEXT_RESULT_LIMIT,
@@ -1568,54 +1565,8 @@ def _selected_result(job: Job) -> list[SearchResult] | None:
     return [SearchResult.model_validate(json.loads(job.selected_result_json))]
 
 
-def _slskd_identity_from_provenance(provenance_json: str | None) -> tuple[str, str] | None:
-    if not provenance_json:
-        return None
-    try:
-        provenance = json.loads(provenance_json)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(provenance, dict):
-        return None
-    identity = normalize_source_candidate_identity(
-        provenance.get("source"), provenance.get("username"), provenance.get("filename")
-    )
-    return identity[1:] if identity is not None else None
-
-
 async def _blocked_slskd_identities(db: AsyncSession) -> set[tuple[str, str]]:
-    now = _now()
-    block_rows = (
-        await db.execute(
-            select(SourceCandidateBlock.peer, SourceCandidateBlock.filename).where(
-                SourceCandidateBlock.provider == "slskd",
-                or_(
-                    SourceCandidateBlock.blocked_until.is_(None),
-                    SourceCandidateBlock.blocked_until > now,
-                ),
-            )
-        )
-    ).all()
-    blocked = {
-        normalized_block[1:]
-        for peer, filename in block_rows
-        if (normalized_block := normalize_source_candidate_identity("slskd", peer, filename))
-        is not None
-    }
-    denied_rows = (
-        await db.scalars(
-            select(Track.acquisition_provenance_json).where(
-                Track.source == "slskd",
-                Track.acoustid_verification_state == AcoustIDVerificationState.denied,
-                Track.acquisition_provenance_json.is_not(None),
-            )
-        )
-    ).all()
-    for provenance_json in denied_rows:
-        provenance_identity = _slskd_identity_from_provenance(provenance_json)
-        if provenance_identity is not None:
-            blocked.add(provenance_identity)
-    return blocked
+    return {identity[1:] for identity in await active_slskd_candidate_identities(db, now=_now())}
 
 
 async def _without_blocked_slskd_results(

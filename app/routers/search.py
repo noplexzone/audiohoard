@@ -4,26 +4,26 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
-from sqlalchemy import or_, select, tuple_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
 from app.config import Settings
 from app.database import get_db
 from app.models.catalog_entities import CatalogArtist, CatalogArtistIdentity
-from app.models.source_candidate_block import SourceCandidateBlock
 from app.schemas.health import SourceStatus
 from app.schemas.search import SearchRequest, SearchResponse, SearchResult
 from app.services.catalog_metadata import search_catalog_artists
 from app.services.discovery import discovery_service
 from app.services.manual_search import group_ranked_results, rank_manual_results
+from app.services.source_candidate_blocks import active_slskd_candidate_identities
+from app.services.source_candidate_identity import normalize_source_candidate_identity
 from app.settings_service import effective_settings_dep, get_runtime_settings
 from app.sources.base import SourceAdapter
 from app.sources.prowlarr import ProwlarrAdapter
@@ -366,42 +366,14 @@ async def search_ui_get() -> RedirectResponse:
 
 
 async def _mark_active_rejected_results(db: AsyncSession, results: list[SearchResult]) -> None:
-    result_identities = {
-        (
-            str(result.metadata.get("username") or ""),
-            str(result.metadata.get("filename") or ""),
-        )
-        for result in results
-        if result.source == "slskd"
-    }
-    result_identities.discard(("", ""))
-    if not result_identities:
-        return
-    identities = {
-        (str(peer), str(filename))
-        for peer, filename in (
-            await db.execute(
-                select(SourceCandidateBlock.peer, SourceCandidateBlock.filename).where(
-                    SourceCandidateBlock.provider == "slskd",
-                    or_(
-                        SourceCandidateBlock.blocked_until.is_(None),
-                        SourceCandidateBlock.blocked_until > datetime.now(UTC),
-                    ),
-                    tuple_(SourceCandidateBlock.peer, SourceCandidateBlock.filename).in_(
-                        result_identities
-                    ),
-                )
-            )
-        ).all()
-    }
+    identities = await active_slskd_candidate_identities(db)
     for result in results:
-        if result.source != "slskd":
-            continue
-        identity = (
-            str(result.metadata.get("username") or ""),
-            str(result.metadata.get("filename") or ""),
+        identity = normalize_source_candidate_identity(
+            result.source,
+            result.metadata.get("username"),
+            result.metadata.get("filename"),
         )
-        if identity in identities:
+        if identity is not None and identity in identities:
             result.metadata["blocked"] = True
 
 
