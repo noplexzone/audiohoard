@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -13,9 +14,11 @@ from app.models.acquisition_attempt import (
     AcquisitionAttempt,
     ArtifactState,
     AttemptOutcome,
+    CleanupState,
     ProviderTransferState,
+    RetentionDisposition,
 )
-from app.models.job import Job
+from app.models.job import Job, JobStatus
 from app.models.workflow import AcquisitionState
 from app.schemas.search import SearchResult
 from app.sources.base import CapabilityState
@@ -283,6 +286,207 @@ async def test_candidate_attempt_retry_after_terminal_transfer_creates_new_row(
     assert retried.id != terminal.id
     assert retried.provider_state == ProviderTransferState.pending
     assert retried.provisional_transfer_id is None
+
+
+async def test_completed_missing_artifact_gates_candidates_and_retains_exact_transfer(
+    db_session: AsyncSession,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = "2d93899b-cf9a-4567-8f10-993610f274cf"
+    job = Job(source="slskd", query="Artist Song")
+    db_session.add(job)
+    await db_session.flush()
+    results = [
+        SearchResult(
+            source="slskd",
+            title="Same Song",
+            artist="Artist",
+            metadata={"username": f"peer-{index}", "filename": f"Album/{index:02} Song.flac"},
+        )
+        for index in range(1, 11)
+    ]
+    enqueue_calls: list[tuple[str, str]] = []
+    poll_calls: list[str] = []
+
+    class FakeSlskd:
+        def __init__(self, url: str, key: str) -> None:
+            pass
+
+        async def enqueue(self, username: str, filename: str, size: int | None = None) -> str:
+            enqueue_calls.append((username, filename))
+            return canonical
+
+        async def status(self, transfer_id: str) -> CapabilityState:
+            poll_calls.append(transfer_id)
+            return CapabilityState(
+                True,
+                "Completed",
+                {"id": canonical, "username": "peer-1", "filename": "Album/01 Song.flac"},
+            )
+
+    async def fake_fetch(*args: object, **kwargs: object) -> list[SearchResult]:
+        return results
+
+    monkeypatch.setattr(runner, "SlskdAdapter", FakeSlskd)
+    monkeypatch.setattr(runner, "_call_fetch_results", fake_fetch)
+
+    continuation = await runner._run_job_in_session(job.id, db_session, test_settings)
+
+    attempts = list((await db_session.scalars(select(AcquisitionAttempt))).all())
+    assert continuation is None
+    assert enqueue_calls == [("peer-1", "Album/01 Song.flac")]
+    assert poll_calls == [canonical]
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    assert attempt.peer == "peer-1"
+    assert attempt.remote_path == "Album/01 Song.flac"
+    assert attempt.provider_uuid == canonical
+    assert attempt.provisional_transfer_id == "peer-1:Album/01 Song.flac"
+    assert attempt.provider_state is ProviderTransferState.completed
+    assert attempt.provider_terminal_at is not None
+    assert attempt.outcome is AttemptOutcome.failed
+    assert attempt.artifact_state is ArtifactState.missing
+    assert attempt.error_code == "artifact_missing"
+    assert attempt.terminal_at is not None
+    assert attempt.staged_path is None
+    assert attempt.partial_path is None
+    assert attempt.file_cleanup_eligible is False
+    assert attempt.provider_cleanup_state is CleanupState.not_required
+    assert attempt.file_cleanup_state is CleanupState.not_required
+    assert attempt.retention_disposition is RetentionDisposition.retain_recovery
+    assert job.status is JobStatus.failed
+    assert json.loads(job.result_json or "{}")["error"] == {
+        "code": "artifact_missing",
+        "operation": "acquire",
+        "retryable": True,
+    }
+
+
+async def test_operator_retry_repolls_exact_missing_uuid_without_enqueue(
+    db_session: AsyncSession,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = "2d93899b-cf9a-4567-8f10-993610f274cf"
+    result = SearchResult(
+        source="slskd",
+        title="Same Song",
+        artist="Artist",
+        metadata={"username": "peer", "filename": "Album/01 Same Song.flac"},
+    )
+    job = Job(source="slskd", query="Artist Same Song")
+    db_session.add(job)
+    await db_session.flush()
+    enqueue_calls = 0
+    poll_calls: list[str] = []
+
+    class FakeSlskd:
+        def __init__(self, url: str, key: str) -> None:
+            pass
+
+        async def enqueue(self, username: str, filename: str, size: int | None = None) -> str:
+            nonlocal enqueue_calls
+            enqueue_calls += 1
+            return canonical
+
+        async def status(self, transfer_id: str) -> CapabilityState:
+            poll_calls.append(transfer_id)
+            return CapabilityState(
+                True,
+                "Completed",
+                {
+                    "id": canonical,
+                    "username": "peer",
+                    "filename": "Album/01 Same Song.flac",
+                },
+            )
+
+    async def fake_fetch(*args: object, **kwargs: object) -> list[SearchResult]:
+        return [result]
+
+    async def noop(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "SlskdAdapter", FakeSlskd)
+    monkeypatch.setattr(runner, "_call_fetch_results", fake_fetch)
+    monkeypatch.setattr(runner, "_enrich_musicbrainz", noop)
+    monkeypatch.setattr(runner, "_enrich_deezer", noop)
+    monkeypatch.setattr(runner, "_run_fingerprint_and_verify", noop)
+    monkeypatch.setattr(runner, "_compute_path_preview", noop)
+    monkeypatch.setattr(runner, "_try_auto_import", noop)
+
+    await runner._run_job_in_session(job.id, db_session, test_settings)
+    historical = await db_session.scalar(select(AcquisitionAttempt))
+    assert historical is not None
+    historical_id = historical.id
+    assert historical.error_code == "artifact_missing"
+
+    staged = test_settings.staging_root / "recovered" / "01 Same Song.flac"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(b"recovered audio")
+    job.status = JobStatus.pending
+    job.result_json = None
+    await db_session.flush()
+
+    await runner._run_job_in_session(job.id, db_session, test_settings)
+
+    attempts = list(
+        (
+            await db_session.scalars(select(AcquisitionAttempt).order_by(AcquisitionAttempt.id))
+        ).all()
+    )
+    assert enqueue_calls == 1
+    assert poll_calls == [canonical, canonical]
+    assert len(attempts) == 2
+    assert attempts[0].id == historical_id
+    assert attempts[0].outcome is AttemptOutcome.failed
+    assert attempts[0].artifact_state is ArtifactState.missing
+    assert attempts[0].error_code == "artifact_missing"
+    assert attempts[1].id != historical_id
+    assert attempts[1].provider_uuid == canonical
+    assert attempts[1].peer == "peer"
+    assert attempts[1].remote_path == "Album/01 Same Song.flac"
+    assert attempts[1].outcome is AttemptOutcome.downloaded
+    assert attempts[1].artifact_state is ArtifactState.staged
+    assert job.status is JobStatus.done
+
+
+async def test_missing_artifact_recovery_is_not_title_wide(
+    db_session: AsyncSession,
+) -> None:
+    missing_job = Job(source="slskd", query="first")
+    independent_job = Job(source="slskd", query="second")
+    db_session.add_all([missing_job, independent_job])
+    await db_session.flush()
+    db_session.add(
+        AcquisitionAttempt(
+            job_id=missing_job.id,
+            provider="slskd",
+            peer="peer-a",
+            remote_path="A/Same Song.flac",
+            provider_uuid="2d93899b-cf9a-4567-8f10-993610f274cf",
+            provider_state=ProviderTransferState.completed,
+            provider_terminal_at=runner._now(),
+            artifact_state=ArtifactState.missing,
+            outcome=AttemptOutcome.failed,
+            error_code="artifact_missing",
+            terminal_at=runner._now(),
+        )
+    )
+    await db_session.flush()
+    independent = SearchResult(
+        source="slskd",
+        title="same song",
+        metadata={"username": "peer-b", "filename": "B/SAME SONG.flac"},
+    )
+
+    attempt = await runner._candidate_attempt(db_session, independent_job, independent)
+
+    assert attempt.provider_uuid is None
+    assert attempt.provisional_transfer_id is None
+    assert attempt.peer == "peer-b"
+    assert attempt.remote_path == "B/SAME SONG.flac"
 
 
 async def test_restart_adopts_canonical_uuid_without_enqueue(

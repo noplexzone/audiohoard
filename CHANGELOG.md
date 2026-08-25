@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Defer SQLite-locked job admissions without crossing the provider boundary, and retain exact completed slskd transfers for retry when their staged artifact is temporarily missing.
 - Canonicalize exact slskd peer/path identities so review denial durably blocks the provider artifact before re-acquisition, excludes any containing album folder, and truthfully reports when provenance cannot identify a source.
 - Serialize startup database maintenance, catalog ownership, library reconciliation, and each scheduler's initial cycle before recovering queued jobs, preventing post-update SQLite writer storms from failing recovered work.
 - Skip expensive orphan-history pruning when startup finds queued or interrupted acquisitions, allowing serialized job recovery to resume downloads promptly after an update.

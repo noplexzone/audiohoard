@@ -151,6 +151,39 @@ async def test_completed_transfer_without_durable_artifact_binding_is_not_cleanu
     assert adapter.calls == []
 
 
+async def test_completed_missing_artifact_is_retained_by_cleanup_reconciler(
+    db_session: AsyncSession,
+) -> None:
+    job = Job(source="slskd", query="Artist Song")
+    attempt = AcquisitionAttempt(
+        job=job,
+        provider="slskd",
+        peer="peer",
+        remote_path="Album/01 Song.flac",
+        provisional_transfer_id="peer:Album/01 Song.flac",
+        provider_uuid=UUID,
+        provider_state=ProviderTransferState.completed,
+        outcome=AttemptOutcome.failed,
+        provider_terminal_at=datetime.now(UTC),
+        terminal_at=datetime.now(UTC),
+        artifact_state=ArtifactState.missing,
+        error_code="artifact_missing",
+        provider_cleanup_state=CleanupState.not_required,
+        file_cleanup_state=CleanupState.not_required,
+        file_cleanup_eligible=False,
+        retention_disposition=RetentionDisposition.retain_recovery,
+    )
+    db_session.add_all([job, attempt])
+    await db_session.commit()
+    adapter = FakeAdapter([[{"id": UUID, "username": "peer", "filename": "Album/01 Song.flac"}]])
+
+    assert await cleanup_durable_slskd_transfers(_factory(db_session), adapter) == 0
+    assert adapter.calls == []
+    await db_session.refresh(attempt)
+    assert attempt.provider_cleanup_state is CleanupState.not_required
+    assert attempt.retention_disposition is RetentionDisposition.retain_recovery
+
+
 async def _terminal_intent(
     db_session: AsyncSession, *, provider_uuid: str | None = None
 ) -> AcquisitionAttempt:

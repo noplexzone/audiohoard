@@ -39,6 +39,7 @@ from app.models.acquisition_attempt import (
     AcquisitionAttempt,
     ArtifactState,
     AttemptOutcome,
+    CleanupState,
     ProviderTransferState,
     RetentionDisposition,
 )
@@ -237,6 +238,23 @@ async def _candidate_attempt(
         .limit(1)
     )
     if attempt is None:
+        recoverable = await db.scalar(
+            select(AcquisitionAttempt)
+            .where(
+                AcquisitionAttempt.job_id == job.id,
+                AcquisitionAttempt.provider == result.source,
+                AcquisitionAttempt.peer == peer,
+                AcquisitionAttempt.remote_path == remote_path,
+                AcquisitionAttempt.terminal_at.is_not(None),
+                AcquisitionAttempt.provider_state == ProviderTransferState.completed,
+                AcquisitionAttempt.artifact_state == ArtifactState.missing,
+                AcquisitionAttempt.outcome == AttemptOutcome.failed,
+                AcquisitionAttempt.error_code == "artifact_missing",
+                AcquisitionAttempt.provider_uuid.is_not(None),
+            )
+            .order_by(AcquisitionAttempt.id.desc())
+            .limit(1)
+        )
         attempt = AcquisitionAttempt(
             job_id=job.id,
             catalog_album_id=job.catalog_album_id,
@@ -244,6 +262,24 @@ async def _candidate_attempt(
             provider=result.source,
             peer=peer,
             remote_path=remote_path,
+            provisional_transfer_id=(
+                recoverable.provisional_transfer_id if recoverable is not None else None
+            ),
+            provider_uuid=recoverable.provider_uuid if recoverable is not None else None,
+            provider_state=(
+                ProviderTransferState.completed
+                if recoverable is not None
+                else ProviderTransferState.pending
+            ),
+            provider_enqueued_at=(
+                recoverable.provider_enqueued_at if recoverable is not None else None
+            ),
+            provider_uuid_discovered_at=(
+                recoverable.provider_uuid_discovered_at if recoverable is not None else None
+            ),
+            provider_terminal_at=(
+                recoverable.provider_terminal_at if recoverable is not None else None
+            ),
         )
         db.add(attempt)
         await db.flush()
@@ -562,7 +598,7 @@ async def run_job(
                         job_id,
                         expected_statuses={JobStatus.pending},
                         status=JobStatus.failed,
-                        result_json=_job_error_result(phase1_error, "init", retryable=False),
+                        result_json=_job_error_result(phase1_error, "init", retryable=True),
                     )
         return
 
@@ -581,17 +617,21 @@ async def run_job(
             return
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception("Job %d phase-2 running transition failed", job_id)
+        if is_sqlite_database_locked(exc):
+            # Admission never committed and no provider boundary was crossed. Keep
+            # pending state intact so startup/watchdog recovery can redispatch it.
+            return
         with contextlib.suppress(Exception):
             async with factory() as session:
                 await _persist_job_envelope(
                     session,
                     job_id,
-                    expected_statuses={JobStatus.pending, JobStatus.running},
+                    expected_statuses={JobStatus.pending},
                     status=JobStatus.failed,
                     result_json=_job_error_result(
-                        "running_transition_error", "init", retryable=False
+                        "running_transition_error", "init", retryable=True
                     ),
                 )
         return
@@ -861,6 +901,7 @@ async def _run_job_in_session(
             results = results[:1]
         tracks_created = 0
         failures: list[dict[str, object]] = []
+        artifact_missing_gate: dict[str, object] | None = None
         root_job = await _root_job(job, db)
         existing_releases = list(
             (await db.scalars(select(Release).where(Release.job_id == root_job.id))).all()
@@ -1037,6 +1078,27 @@ async def _run_job_in_session(
 
                 tracks_created += 1
             except ProviderError as exc:
+                if exc.code == "artifact_missing" and result.source == "slskd":
+                    now = _now()
+                    attempt.provider_state = ProviderTransferState.completed
+                    attempt.provider_terminal_at = attempt.provider_terminal_at or now
+                    attempt.artifact_state = ArtifactState.missing
+                    attempt.staged_path = None
+                    attempt.partial_path = None
+                    attempt.artifact_device = None
+                    attempt.artifact_inode = None
+                    attempt.artifact_mtime_ns = None
+                    attempt.artifact_size = None
+                    attempt.artifact_sha256 = None
+                    attempt.file_cleanup_eligible = False
+                    attempt.provider_cleanup_state = CleanupState.not_required
+                    attempt.file_cleanup_state = CleanupState.not_required
+                    attempt.retention_disposition = RetentionDisposition.retain_recovery
+                    artifact_missing_gate = {
+                        "code": "artifact_missing",
+                        "operation": "acquire",
+                        "retryable": True,
+                    }
                 attempt.outcome = AttemptOutcome.failed
                 attempt.error_code = exc.code
                 attempt.error_detail = str(exc)
@@ -1101,6 +1163,8 @@ async def _run_job_in_session(
                         if commit_progress:
                             await db.commit()
                 logger.warning("Provider result processing failed with code %s", exc.code)
+                if artifact_missing_gate is not None:
+                    break
                 failures.append(exc.details())
             except Exception:
                 attempt.outcome = AttemptOutcome.failed
@@ -1118,7 +1182,13 @@ async def _run_job_in_session(
                 job.updated_at = _now()
                 await db.commit()
 
-        if catalog_tracks and catalog_album is not None:
+        if artifact_missing_gate is not None:
+            job.status = JobStatus.failed
+            payload = _job_payload(job)
+            payload.update({"tracks_created": tracks_created, "error": artifact_missing_gate})
+            job.result_json = json.dumps(payload, sort_keys=True)
+            continuation_request = None
+        elif catalog_tracks and catalog_album is not None:
             acquired_rows = (
                 await db.execute(
                     select(Track.catalog_track_id, ImportPlan.destination_path)
