@@ -364,10 +364,56 @@ async def test_preview_manifest_hydration_without_jobs(
         select(DiscographyBatchItem).where(DiscographyBatchItem.batch_id == preview.id)
     )
     assert item is not None and item.reason_code == reason
+    assert item.expected_track_count == expected
     assert item.release_identity == f"catalog_album:{album.id}"
     assert preview.hydration_required_count == 1
     assert preview.missing_count == expected and preview.estimated_job_count == expected
     assert await db_session.scalar(select(func.count(Job.id))) == 0
+
+
+async def test_provider_preview_snapshots_strongest_manifest_expectation(
+    db_session: AsyncSession,
+) -> None:
+    artist, identity = await _artist(db_session)
+    album = CatalogAlbum(artist=artist, title="Provider manifest", track_count=1)
+    album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Only"))
+    provider = _release(
+        identity, "provider-manifest", album.title, "2026", "album", True, album, 2
+    )
+    db_session.add(provider)
+    await db_session.flush()
+
+    preview = await create_discography_batch_preview(
+        db_session, DiscographyScopeKind.artist, _scope(artist.id), quality_profile=PROFILE
+    )
+    item = await db_session.scalar(
+        select(DiscographyBatchItem).where(DiscographyBatchItem.batch_id == preview.id)
+    )
+
+    assert item is not None
+    assert item.expected_track_count == 2
+    assert item.reason_code == "catalog_manifest_incomplete"
+    assert preview.hydration_required_count == 1
+
+
+async def test_preview_rejects_unrelated_pending_catalog_album(
+    db_session: AsyncSession,
+) -> None:
+    unrelated = CatalogAlbum(artist_id=999_999, title="Caller pending")
+    db_session.add(unrelated)
+
+    with pytest.raises(ValueError, match="pending ORM changes"):
+        await create_discography_batch_preview(
+            db_session,
+            DiscographyScopeKind.wanted_selected,
+            {"album_ids": []},
+            quality_profile=PROFILE,
+        )
+
+    assert unrelated in db_session.new
+    assert unrelated.id is None
+    with db_session.no_autoflush:
+        assert await db_session.scalar(select(func.count(DiscographyBatch.id))) == 0
 
 
 async def test_preview_counts_active_missing_and_estimates(db_session: AsyncSession) -> None:

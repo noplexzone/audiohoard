@@ -136,6 +136,7 @@ class DiscographyBatchItem(Base):
         UniqueConstraint(
             "batch_id", "release_identity", name="uq_discography_batch_items_release_identity"
         ),
+        CheckConstraint("expected_track_count >= 0", name="ck_expected_track_count_nonnegative"),
         CheckConstraint("target_count >= 0", name="ck_target_count_nonnegative"),
         CheckConstraint("active_count >= 0", name="ck_active_count_nonnegative"),
         CheckConstraint("skipped_count >= 0", name="ck_skipped_count_nonnegative"),
@@ -176,6 +177,7 @@ class DiscographyBatchItem(Base):
     release_year: Mapped[str | None] = mapped_column(String(4), nullable=True)
     release_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
     provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    expected_track_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     state: Mapped[DiscographyBatchItemState] = mapped_column(
         Enum(DiscographyBatchItemState, native_enum=False, create_constraint=True),
         nullable=False,

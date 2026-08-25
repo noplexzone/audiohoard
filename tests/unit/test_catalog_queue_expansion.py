@@ -284,6 +284,7 @@ async def test_provider_manifest_expectation_prevents_partial_expansion(
         catalog_album=album,
         artist_name=album.artist.name,
         release_title=album.title,
+        expected_track_count=2,
         state=DiscographyBatchItemState.preview,
     )
     db_session.add(item)
@@ -299,6 +300,46 @@ async def test_provider_manifest_expectation_prevents_partial_expansion(
     assert outcome.hydration_required
     assert outcome.created_job_ids == outcome.observed_job_ids == ()
     assert await db_session.scalar(select(func.count(Job.id))) == 0
+
+    await db_session.delete(provider_release)
+    await db_session.commit()
+    await db_session.refresh(item)
+
+    after_provider_cleanup = await expand_catalog_album_missing_track_jobs(
+        db_session,
+        album,
+        quality_profile=PROFILE,
+        batch_item_id=item.id,
+    )
+    assert after_provider_cleanup.hydration_required
+    assert after_provider_cleanup.created_job_ids == after_provider_cleanup.observed_job_ids == ()
+    assert await db_session.scalar(select(func.count(Job.id))) == 0
+
+    await db_session.delete(album)
+    await db_session.commit()
+    await db_session.refresh(item)
+    assert item.expected_track_count == 2
+
+
+async def test_expansion_rejects_unrelated_pending_catalog_album(
+    db_session: AsyncSession,
+) -> None:
+    album = await _album(db_session)
+    await db_session.commit()
+    unrelated = CatalogAlbum(artist_id=album.artist_id, title="Caller pending")
+    db_session.add(unrelated)
+
+    with pytest.raises(ValueError, match="pending ORM changes"):
+        await expand_catalog_album_missing_track_jobs(
+            db_session,
+            album,
+            quality_profile=PROFILE,
+        )
+
+    assert unrelated in db_session.new
+    assert unrelated.id is None
+    with db_session.no_autoflush:
+        assert await db_session.scalar(select(func.count(Job.id))) == 0
 
 
 async def test_locked_commit_retry_resets_attempt_local_outcome(

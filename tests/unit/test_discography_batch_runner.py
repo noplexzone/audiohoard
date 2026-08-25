@@ -112,3 +112,31 @@ async def test_terminal_link_without_verified_artifact_fails_item(tmp_path: Path
         assert item is not None and item.state == DiscographyBatchItemState.failed
         assert batch is not None and batch.state == DiscographyBatchState.completed_with_failures
     await engine.dispose()
+
+
+async def test_reconciliation_retains_snapshot_manifest_expectation(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'snapshot.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    _batch_id, item_id = await _seed(factory)
+    runner = DiscographyBatchRunner(
+        factory, dispatcher=lambda _job_id: None, quality_profile=PROFILE
+    )
+
+    async with factory() as db:
+        item = await db.get(DiscographyBatchItem, item_id)
+        assert item is not None
+        item.expected_track_count = 2
+        item.state = DiscographyBatchItemState.expanding
+        await db.commit()
+
+    async with factory() as db:
+        await runner._reconcile_item(db, item_id, attempted=False)
+        item = await db.get(DiscographyBatchItem, item_id)
+        assert item is not None
+        assert item.state == DiscographyBatchItemState.pending
+        assert item.reason_code == "catalog_manifest_incomplete"
+        assert await db.scalar(select(func.count(Job.id))) == 0
+
+    await engine.dispose()

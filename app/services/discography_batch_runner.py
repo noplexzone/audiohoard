@@ -330,7 +330,7 @@ class DiscographyBatchRunner:
             item.reason_code = "catalog_release_unbound"
             item.completed_at = now
             return
-        expected = item.catalog_album.track_count
+        expected = max(item.expected_track_count or 0, item.catalog_album.track_count or 0) or None
         if item.provider_release_id is not None:
             provider_expected = await db.scalar(
                 select(CatalogAlbumProvider.track_count).where(

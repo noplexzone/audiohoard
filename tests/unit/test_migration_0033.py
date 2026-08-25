@@ -106,6 +106,7 @@ def test_0033_schema_contract(tmp_path: Path) -> None:
             "release_year",
             "release_kind",
             "provider",
+            "expected_track_count",
             "state",
             "reason_code",
             "target_count",
@@ -167,6 +168,7 @@ def test_0033_schema_contract(tmp_path: Path) -> None:
         } >= {
             "discographybatchitemstate",
             "ck_discography_batch_item_identity",
+            "ck_expected_track_count_nonnegative",
             "ck_target_count_nonnegative",
             "ck_active_count_nonnegative",
             "ck_skipped_count_nonnegative",
@@ -241,6 +243,10 @@ def test_0033_rejects_invalid_values_and_empty_identity(tmp_path: Path) -> None:
                 "INSERT INTO discography_batch_items"
                 "(batch_id,release_identity,catalog_album_id,artist_name,release_title,"
                 "target_count) "
+                f"VALUES ({batch},'catalog_album:{album}',{album},'Artist','Album',-1)",
+                "INSERT INTO discography_batch_items"
+                "(batch_id,release_identity,catalog_album_id,artist_name,release_title,"
+                "expected_track_count) "
                 f"VALUES ({batch},'catalog_album:{album}',{album},'Artist','Album',-1)",
                 "INSERT INTO discography_batch_items"
                 "(batch_id,release_identity,catalog_album_id,artist_name,release_title) "
@@ -365,8 +371,8 @@ def test_0033_catalog_cleanup_preserves_durable_item_identity(tmp_path: Path) ->
             insert = sa.text(
                 "INSERT INTO discography_batch_items"
                 "(batch_id,release_identity,provider_release_id,catalog_album_id,"
-                "artist_name,release_title) VALUES "
-                "(:batch,:identity,:provider,:album,'Artist','Album')"
+                "artist_name,release_title,expected_track_count) VALUES "
+                "(:batch,:identity,:provider,:album,'Artist','Album',:expected)"
             )
             provider_only = connection.execute(
                 insert,
@@ -375,6 +381,7 @@ def test_0033_catalog_cleanup_preserves_durable_item_identity(tmp_path: Path) ->
                     "identity": "provider:deezer:release-1",
                     "provider": provider_one,
                     "album": None,
+                    "expected": 7,
                 },
             ).lastrowid
             dual = connection.execute(
@@ -384,6 +391,7 @@ def test_0033_catalog_cleanup_preserves_durable_item_identity(tmp_path: Path) ->
                     "identity": "provider:deezer:release-2",
                     "provider": provider_two,
                     "album": album,
+                    "expected": 8,
                 },
             ).lastrowid
             canonical = connection.execute(
@@ -393,6 +401,7 @@ def test_0033_catalog_cleanup_preserves_durable_item_identity(tmp_path: Path) ->
                     "identity": f"catalog_album:{album}",
                     "provider": None,
                     "album": album,
+                    "expected": 9,
                 },
             ).lastrowid
 
@@ -404,8 +413,8 @@ def test_0033_catalog_cleanup_preserves_durable_item_identity(tmp_path: Path) ->
                 row.id: row
                 for row in connection.execute(
                     sa.text(
-                        "SELECT id,release_identity,provider_release_id,catalog_album_id "
-                        "FROM discography_batch_items"
+                        "SELECT id,release_identity,provider_release_id,catalog_album_id,"
+                        "expected_track_count FROM discography_batch_items"
                     )
                 ).mappings()
             }
@@ -414,11 +423,14 @@ def test_0033_catalog_cleanup_preserves_durable_item_identity(tmp_path: Path) ->
                 "release_identity": "provider:deezer:release-1",
                 "provider_release_id": None,
                 "catalog_album_id": None,
+                "expected_track_count": 7,
             }
             assert rows[dual]["release_identity"] == "provider:deezer:release-2"
             assert rows[dual]["provider_release_id"] is None
             assert rows[dual]["catalog_album_id"] == album
+            assert rows[dual]["expected_track_count"] == 8
             assert rows[canonical]["catalog_album_id"] == album
+            assert rows[canonical]["expected_track_count"] == 9
 
             connection.execute(
                 sa.text("DELETE FROM catalog_albums WHERE id=:album"), {"album": album}
@@ -426,8 +438,8 @@ def test_0033_catalog_cleanup_preserves_durable_item_identity(tmp_path: Path) ->
             remaining = (
                 connection.execute(
                     sa.text(
-                        "SELECT id,release_identity,provider_release_id,catalog_album_id "
-                        "FROM discography_batch_items ORDER BY id"
+                        "SELECT id,release_identity,provider_release_id,catalog_album_id,"
+                        "expected_track_count FROM discography_batch_items ORDER BY id"
                     )
                 )
                 .mappings()
@@ -440,6 +452,7 @@ def test_0033_catalog_cleanup_preserves_durable_item_identity(tmp_path: Path) ->
             ]
             assert all(row["provider_release_id"] is None for row in remaining)
             assert all(row["catalog_album_id"] is None for row in remaining)
+            assert [row["expected_track_count"] for row in remaining] == [7, 8, 9]
     finally:
         engine.dispose()
 

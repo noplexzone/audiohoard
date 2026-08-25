@@ -118,6 +118,7 @@ def upgrade() -> None:
         sa.Column("release_year", sa.String(length=4), nullable=True),
         sa.Column("release_kind", sa.String(length=32), nullable=True),
         sa.Column("provider", sa.String(length=32), nullable=True),
+        sa.Column("expected_track_count", sa.Integer(), nullable=True),
         sa.Column("state", _ITEM_STATE, server_default="preview", nullable=False),
         sa.Column("reason_code", sa.String(length=64), nullable=True),
         sa.Column("target_count", sa.Integer(), server_default="0", nullable=False),
@@ -141,7 +142,12 @@ def upgrade() -> None:
             name="ck_discography_batch_item_identity",
         ),
         *_nonnegative(
-            "target_count", "active_count", "skipped_count", "estimated_job_count", "attempt_count"
+            "expected_track_count",
+            "target_count",
+            "active_count",
+            "skipped_count",
+            "estimated_job_count",
+            "attempt_count",
         ),
         sa.ForeignKeyConstraint(["batch_id"], ["discography_batches.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(

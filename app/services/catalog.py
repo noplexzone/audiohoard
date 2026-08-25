@@ -41,6 +41,7 @@ from app.naming.convention import _sanitize_segment
 from app.services.catalog_artist_credits import catalog_track_artist_name
 from app.services.catalog_manifest import catalog_manifest_issue
 from app.services.release_editions import project_release_families
+from app.services.session_contract import reject_pending_orm_changes
 from app.settings_service import QualityProfile, get_runtime_settings
 
 UNKNOWN = "Unknown"
@@ -918,6 +919,7 @@ async def expand_catalog_album_missing_track_jobs(
     library_root: Path | None = None,
 ) -> CatalogQueueOutcome:
     """Create or observe exact ordinary jobs behind the acquisition claim fence."""
+    reject_pending_orm_changes(db, allowed_entities=(album,))
     album_id = album.id
     if album_id is None:
         raise ValueError("catalog album must be persisted")
@@ -980,6 +982,7 @@ async def expand_catalog_album_missing_track_jobs(
                 raise ValueError("discography batch item belongs to a different catalog album")
             if not _item_is_expansion_eligible(item):
                 raise ValueError("discography batch item is not expansion-eligible")
+            expected_count = max(expected_count or 0, item.expected_track_count or 0) or None
             if item.provider_release_id is not None:
                 provider_expected = await db.scalar(
                     select(CatalogAlbumProvider.track_count).where(

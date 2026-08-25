@@ -33,6 +33,7 @@ from app.services.catalog import (
     project_catalog_album_queue_targets,
 )
 from app.services.catalog_manifest import catalog_manifest_issue
+from app.services.session_contract import reject_pending_orm_changes
 from app.settings_service import QualityProfile, get_runtime_settings
 
 _YEAR = re.compile(r"^\d{4}$")
@@ -235,11 +236,15 @@ async def _select_artist_releases(
             year=release.year,
             release_kind=release.release_kind,
             provider=scope.provider,
-            expected_count=max(
-                release.track_count or 0,
-                release.catalog_album.track_count or 0 if release.catalog_album is not None else 0,
-            )
-            or None,
+            expected_count=(
+                release.track_count
+                if release.track_count is not None
+                else (
+                    release.catalog_album.track_count
+                    if release.catalog_album is not None
+                    else None
+                )
+            ),
         )
         for release in releases
     ]
@@ -340,6 +345,7 @@ async def _populate_batch_items(
                     release_year=release.year,
                     release_kind=release.release_kind,
                     provider=release.provider,
+                    expected_track_count=release.expected_count,
                     state=DiscographyBatchItemState.skipped,
                     reason_code=reason,
                     skipped_count=1,
@@ -419,6 +425,7 @@ async def _populate_batch_items(
                 release_year=release.year,
                 release_kind=release.release_kind,
                 provider=release.provider,
+                expected_track_count=release.expected_count,
                 state=state,
                 reason_code=reason,
                 target_count=target_count,
@@ -482,6 +489,7 @@ async def create_discography_batch_preview(
     quality_profile: QualityProfile | None = None,
 ) -> DiscographyBatchPreview:
     """Select, classify, and durably persist a provider-I/O-free preview."""
+    reject_pending_orm_changes(db)
     scope, scope_json = canonicalize_scope(scope_kind, payload)
     kind = DiscographyScopeKind(scope_kind)
     releases = (
@@ -667,7 +675,7 @@ async def resume_discography_batch(
             item.state = DiscographyBatchItemState.skipped
             item.reason_code = "catalog_release_unbound"
             continue
-        expected = album.track_count
+        expected = max(item.expected_track_count or 0, album.track_count or 0) or None
         if item.provider_release_id is not None:
             provider_expected = await db.scalar(
                 select(CatalogAlbumProvider.track_count).where(
