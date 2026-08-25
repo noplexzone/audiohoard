@@ -462,3 +462,60 @@ async def test_waiting_item_does_not_starve_later_pending(tmp_path: Path) -> Non
         assert later is not None and later.state == DiscographyBatchItemState.waiting
     assert len(dispatched) == 1
     await engine.dispose()
+
+
+async def test_unchanged_waiting_item_does_not_starve_later_terminal_job(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'waiting-fair.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    _batch_id, first_id = await _seed(factory)
+    async with factory() as db:
+        first = await db.get(DiscographyBatchItem, first_id)
+        assert first is not None
+        source_album = await db.get(CatalogAlbum, first.catalog_album_id)
+        assert source_album is not None
+        album = CatalogAlbum(artist_id=source_album.artist_id, title="Later", track_count=1)
+        album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Later"))
+        later = DiscographyBatchItem(
+            batch_id=first.batch_id,
+            release_identity="later-waiting",
+            catalog_album=album,
+            artist_name="Runner",
+            release_title="Later",
+            state=DiscographyBatchItemState.pending,
+        )
+        db.add(later)
+        await db.commit()
+        later_id = later.id
+
+    runner = DiscographyBatchRunner(
+        factory, dispatcher=lambda _job_id: None, quality_profile=PROFILE
+    )
+    assert await runner.run_once()
+    assert await runner.run_once()
+    async with factory() as db:
+        links = list(
+            (
+                await db.execute(
+                    select(DiscographyBatchItemJob.item_id, Job)
+                    .join(Job, Job.id == DiscographyBatchItemJob.job_id)
+                    .order_by(DiscographyBatchItemJob.item_id)
+                )
+            ).all()
+        )
+        assert [item_id for item_id, _job in links] == [first_id, later_id]
+        links[0][1].status = JobStatus.running
+        links[1][1].status = JobStatus.done
+        await db.commit()
+
+    assert await runner.run_once()
+    async with factory() as db:
+        first = await db.get(DiscographyBatchItem, first_id)
+        later = await db.get(DiscographyBatchItem, later_id)
+        assert first is not None and first.state == DiscographyBatchItemState.waiting
+        assert later is not None and later.state == DiscographyBatchItemState.failed
+        assert later.reason_code == "targets_remain_without_active_jobs"
+    await engine.dispose()

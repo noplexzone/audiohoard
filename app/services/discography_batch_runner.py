@@ -123,17 +123,33 @@ class DiscographyBatchRunner:
                 await asyncio.wait_for(self._wake.wait(), timeout=self._interval_seconds)
 
     async def run_once(self) -> bool:
-        """Recover and process at most one item and at most 25 new jobs."""
+        """Recover work, inspect at most 25 waiting items, and create at most 25 jobs."""
         now = datetime.now(UTC)
         await self._recover_expired(now)
         claimed = await self._claim_pending(now)
         if claimed is None:
-            waiting_id = await self._next_waiting_item()
-            if waiting_id is not None:
+            waiting_ids = await self._next_waiting_items()
+            if waiting_ids:
+                changed = False
                 async with self._session_factory() as db:
-                    changed = await self._reconcile_item(db, waiting_id, attempted=True)
-                    if changed:
-                        await self._finish_batch_for_item(db, waiting_id)
+                    for waiting_id in waiting_ids:
+                        item_changed = await self._reconcile_item(db, waiting_id, attempted=True)
+                        if item_changed:
+                            await self._finish_batch_for_item(db, waiting_id)
+                            changed = True
+                        else:
+                            # Persist a restart-safe rotation marker without claiming a lease.
+                            # This keeps a bounded pass from repeatedly selecting the same
+                            # unchanged active jobs while later waiting rows starve.
+                            await db.execute(
+                                update(DiscographyBatchItem)
+                                .where(
+                                    DiscographyBatchItem.id == waiting_id,
+                                    DiscographyBatchItem.state
+                                    == DiscographyBatchItemState.waiting,
+                                )
+                                .values(updated_at=datetime.now(UTC))
+                            )
                     await db.commit()
                 return changed
             return await self._reconcile_idle_batch()
@@ -260,19 +276,19 @@ class DiscographyBatchRunner:
             )
             await db.commit()
 
-    async def _next_waiting_item(self) -> int | None:
+    async def _next_waiting_items(self) -> list[int]:
         async with self._session_factory() as db:
-            value = await db.scalar(
+            values = await db.scalars(
                 select(DiscographyBatchItem.id)
                 .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
                 .where(
                     DiscographyBatch.state.in_(_ACTIVE_BATCHES),
                     DiscographyBatchItem.state == DiscographyBatchItemState.waiting,
                 )
-                .order_by(DiscographyBatchItem.id)
-                .limit(1)
+                .order_by(DiscographyBatchItem.updated_at, DiscographyBatchItem.id)
+                .limit(25)
             )
-            return int(value) if value is not None else None
+            return [int(value) for value in values]
 
     async def _claim_pending(self, now: datetime) -> tuple[int, bool, str] | None:
         for attempt in range(6):
