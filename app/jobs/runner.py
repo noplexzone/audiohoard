@@ -2167,6 +2167,23 @@ async def _cancellation_safe_checkpoint(checkpoint: Callable[[], Awaitable[None]
         raise
 
 
+def _track_slskd_source_matches_candidate(track: Track, username: str, filename: str) -> bool:
+    """Return whether legacy Track provenance identifies this exact candidate."""
+    if not track.acquisition_provenance_json:
+        return False
+    try:
+        provenance = json.loads(track.acquisition_provenance_json)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(provenance, dict):
+        return False
+    persisted_identity = normalize_source_candidate_identity(
+        provenance.get("source"), provenance.get("username"), provenance.get("filename")
+    )
+    candidate_identity = normalize_source_candidate_identity("slskd", username, filename)
+    return persisted_identity is not None and persisted_identity == candidate_identity
+
+
 async def _prepare_acquisition(
     result: SearchResult,
     source: str,
@@ -2212,7 +2229,12 @@ async def _prepare_acquisition(
         transfer_id: str | None = None
         if attempt is not None:
             transfer_id = attempt.provider_uuid or attempt.provisional_transfer_id
-        if transfer_id is None and track is not None and track.source_job_id:
+        if (
+            transfer_id is None
+            and track is not None
+            and track.source_job_id
+            and _track_slskd_source_matches_candidate(track, username, filename)
+        ):
             if track.acquisition_state == AcquisitionState.acquiring:
                 transfer_id = track.source_job_id
             else:

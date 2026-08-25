@@ -21,7 +21,23 @@ logger = logging.getLogger(__name__)
 
 
 def is_sqlite_database_locked(exc: BaseException) -> bool:
-    return isinstance(exc, OperationalError) and "database is locked" in str(exc).casefold()
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(current, OperationalError) and (
+            "database is locked" in str(current).casefold()
+        ):
+            return True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return False
 
 
 async def run_with_sqlite_lock_retry(
