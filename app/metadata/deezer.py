@@ -111,9 +111,11 @@ class DeezerClient:
             response = await request_with_retry(client, "GET", path, params=params)
             response.raise_for_status()
         payload = response.json()
-        if isinstance(payload, dict) and "error" in payload:
+        if not isinstance(payload, dict):
+            raise ValueError("Deezer returned an invalid discovery feed envelope")
+        if "error" in payload:
             raise ValueError("Deezer returned an error envelope")
-        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        rows = payload.get("data")
         if not isinstance(rows, list):
             raise ValueError("Deezer returned an invalid discovery feed")
         valid = [row for row in rows[local_start : local_start + limit] if isinstance(row, dict)]
@@ -121,7 +123,7 @@ class DeezerClient:
             return [
                 artist
                 for row in valid
-                if (artist := _parse_artist(row)).provider_id and artist.name
+                if (artist := _parse_discovery_artist(row)) is not None and artist.name
             ]
         if feed == "genres":
             return [
@@ -130,7 +132,7 @@ class DeezerClient:
         return [
             release
             for row in valid
-            if (release := _parse_discovery_release(row)).provider_id
+            if (release := _parse_discovery_release(row)) is not None
             and release.title
             and release.artist_provider_id
         ]
@@ -560,6 +562,13 @@ def _parse_artist_detail(data: dict[str, object]) -> ArtistDetail:
     return ArtistDetail(**hit.__dict__)
 
 
+def _parse_discovery_artist(data: dict[str, object]) -> ArtistHit | None:
+    artist_id = _positive_scalar_id(data.get("id"))
+    if artist_id is None:
+        return None
+    return replace(_parse_artist(data), provider_id=artist_id, deezer_id=artist_id)
+
+
 def _parse_genre(data: dict[str, object]) -> DiscoveryGenre:
     genre_id = _positive_scalar_id(data.get("id"))
     if genre_id is None:
@@ -572,13 +581,18 @@ def _parse_genre(data: dict[str, object]) -> DiscoveryGenre:
     )
 
 
-def _parse_discovery_release(data: dict[str, object]) -> DiscoveryRelease:
+def _parse_discovery_release(data: dict[str, object]) -> DiscoveryRelease | None:
+    release_id = _positive_scalar_id(data.get("id"))
     artist = data.get("artist")
-    artist_name = str(artist.get("name") or "") if isinstance(artist, dict) else ""
-    artist_id = str(artist.get("id") or "") if isinstance(artist, dict) else ""
+    if release_id is None or not isinstance(artist, dict):
+        return None
+    artist_id = _positive_scalar_id(artist.get("id"))
+    if artist_id is None:
+        return None
+    artist_name = str(artist.get("name") or "")
     return DiscoveryRelease(
         provider="deezer",
-        provider_id=str(data.get("id") or ""),
+        provider_id=release_id,
         title=str(data.get("title") or ""),
         artist_name=artist_name,
         artist_provider_id=artist_id,

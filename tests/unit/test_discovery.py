@@ -232,6 +232,105 @@ async def test_deezer_discovery_rejects_http_200_error_envelope(monkeypatch) -> 
         await provider.discovery_feed("popular")
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [42, [], {}, {"data": {}}, {"error": None, "data": []}],
+    ids=["scalar-root", "list-root", "missing-data", "non-list-data", "null-error"],
+)
+async def test_deezer_discovery_rejects_malformed_http_200_envelopes(
+    monkeypatch, payload: object
+) -> None:
+    provider = DeezerClient()
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com",
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=payload)),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Deezer returned"):
+        await provider.discovery_feed("popular")
+
+
+_INVALID_DISCOVERY_IDS = [True, 1.5, {}, [], "", "0", 0, -1, "-1", "abc"]
+
+
+@pytest.mark.parametrize("bad_id", _INVALID_DISCOVERY_IDS)
+@pytest.mark.parametrize(
+    "feed,identity_field",
+    [
+        ("popular", "item"),
+        ("new", "item"),
+        ("new", "artist"),
+        ("trending", "item"),
+        ("trending", "artist"),
+    ],
+)
+async def test_deezer_discovery_rejects_malformed_card_identities(
+    monkeypatch, feed: str, identity_field: str, bad_id: object
+) -> None:
+    if feed == "popular":
+        candidate: dict[str, object] = {"id": 7, "name": "Artist"}
+    else:
+        candidate = {
+            "id": 8,
+            "title": "Release",
+            "artist": {"id": 9, "name": "Artist"},
+        }
+    if identity_field == "item":
+        candidate["id"] = bad_id
+    else:
+        candidate["artist"] = {"id": bad_id, "name": "Artist"}
+
+    provider = DeezerClient()
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com",
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, json={"data": [candidate]})
+            ),
+        ),
+    )
+
+    assert await provider.discovery_feed(feed) == []
+
+
+@pytest.mark.parametrize("feed", ["popular", "new", "trending"])
+async def test_deezer_discovery_preserves_integer_and_digit_string_identities(
+    monkeypatch, feed: str
+) -> None:
+    if feed == "popular":
+        rows = [{"id": 7, "name": "One"}, {"id": "8", "name": "Two"}]
+    else:
+        rows = [
+            {"id": 7, "title": "One", "artist": {"id": "9", "name": "Artist One"}},
+            {"id": "8", "title": "Two", "artist": {"id": 10, "name": "Artist Two"}},
+        ]
+    provider = DeezerClient()
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com",
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, json={"data": rows})
+            ),
+        ),
+    )
+
+    cards = await provider.discovery_feed(feed)
+
+    assert [card.provider_id for card in cards] == ["7", "8"]
+    if feed != "popular":
+        assert [
+            card.artist_provider_id for card in cards if isinstance(card, DiscoveryRelease)
+        ] == ["9", "10"]
+
+
 async def test_deezer_genre_discovery_uses_exact_radio_tracks_and_deduplicates(
     monkeypatch,
 ) -> None:
