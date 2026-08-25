@@ -60,6 +60,23 @@ async def test_activity_summary_counts_actionable_work_in_one_query(
         DiscographyBatchItemJob(job=pending, ownership=DiscographyJobOwnership.created)
     )
     queued_batch.items.append(materialized_item)
+    duplicate_batch = DiscographyBatch(
+        scope_kind=DiscographyScopeKind.wanted_page,
+        scope_json="{}",
+        scope_hash="queued-activity-duplicate",
+        state=DiscographyBatchState.running,
+        estimated_job_count=3,
+    )
+    duplicate_batch.items.append(
+        DiscographyBatchItem(
+            release_identity="catalog_album:activity",
+            artist_name="Queued artist",
+            release_title="Queued album",
+            state=DiscographyBatchItemState.hydrating,
+            target_count=3,
+            estimated_job_count=3,
+        )
+    )
     failed = Job(source="slskd", query="failed", status=JobStatus.failed)
     partial = Job(source="slskd", query="retrying", status=JobStatus.partial)
     hidden_failed = Job(source="slskd", query="hidden", status=JobStatus.failed, queue_hidden=True)
@@ -88,6 +105,7 @@ async def test_activity_summary_counts_actionable_work_in_one_query(
             running,
             pending,
             queued_batch,
+            duplicate_batch,
             failed,
             partial,
             hidden_failed,
