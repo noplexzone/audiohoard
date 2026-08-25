@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.services.source_candidate_identity import normalize_source_candidate_identity
 
 
@@ -80,3 +82,46 @@ def test_slskd_identity_rejects_malformed_unc_without_server_and_share() -> None
     assert normalize_source_candidate_identity("slskd", "peer", "//server") is None
     assert normalize_source_candidate_identity("slskd", "peer", "//server/") is None
     assert normalize_source_candidate_identity("slskd", "peer", "//../share/song.flac") is None
+
+
+@pytest.mark.parametrize(
+    "remote_path",
+    [
+        "/",
+        "/./",
+        "C:",
+        "C:/",
+        "C:\\",
+        "//server/share",
+        "//server/share/.",
+        "//server/share/folder/..",
+        "//./share/song.flac",
+        "//../share/song.flac",
+        "//server/./song.flac",
+        "//server/../song.flac",
+    ],
+)
+def test_slskd_identity_rejects_namespace_roots_and_malformed_unc(remote_path: str) -> None:
+    assert normalize_source_candidate_identity("slskd", "peer", remote_path) is None
+
+
+@pytest.mark.parametrize(
+    ("remote_path", "canonical_path"),
+    [
+        ("song.flac", "song.flac"),
+        ("../folder/song.flac", "../folder/song.flac"),
+        ("/song.flac", "/song.flac"),
+        ("C:song.flac", "C:song.flac"),
+        ("C:../song.flac", "C:../song.flac"),
+        ("C:/song.flac", "C:/song.flac"),
+        ("//server/share/song.flac", "//server/share/song.flac"),
+    ],
+)
+def test_slskd_identity_accepts_complete_artifact_paths(
+    remote_path: str, canonical_path: str
+) -> None:
+    assert normalize_source_candidate_identity("slskd", "peer", remote_path) == (
+        "slskd",
+        "peer",
+        canonical_path,
+    )

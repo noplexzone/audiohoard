@@ -28,11 +28,13 @@ def _normalize_slskd_remote_path(value: str) -> str:
         return ""
 
     if path.startswith("//"):
-        components = [part for part in path[2:].split("/") if part and part != "."]
-        if len(components) < 2 or components[0] == ".." or components[1] == "..":
+        components = [part for part in path[2:].split("/") if part]
+        if len(components) < 3 or any(anchor in {"", ".", ".."} for anchor in components[:2]):
             return ""
         server, share, *tail = components
         normalized_tail = _collapse_path_parts(tail, anchored=True)
+        if not normalized_tail:
+            return ""
         return "//" + "/".join([server, share, *normalized_tail])
 
     drive_match = _DRIVE_PREFIX.match(path)
@@ -40,14 +42,21 @@ def _normalize_slskd_remote_path(value: str) -> str:
         drive, remainder = drive_match.groups()
         absolute = remainder.startswith("/")
         normalized = _collapse_path_parts(remainder.split("/"), anchored=absolute)
+        if not normalized or all(part == ".." for part in normalized):
+            return ""
         separator = "/" if absolute else ""
         return drive + separator + "/".join(normalized)
 
     if path.startswith("/"):
         normalized = _collapse_path_parts(path.split("/"), anchored=True)
+        if not normalized:
+            return ""
         return "/" + "/".join(normalized)
 
-    return "/".join(_collapse_path_parts(path.split("/"), anchored=False))
+    normalized = _collapse_path_parts(path.split("/"), anchored=False)
+    if not normalized or all(part == ".." for part in normalized):
+        return ""
+    return "/".join(normalized)
 
 
 def normalize_source_candidate_identity(

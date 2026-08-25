@@ -63,7 +63,17 @@ def test_0032_backfills_and_deduplicates_exact_legacy_denied_sources(tmp_path: P
                         (2, 'slskd', 'denied',
                          '{"source":"slskd","username":"DrivePeer","filename":"C:../song.flac"}'),
                         (2, 'slskd', 'denied',
-                         '{"source":"slskd","username":"MalformedUnc","filename":"//server"}')
+                         '{"source":"slskd","username":"MalformedUnc","filename":"//server"}'),
+                        (2, 'slskd', 'denied',
+                         '{"source":"slskd","username":"RootOnly","filename":"/"}'),
+                        (2, 'slskd', 'denied',
+                         '{"source":"slskd","username":"DriveRoot","filename":"C:/"}'),
+                        (2, 'slskd', 'denied',
+                         '{"source":"slskd","username":"DriveOnly","filename":"C:"}'),
+                        (2, 'slskd', 'denied',
+                         '{"source":"slskd","username":"UncRoot","filename":"//server/share"}'),
+                        (2, 'slskd', 'denied',
+                         '{"source":"slskd","username":"DotServer","filename":"//./share/song.flac"}')
                     """
                 ),
                 {
@@ -137,3 +147,107 @@ def test_0032_backfills_and_deduplicates_exact_legacy_denied_sources(tmp_path: P
             assert connection.scalar(sa.text("SELECT count(*) FROM source_candidate_blocks")) == 6
     finally:
         engine.dispose()
+
+
+def test_0032_deduplicates_by_strongest_policy_and_preserves_denied_telemetry(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "migration-0032-policy.db"
+    cfg = _config(database)
+    command.upgrade(cfg, "0031")
+    now = datetime.now(UTC)
+    expired = now - timedelta(days=1)
+    future = now + timedelta(days=7)
+    farther_future = now + timedelta(days=14)
+    oldest_failure = now - timedelta(days=3)
+    older_failure = now - timedelta(days=2)
+    latest_failure = now - timedelta(hours=1)
+
+    engine = sa.create_engine(f"sqlite:///{database}")
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text("INSERT INTO jobs (id, source, query) VALUES (1, 'slskd', 'legacy')")
+            )
+            connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO tracks
+                        (job_id, source, acoustid_verification_state,
+                         acquisition_provenance_json)
+                    VALUES
+                        (1, 'slskd', 'denied',
+                         '{"source":"slskd","username":"DeniedPeer","filename":"Denied/Track.flac"}')
+                    """
+                )
+            )
+            connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO source_candidate_blocks
+                        (provider, peer, filename, reason, retry_count,
+                         last_failure_at, blocked_until)
+                    VALUES
+                        ('slskd', 'CooldownPeer', 'Album/Track.flac', 'expired', 1,
+                         :oldest_failure, :expired),
+                        (' SLSKD ', 'CooldownPeer', 'Album/./Track.flac', 'future', 8,
+                         :latest_failure, :future),
+                        ('slskd', 'PermanentPeer', 'Keep/Track.flac', 'permanent', 2,
+                         :older_failure, NULL),
+                        (' SLSKD ', 'PermanentPeer', 'Keep/./Track.flac', 'future', 9,
+                         :latest_failure, :farther_future),
+                        ('slskd', 'DeniedPeer', 'Denied/Track.flac', 'operator', 1,
+                         :oldest_failure, NULL),
+                        (' SLSKD ', 'DeniedPeer', 'Denied/./Track.flac', 'temporary', 11,
+                         :latest_failure, :farther_future)
+                    """
+                ),
+                {
+                    "expired": expired,
+                    "future": future,
+                    "farther_future": farther_future,
+                    "oldest_failure": oldest_failure,
+                    "older_failure": older_failure,
+                    "latest_failure": latest_failure,
+                },
+            )
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, "head")
+
+    engine = sa.create_engine(f"sqlite:///{database}")
+    try:
+        with engine.connect() as connection:
+            rows = {
+                row.peer: row
+                for row in connection.execute(
+                    sa.text(
+                        "SELECT id, provider, peer, filename, reason, retry_count, "
+                        "last_failure_at, blocked_until FROM source_candidate_blocks"
+                    )
+                ).mappings()
+            }
+    finally:
+        engine.dispose()
+
+    assert set(rows) == {"CooldownPeer", "PermanentPeer", "DeniedPeer"}
+    cooldown = rows["CooldownPeer"]
+    assert cooldown.id == 2
+    assert cooldown.filename == "Album/Track.flac"
+    assert cooldown.reason == "future"
+    assert cooldown.retry_count == 8
+    assert cooldown.blocked_until is not None
+
+    permanent = rows["PermanentPeer"]
+    assert permanent.id == 3
+    assert permanent.reason == "permanent"
+    assert permanent.retry_count == 2
+    assert permanent.blocked_until is None
+
+    denied = rows["DeniedPeer"]
+    assert denied.id == 5
+    assert denied.reason == "denied"
+    assert denied.retry_count == 11
+    assert denied.last_failure_at is not None
+    assert denied.blocked_until is None

@@ -44,25 +44,32 @@ def _normalize_remote_path(value: str) -> str:
     if not path:
         return ""
     if path.startswith("//"):
-        components = [part for part in path[2:].split("/") if part and part != "."]
-        if len(components) < 2 or components[0] == ".." or components[1] == "..":
+        components = [part for part in path[2:].split("/") if part]
+        if len(components) < 3 or any(anchor in {"", ".", ".."} for anchor in components[:2]):
             return ""
         server, share, *tail = components
-        return "//" + "/".join([server, share, *_collapse_path_parts(tail, anchored=True)])
+        normalized_tail = _collapse_path_parts(tail, anchored=True)
+        if not normalized_tail:
+            return ""
+        return "//" + "/".join([server, share, *normalized_tail])
     drive_match = _DRIVE_PREFIX.match(path)
     if drive_match is not None:
         drive, remainder = drive_match.groups()
-        separator = "/" if remainder.startswith("/") else ""
-        return (
-            drive
-            + separator
-            + "/".join(
-                _collapse_path_parts(remainder.split("/"), anchored=remainder.startswith("/"))
-            )
-        )
+        absolute = remainder.startswith("/")
+        normalized = _collapse_path_parts(remainder.split("/"), anchored=absolute)
+        if not normalized or all(part == ".." for part in normalized):
+            return ""
+        separator = "/" if absolute else ""
+        return drive + separator + "/".join(normalized)
     if path.startswith("/"):
-        return "/" + "/".join(_collapse_path_parts(path.split("/"), anchored=True))
-    return "/".join(_collapse_path_parts(path.split("/"), anchored=False))
+        normalized = _collapse_path_parts(path.split("/"), anchored=True)
+        if not normalized:
+            return ""
+        return "/" + "/".join(normalized)
+    normalized = _collapse_path_parts(path.split("/"), anchored=False)
+    if not normalized or all(part == ".." for part in normalized):
+        return ""
+    return "/".join(normalized)
 
 
 def _normalize_identity(
@@ -81,7 +88,8 @@ def _canonicalize_existing_blocks(
 ) -> set[tuple[str, str, str]]:
     rows = bind.execute(
         sa.text(
-            "SELECT id, provider, peer, filename, reason, blocked_until "
+            "SELECT id, provider, peer, filename, reason, retry_count, "
+            "last_failure_at, blocked_until "
             "FROM source_candidate_blocks ORDER BY id"
         )
     ).mappings()
@@ -92,8 +100,34 @@ def _canonicalize_existing_blocks(
             groups[identity].append(dict(row))
 
     for identity, duplicates in groups.items():
-        permanent = [row for row in duplicates if row["blocked_until"] is None]
-        keeper = (permanent or duplicates)[0]
+        keeper = max(
+            duplicates,
+            key=lambda row: (
+                row["blocked_until"] is None,
+                str(row["blocked_until"] or ""),
+                int(row["retry_count"] or 0),
+                str(row["last_failure_at"] or ""),
+                -int(row["id"]),
+            ),
+        )
+        if identity in denied_identities:
+            retry_count = max(int(row["retry_count"] or 0) for row in duplicates)
+            last_failure_at = max(
+                (row["last_failure_at"] for row in duplicates),
+                key=lambda value: str(value or ""),
+            )
+            bind.execute(
+                sa.text(
+                    "UPDATE source_candidate_blocks SET reason = 'denied', blocked_until = NULL, "
+                    "retry_count = :retry_count, last_failure_at = :last_failure_at "
+                    "WHERE id = :id"
+                ),
+                {
+                    "retry_count": retry_count,
+                    "last_failure_at": last_failure_at,
+                    "id": keeper["id"],
+                },
+            )
         duplicate_ids = [row["id"] for row in duplicates if row["id"] != keeper["id"]]
         if duplicate_ids:
             bind.execute(
@@ -102,14 +136,10 @@ def _canonicalize_existing_blocks(
                 ),
                 {"ids": duplicate_ids},
             )
-        denial_update = (
-            ", reason = 'denied', blocked_until = NULL" if identity in denied_identities else ""
-        )
         bind.execute(
             sa.text(
                 "UPDATE source_candidate_blocks "
-                "SET provider = :provider, peer = :peer, filename = :filename"
-                f"{denial_update} WHERE id = :id"
+                "SET provider = :provider, peer = :peer, filename = :filename WHERE id = :id"
             ),
             {
                 "provider": identity[0],
