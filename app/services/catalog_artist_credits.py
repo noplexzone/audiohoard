@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
-
-if TYPE_CHECKING:
-    from app.models.track import Track
 
 
 @dataclass(frozen=True)
@@ -27,20 +23,21 @@ def is_compilation_album(album: CatalogAlbum) -> bool:
 def project_catalog_artist_credits(
     album: CatalogAlbum,
     catalog_track: CatalogAlbumTrack | None = None,
-    track: Track | None = None,
 ) -> CatalogArtistCredits:
-    """Project catalog credits without flattening compilation performers to their owner."""
+    """Project deterministic catalog credits without trusting mutable source-track metadata."""
     owner = _clean_credit(album.artist.name if album.artist is not None else None)
-    album_artist = _clean_credit(album.album_artist_name) or owner
+    compilation = is_compilation_album(album)
+    album_artist = _clean_credit(album.album_artist_name)
+    if not album_artist:
+        album_artist = "Various Artists" if compilation else owner
 
     # Catalog providers often expose featured performers on ordinary artist albums.
     # Preserve the established owner credit there; per-track credits are authoritative
     # for compilations, where flattening them loses the actual performer identity.
     track_artist = owner
-    if is_compilation_album(album):
+    if compilation:
         track_artist = (
             _clean_credit(catalog_track.artist_name if catalog_track is not None else None)
-            or _clean_credit(track.artist if track is not None else None)
             or owner
         )
 

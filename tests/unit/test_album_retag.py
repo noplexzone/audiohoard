@@ -26,6 +26,7 @@ from app.services.library_import import (
     CanonicalArtwork,
     ImportExecutionError,
     MutagenTagWriter,
+    _discover_legacy_album_files,
     retag_catalog_album,
 )
 from app.services.pinned_destination import PinnedDestination
@@ -1093,7 +1094,7 @@ async def test_retag_compilation_projects_track_and_album_credits_without_reloca
     assert FLAC(paths[0]).pictures[0].data == b"existing-cover"
 
 
-async def test_retag_compilation_discovers_album_artist_legacy_folder(
+async def test_retag_compilation_missing_child_artist_uses_owner_in_legacy_folder(
     db_session: AsyncSession, tmp_path: Path
 ) -> None:
     library_root = tmp_path / "library"
@@ -1108,7 +1109,7 @@ async def test_retag_compilation_discovers_album_artist_legacy_folder(
         track_count=1,
     )
     catalog_track = CatalogAlbumTrack(
-        disc=1, position=1, title="The Hanging Tree", artist_name="Rachel Zegler"
+        disc=1, position=1, title="The Hanging Tree", artist_name=None
     )
     album.tracks.append(catalog_track)
     db_session.add(owner)
@@ -1123,5 +1124,58 @@ async def test_retag_compilation_discovers_album_artist_legacy_folder(
     assert result.files_retagged == 1
     assert result.files_renamed == 0
     assert path.exists()
-    assert FLAC(path)["artist"] == ["Rachel Zegler"]
+    assert FLAC(path)["artist"] == [owner.name]
     assert FLAC(path)["albumartist"] == ["Various Artists"]
+
+
+@pytest.mark.parametrize(
+    ("owner_name", "album_artist_name", "title", "year"),
+    [
+        ("../escape", "Various Artists", "Soundtrack", "2023"),
+        ("Olivia Rodrigo", "/tmp/absolute", "Soundtrack", "2023"),
+        ("Olivia Rodrigo", "Various Artists", "../escape", "2023"),
+        ("Olivia Rodrigo", "Various Artists", "Soundtrack", "../escape"),
+    ],
+)
+def test_legacy_discovery_rejects_unsafe_provider_folder_segments(
+    tmp_path: Path,
+    owner_name: str,
+    album_artist_name: str,
+    title: str,
+    year: str,
+) -> None:
+    album = CatalogAlbum(
+        artist=CatalogArtist(name=owner_name),
+        title=title,
+        year=year,
+        release_type="compilation",
+        is_compilation=True,
+        album_artist_name=album_artist_name,
+    )
+
+    with pytest.raises(ImportExecutionError, match="unsafe legacy album folder segment"):
+        _discover_legacy_album_files(album, tmp_path / "library")
+
+
+def test_legacy_discovery_rejects_symlinked_artist_parent_outside_library(
+    tmp_path: Path,
+) -> None:
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (library_root / "Olivia Rodrigo").symlink_to(outside, target_is_directory=True)
+    album = CatalogAlbum(
+        artist=CatalogArtist(name="Olivia Rodrigo"),
+        title="Soundtrack",
+        year="2023",
+        release_type="compilation",
+        is_compilation=True,
+        album_artist_name="Various Artists",
+    )
+    outside_folder = outside / "Soundtrack (2023)"
+    outside_folder.mkdir()
+    (outside_folder / "01 - Song.flac").write_bytes(_minimal_flac_bytes())
+
+    with pytest.raises(ImportExecutionError, match="symlinked path"):
+        _discover_legacy_album_files(album, library_root)

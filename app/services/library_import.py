@@ -13,7 +13,7 @@ import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import BinaryIO, no_type_check
 from urllib.parse import urljoin, urlparse
 
@@ -793,7 +793,7 @@ def _catalog_track_total_values(album: CatalogAlbum, disc: int) -> dict[str, str
 def _catalog_tags(
     album: CatalogAlbum, catalog_track: CatalogAlbumTrack, track: Track | None
 ) -> dict[str, str]:
-    credits = project_catalog_artist_credits(album, catalog_track, track)
+    credits = project_catalog_artist_credits(album, catalog_track)
     values = {
         "title": catalog_track.title,
         "artist": credits.track_artist,
@@ -824,7 +824,7 @@ def _sync_track_from_catalog(
 ) -> None:
     disc_total = _catalog_disc_total(album)
     track.catalog_album_id = album.id
-    credits = project_catalog_artist_credits(album, catalog_track, track)
+    credits = project_catalog_artist_credits(album, catalog_track)
     track.catalog_track_id = catalog_track.id
     track.title = catalog_track.title
     track.artist = credits.track_artist
@@ -867,18 +867,39 @@ def _canonical_destination_for_catalog_track(
     return current_path.parent / Path(rendered).name
 
 
+def _validated_legacy_folder_segment(value: str) -> str:
+    if (
+        not value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or "\x00" in value
+        or Path(value).is_absolute()
+        or PureWindowsPath(value).is_absolute()
+    ):
+        raise ImportExecutionError("unsafe legacy album folder segment")
+    return value
+
+
 def _discover_legacy_album_files(
     album: CatalogAlbum, library_root: Path
 ) -> list[tuple[Path, None, CatalogAlbumTrack]]:
     root = library_root.resolve()
     credits = project_catalog_artist_credits(album)
     artist_folders = dict.fromkeys((album.artist.name, credits.album_artist))
-    folders = [
-        root / artist_name / f"{album.title} ({album.year or ''})"
-        for artist_name in artist_folders
-        if artist_name
-    ]
-    folders = [folder for folder in folders if folder.is_dir() and not folder.is_symlink()]
+    album_folder = _validated_legacy_folder_segment(f"{album.title} ({album.year or ''})")
+    folders: list[Path] = []
+    for artist_name in artist_folders:
+        if not artist_name:
+            continue
+        folder = root / _validated_legacy_folder_segment(artist_name) / album_folder
+        if _existing_parent_symlink(root, folder / ".legacy-discovery-probe") is not None:
+            raise ImportExecutionError("album folder contains a symlinked path")
+        resolved_folder = folder.resolve(strict=False)
+        if resolved_folder != root and root not in resolved_folder.parents:
+            raise ImportExecutionError("legacy album folder escapes library root")
+        if folder.is_dir():
+            folders.append(folder)
     if not folders:
         return []
     catalog_by_position = {(track.disc, track.position): track for track in album.tracks}
