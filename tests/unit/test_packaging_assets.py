@@ -134,7 +134,7 @@ def test_favicon_ico_uses_the_requested_artwork_at_every_size() -> None:
 
 def test_dockerfile_version_and_healthcheck_match_current_runtime_contract() -> None:
     dockerfile = Path("docker/Dockerfile").read_text(encoding="utf-8")
-    assert 'org.opencontainers.image.version="0.25.0"' in dockerfile
+    assert 'org.opencontainers.image.version="0.26.0"' in dockerfile
     assert "http://localhost:8000/health/ready" in dockerfile
 
 
