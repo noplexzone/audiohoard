@@ -619,3 +619,24 @@ async def test_discovery_cache_is_bounded_and_expires_stale_entries() -> None:
     await service.get("new", "US", page=1)
 
     assert len(service._cache) <= 2
+
+
+async def test_deezer_exact_artist_rejects_error_key_even_when_null(monkeypatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/artist/1"
+        return httpx.Response(
+            200,
+            json={"id": 1, "name": "Rejected envelope", "error": None},
+        )
+
+    provider = DeezerClient()
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com", transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="valid matching artist identity"):
+        await provider.get_artist("1")
