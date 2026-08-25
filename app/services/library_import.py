@@ -971,23 +971,42 @@ async def retag_catalog_album(
                 ImportPlan.status == ImportWorkflowState.imported,
                 ImportPlan.destination_path != "",
             )
-            .order_by(ImportPlan.id)
+            .order_by(Track.id, ImportPlan.id)
         )
     ).all()
-    latest: dict[int, tuple[Track, ImportPlan]] = {track.id: (track, plan) for track, plan in rows}
+    claims_by_track: dict[int, list[tuple[Track, ImportPlan]]] = {}
+    for track, plan in rows:
+        claims_by_track.setdefault(track.id, []).append((track, plan))
+
+    current: dict[int, tuple[Track, ImportPlan]] = {}
+    for track_id, claims in claims_by_track.items():
+        present = [claim for claim in claims if claim[1].file_state == LibraryFileState.present]
+        if len(present) > 1:
+            raise ImportExecutionError(f"track {track_id} has duplicate present claims")
+        if present:
+            current[track_id] = present[0]
+            continue
+        unknown = [claim for claim in claims if claim[1].file_state == LibraryFileState.unknown]
+        if len(unknown) > 1:
+            raise ImportExecutionError(f"track {track_id} has ambiguous unknown claims")
+        if unknown:
+            # Legacy rows predate durable file-state tracking. Execution performs the
+            # contained, regular, non-symlink audio checks before touching any file.
+            current[track_id] = unknown[0]
+
     artwork = await _fetch_canonical_artwork(album.artwork_url)
-    for track, _plan in latest.values():
+    for track, _plan in current.values():
         catalog_track = catalog_tracks.get(track.catalog_track_id or 0)
         if catalog_track is None:
             raise ImportExecutionError("imported file is not linked to stored track metadata")
         _sync_track_numbering_from_catalog(track, album, catalog_track)
-    if not latest:
+    if not current:
         raise ImportExecutionError("album has no imported files to retag")
 
     transaction = await asyncio.to_thread(
         _retag_catalog_album_files,
         album,
-        list(latest.values()),
+        list(current.values()),
         library_root=library_root,
         tag_writer=tag_writer,
         artwork=artwork,

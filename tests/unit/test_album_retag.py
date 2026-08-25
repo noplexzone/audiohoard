@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.services.library_import as library_import_module
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
-from app.models.import_plan import ImportPlan
+from app.models.import_plan import ImportPlan, LibraryFileState
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.track import Track
@@ -340,6 +340,83 @@ async def test_retag_catalog_album_rejects_name_only_track_from_same_title_editi
     assert [path.read_bytes() for path in paths] == original_bytes
 
 
+async def test_retag_catalog_album_prefers_older_present_claim_over_newer_missing(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, tracks = await _seed_imported_album(db_session, library_root)
+    current = tracks[0].import_plans[0]
+    current.file_state = LibraryFileState.present
+    missing = ImportPlan(
+        release=tracks[0].release,
+        track=tracks[0],
+        source_path="/staging/gone.flac",
+        destination_path=str(paths[0].with_name("newer-but-missing.flac")),
+        status=ImportWorkflowState.imported,
+        file_state=LibraryFileState.missing,
+    )
+    db_session.add(missing)
+    await db_session.flush()
+
+    result = await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert result.files_retagged == 2
+    assert paths[0].exists()
+    assert current.destination_path == str(paths[0])
+    assert missing.destination_path.endswith("newer-but-missing.flac")
+
+
+async def test_retag_catalog_album_rejects_duplicate_present_claims_untouched(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, tracks = await _seed_imported_album(db_session, library_root)
+    original_bytes = [path.read_bytes() for path in paths]
+    tracks[0].import_plans[0].file_state = LibraryFileState.present
+    db_session.add(
+        ImportPlan(
+            release=tracks[0].release,
+            track=tracks[0],
+            source_path=tracks[0].source_path,
+            destination_path=str(paths[0]),
+            status=ImportWorkflowState.imported,
+            file_state=LibraryFileState.present,
+        )
+    )
+    await db_session.flush()
+
+    with pytest.raises(ImportExecutionError, match="duplicate present claims"):
+        await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert [path.read_bytes() for path in paths] == original_bytes
+    assert not list(paths[0].parent.glob(".*.retag-backup"))
+
+
+async def test_retag_catalog_album_rejects_ambiguous_unknown_claims_untouched(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, tracks = await _seed_imported_album(db_session, library_root)
+    original_bytes = [path.read_bytes() for path in paths]
+    db_session.add(
+        ImportPlan(
+            release=tracks[0].release,
+            track=tracks[0],
+            source_path=tracks[0].source_path,
+            destination_path=str(paths[0]),
+            status=ImportWorkflowState.imported,
+            file_state=LibraryFileState.unknown,
+        )
+    )
+    await db_session.flush()
+
+    with pytest.raises(ImportExecutionError, match="ambiguous unknown claims"):
+        await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert [path.read_bytes() for path in paths] == original_bytes
+    assert not list(paths[0].parent.glob(".*.retag-backup"))
+
+
 async def test_retag_catalog_album_restores_files_when_request_commit_fails(
     db_session: AsyncSession, tmp_path: Path
 ) -> None:
@@ -356,6 +433,28 @@ async def test_retag_catalog_album_restores_files_when_request_commit_fails(
 
     assert [path.read_bytes() for path in paths] == original_bytes
     assert not list(paths[0].parent.glob(".*.retag-backup"))
+
+
+async def test_retag_catalog_album_restores_files_when_callback_registration_fails(
+    db_session: AsyncSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library_root = tmp_path / "library"
+    album, paths, _tracks = await _seed_imported_album(db_session, library_root)
+    original_bytes = [path.read_bytes() for path in paths]
+
+    def fail_registration(*args, **kwargs) -> None:
+        raise RuntimeError("callback registration failed")
+
+    monkeypatch.setattr(library_import_module, "register_transaction_callbacks", fail_registration)
+    with pytest.raises(RuntimeError, match="callback registration failed"):
+        await retag_catalog_album(db_session, album.id, library_root=library_root)
+
+    assert [path.read_bytes() for path in paths] == original_bytes
+    assert not list(paths[0].parent.glob(".*.retag-backup"))
+    probe = paths[0].with_suffix(".probe")
+    paths[0].rename(probe)
+    probe.unlink()
+    paths[0].write_bytes(original_bytes[0])
 
 
 async def test_retag_catalog_album_removes_backups_only_after_request_commit(
@@ -504,6 +603,7 @@ async def test_retag_catalog_album_renames_multidisc_files_to_disc_track_templat
     folder.mkdir(parents=True)
     old_path = folder / "09 - LA Night.flac"
     old_path.write_bytes(_minimal_flac_bytes())
+    original_bytes = old_path.read_bytes()
     track = Track(
         job=job,
         release=release,
@@ -547,6 +647,19 @@ async def test_retag_catalog_album_renames_multidisc_files_to_disc_track_templat
     assert repaired["discnumber"] == ["3"]
     assert repaired["disctotal"] == ["3"]
     assert repaired["tracktotal"] == ["1"]
+
+    db_session.add(CatalogArtist(name="duplicate", mbid=artist.mbid))
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
+    await db_session.rollback()
+
+    assert old_path.read_bytes() == original_bytes
+    assert not new_path.exists()
+    assert not list(folder.glob(".*.retag-backup"))
+    probe = old_path.with_suffix(".probe")
+    old_path.rename(probe)
+    probe.unlink()
+    old_path.write_bytes(original_bytes)
 
 
 async def test_retag_catalog_album_rejects_flat_multidisc_files_without_identity(
