@@ -435,12 +435,16 @@ async def test_retag_catalog_album_restores_files_when_request_commit_fails(
     assert not list(paths[0].parent.glob(".*.retag-backup"))
 
 
-@pytest.mark.parametrize("cleanup_raises", [False, True])
+@pytest.mark.parametrize(
+    ("cleanup_raises", "discard_raises"),
+    [(False, False), (True, False), (False, True)],
+)
 async def test_retag_catalog_album_restores_files_when_callback_registration_fails(
     db_session: AsyncSession,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cleanup_raises: bool,
+    discard_raises: bool,
 ) -> None:
     library_root = tmp_path / "library"
     album, paths, _tracks = await _seed_imported_album(db_session, library_root)
@@ -468,8 +472,13 @@ async def test_retag_catalog_album_restores_files_when_callback_registration_fai
         original_register(*args, **kwargs)
         raise RuntimeError("callback registration failed")
 
+    def fail_discard(*_args, **_kwargs) -> None:
+        raise OSError("callback discard failed")
+
     monkeypatch.setattr(library_import_module, "_retag_catalog_album_files", counted_retag)
     monkeypatch.setattr(library_import_module, "register_transaction_callbacks", fail_registration)
+    if discard_raises:
+        monkeypatch.setattr(library_import_module, "discard_transaction_callbacks", fail_discard)
     with pytest.raises(RuntimeError, match="callback registration failed"):
         await retag_catalog_album(db_session, album.id, library_root=library_root)
 

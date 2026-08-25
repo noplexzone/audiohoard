@@ -1015,20 +1015,39 @@ async def retag_catalog_album(
         tag_writer=tag_writer,
         artwork=artwork,
     )
+    callback_finished = False
+
+    def commit_once() -> None:
+        nonlocal callback_finished
+        if callback_finished:
+            return
+        callback_finished = True
+        transaction.after_commit()
+
+    def rollback_once() -> None:
+        nonlocal callback_finished
+        if callback_finished:
+            return
+        callback_finished = True
+        transaction.after_rollback()
+
     try:
         register_transaction_callbacks(
             db,
-            after_commit=transaction.after_commit,
-            after_rollback=transaction.after_rollback,
+            after_commit=commit_once,
+            after_rollback=rollback_once,
         )
     except Exception:
-        discard_transaction_callbacks(
-            db,
-            after_commit=transaction.after_commit,
-            after_rollback=transaction.after_rollback,
-        )
         try:
-            transaction.after_rollback()
+            discard_transaction_callbacks(
+                db,
+                after_commit=commit_once,
+                after_rollback=rollback_once,
+            )
+        except Exception:
+            logger.exception("retag callback discard failed after registration error")
+        try:
+            rollback_once()
         except Exception:
             logger.exception("retag rollback cleanup failed after callback registration error")
         try:
