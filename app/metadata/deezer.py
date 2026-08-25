@@ -454,7 +454,7 @@ def _positive_scalar_id(value: object) -> str | None:
         return None
     if isinstance(value, int):
         return str(value) if value > 0 else None
-    if isinstance(value, str) and value.isdigit():
+    if isinstance(value, str) and value.isascii() and value.isdigit():
         normalized = value.lstrip("0")
         return normalized or None
     return None

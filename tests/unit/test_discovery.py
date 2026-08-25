@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from app.metadata.base import ArtistDetail, ArtistHit, DiscoveryRelease
-from app.metadata.deezer import DeezerClient
+from app.metadata.deezer import DeezerClient, _positive_scalar_id
 from app.services.discovery import DiscoveryService
 
 
@@ -254,7 +254,38 @@ async def test_deezer_discovery_rejects_malformed_http_200_envelopes(
         await provider.discovery_feed("popular")
 
 
-_INVALID_DISCOVERY_IDS = [True, 1.5, {}, [], "", "0", 0, -1, "-1", "abc"]
+_INVALID_DISCOVERY_IDS = [
+    True,
+    1.5,
+    {},
+    [],
+    "",
+    "0",
+    0,
+    -1,
+    "-1",
+    "abc",
+    "١",
+    "²",
+    "１２",
+    "Ⅻ",
+    "½",
+]
+
+
+@pytest.mark.parametrize("bad_id", [*_INVALID_DISCOVERY_IDS, object()])
+def test_positive_scalar_id_rejects_non_ascii_and_non_positive_values(bad_id: object) -> None:
+    assert _positive_scalar_id(bad_id) is None
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "expected"),
+    [(1, "1"), (42, "42"), ("1", "1"), ("00042", "42")],
+)
+def test_positive_scalar_id_normalizes_valid_ascii_values(
+    provider_id: object, expected: str
+) -> None:
+    assert _positive_scalar_id(provider_id) == expected
 
 
 @pytest.mark.parametrize("bad_id", _INVALID_DISCOVERY_IDS)
@@ -304,11 +335,11 @@ async def test_deezer_discovery_preserves_integer_and_digit_string_identities(
     monkeypatch, feed: str
 ) -> None:
     if feed == "popular":
-        rows = [{"id": 7, "name": "One"}, {"id": "8", "name": "Two"}]
+        rows = [{"id": 7, "name": "One"}, {"id": "0008", "name": "Two"}]
     else:
         rows = [
             {"id": 7, "title": "One", "artist": {"id": "9", "name": "Artist One"}},
-            {"id": "8", "title": "Two", "artist": {"id": 10, "name": "Artist Two"}},
+            {"id": "0008", "title": "Two", "artist": {"id": 10, "name": "Artist Two"}},
         ]
     provider = DeezerClient()
     monkeypatch.setattr(
@@ -678,7 +709,7 @@ async def test_deezer_genre_discovery_rejects_error_key_regardless_of_truthiness
         await provider.genre_artist_candidates("132")
 
 
-@pytest.mark.parametrize("bad_id", [{"unsafe": 1}, [1], True, 1.5, "", "0", 0])
+@pytest.mark.parametrize("bad_id", _INVALID_DISCOVERY_IDS)
 @pytest.mark.parametrize("location", ["radio", "artist"])
 async def test_deezer_genre_discovery_rejects_non_positive_scalar_ids_before_use(
     monkeypatch, bad_id: object, location: str
@@ -713,7 +744,7 @@ async def test_deezer_genre_discovery_rejects_non_positive_scalar_ids_before_use
         assert not any(path.startswith("/radio/") for path in requested_paths)
 
 
-@pytest.mark.parametrize("bad_id", [{"unsafe": 1}, [132], True, 132.0, "", "0", 0])
+@pytest.mark.parametrize("bad_id", _INVALID_DISCOVERY_IDS)
 async def test_deezer_genre_discovery_rejects_invalid_exact_genre_ids(
     monkeypatch, bad_id: object
 ) -> None:
