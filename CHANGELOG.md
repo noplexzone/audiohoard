@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-08-25
+
+### Added
+
+- Add a shared poster-first Discover surface with responsive artist, release, and exact-genre cards, truthful state badges, safe native watch controls, and explicit feed continuation.
+- Add read-only provider artist previews, exact provider-identity Discover card state, and safe in-context native watchlist returns without mutating navigation GETs.
+- Load Discover landing feeds as independent authenticated fragments with truthful cached, pending, empty, stale, and error states so provider latency no longer blocks the page shell.
+- Add durable scoped discography batches and native status controls for artist watchlists and Wanted selections, pages, and server-rerun matching scopes while reusing ordinary bounded acquisition jobs.
+- Add Wanted-page queue-all-matching bulk dispatch and quality-profile enabled-format controls for strict MP3-320-or-better acquisition.
+
 ### Fixed
 
 - Release SQLite writer locks between startup orphan-pruning batches so valid logins can create sessions while background maintenance continues.
@@ -21,17 +31,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Invalidate cached slskd download snapshots after a successful enqueue so accepted transfers are not immediately misclassified as missing and redundantly downloaded from every candidate.
 - Retry callers awaiting a displaced slskd snapshot generation so concurrent queue mutations cannot return a stale pre-enqueue result.
 - Preserve provider-native album and track artist credits for compilation releases through import planning, destination naming, tag write/readback, retagging, and conservative legacy-folder repair while leaving existing folders in place.
-
-### Added
-
-- Add a shared poster-first Discover surface with responsive artist, release, and exact-genre cards, truthful state badges, safe native watch controls, and explicit feed continuation.
-- Add read-only provider artist previews, exact provider-identity Discover card state, and safe in-context native watchlist returns without mutating navigation GETs.
-- Load Discover landing feeds as independent authenticated fragments with truthful cached, pending, empty, stale, and error states so provider latency no longer blocks the page shell.
-- Add durable scoped discography batches and native status controls for artist watchlists and Wanted selections, pages, and server-rerun matching scopes while reusing ordinary bounded acquisition jobs.
-- Add Wanted-page queue-all-matching bulk dispatch and quality-profile enabled-format controls for strict MP3-320-or-better acquisition.
-
-### Fixed
-
 - Hide automatic Retry controls for non-retryable download failures and show explicit restart/watchdog recovery notices in the Downloads queue.
 - Run imported-source cleanup from startup in the background so stale cleanup obligations cannot keep the WebUI port closed during application startup.
 - Defer startup cleanup scheduling until the app has finished starting so cleanup debt cannot run before the WebUI becomes reachable.
