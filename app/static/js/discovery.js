@@ -28,8 +28,8 @@
     message.textContent = "This discovery feed could not be loaded.";
     const retry = document.createElement("a");
     retry.className = "btn secondary";
-    retry.href = container.dataset.discoverFragmentUrl || window.location.href;
-    retry.dataset.nativeNavigation = "";
+    retry.href = `/search#${container.id}`;
+    retry.dataset.discoverRetry = "";
     retry.textContent = "Retry this section";
     alert.append(message, retry);
     body.replaceChildren(alert);
@@ -52,9 +52,15 @@
           signal,
         }).then(async (response) => {
           if (!response.ok) throw new Error("fragment request failed");
+          const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+          if (contentType !== "text/html") throw new Error("invalid fragment content type");
           const documentFragment = new DOMParser().parseFromString(await response.text(), "text/html");
           const fresh = documentFragment.querySelector("[data-discover-section]");
-          if (!fresh || !["pending", "ready", "stale", "error"].includes(fresh.dataset.discoverState)) {
+          const expectedUrl = container.dataset.discoverFragmentUrl;
+          if (!fresh ||
+              !["pending", "ready", "stale", "error"].includes(fresh.dataset.discoverState) ||
+              fresh.id !== container.id ||
+              fresh.dataset.discoverFragmentUrl !== expectedUrl) {
             throw new Error("invalid fragment response");
           }
           container.replaceWith(fresh);
@@ -64,6 +70,27 @@
         });
       });
     };
+
+    root.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const retry = target.closest("[data-discover-retry]");
+      if (!(retry instanceof HTMLAnchorElement)) return;
+      const container = retry.closest("[data-discover-section]");
+      if (!(container instanceof HTMLElement)) return;
+      event.preventDefault();
+      container.dataset.discoverState = "pending";
+      delete container.dataset.discoverRequested;
+      const body = container.querySelector("[data-discover-body]");
+      if (body) {
+        const status = document.createElement("div");
+        status.className = "empty-state";
+        status.setAttribute("role", "status");
+        status.textContent = "Retrying discovery feed…";
+        body.replaceChildren(status);
+      }
+      loadPending();
+    }, {signal});
 
     bindDialogs(root);
     loadPending();

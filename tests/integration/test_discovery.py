@@ -8,6 +8,7 @@ from app.metadata.base import (
     ArtistDetail,
     ArtistHit,
     DiscoveryGenre,
+    DiscoveryRelease,
     DiscoverySection,
 )
 from app.models.catalog_entities import CatalogArtist
@@ -123,6 +124,18 @@ async def test_discovery_fragment_allowlist_errors_empty_and_exact_card_state(
         items = ()
         if feed == "popular":
             items = (ArtistHit("deezer", "exact-artist", "Exact Artist"),)
+        elif feed == "genres":
+            items = (DiscoveryGenre("deezer", "132", "Pop"),)
+        elif feed == "trending":
+            items = (
+                DiscoveryRelease(
+                    "deezer",
+                    "release-1",
+                    "Exact Release",
+                    "Release Artist",
+                    "release-artist",
+                ),
+            )
         return DiscoverySection(feed, feed.title(), region, "GLOBAL", True, items)
 
     async def project(_db, identities):
@@ -138,18 +151,32 @@ async def test_discovery_fragment_allowlist_errors_empty_and_exact_card_state(
 
     failed = await client.get("/discover/fragments/new")
     ready = await client.get("/discover/fragments/popular")
-    empty = await client.get("/discover/fragments/genres")
+    genre = await client.get("/discover/fragments/genres")
+    release = await client.get("/discover/fragments/trending")
 
-    assert failed.status_code == ready.status_code == empty.status_code == 200
+    assert (
+        failed.status_code == ready.status_code == genre.status_code == release.status_code == 200
+    )
     assert "temporarily unavailable" in failed.text
+    assert 'href="/search#discovery-new"' in failed.text
+    assert "data-discover-retry" in failed.text
     assert "Exact Artist" in ready.text
     assert 'name="csrf_token"' in ready.text
     assert 'name="provider_id" value="exact-artist"' in ready.text
     assert 'name="return_to" value="/search#discovery-popular"' in ready.text
-    assert "This feed is currently empty" in empty.text
-    assert "Loading discovery feed" not in empty.text
-    assert calls == ["new", "popular", "genres"]
-    assert projections == [set(), {("deezer", "exact-artist")}, set()]
+    assert "/discover/genres/132" in genre.text
+    assert "Exact Release" in release.text
+    assert "Release Artist" in release.text
+    assert "/artists/provider-preview?" in release.text
+    assert "/artists/catalog/open?" not in release.text
+    assert "Loading discovery feed" not in genre.text
+    assert calls == ["new", "popular", "genres", "trending"]
+    assert projections == [
+        set(),
+        {("deezer", "exact-artist")},
+        {("deezer", "132")},
+        {("deezer", "release-artist")},
+    ]
 
 
 async def test_dedicated_discovery_routes_bound_page_and_genre(client, monkeypatch) -> None:

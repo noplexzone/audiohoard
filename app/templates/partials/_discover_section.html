@@ -14,7 +14,7 @@
       {% for _ in range(3) %}<div class="card discovery-skeleton"><span class="hint">Loading…</span></div>{% endfor %}
     </div>
   {% elif section.state == 'error' %}
-    <div class="alert error" role="alert"><p>{{ section.message or 'Discovery provider is temporarily unavailable' }}</p><a class="btn secondary" href="/discover/fragments/{{ section.feed }}" data-native-navigation>Retry this section</a></div>
+    <div class="alert error" role="alert"><p>{{ section.message or 'Discovery provider is temporarily unavailable' }}</p><a class="btn secondary" href="/search#discovery-{{ section.feed }}" data-discover-retry>Retry this section</a></div>
   {% elif not section.items %}
     <div class="empty-state" role="status"><h3>No {{ section.title | lower }} available</h3><p>This feed is currently empty. Check again later.</p></div>
   {% else %}

@@ -192,7 +192,7 @@ class DiscoveryService:
             cached[1],
             state="stale",
             stale=True,
-            message="Showing cached results while this feed refreshes",
+            message="Showing cached results",
         )
 
     def landing_snapshot(self, region: str, *, limit: int = 12) -> list[DiscoverySection]:
