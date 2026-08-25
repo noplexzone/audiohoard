@@ -243,6 +243,44 @@ async def test_deezer_genres_skip_live_global_and_malformed_rows(monkeypatch) ->
     ]
 
 
+async def test_deezer_genre_pages_filter_before_slicing_stable_offsets(monkeypatch) -> None:
+    provider = DeezerClient()
+    rows = [
+        {"id": 0, "name": "All"},
+        {"id": 1, "name": "One"},
+        {"id": "bad", "name": "Malformed"},
+        *({"id": index, "name": f"Genre {index}"} for index in range(2, 15)),
+    ]
+    monkeypatch.setattr(
+        provider,
+        "_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://api.deezer.com",
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, json={"data": rows})
+            ),
+        ),
+    )
+
+    first = await provider.discovery_feed("genres", limit=12, offset=0)
+    second = await provider.discovery_feed("genres", limit=12, offset=12)
+
+    first_ids = [genre.provider_id for genre in first]
+    second_ids = [genre.provider_id for genre in second]
+    assert first_ids == [str(index) for index in range(1, 13)]
+    assert second_ids == ["13", "14"]
+    assert set(first_ids).isdisjoint(second_ids)
+
+    service = DiscoveryService(provider)
+    first_section = await service.get("genres", "US", page=1)
+    second_section = await service.get("genres", "US", page=2)
+    assert first_section.has_next is True
+    assert second_section.has_next is False
+    assert {item.provider_id for item in first_section.items}.isdisjoint(
+        item.provider_id for item in second_section.items
+    )
+
+
 async def test_deezer_new_feed_uses_primary_release_contract_without_chart_fallback(
     monkeypatch,
 ) -> None:

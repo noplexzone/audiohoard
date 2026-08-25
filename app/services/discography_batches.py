@@ -29,6 +29,7 @@ from app.models.discography_batch import (
 )
 from app.models.job import Job, JobStatus
 from app.services.catalog import (
+    CatalogAlbumQueueProjection,
     _missing_releases_query,
     get_missing_release_ids,
     project_catalog_album_queue_targets,
@@ -328,6 +329,8 @@ async def _populate_batch_items(
     batch: DiscographyBatch,
     releases: list[_SelectedRelease],
     quality_profile: QualityProfile,
+    *,
+    projections: dict[int, CatalogAlbumQueueProjection] | None = None,
 ) -> None:
     """Replace one batch's materialized preview from an exact server-side selection."""
     item_ids = select(DiscographyBatchItem.id).where(DiscographyBatchItem.batch_id == batch.id)
@@ -370,9 +373,10 @@ async def _populate_batch_items(
             )
 
     album_ids = [release.album.id for release in actionable if release.album is not None]
-    projections = await project_catalog_album_queue_targets(
-        db, album_ids, quality_profile=quality_profile
-    )
+    if projections is None:
+        projections = await project_catalog_album_queue_targets(
+            db, album_ids, quality_profile=quality_profile
+        )
     all_track_ids = {
         track.id
         for release in actionable
@@ -565,6 +569,12 @@ async def queue_discography_batch(
     )
     if quality_profile is None:
         quality_profile = (await get_runtime_settings(db)).quality_profile
+    album_ids = list(
+        dict.fromkeys(release.album.id for release in releases if release.album is not None)
+    )
+    projections = await project_catalog_album_queue_targets(
+        db, album_ids, quality_profile=quality_profile
+    )
     batch = DiscographyBatch(
         scope_kind=kind,
         scope_json=scope_json,
@@ -575,7 +585,13 @@ async def queue_discography_batch(
         async with db.begin_nested():
             db.add(batch)
             await db.flush()
-            await _populate_batch_items(db, batch, releases, quality_profile)
+            await _populate_batch_items(
+                db,
+                batch,
+                releases,
+                quality_profile,
+                projections=projections,
+            )
             await db.execute(
                 update(DiscographyBatchItem)
                 .where(

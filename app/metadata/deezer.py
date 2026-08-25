@@ -131,6 +131,13 @@ class DeezerClient:
                     "/chart/0/albums",
                     {"limit": limit, "index": min(index + 25, 500)},
                 )
+        if feed == "genres":
+            parsed_genres: list[ArtistHit | DiscoveryGenre | DiscoveryRelease] = [
+                genre
+                for row in rows
+                if isinstance(row, dict) and (genre := _parse_genre(row)) is not None
+            ]
+            return parsed_genres[index : index + limit]
         valid = [row for row in rows[local_start : local_start + limit] if isinstance(row, dict)]
         if feed == "popular":
             return [
@@ -138,8 +145,6 @@ class DeezerClient:
                 for row in valid
                 if (artist := _parse_discovery_artist(row)) is not None and artist.name
             ]
-        if feed == "genres":
-            return [genre for row in valid if (genre := _parse_genre(row)) is not None]
         releases: list[ArtistHit | DiscoveryGenre | DiscoveryRelease] = []
         seen_release_ids: set[str] = set()
         for row in valid:

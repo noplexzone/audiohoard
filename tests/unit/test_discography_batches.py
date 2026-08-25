@@ -235,6 +235,8 @@ async def test_direct_queue_selects_and_materializes_once_then_commits_pending(
     populate_calls = 0
     real_select = discography_batches._select_artist_releases
     real_populate = discography_batches._populate_batch_items
+    real_project = discography_batches.project_catalog_album_queue_targets
+    projection_before_batch_insert = False
 
     async def counted_select(*args, **kwargs):
         nonlocal select_calls
@@ -246,8 +248,18 @@ async def test_direct_queue_selects_and_materializes_once_then_commits_pending(
         populate_calls += 1
         return await real_populate(*args, **kwargs)
 
+    async def observed_project(*args, **kwargs):
+        nonlocal projection_before_batch_insert
+        projection_before_batch_insert = not any(
+            isinstance(row, DiscographyBatch) for row in db_session.new
+        )
+        return await real_project(*args, **kwargs)
+
     monkeypatch.setattr(discography_batches, "_select_artist_releases", counted_select)
     monkeypatch.setattr(discography_batches, "_populate_batch_items", counted_populate)
+    monkeypatch.setattr(
+        discography_batches, "project_catalog_album_queue_targets", observed_project
+    )
 
     queued = await queue_discography_batch(
         db_session,
@@ -257,6 +269,7 @@ async def test_direct_queue_selects_and_materializes_once_then_commits_pending(
     )
 
     assert select_calls == populate_calls == 1
+    assert projection_before_batch_insert is True
     assert queued.state == DiscographyBatchState.queued
     assert db_session.in_transaction() is False
     states = list(
