@@ -1,4 +1,4 @@
-<section id="discovery-{{ section.feed }}" class="card discovery-section" aria-labelledby="discovery-{{ section.feed }}-heading" data-discover-section data-discover-state="{{ section.state }}" data-discover-fragment-url="/discover/fragments/{{ section.feed }}">
+<section id="discovery-{{ section.feed }}" class="discovery-section" aria-labelledby="discovery-{{ section.feed }}-heading" data-discover-section data-discover-state="{{ section.state }}" data-discover-fragment-url="/discover/fragments/{{ section.feed }}">
   <div class="page-header">
     <div>
       <h2 id="discovery-{{ section.feed }}-heading">{{ section.title }}</h2>
@@ -10,8 +10,8 @@
   <div data-discover-body>
   {% if section.state == 'pending' %}
     <div class="empty-state" role="status" aria-live="polite"><h3>Loading discovery feed…</h3><p>This section will appear independently when it is ready.</p></div>
-    <div class="grid catalog-result-grid" aria-hidden="true">
-      {% for _ in range(3) %}<div class="card discovery-skeleton"><span class="hint">Loading…</span></div>{% endfor %}
+    <div class="discover-poster-grid" aria-hidden="true">
+      {% for _ in range(6) %}<div class="discovery-skeleton"><span class="hint">Loading…</span></div>{% endfor %}
     </div>
   {% elif section.state == 'error' %}
     <div class="alert error" role="alert"><p>{{ section.message or 'Discovery provider is temporarily unavailable' }}</p><a class="btn secondary" href="/search#discovery-{{ section.feed }}" data-discover-retry>Retry this section</a></div>
@@ -19,12 +19,12 @@
     <div class="empty-state" role="status"><h3>No {{ section.title | lower }} available</h3><p>This feed is currently empty. Check again later.</p></div>
   {% else %}
     {% if section.message %}<p class="hint" role="status">{{ section.message }}</p>{% endif %}
-    <div class="grid catalog-result-grid">
+    <div class="discover-poster-grid">
     {% for item in section.items %}
       {% if section.feed == 'popular' %}
         {% set artist_hit = item %}{% set watched_artist = watched_catalog_artists.get(item.provider, {}).get(item.provider_id) %}{% set artist_card_id = 'discover-' ~ section.feed ~ '-' ~ loop.index %}{% include "partials/_artist_card.html" %}
       {% elif section.feed == 'genres' %}
-        <a class="card discovery-genre-card" href="/discover/genres/{{ item.provider_id }}">{% if item.artwork_url %}<img src="/artwork?url={{ item.artwork_url | urlencode }}" alt="" class="catalog-result-art">{% endif %}<h3>{{ item.name }}</h3></a>
+        {% include "partials/_genre_card.html" %}
       {% else %}
         {% include "partials/_release_card.html" %}
       {% endif %}

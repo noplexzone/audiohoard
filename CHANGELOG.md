@@ -19,6 +19,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Add a shared poster-first Discover surface with responsive artist, release, and exact-genre cards, truthful state badges, safe native watch controls, and explicit feed continuation.
 - Add read-only provider artist previews, exact provider-identity Discover card state, and safe in-context native watchlist returns without mutating navigation GETs.
 - Load Discover landing feeds as independent authenticated fragments with truthful cached, pending, empty, stale, and error states so provider latency no longer blocks the page shell.
 - Add durable scoped discography batch previews and native status controls for artist watchlists and Wanted selections, pages, and server-rerun matching scopes while reusing ordinary bounded acquisition jobs.

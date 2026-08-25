@@ -1,20 +1,20 @@
-{% set artist_state = watched_artist or watchlist_defaults %}
 {% set persisted_artist_id = watched_artist.artist_id if watched_artist else none %}
 {% set is_monitored = watched_artist and watched_artist.monitored %}
 {% set preview_url = '/artists/provider-preview?provider=' ~ (artist_hit.provider | urlencode) ~ '&provider_id=' ~ (artist_hit.provider_id | urlencode) ~ '&return_to=' ~ (discover_return_to | urlencode) %}
-<article class="card catalog-result-card" data-provider="{{ artist_hit.provider | e }}" data-provider-id="{{ artist_hit.provider_id | e }}" data-watched="{{ 'true' if is_monitored else 'false' }}">
-  <a href="{{ '/artists/catalog/' ~ persisted_artist_id if persisted_artist_id else preview_url }}">{% if artist_hit.artwork_url %}<img src="/artwork?url={{ artist_hit.artwork_url | urlencode }}" alt="" class="catalog-result-art">{% else %}<div class="catalog-result-art catalog-result-art-missing" aria-hidden="true">No image</div>{% endif %}</a>
-  <h3><a href="{{ '/artists/catalog/' ~ persisted_artist_id if persisted_artist_id else preview_url }}">{{ artist_hit.name }}</a></h3>
-  <p class="catalog-provider-line"><span class="badge info">{{ display_name(artist_hit.provider) }}</span>{% if artist_hit.disambiguation %} {{ artist_hit.disambiguation }}{% endif %}</p>
-  <dl class="catalog-evidence-list"><div><dt>Provider ID</dt><dd>{{ artist_hit.provider_id }}</dd></div>{% if artist_hit.fan_count is not none %}<div><dt>Fans</dt><dd>{{ artist_hit.fan_count }}</dd></div>{% endif %}</dl>
-  <p>{% if is_monitored %}<span class="badge ok">Monitored</span>{% elif watched_artist %}<span class="badge info">Saved</span>{% else %}<span class="badge">Not saved</span>{% endif %}{% if watched_artist and watched_artist.local_library %} <span class="badge ok">In library</span>{% endif %}</p>
-  <div class="form-row catalog-result-actions">
-    <a class="btn secondary" data-discography-link href="{{ '/artists/catalog/' ~ persisted_artist_id if persisted_artist_id else preview_url }}">{{ 'View known releases' if persisted_artist_id else 'Preview artist' }}</a>
-    <form method="post" action="/artists/catalog/open" data-watchlist-form>
+{% set view_url = '/artists/catalog/' ~ persisted_artist_id if persisted_artist_id else preview_url %}
+<article class="discover-poster-card" data-provider="{{ artist_hit.provider | e }}" data-provider-id="{{ artist_hit.provider_id | e }}" data-watched="{{ 'true' if is_monitored else 'false' }}">
+  <a class="discover-poster-link" href="{{ view_url }}" aria-label="View {{ artist_hit.name | e }}">
+    {% if artist_hit.artwork_url %}<img src="/artwork?url={{ artist_hit.artwork_url | urlencode }}" alt="" class="discover-poster" width="480" height="480" loading="lazy" decoding="async">{% else %}<span class="discover-poster discover-poster-missing" aria-hidden="true"><strong>AH</strong><small>Audiohoard</small></span>{% endif %}
+    <span class="discover-poster-overlay"><span class="badge info">{{ display_name(artist_hit.provider) }}</span>{% if artist_hit.disambiguation %}<span class="discover-evidence">{{ artist_hit.disambiguation }}</span>{% endif %}</span>
+  </a>
+  <div class="discover-card-body">
+    <h3><a href="{{ view_url }}">{{ artist_hit.name }}</a></h3>
+    <div class="discover-state-badges">{% if is_monitored %}<span class="badge ok">Monitored</span>{% elif watched_artist %}<span class="badge info">Saved</span>{% endif %}{% if watched_artist and watched_artist.local_library is sameas true %}<span class="badge ok">In library</span>{% endif %}</div>
+    {% if persisted_artist_id and not is_monitored %}<a class="btn discover-primary" href="{{ view_url }}">View known releases</a>{% endif %}
+    <form method="post" action="/artists/catalog/open" data-watchlist-form class="discover-watch-form{% if persisted_artist_id and not is_monitored %} discover-secondary-action{% endif %}">
       <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf', '') | e }}"><input type="hidden" name="provider" value="{{ artist_hit.provider | e }}"><input type="hidden" name="provider_id" value="{{ artist_hit.provider_id | e }}"><input type="hidden" name="monitor" value="true"><input type="hidden" name="return_to" value="{{ discover_return_to | e }}">
-      <button class="btn" type="submit" data-watchlist-submit{% if is_monitored %} disabled{% endif %}>{{ 'Watched' if is_monitored else 'Add to watchlist' }}</button>
+      <button class="btn discover-primary" type="submit" data-watchlist-submit{% if is_monitored %} disabled{% endif %}>{{ 'Watched' if is_monitored else 'Add to watchlist' }}</button>
     </form>
-    {% if persisted_artist_id %}<a class="btn secondary" href="/artists/catalog/{{ persisted_artist_id }}" data-watchlist-configure>Configure</a>{% endif %}
+    <p class="catalog-watch-status" data-watchlist-status aria-live="polite">{% if watched_artist and not is_monitored %}Saved, not monitored{% endif %}</p><p class="alert error catalog-inline-error" data-watchlist-error role="alert" hidden></p>
   </div>
-  <p class="catalog-watch-status" data-watchlist-status aria-live="polite">{% if is_monitored %}Watched{% elif watched_artist %}Saved, not monitored{% endif %}</p><p class="alert error catalog-inline-error" data-watchlist-error role="alert" hidden></p>
 </article>

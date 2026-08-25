@@ -49,6 +49,14 @@ class DeezerTrack:
     duration_sec: int | None = None
 
 
+class GenreArtistCandidates(list[ArtistHit]):
+    """Validated exact-genre candidates plus the resolved provider name."""
+
+    def __init__(self, genre_name: str, artists: list[ArtistHit]) -> None:
+        super().__init__(artists)
+        self.genre_name = genre_name
+
+
 class DeezerClient:
     name = "deezer"
 
@@ -66,11 +74,19 @@ class DeezerClient:
         return CapabilityState(available=True)
 
     async def discovery_feed(
-        self, feed: str, *, page: int = 1, limit: int = 12, genre_id: str | None = None
+        self,
+        feed: str,
+        *,
+        page: int = 1,
+        limit: int = 12,
+        genre_id: str | None = None,
+        offset: int | None = None,
     ) -> list[ArtistHit | DiscoveryGenre | DiscoveryRelease]:
         """Return a bounded provider-neutral Deezer discovery feed."""
         limit = max(1, min(limit, 25))
-        index = (max(1, min(page, 20)) - 1) * limit
+        index = (
+            max(0, min(offset, 500)) if offset is not None else (max(1, min(page, 20)) - 1) * limit
+        )
         local_start = 0
         if feed == "popular":
             path = "/chart/0/artists"
@@ -119,7 +135,7 @@ class DeezerClient:
             and release.artist_provider_id
         ]
 
-    async def genre_artist_candidates(self, genre_id: str) -> list[ArtistHit]:
+    async def genre_artist_candidates(self, genre_id: str) -> GenreArtistCandidates:
         """Return the complete bounded, ordered candidate pool for an exact genre."""
         normalized_genre_id = _positive_scalar_id(genre_id)
         if normalized_genre_id is None:
@@ -181,7 +197,7 @@ class DeezerClient:
                 seen_artist_ids.add(artist.provider_id)
                 artists.append(artist)
 
-        return artists
+        return GenreArtistCandidates(genre["name"].strip(), artists)
 
     async def search_artists(self, query: str) -> list[ArtistHit]:
         cache_key = f"artist-search:{query}"

@@ -227,6 +227,58 @@ async def test_genre_next_link_uses_explicit_continuation_contract(client, monke
     assert 'href="?page=2"' not in response.text
 
 
+async def test_poster_cards_and_dedicated_genre_use_operate_contract(client, monkeypatch) -> None:
+    from app.routers import search as search_router
+
+    async def get(feed, region, *, page=1, limit=12, genre_id=None):
+        if feed == "genre":
+            return DiscoverySection(
+                feed,
+                "Jazz",
+                region,
+                "GLOBAL",
+                True,
+                (
+                    ArtistHit(
+                        "deezer",
+                        "same-1",
+                        "A very long artist name that must wrap safely",
+                        artwork_url="https://images.example/one.jpg",
+                    ),
+                    ArtistHit("deezer", "same-2", "A very long artist name that must wrap safely"),
+                ),
+                has_next=True,
+            )
+        if feed == "genres":
+            return DiscoverySection(
+                feed,
+                "Genres",
+                region,
+                "GLOBAL",
+                True,
+                (DiscoveryGenre("deezer", "132", "Pop"),),
+                has_next=False,
+            )
+        return DiscoverySection(feed, feed.title(), region, "GLOBAL", True, (), has_next=False)
+
+    monkeypatch.setattr(search_router.discovery_service, "get", get)
+    genre = await client.get("/discover/genres/132")
+    genres = await client.get("/discover/genres")
+    assert "<h1>Jazz</h1>" in genre.text
+    assert 'aria-label="Breadcrumb"' in genre.text
+    assert 'data-provider-id="same-1"' in genre.text
+    assert 'data-provider-id="same-2"' in genre.text
+    assert 'loading="lazy"' in genre.text and 'decoding="async"' in genre.text
+    assert 'width="480" height="480"' in genre.text
+    assert "Audiohoard" in genre.text
+    assert 'method="post" action="/artists/catalog/open"' in genre.text
+    assert 'href="?page=2"' in genre.text
+    assert 'href="/discover/genres/132"' in genres.text
+    assert 'class="discover-poster-grid"' in genres.text
+    assert "horizontal-scroller" not in genres.text
+    assert "/artists/catalog/open?" not in genre.text
+
+
 async def test_advanced_search_skips_discovery_network(client, monkeypatch) -> None:
     from app.routers import search as search_router
 

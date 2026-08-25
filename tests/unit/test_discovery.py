@@ -16,7 +16,13 @@ class FakeDiscoveryProvider:
         self.fail = False
 
     async def discovery_feed(
-        self, feed: str, *, page: int = 1, limit: int = 12, genre_id: str | None = None
+        self,
+        feed: str,
+        *,
+        page: int = 1,
+        limit: int = 12,
+        genre_id: str | None = None,
+        offset: int | None = None,
     ) -> list[ArtistHit | DiscoveryRelease]:
         self.calls.append((feed, page))
         if self.fail:
@@ -136,11 +142,19 @@ def test_progressive_discovery_script_has_bounded_navigation_safe_fragment_contr
 async def test_landing_sections_fail_independently_and_report_global_fallback() -> None:
     class PartialProvider(FakeDiscoveryProvider):
         async def discovery_feed(
-            self, feed: str, *, page: int = 1, limit: int = 12, genre_id: str | None = None
+            self,
+            feed: str,
+            *,
+            page: int = 1,
+            limit: int = 12,
+            genre_id: str | None = None,
+            offset: int | None = None,
         ) -> list[ArtistHit | DiscoveryRelease]:
             if feed == "genres":
                 raise OSError("down")
-            return await super().discovery_feed(feed, page=page, limit=limit, genre_id=genre_id)
+            return await super().discovery_feed(
+                feed, page=page, limit=limit, genre_id=genre_id, offset=offset
+            )
 
     sections = await DiscoveryService(PartialProvider()).landing("JP")  # type: ignore[arg-type]
 
@@ -448,6 +462,7 @@ async def test_deezer_genre_candidates_keep_radio_order_when_later_response_fini
 
     artists = await provider.genre_artist_candidates("132")
 
+    assert artists.genre_name == "Pop"
     assert completed == ["2", "1"]
     assert [artist.provider_id for artist in artists] == ["10", "20"]
 
@@ -634,6 +649,7 @@ async def test_discovery_filters_definitively_invalid_artist_identity() -> None:
             page: int = 1,
             limit: int = 12,
             genre_id: str | None = None,
+            offset: int | None = None,
         ) -> list[ArtistHit | DiscoveryRelease]:
             if feed == "new":
                 return [
@@ -641,7 +657,9 @@ async def test_discovery_filters_definitively_invalid_artist_identity() -> None:
                         "deezer", "release-bad", "Bad release", "Bad artist", "10002824"
                     )
                 ]
-            return await super().discovery_feed(feed, page=page, limit=limit, genre_id=genre_id)
+            return await super().discovery_feed(
+                feed, page=page, limit=limit, genre_id=genre_id, offset=offset
+            )
 
         async def get_artist(self, provider_id: str) -> ArtistDetail:
             raise ValueError("Deezer returned an error envelope")
@@ -779,3 +797,45 @@ async def test_discovery_library_probe_is_bounded_and_truthful_when_truncated(
     result = await discovery_service._probe_discovery_library_paths(paths, total_count=100)
     assert result is None
     assert len(calls) == discovery_service._DISCOVERY_FILE_PROBE_LIMIT
+
+
+async def test_non_genre_pagination_uses_display_offset_and_validated_continuation() -> None:
+    class Provider(FakeDiscoveryProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.requests: list[tuple[int, int | None]] = []
+
+        async def discovery_feed(
+            self,
+            feed: str,
+            *,
+            page: int = 1,
+            limit: int = 12,
+            genre_id: str | None = None,
+            offset: int | None = None,
+        ) -> list[ArtistHit | DiscoveryRelease]:
+            self.requests.append((limit, offset))
+            start = offset if offset is not None else (page - 1) * limit
+            return [
+                ArtistHit(
+                    "deezer",
+                    str(index),
+                    f"Artist {index}",
+                    deezer_id=str(index),
+                )
+                for index in range(start, start + limit)
+            ]
+
+        async def get_artist(self, provider_id: str) -> ArtistDetail:
+            if int(provider_id) < 22:
+                raise ValueError("invalid early artist")
+            return ArtistDetail(
+                "deezer", provider_id, f"Artist {provider_id}", deezer_id=provider_id
+            )
+
+    provider = Provider()
+    section = await DiscoveryService(provider).get("popular", "US", page=2, limit=12)  # type: ignore[arg-type]
+
+    assert provider.requests == [(25, 12)]
+    assert [item.provider_id for item in section.items] == [str(index) for index in range(22, 34)]
+    assert section.has_next is True

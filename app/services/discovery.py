@@ -229,6 +229,7 @@ class DiscoveryService:
                 if genre_id is None:
                     raise ValueError("Genre discovery requires an ID")
                 candidates = await self.provider.genre_artist_candidates(genre_id)
+                resolved_title = getattr(candidates, "genre_name", _TITLES[feed])
                 index = (page - 1) * limit
                 target = index + limit + 1
                 validated: list[ArtistHit] = []
@@ -248,7 +249,11 @@ class DiscoveryService:
                 has_next = page < 20 and len(validated) > index + limit
             else:
                 items = await self.provider.discovery_feed(
-                    feed, page=page, limit=limit, genre_id=genre_id
+                    feed,
+                    page=page,
+                    limit=25,
+                    genre_id=genre_id,
+                    offset=(page - 1) * limit,
                 )
             if feed == "popular":
                 artists = [item for item in items if isinstance(item, ArtistHit)]
@@ -274,6 +279,9 @@ class DiscoveryService:
                 items.extend(
                     release for release in releases if release.artist_provider_id in allowed
                 )
+            if feed != "genre":
+                has_next = page < 20 and len(items) > limit
+                items = items[:limit]
         except Exception:
             if cached and cached[0] + self.stale_seconds > now:
                 return replace(
@@ -294,7 +302,7 @@ class DiscoveryService:
             )
         section = DiscoverySection(
             feed=feed,
-            title=_TITLES[feed],
+            title=resolved_title if feed == "genre" else _TITLES[feed],
             requested_region=region,
             effective_region="GLOBAL",
             fallback_global=True,
