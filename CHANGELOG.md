@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Derive Deezer genre discovery artists from exact genre radio tracks instead of provider endpoints that silently return the same global chart for every genre.
 - Defer SQLite-locked job admissions without crossing the provider boundary, and retain exact completed slskd transfers for retry when their staged artifact is temporarily missing.
 - Canonicalize namespace-aware exact slskd peer/path identities so review denial durably blocks the provider artifact before re-acquisition, legacy denied provenance is backfilled once, containing album folders are excluded, and Allow or Allow and retry truthfully makes the exact source selectable without rewriting denied history.
 - Serialize startup database maintenance, catalog ownership, library reconciliation, and each scheduler's initial cycle before recovering queued jobs, preventing post-update SQLite writer storms from failing recovered work.

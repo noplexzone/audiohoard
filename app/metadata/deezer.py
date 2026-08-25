@@ -4,7 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, replace
 from typing import cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -29,6 +29,8 @@ _HTTP_TIMEOUT = httpx.Timeout(10.0)
 _ARTIST_EVIDENCE_HTTP_TIMEOUT = httpx.Timeout(2.0)
 _ARTIST_EVIDENCE_BUDGET_SECONDS = 3.0
 _DEEZER_PLACEHOLDER_IMAGE_HASH = "d41d8cd98f00b204e9800998ecf8427e"
+_GENRE_RADIO_LIMIT = 5
+_GENRE_TRACK_LIMIT = 100
 
 
 @dataclass
@@ -66,7 +68,7 @@ class DeezerClient:
     async def discovery_feed(
         self, feed: str, *, page: int = 1, limit: int = 12, genre_id: str | None = None
     ) -> list[ArtistHit | DiscoveryGenre | DiscoveryRelease]:
-        """Return a bounded provider-neutral feed from Deezer's global public charts."""
+        """Return a bounded provider-neutral Deezer discovery feed."""
         limit = max(1, min(limit, 25))
         index = (max(1, min(page, 20)) - 1) * limit
         local_start = 0
@@ -77,7 +79,10 @@ class DeezerClient:
         elif feed == "genre":
             if not genre_id or not genre_id.isdigit():
                 raise ValueError("Invalid Deezer genre")
-            path = f"/genre/{genre_id}/artists"
+            return cast(
+                list[ArtistHit | DiscoveryGenre | DiscoveryRelease],
+                await self._genre_artists(genre_id, index=index, limit=limit),
+            )
         elif feed == "new":
             path = "/editorial/0/releases"
         elif feed == "trending":
@@ -95,7 +100,7 @@ class DeezerClient:
         if not isinstance(rows, list):
             raise ValueError("Deezer returned an invalid discovery feed")
         valid = [row for row in rows[local_start : local_start + limit] if isinstance(row, dict)]
-        if feed in {"popular", "genre"}:
+        if feed == "popular":
             return [
                 artist
                 for row in valid
@@ -112,6 +117,69 @@ class DeezerClient:
             and release.title
             and release.artist_provider_id
         ]
+
+    async def _genre_artists(self, genre_id: str, *, index: int, limit: int) -> list[ArtistHit]:
+        """Derive genre artists from exact genre-radio tracks with bounded fanout."""
+        async with asyncio.timeout(12), self._client() as client:
+            genre_response = await request_with_retry(client, "GET", f"/genre/{genre_id}")
+            genre_response.raise_for_status()
+            genre = genre_response.json()
+            if (
+                not isinstance(genre, dict)
+                or genre.get("error")
+                or str(genre.get("id") or "") != genre_id
+                or not str(genre.get("name") or "").strip()
+            ):
+                raise ValueError("Deezer returned an invalid exact genre")
+
+            radios_response = await request_with_retry(
+                client,
+                "GET",
+                f"/genre/{genre_id}/radios",
+                params={"limit": _GENRE_RADIO_LIMIT},
+            )
+            radios_response.raise_for_status()
+            radio_rows = _genre_collection(radios_response.json(), "genre radios")
+            radio_ids: list[str] = []
+            for row in radio_rows[:_GENRE_RADIO_LIMIT]:
+                radio_id = str(row.get("id") or "").strip()
+                if not radio_id:
+                    raise ValueError("Deezer returned malformed genre radios")
+                radio_ids.append(radio_id)
+
+            tracks_per_radio = min(_GENRE_TRACK_LIMIT, index + limit)
+
+            async def get_radio_tracks(radio_id: str) -> list[dict[str, object]]:
+                safe_radio_id = quote(radio_id, safe="")
+                response = await request_with_retry(
+                    client,
+                    "GET",
+                    f"/radio/{safe_radio_id}/tracks",
+                    params={"limit": tracks_per_radio},
+                )
+                response.raise_for_status()
+                return _genre_collection(response.json(), "genre radio tracks")
+
+            track_groups = await asyncio.gather(
+                *(get_radio_tracks(radio_id) for radio_id in radio_ids)
+            )
+
+        artists: list[ArtistHit] = []
+        seen_artist_ids: set[str] = set()
+        for tracks in track_groups:
+            for track in tracks:
+                artist_row = track.get("artist")
+                if not isinstance(artist_row, dict):
+                    raise ValueError("Deezer returned malformed genre radio tracks")
+                artist = _parse_artist(artist_row)
+                if not artist.provider_id or not artist.name.strip():
+                    raise ValueError("Deezer returned malformed genre radio artists")
+                if artist.provider_id in seen_artist_ids:
+                    continue
+                seen_artist_ids.add(artist.provider_id)
+                artists.append(artist)
+
+        return artists[index : index + limit]
 
     async def search_artists(self, query: str) -> list[ArtistHit]:
         cache_key = f"artist-search:{query}"
@@ -350,6 +418,15 @@ async def _backfill_artist_search_evidence(client: DeezerClient, hits: list[Arti
                 "Deezer artist search evidence backfill exceeded %.1f seconds",
                 _ARTIST_EVIDENCE_BUDGET_SECONDS,
             )
+
+
+def _genre_collection(payload: object, context: str) -> list[dict[str, object]]:
+    if not isinstance(payload, dict) or payload.get("error"):
+        raise ValueError(f"Deezer returned an invalid {context} envelope")
+    rows = payload.get("data")
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise ValueError(f"Deezer returned malformed {context}")
+    return cast(list[dict[str, object]], rows)
 
 
 def _to_float(value: object) -> float | None:
