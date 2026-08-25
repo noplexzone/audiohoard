@@ -83,6 +83,56 @@ async def test_expired_cache_is_served_stale_on_provider_error() -> None:
     assert "provider details" not in stale.message
 
 
+def test_landing_snapshot_is_local_only_and_distinguishes_ready_stale_and_pending() -> None:
+    provider = FakeDiscoveryProvider()
+    service = DiscoveryService(provider, ttl_seconds=60, stale_seconds=3600)  # type: ignore[arg-type]
+
+    pending = service.landing_snapshot("US")
+
+    assert [section.feed for section in pending] == ["popular", "genres", "new", "trending"]
+    assert all(section.state == "pending" for section in pending)
+    assert provider.calls == []
+
+
+async def test_landing_snapshot_reuses_ready_and_usable_stale_cache_without_io() -> None:
+    provider = FakeDiscoveryProvider()
+    service = DiscoveryService(provider, ttl_seconds=60, stale_seconds=3600)  # type: ignore[arg-type]
+    ready = await service.get("popular", "US", limit=12)
+    key = "deezer:popular:US:1:12:"
+    expires, cached = service._cache[key]
+
+    snapshot = service.landing_snapshot("US")
+    assert snapshot[0] is ready
+    assert snapshot[0].state == "ready"
+    assert provider.calls == [("popular", 1)]
+
+    service._cache[key] = (expires - 120, cached)
+    stale_snapshot = service.landing_snapshot("US")
+    assert stale_snapshot[0].state == "stale"
+    assert stale_snapshot[0].stale is True
+    assert stale_snapshot[0].items == ready.items
+    assert provider.calls == [("popular", 1)]
+
+
+def test_progressive_discovery_script_has_bounded_navigation_safe_fragment_contract() -> None:
+    from pathlib import Path
+
+    script = Path("app/static/js/discovery.js").read_text(encoding="utf-8")
+
+    for contract in (
+        "data-discover-fragment-url",
+        'dataset.discoverState !== "pending"',
+        'credentials: "same-origin"',
+        "container.replaceWith",
+        'document.addEventListener("visibilitychange"',
+        'window.addEventListener("pagehide"',
+        "audiohoard:page-dispose",
+        "AbortController",
+    ):
+        assert contract in script
+    assert "setInterval" not in script
+
+
 async def test_landing_sections_fail_independently_and_report_global_fallback() -> None:
     class PartialProvider(FakeDiscoveryProvider):
         async def discovery_feed(

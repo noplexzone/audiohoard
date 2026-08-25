@@ -271,7 +271,7 @@ async def search_page(
         if provider == "primary" and catalog_outcomes and not catalog_outcomes[0].state.available:
             primary_error = catalog_outcomes[0].state.reason or "Primary provider unavailable"
     elif not q and tab == "catalog":
-        discovery_sections = await discovery_service.landing(runtime.discovery_region)
+        discovery_sections = discovery_service.landing_snapshot(runtime.discovery_region)
     card_states = await project_discovery_card_states(
         db, _visible_provider_identities(catalog_outcomes, discovery_sections)
     )
@@ -314,6 +314,36 @@ async def search_page(
             if sources is not None
             else [s for s in runtime.enabled_sources if s in _VALID_SOURCES],
             "error": None,
+        },
+    )
+
+
+@router.get("/discover/fragments/{feed}", response_class=HTMLResponse)
+async def discover_fragment(
+    feed: str,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> HTMLResponse:
+    if feed not in {"popular", "genres", "new", "trending"}:
+        raise HTTPException(status_code=404, detail="Discovery feed not found")
+    runtime = await get_runtime_settings(db)
+    await db.rollback()
+    section = await discovery_service.get(feed, runtime.discovery_region, limit=12)
+    states = await project_discovery_card_states(db, _visible_provider_identities([section]))
+    await db.rollback()
+    return _get_templates(request).TemplateResponse(
+        request,
+        "partials/_discover_section.html",
+        {
+            "section": section,
+            "watched_catalog_artists": _group_card_states(states),
+            "discover_return_to": f"/search#discovery-{feed}",
+            "watchlist_defaults": {
+                "watchlist_release_albums": runtime.default_watchlist_release_albums,
+                "watchlist_release_singles": runtime.default_watchlist_release_singles,
+                "watchlist_release_eps": runtime.default_watchlist_release_eps,
+                "watchlist_monitor_upgrades": runtime.default_watchlist_monitor_upgrades,
+            },
         },
     )
 

@@ -26,6 +26,8 @@ from app.services.catalog_metadata import validated_artist_hits
 _DISCOVERY_FILE_PROBE_LIMIT = 64
 _DISCOVERY_FILE_PROBE_CONCURRENCY = 8
 
+_LANDING_FEEDS = ("popular", "genres", "new", "trending")
+
 _TITLES = {
     "popular": "Popular artists",
     "genres": "Genres",
@@ -155,6 +157,48 @@ class DiscoveryService:
         marker = f":{region}:"
         self._cache = {key: value for key, value in self._cache.items() if marker not in key}
 
+    @staticmethod
+    def _cache_key(feed: str, region: str, *, page: int, limit: int, genre_id: str | None) -> str:
+        return f"deezer:{feed}:{region}:{page}:{limit}:{genre_id or ''}"
+
+    def peek(
+        self,
+        feed: str,
+        region: str,
+        *,
+        page: int = 1,
+        limit: int = 12,
+        genre_id: str | None = None,
+    ) -> DiscoverySection:
+        """Return a usable cached section or a pending placeholder without doing I/O."""
+        page = max(1, min(page, 20))
+        limit = max(1, min(limit, 25))
+        key = self._cache_key(feed, region, page=page, limit=limit, genre_id=genre_id)
+        now = time.monotonic()
+        cached = self._cache.get(key)
+        if cached is None or cached[0] + self.stale_seconds <= now:
+            self._cache.pop(key, None)
+            return DiscoverySection(
+                feed=feed,
+                title=_TITLES[feed],
+                requested_region=region,
+                effective_region=region,
+                fallback_global=False,
+                state="pending",
+            )
+        if cached[0] > now:
+            return cached[1]
+        return replace(
+            cached[1],
+            state="stale",
+            stale=True,
+            message="Showing cached results while this feed refreshes",
+        )
+
+    def landing_snapshot(self, region: str, *, limit: int = 12) -> list[DiscoverySection]:
+        """Build the landing feed entirely from local cache state."""
+        return [self.peek(feed, region, limit=limit) for feed in _LANDING_FEEDS]
+
     async def get(
         self,
         feed: str,
@@ -166,7 +210,7 @@ class DiscoveryService:
     ) -> DiscoverySection:
         page = max(1, min(page, 20))
         limit = max(1, min(limit, 25))
-        key = f"deezer:{feed}:{region}:{page}:{limit}:{genre_id or ''}"
+        key = self._cache_key(feed, region, page=page, limit=limit, genre_id=genre_id)
         now = time.monotonic()
         self._cache = {
             cache_key: value
@@ -233,7 +277,10 @@ class DiscoveryService:
         except Exception:
             if cached and cached[0] + self.stale_seconds > now:
                 return replace(
-                    cached[1], stale=True, message="Showing cached results; refresh failed"
+                    cached[1],
+                    state="stale",
+                    stale=True,
+                    message="Showing cached results; refresh failed",
                 )
             return DiscoverySection(
                 feed=feed,
@@ -260,12 +307,11 @@ class DiscoveryService:
         return section
 
     async def landing(self, region: str) -> list[DiscoverySection]:
-        feeds = ("popular", "genres", "new", "trending")
         outcomes = await asyncio.gather(
-            *(self.get(feed, region) for feed in feeds), return_exceptions=True
+            *(self.get(feed, region) for feed in _LANDING_FEEDS), return_exceptions=True
         )
         sections: list[DiscoverySection] = []
-        for feed, outcome in zip(feeds, outcomes, strict=True):
+        for feed, outcome in zip(_LANDING_FEEDS, outcomes, strict=True):
             if isinstance(outcome, BaseException):
                 sections.append(
                     DiscoverySection(

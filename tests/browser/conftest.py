@@ -18,7 +18,7 @@ import app.models  # noqa: F401
 from app.config import Settings, get_settings, override_settings
 from app.database import Base, get_session_factory, reset_engine
 from app.main import create_app
-from app.metadata.base import ArtistDetail, ArtistHit
+from app.metadata.base import ArtistDetail, ArtistHit, DiscoverySection
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.release import Release
@@ -207,11 +207,16 @@ def browser_base_url(tmp_path_factory: pytest.TempPathFactory) -> Generator[str,
     async def no_dispatch(*_args: object, **_kwargs: object) -> None:
         return None
 
-    async def empty_discovery(*_args: object, **_kwargs: object) -> list[object]:
-        return []
+    async def empty_discovery(feed: str, region: str, **_kwargs: object) -> DiscoverySection:
+        items = (
+            (ArtistHit("deezer", "browser-discovery-artist", "Browser Discovery Artist"),)
+            if feed == "popular"
+            else ()
+        )
+        return DiscoverySection(feed, feed.title(), region, "GLOBAL", True, items)
 
     monkeypatch.setattr("app.routers.search.search_catalog_artists", search_artists)
-    monkeypatch.setattr("app.routers.search.discovery_service.landing", empty_discovery)
+    monkeypatch.setattr("app.routers.search.discovery_service.get", empty_discovery)
     monkeypatch.setattr("app.routers.catalog.fetch_catalog_artist_detail", artist_detail)
     monkeypatch.setattr("app.routers.catalog._start_discography_task", lambda *_args: False)
     monkeypatch.setattr("app.routers.catalog.job_dispatcher.dispatch", no_dispatch)

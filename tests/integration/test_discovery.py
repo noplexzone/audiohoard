@@ -1,96 +1,155 @@
 from __future__ import annotations
 
+import asyncio
+
 from sqlalchemy import select
 
 from app.metadata.base import (
     ArtistDetail,
     ArtistHit,
     DiscoveryGenre,
-    DiscoveryRelease,
     DiscoverySection,
 )
 from app.models.catalog_entities import CatalogArtist
 
 
-async def test_empty_search_renders_neutral_discovery_without_persisting_rows(
+async def test_empty_search_renders_pending_shell_without_calling_provider(
     client, monkeypatch
 ) -> None:
     from app.routers import search as search_router
 
-    async def landing(region: str):
+    provider_called = asyncio.Event()
+
+    async def get(*_args, **_kwargs):
+        provider_called.set()
+        await asyncio.Event().wait()
+
+    def landing_snapshot(region: str):
         return [
-            DiscoverySection(
-                "popular",
-                "Popular artists",
-                region,
-                "GLOBAL",
-                True,
-                (ArtistHit("deezer", "artist-1", "Popular Artist", rank=1),),
-            ),
-            DiscoverySection(
-                "genres",
-                "Genres",
-                region,
-                "GLOBAL",
-                True,
-                (DiscoveryGenre("deezer", "132", "Pop"),),
-            ),
-            DiscoverySection(
-                "new",
-                "New releases",
-                region,
-                "GLOBAL",
-                True,
-                (
-                    DiscoveryRelease(
-                        "deezer",
-                        "release-1",
-                        "New Album",
-                        "New Artist",
-                        "artist-2",
-                        release_date="2026-08-01",
-                    ),
-                ),
-            ),
-            DiscoverySection(
-                "trending",
-                "Trending releases",
-                region,
-                "GLOBAL",
-                True,
-                (
-                    DiscoveryRelease(
-                        "deezer",
-                        "release-2",
-                        "Trending Album",
-                        "Trending Artist",
-                        "artist-3",
-                        rank=2,
-                    ),
-                ),
-            ),
+            DiscoverySection(feed, title, region, "GLOBAL", True, state="pending")
+            for feed, title in (
+                ("popular", "Popular artists"),
+                ("genres", "Genres"),
+                ("new", "New releases"),
+                ("trending", "Trending releases"),
+            )
         ]
 
-    monkeypatch.setattr(search_router.discovery_service, "landing", landing)
+    monkeypatch.setattr(search_router.discovery_service, "get", get)
+    monkeypatch.setattr(search_router.discovery_service, "landing_snapshot", landing_snapshot)
 
-    response = await client.get("/search")
+    response = await asyncio.wait_for(client.get("/search"), timeout=0.5)
 
     assert response.status_code == 200
     for text in ("Popular artists", "Genres", "New releases", "Trending releases"):
         assert text in response.text
-    assert "Global fallback" in response.text
-    assert 'action="/artists/catalog/open"' in response.text
-    assert 'name="provider_id" value="artist-2"' in response.text
-    assert "/artists/provider-preview?" in response.text
-    assert "/artists/catalog/open?" not in response.text
-    assert 'action="/downloads/create"' not in response.text
-    assert "data-download-form" not in response.text
-    assert "/discover/genres/132" in response.text
+    assert response.text.count('data-discover-state="pending"') == 4
+    assert response.text.count("Loading discovery feed") == 4
+    assert "Nothing to show" not in response.text
+    assert provider_called.is_set() is False
 
     from app.database import get_session_factory
 
     async with get_session_factory()() as db:
         assert list(await db.scalars(select(CatalogArtist))) == []
+
+
+async def test_empty_search_renders_cached_ready_and_stale_sections_without_provider(
+    client, monkeypatch
+) -> None:
+    from app.routers import search as search_router
+
+    sections = [
+        DiscoverySection(
+            "popular",
+            "Popular artists",
+            "US",
+            "GLOBAL",
+            True,
+            (ArtistHit("deezer", "artist-1", "Cached Artist"),),
+        ),
+        DiscoverySection("genres", "Genres", "US", "GLOBAL", True, state="stale", stale=True),
+        DiscoverySection("new", "New releases", "US", "GLOBAL", True, state="pending"),
+        DiscoverySection("trending", "Trending releases", "US", "GLOBAL", True, state="pending"),
+    ]
+
+    def landing_snapshot(_region: str):
+        return sections
+
+    async def unexpected_get(*_args, **_kwargs):
+        raise AssertionError("landing shell must not call provider")
+
+    monkeypatch.setattr(search_router.discovery_service, "landing_snapshot", landing_snapshot)
+    monkeypatch.setattr(search_router.discovery_service, "get", unexpected_get)
+
+    response = await client.get("/search")
+
+    assert response.status_code == 200
+    assert "Cached Artist" in response.text
+    assert 'data-discover-state="ready"' in response.text
+    assert 'data-discover-state="stale"' in response.text
+    assert "Cached" in response.text
+    assert "This feed is currently empty" in response.text
+
+
+async def test_discovery_fragment_requires_authentication(unauthenticated_client) -> None:
+    response = await unauthenticated_client.get(
+        "/discover/fragments/popular", follow_redirects=False
+    )
+    assert response.status_code == 401
+
+
+async def test_discovery_fragment_allowlist_errors_empty_and_exact_card_state(
+    client, monkeypatch
+) -> None:
+    from app.metadata.base import DiscoveryCardState
+    from app.routers import search as search_router
+
+    calls: list[str] = []
+    projections: list[set[tuple[str, str]]] = []
+
+    async def get(feed, region, *, page=1, limit=12, genre_id=None):
+        calls.append(feed)
+        if feed == "new":
+            return DiscoverySection(
+                feed,
+                "New releases",
+                region,
+                "GLOBAL",
+                True,
+                state="error",
+                message="Discovery provider is temporarily unavailable",
+            )
+        items = ()
+        if feed == "popular":
+            items = (ArtistHit("deezer", "exact-artist", "Exact Artist"),)
+        return DiscoverySection(feed, feed.title(), region, "GLOBAL", True, items)
+
+    async def project(_db, identities):
+        projections.append(identities)
+        if not identities:
+            return {}
+        return {("deezer", "exact-artist"): DiscoveryCardState(42, False, False)}
+
+    monkeypatch.setattr(search_router.discovery_service, "get", get)
+    monkeypatch.setattr(search_router, "project_discovery_card_states", project)
+
+    assert (await client.get("/discover/fragments/unknown")).status_code == 404
+
+    failed = await client.get("/discover/fragments/new")
+    ready = await client.get("/discover/fragments/popular")
+    empty = await client.get("/discover/fragments/genres")
+
+    assert failed.status_code == ready.status_code == empty.status_code == 200
+    assert "temporarily unavailable" in failed.text
+    assert "Exact Artist" in ready.text
+    assert 'name="csrf_token"' in ready.text
+    assert 'name="provider_id" value="exact-artist"' in ready.text
+    assert 'name="return_to" value="/search#discovery-popular"' in ready.text
+    assert "This feed is currently empty" in empty.text
+    assert "Loading discovery feed" not in empty.text
+    assert calls == ["new", "popular", "genres"]
+    assert projections == [set(), {("deezer", "exact-artist")}, set()]
 
 
 async def test_dedicated_discovery_routes_bound_page_and_genre(client, monkeypatch) -> None:

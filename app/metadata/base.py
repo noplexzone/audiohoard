@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import Literal, Protocol, TypeVar, runtime_checkable
 
 from app.sources.base import CapabilityState
 
@@ -76,7 +76,7 @@ class DiscoverySection:
     effective_region: str
     fallback_global: bool
     items: tuple[ArtistHit | DiscoveryGenre | DiscoveryRelease, ...] = field(default_factory=tuple)
-    state: str = "ready"
+    state: Literal["pending", "ready", "stale", "error"] = "ready"
     message: str | None = None
     stale: bool = False
     has_next: bool | None = None

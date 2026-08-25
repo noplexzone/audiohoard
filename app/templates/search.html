@@ -63,18 +63,7 @@
 {% endif %}
 <div class="discovery-region-note" role="status">Discovery region: <strong>{{ discovery_region }}</strong>. Global fallback is labeled below.</div>
 {% for section in discovery_sections %}
-<section class="card discovery-section" aria-labelledby="discovery-{{ section.feed }}">
-  <div class="page-header"><div><h2 id="discovery-{{ section.feed }}">{{ section.title }}</h2>{% if section.fallback_global %}<span class="badge info">Global fallback</span>{% endif %}{% if section.stale %}<span class="badge info">Cached</span>{% endif %}</div><a class="btn secondary" href="/discover/{{ section.feed }}">View all</a></div>
-  {% if section.state == 'error' %}<div class="alert error" role="alert">{{ section.message }}</div>
-  {% elif not section.items %}<div class="empty-state" role="status"><h3>Nothing to show</h3><p>This feed is currently empty.</p></div>
-  {% else %}<div class="grid catalog-result-grid">
-    {% for item in section.items %}
-      {% if section.feed == 'popular' %}{% set artist_hit = item %}{% set watched_artist = watched_catalog_artists.get(item.provider, {}).get(item.provider_id) %}{% set artist_card_id = 'discover-' ~ section.feed ~ '-' ~ loop.index %}{% include "partials/_artist_card.html" %}
-      {% elif section.feed == 'genres' %}<a class="card discovery-genre-card" href="/discover/genres/{{ item.provider_id }}">{% if item.artwork_url %}<img src="/artwork?url={{ item.artwork_url | urlencode }}" alt="" class="catalog-result-art">{% endif %}<h3>{{ item.name }}</h3></a>
-      {% else %}{% include "partials/_release_card.html" %}{% endif %}
-    {% endfor %}
-  </div>{% endif %}
-</section>
+{% include "partials/_discover_section.html" %}
 {% endfor %}
 {% endif %}
 {% else %}

@@ -4,6 +4,78 @@
   const pendingForms = new WeakSet();
   let lastDialogTrigger = null;
 
+  function bindDialogs(root) {
+    root.querySelectorAll("[data-watchlist-dialog]").forEach((dialog) => {
+      if (dialog.dataset.discoveryBound === "true") return;
+      dialog.dataset.discoveryBound = "true";
+      dialog.addEventListener("close", () => {
+        if (lastDialogTrigger instanceof HTMLElement && lastDialogTrigger.isConnected) {
+          lastDialogTrigger.focus();
+        }
+        lastDialogTrigger = null;
+      });
+    });
+  }
+
+  function showFragmentError(container) {
+    container.dataset.discoverState = "error";
+    const body = container.querySelector("[data-discover-body]");
+    if (!body) return;
+    const alert = document.createElement("div");
+    alert.className = "alert error";
+    alert.setAttribute("role", "alert");
+    const message = document.createElement("p");
+    message.textContent = "This discovery feed could not be loaded.";
+    const retry = document.createElement("a");
+    retry.className = "btn secondary";
+    retry.href = container.dataset.discoverFragmentUrl || window.location.href;
+    retry.dataset.nativeNavigation = "";
+    retry.textContent = "Retry this section";
+    alert.append(message, retry);
+    body.replaceChildren(alert);
+  }
+
+  function initializeDiscovery(root) {
+    const controller = new AbortController();
+    const signal = controller.signal;
+
+    const loadPending = () => {
+      if (document.hidden || signal.aborted) return;
+      root.querySelectorAll("[data-discover-fragment-url]").forEach((container) => {
+        if (container.dataset.discoverState !== "pending" ||
+            container.dataset.discoverRequested === "true") return;
+        container.dataset.discoverRequested = "true";
+        void fetch(container.dataset.discoverFragmentUrl, {
+          method: "GET",
+          credentials: "same-origin",
+          headers: {Accept: "text/html", "X-Requested-With": "discover-fragment"},
+          signal,
+        }).then(async (response) => {
+          if (!response.ok) throw new Error("fragment request failed");
+          const documentFragment = new DOMParser().parseFromString(await response.text(), "text/html");
+          const fresh = documentFragment.querySelector("[data-discover-section]");
+          if (!fresh || !["pending", "ready", "stale", "error"].includes(fresh.dataset.discoverState)) {
+            throw new Error("invalid fragment response");
+          }
+          container.replaceWith(fresh);
+          bindDialogs(fresh);
+        }).catch((error) => {
+          if (error?.name !== "AbortError") showFragmentError(container);
+        });
+      });
+    };
+
+    bindDialogs(root);
+    loadPending();
+    document.addEventListener("visibilitychange", loadPending, {signal});
+    document.addEventListener("audiohoard:page-dispose", () => controller.abort(), {
+      signal,
+      once: true,
+    });
+    window.addEventListener("pagehide", () => controller.abort(), {signal, once: true});
+    return () => controller.abort();
+  }
+
   const cardFor = (element) => element.closest("[data-provider][data-provider-id]");
 
   function setError(card, message = "") {
@@ -164,12 +236,9 @@
     }
   });
 
-  document.querySelectorAll("[data-watchlist-dialog]").forEach((dialog) => {
-    dialog.addEventListener("close", () => {
-      if (lastDialogTrigger instanceof HTMLElement && lastDialogTrigger.isConnected) {
-        lastDialogTrigger.focus();
-      }
-      lastDialogTrigger = null;
-    });
-  });
+  if (window.AudiohoardNavigation) {
+    window.AudiohoardNavigation.registerPage("discovery", initializeDiscovery);
+  } else {
+    document.addEventListener("DOMContentLoaded", () => initializeDiscovery(document), {once: true});
+  }
 })();
