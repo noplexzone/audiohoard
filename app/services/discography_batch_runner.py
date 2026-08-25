@@ -9,22 +9,27 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
-from sqlalchemy import select, update
+from sqlalchemy import exists, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
+from app.database import is_sqlite_database_locked
 from app.models.acquisition_claim import AcquisitionDispatchClaim
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumProvider
 from app.models.discography_batch import (
     DiscographyBatch,
     DiscographyBatchItem,
+    DiscographyBatchItemJob,
     DiscographyBatchItemState,
     DiscographyBatchState,
+    DiscographyJobOwnership,
 )
 from app.models.job import Job, JobStatus
 from app.services.catalog import (
+    DiscographyLeaseLostError,
     expand_catalog_album_missing_track_jobs,
     project_catalog_album_queue_targets,
 )
@@ -34,7 +39,7 @@ from app.settings_service import QualityProfile, get_runtime_settings
 logger = logging.getLogger(__name__)
 
 Dispatcher = Callable[[int], Awaitable[object] | object]
-Hydrator = Callable[[int], Awaitable[None]]
+Hydrator = Callable[[int, str], Awaitable[None]]
 _ACTIVE_BATCHES = (DiscographyBatchState.queued, DiscographyBatchState.running)
 _WORKING_ITEMS = (DiscographyBatchItemState.hydrating, DiscographyBatchItemState.expanding)
 _TERMINAL_ITEMS = (
@@ -81,7 +86,7 @@ class DiscographyBatchRunner:
         self._task: asyncio.Task[None] | None = None
         self._initial_cycle_complete = asyncio.Event()
 
-    async def _missing_hydrator(self, _item_id: int) -> None:
+    async def _missing_hydrator(self, _item_id: int, _lease_token: str) -> None:
         raise RuntimeError("no safe metadata hydration callback is configured")
 
     async def start(self, *, wait_for_initial_cycle: bool = False) -> None:
@@ -131,25 +136,40 @@ class DiscographyBatchRunner:
 
         claimed = await self._claim_pending(now)
         if claimed is None:
-            return False
-        item_id, requires_hydration = claimed
+            return await self._reconcile_idle_batch()
+        item_id, requires_hydration, lease_token = claimed
         try:
             if requires_hydration:
                 # The claim transaction is committed and its session is closed before provider I/O.
-                await self._hydrator(item_id)
+                await self._hydrator(item_id, lease_token)
                 async with self._session_factory() as db:
-                    item = await db.get(DiscographyBatchItem, item_id)
-                    if item is None or item.state != DiscographyBatchItemState.hydrating:
+                    result = await db.execute(
+                        update(DiscographyBatchItem)
+                        .where(
+                            DiscographyBatchItem.id == item_id,
+                            DiscographyBatchItem.state == DiscographyBatchItemState.hydrating,
+                            DiscographyBatchItem.lease_token == lease_token,
+                            DiscographyBatchItem.batch_id.in_(
+                                select(DiscographyBatch.id).where(
+                                    DiscographyBatch.state.in_(_ACTIVE_BATCHES)
+                                )
+                            ),
+                        )
+                        .values(
+                            state=DiscographyBatchItemState.expanding,
+                            heartbeat_at=datetime.now(UTC),
+                        )
+                    )
+                    if not isinstance(result, CursorResult) or result.rowcount != 1:
+                        await db.rollback()
                         return True
-                    item.state = DiscographyBatchItemState.expanding
-                    item.heartbeat_at = datetime.now(UTC)
                     await db.commit()
 
             async with self._session_factory() as db:
-                item = await db.get(DiscographyBatchItem, item_id)
+                item = await self._owned_item(
+                    db, item_id, lease_token, (DiscographyBatchItemState.expanding,)
+                )
                 if item is None:
-                    return True
-                if item.state not in _WORKING_ITEMS:
                     return True
                 if item.catalog_album_id is None:
                     item.state = DiscographyBatchItemState.skipped
@@ -174,6 +194,7 @@ class DiscographyBatchRunner:
                     album,
                     quality_profile=profile,
                     batch_item_id=item_id,
+                    batch_lease_token=lease_token,
                     max_new_jobs=25,
                     library_root=self._library_root,
                 )
@@ -182,20 +203,27 @@ class DiscographyBatchRunner:
             # Expansion commits links and jobs. Dispatch is deliberately
             # after the session closes.
             for job_id in created_ids:
-                result = self._dispatcher(job_id)
-                if inspect.isawaitable(result):
-                    await result
+                if not await self._may_dispatch(item_id, lease_token, job_id):
+                    break
+                dispatch_result = self._dispatcher(job_id)
+                if inspect.isawaitable(dispatch_result):
+                    await dispatch_result
 
             async with self._session_factory() as db:
-                await self._reconcile_item(db, item_id, attempted=True)
-                await self._finish_batch_for_item(db, item_id)
+                reconciled = await self._reconcile_item(
+                    db, item_id, attempted=True, expected_lease_token=lease_token
+                )
+                if reconciled:
+                    await self._finish_batch_for_item(db, item_id)
                 await db.commit()
         except asyncio.CancelledError:
             raise
+        except DiscographyLeaseLostError:
+            return True
         except Exception as exc:
             async with self._session_factory() as db:
-                item = await db.get(DiscographyBatchItem, item_id)
-                if item is not None and item.state in _WORKING_ITEMS:
+                item = await self._owned_item(db, item_id, lease_token, _WORKING_ITEMS)
+                if item is not None:
                     item.state = DiscographyBatchItemState.failed
                     item.reason_code = (
                         "hydration_failed" if requires_hydration else "expansion_failed"
@@ -246,7 +274,7 @@ class DiscographyBatchRunner:
             )
             return int(value) if value is not None else None
 
-    async def _claim_pending(self, now: datetime) -> tuple[int, bool] | None:
+    async def _claim_pending(self, now: datetime) -> tuple[int, bool, str] | None:
         for attempt in range(6):
             try:
                 async with self._session_factory() as db:
@@ -305,23 +333,121 @@ class DiscographyBatchRunner:
                         .values(state=DiscographyBatchState.running, started_at=now)
                     )
                     await db.commit()
-                    return int(candidate), hydrating
+                    return int(candidate), hydrating, token
             except Exception as exc:
-                if "locked" not in str(exc).casefold() or attempt == 5:
+                if not is_sqlite_database_locked(exc) or attempt == 5:
                     raise
                 await asyncio.sleep(0.05 * (attempt + 1))
         return None
 
-    async def _reconcile_item(self, db: AsyncSession, item_id: int, *, attempted: bool) -> None:
+    async def _owned_item(
+        self,
+        db: AsyncSession,
+        item_id: int,
+        lease_token: str,
+        states: tuple[DiscographyBatchItemState, ...],
+    ) -> DiscographyBatchItem | None:
+        return cast(
+            DiscographyBatchItem | None,
+            await db.scalar(
+                select(DiscographyBatchItem)
+                .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+                .where(
+                    DiscographyBatchItem.id == item_id,
+                    DiscographyBatchItem.lease_token == lease_token,
+                    DiscographyBatchItem.state.in_(states),
+                    DiscographyBatch.state.in_(_ACTIVE_BATCHES),
+                )
+            ),
+        )
+
+    async def _may_dispatch(self, item_id: int, lease_token: str, job_id: int) -> bool:
+        async with self._session_factory() as db:
+            row = (
+                await db.execute(
+                    select(DiscographyBatchItem, DiscographyBatch.state)
+                    .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+                    .where(DiscographyBatchItem.id == item_id)
+                )
+            ).one_or_none()
+            if row is None:
+                return False
+            item, batch_state = row
+            if item.lease_token != lease_token or item.state not in (
+                DiscographyBatchItemState.expanding,
+                DiscographyBatchItemState.waiting,
+            ):
+                return False
+            if batch_state == DiscographyBatchState.paused:
+                created_ids = select(DiscographyBatchItemJob.job_id).where(
+                    DiscographyBatchItemJob.item_id == item_id,
+                    DiscographyBatchItemJob.ownership == DiscographyJobOwnership.created,
+                )
+                await db.execute(
+                    update(Job)
+                    .where(Job.id.in_(created_ids), Job.status == JobStatus.pending)
+                    .values(status=JobStatus.cancelled)
+                )
+                item.state = DiscographyBatchItemState.pending
+                item.lease_token = None
+                item.heartbeat_at = None
+                await db.commit()
+                return False
+            if batch_state not in _ACTIVE_BATCHES:
+                return False
+            return await db.scalar(select(Job.status).where(Job.id == job_id)) == JobStatus.pending
+
+    async def _reconcile_idle_batch(self) -> bool:
+        async with self._session_factory() as db:
+            batch_id = await db.scalar(
+                select(DiscographyBatch.id)
+                .where(
+                    DiscographyBatch.state.in_(_ACTIVE_BATCHES),
+                    ~exists(
+                        select(DiscographyBatchItem.id).where(
+                            DiscographyBatchItem.batch_id == DiscographyBatch.id,
+                            DiscographyBatchItem.state.not_in(_TERMINAL_ITEMS),
+                        )
+                    ),
+                )
+                .order_by(DiscographyBatch.id)
+                .limit(1)
+            )
+            if batch_id is None:
+                return False
+            await self._finish_batch(db, int(batch_id))
+            await db.commit()
+            return True
+
+    async def _reconcile_item(
+        self,
+        db: AsyncSession,
+        item_id: int,
+        *,
+        attempted: bool,
+        expected_lease_token: str | None = None,
+    ) -> bool:
+        filters = [
+            DiscographyBatchItem.id == item_id,
+            DiscographyBatch.state.in_(_ACTIVE_BATCHES),
+        ]
+        if expected_lease_token is not None:
+            filters.extend(
+                [
+                    DiscographyBatchItem.lease_token == expected_lease_token,
+                    DiscographyBatchItem.state.in_(_WORKING_ITEMS),
+                ]
+            )
         item = await db.scalar(
             select(DiscographyBatchItem)
-            .where(DiscographyBatchItem.id == item_id)
+            .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+            .where(*filters)
             .options(
                 selectinload(DiscographyBatchItem.catalog_album).selectinload(CatalogAlbum.tracks)
             )
         )
         if item is None:
-            return
+            return False
         now = datetime.now(UTC)
         item.lease_token = None
         item.heartbeat_at = None
@@ -329,7 +455,7 @@ class DiscographyBatchRunner:
             item.state = DiscographyBatchItemState.skipped
             item.reason_code = "catalog_release_unbound"
             item.completed_at = now
-            return
+            return True
         expected = max(item.expected_track_count or 0, item.catalog_album.track_count or 0) or None
         if item.provider_release_id is not None:
             provider_expected = await db.scalar(
@@ -351,7 +477,7 @@ class DiscographyBatchRunner:
                 "catalog_tracks_overfull": "catalog_manifest_overfull",
                 "catalog_tracks_invalid_positions": "catalog_manifest_invalid_positions",
             }[issue]
-            return
+            return True
         profile = self._quality_profile or (await get_runtime_settings(db)).quality_profile
         projection = (
             await project_catalog_album_queue_targets(
@@ -398,6 +524,7 @@ class DiscographyBatchRunner:
         else:
             item.state = DiscographyBatchItemState.pending
             item.reason_code = None
+        return True
 
     async def _finish_batch_for_item(self, db: AsyncSession, item_id: int) -> None:
         batch_id = await db.scalar(
@@ -422,7 +549,7 @@ class DiscographyBatchRunner:
                 )
             ).all()
         )
-        if states and all(state in _TERMINAL_ITEMS for state in states):
+        if all(state in _TERMINAL_ITEMS for state in states):
             failed = any(
                 state in {DiscographyBatchItemState.failed, DiscographyBatchItemState.cancelled}
                 for state in states

@@ -6,6 +6,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from functools import partial
 from importlib.resources import files
 from pathlib import Path
 from typing import Annotated
@@ -51,6 +52,7 @@ from app.services.acquisition_recovery import recover_approved_downloads
 from app.services.activity import get_activity_summary
 from app.services.artist_monitoring import DiscographyRefreshScheduler
 from app.services.catalog_metadata import (
+    hydrate_discography_batch_item,
     reconcile_deezer_release_snapshots,
     reconcile_duplicate_catalog_artists,
 )
@@ -252,7 +254,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     library_adoption_runner = LibraryAdoptionRunner(get_session_factory())
     app.state.library_adoption_runner = library_adoption_runner
     discography_batch_runner = DiscographyBatchRunner(
-        get_session_factory(), dispatcher=job_dispatcher.dispatch
+        get_session_factory(),
+        dispatcher=job_dispatcher.dispatch,
+        hydration_callback=partial(
+            hydrate_discography_batch_item,
+            get_session_factory(),
+            settings=effective_settings,
+        ),
     )
     app.state.discography_batch_runner = discography_batch_runner
     await recover_deletion_operations(

@@ -14,6 +14,7 @@ from app.models.discography_batch import (
     DiscographyScopeKind,
 )
 from app.models.job import Job, JobStatus
+from app.services import discography_batches
 from app.services.discography_batches import (
     cancel_discography_batch,
     confirm_discography_batch,
@@ -143,3 +144,44 @@ async def test_retry_resets_only_selected_retryable_item(db_session: AsyncSessio
     assert result.reset_item_ids == (failed.id,)
     assert failed.state == DiscographyBatchItemState.pending
     assert sibling.state == DiscographyBatchItemState.failed
+
+
+async def test_confirmation_completes_empty_batch_without_queueing(
+    db_session: AsyncSession,
+) -> None:
+    preview = await create_discography_batch_preview(
+        db_session,
+        DiscographyScopeKind.wanted_selected,
+        {"album_ids": []},
+        quality_profile=PROFILE,
+    )
+    confirmation = await confirm_discography_batch(db_session, preview.id, quality_profile=PROFILE)
+    assert not confirmation.scope_changed
+    assert confirmation.batch.state == DiscographyBatchState.completed
+
+
+async def test_confirmation_completes_batch_when_every_item_is_already_complete(
+    db_session: AsyncSession, monkeypatch
+) -> None:
+    album = await _album(db_session)
+    preview = await create_discography_batch_preview(
+        db_session,
+        DiscographyScopeKind.wanted_selected,
+        {"album_ids": [album.id]},
+        quality_profile=PROFILE,
+    )
+    item = await db_session.scalar(
+        select(DiscographyBatchItem).where(DiscographyBatchItem.batch_id == preview.id)
+    )
+    assert item is not None
+    item.state = DiscographyBatchItemState.complete
+    item.reason_code = "verified_complete"
+    await db_session.commit()
+
+    async def preserve_complete(*_args) -> None:
+        return None
+
+    monkeypatch.setattr(discography_batches, "_populate_batch_items", preserve_complete)
+    confirmation = await confirm_discography_batch(db_session, preview.id, quality_profile=PROFILE)
+    assert not confirmation.scope_changed
+    assert confirmation.batch.state == DiscographyBatchState.completed

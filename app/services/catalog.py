@@ -26,9 +26,11 @@ from app.models.catalog_entities import (
     CatalogArtistIdentity,
 )
 from app.models.discography_batch import (
+    DiscographyBatch,
     DiscographyBatchItem,
     DiscographyBatchItemJob,
     DiscographyBatchItemState,
+    DiscographyBatchState,
     DiscographyJobOwnership,
 )
 from app.models.import_plan import ImportPlan, LibraryFileState
@@ -909,12 +911,17 @@ async def _link_discography_job(
         db.add(DiscographyBatchItemJob(item_id=item_id, job_id=job_id, ownership=ownership))
 
 
+class DiscographyLeaseLostError(RuntimeError):
+    """The durable batch item is no longer owned by this materializer."""
+
+
 async def expand_catalog_album_missing_track_jobs(
     db: AsyncSession,
     album: CatalogAlbum,
     *,
     quality_profile: QualityProfile,
     batch_item_id: int | None = None,
+    batch_lease_token: str | None = None,
     max_new_jobs: int = 25,
     library_root: Path | None = None,
 ) -> CatalogQueueOutcome:
@@ -980,6 +987,17 @@ async def expand_catalog_album_missing_track_jobs(
                 raise ValueError("discography batch item does not exist")
             if item.catalog_album_id != album_id:
                 raise ValueError("discography batch item belongs to a different catalog album")
+            if batch_lease_token is not None:
+                batch_state = await db.scalar(
+                    select(DiscographyBatch.state).where(DiscographyBatch.id == item.batch_id)
+                )
+                if (
+                    item.state != DiscographyBatchItemState.expanding
+                    or item.lease_token != batch_lease_token
+                    or batch_state
+                    not in (DiscographyBatchState.queued, DiscographyBatchState.running)
+                ):
+                    raise DiscographyLeaseLostError("discography batch lease is no longer active")
             if not _item_is_expansion_eligible(item):
                 raise ValueError("discography batch item is not expansion-eligible")
             expected_count = max(expected_count or 0, item.expected_track_count or 0) or None

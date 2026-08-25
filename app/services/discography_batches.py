@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 from sqlalchemy import delete, select, update
@@ -563,7 +564,34 @@ async def confirm_discography_batch(
             )
             .values(state=DiscographyBatchItemState.pending)
         )
-        batch.state = DiscographyBatchState.queued
+        states = list(
+            (
+                await db.scalars(
+                    select(DiscographyBatchItem.state).where(
+                        DiscographyBatchItem.batch_id == batch.id
+                    )
+                )
+            ).all()
+        )
+        terminal = {
+            DiscographyBatchItemState.complete,
+            DiscographyBatchItemState.skipped,
+            DiscographyBatchItemState.failed,
+            DiscographyBatchItemState.cancelled,
+        }
+        if all(state in terminal for state in states):
+            batch.state = (
+                DiscographyBatchState.completed_with_failures
+                if any(
+                    state
+                    in (DiscographyBatchItemState.failed, DiscographyBatchItemState.cancelled)
+                    for state in states
+                )
+                else DiscographyBatchState.completed
+            )
+            batch.completed_at = datetime.now(UTC)
+        else:
+            batch.state = DiscographyBatchState.queued
     await db.commit()
     return DiscographyBatchConfirmation(batch=_preview_result(batch), scope_changed=scope_changed)
 
