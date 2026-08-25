@@ -336,6 +336,7 @@ async def test_downloads_shows_elapsed_and_external_transfer_wait(client: AsyncC
     # Auto-refresh is implemented by the external CSP-compatible script.
     assert re.search(r'src="/static/js/downloads\.js\?v=[0-9a-f]{12}"', text)
     assert "POLL_INTERVAL_MS = 10000" in DOWNLOADS_JS
+    assert "data-preparing-download" in DOWNLOADS_JS
 
     # Elapsed and last-activity columns are present
     assert "Elapsed" in text

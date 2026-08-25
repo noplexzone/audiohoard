@@ -23,6 +23,19 @@
 </div>
 {% endif %}
 
+{% if batch_failures %}
+<section aria-labelledby="queue-failures-heading">
+  <h2 id="queue-failures-heading">Queue preparation failed</h2>
+  {% for failure in batch_failures %}
+  <div class="alert error">
+    <strong>{{ failure.release_title }}</strong> · {{ failure.artist_name }}<br>
+    {{ failure.error_detail }}
+    <a class="btn secondary" href="/discography-batches/{{ failure.batch_id }}">Review and retry</a>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
 {% if activity_summary %}
 <section class="activity-overview" aria-label="Activity overview" data-activity-attention="{{ activity_summary.attention }}">
   <a class="activity-summary-card" href="/wanted">

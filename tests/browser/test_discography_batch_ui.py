@@ -28,6 +28,24 @@ def test_discography_batch_direct_queue_desktop_and_mobile(
         path=str(SCREENSHOT_ROOT / "audiohoard-preparing-downloads-desktop.png"),
         full_page=True,
     )
+    page.route(
+        "**/downloads/queue?status=running",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="text/html",
+            body=(
+                '<div data-materialized-job="1">'
+                "<strong>Browser Context Album</strong>"
+                '<span class="badge">pending</span>'
+                "</div>"
+            ),
+        ),
+    )
+    page.reload()
+    assert page.get_by_text("Browser Context Album", exact=True).is_visible()
+    page.locator('[data-materialized-job="1"]').wait_for(state="visible", timeout=15_000)
+    assert page.locator("[data-preparing-download]").count() == 0
+    page.unroute("**/downloads/queue?status=running")
     page.go_back()
     page.wait_for_url("**/activity?notice=queued")
     assert page.evaluate(

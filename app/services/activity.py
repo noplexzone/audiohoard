@@ -94,6 +94,51 @@ async def get_preparing_downloads(db: AsyncSession) -> list[PreparingDownload]:
 
 
 @dataclass(frozen=True, slots=True)
+class BatchFailure:
+    batch_id: int
+    item_id: int
+    artist_name: str
+    release_title: str
+    error_detail: str
+
+
+def _batch_failures_query() -> Select[tuple[int, int, str, str, str | None, datetime]]:
+    return select(
+        DiscographyBatchItem.batch_id,
+        DiscographyBatchItem.id.label("item_id"),
+        DiscographyBatchItem.artist_name,
+        DiscographyBatchItem.release_title,
+        DiscographyBatchItem.error_detail,
+        DiscographyBatchItem.updated_at,
+    ).where(
+        DiscographyBatchItem.state == DiscographyBatchItemState.failed,
+        ~DiscographyBatchItem.job_links.any(
+            DiscographyBatchItemJob.ownership == DiscographyJobOwnership.created
+        ),
+    )
+
+
+async def get_batch_failures(db: AsyncSession, *, limit: int = 20) -> list[BatchFailure]:
+    rows = (
+        await db.execute(
+            _batch_failures_query()
+            .order_by(DiscographyBatchItem.updated_at.desc(), DiscographyBatchItem.id.desc())
+            .limit(limit)
+        )
+    ).all()
+    return [
+        BatchFailure(
+            batch_id=int(row.batch_id),
+            item_id=int(row.item_id),
+            artist_name=str(row.artist_name),
+            release_title=str(row.release_title),
+            error_detail=str(row.error_detail or "Download preparation failed."),
+        )
+        for row in rows
+    ]
+
+
+@dataclass(frozen=True, slots=True)
 class ActivitySummary:
     """Bounded overview counts for acquisition work and navigation attention."""
 
@@ -156,7 +201,7 @@ async def get_activity_summary(db: AsyncSession) -> ActivitySummary:
         .scalar_subquery()
     )
     active_downloads = active_jobs + preparing_downloads
-    acquisition_issues = (
+    failed_jobs = (
         select(func.count(Job.id))
         .where(
             Job.queue_hidden.is_(False),
@@ -164,6 +209,10 @@ async def get_activity_summary(db: AsyncSession) -> ActivitySummary:
         )
         .scalar_subquery()
     )
+    failed_batch_items = (
+        select(func.count()).select_from(_batch_failures_query().subquery()).scalar_subquery()
+    )
+    acquisition_issues = failed_jobs + failed_batch_items
     awaiting_review = (
         select(func.count(StagingReviewItem.id))
         .join(Release, StagingReviewItem.release_id == Release.id)

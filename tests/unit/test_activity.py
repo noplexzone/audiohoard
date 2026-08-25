@@ -77,6 +77,21 @@ async def test_activity_summary_counts_actionable_work_in_one_query(
             estimated_job_count=3,
         )
     )
+    failed_batch = DiscographyBatch(
+        scope_kind=DiscographyScopeKind.artist,
+        scope_json="{}",
+        scope_hash="failed-activity",
+        state=DiscographyBatchState.completed_with_failures,
+    )
+    failed_batch.items.append(
+        DiscographyBatchItem(
+            release_identity="catalog_album:failed-activity",
+            artist_name="Failed artist",
+            release_title="Failed album",
+            state=DiscographyBatchItemState.failed,
+            error_detail="Provider hydration failed",
+        )
+    )
     failed = Job(source="slskd", query="failed", status=JobStatus.failed)
     partial = Job(source="slskd", query="retrying", status=JobStatus.partial)
     hidden_failed = Job(source="slskd", query="hidden", status=JobStatus.failed, queue_hidden=True)
@@ -106,6 +121,7 @@ async def test_activity_summary_counts_actionable_work_in_one_query(
             pending,
             queued_batch,
             duplicate_batch,
+            failed_batch,
             failed,
             partial,
             hidden_failed,
@@ -133,10 +149,10 @@ async def test_activity_summary_counts_actionable_work_in_one_query(
     assert statements == 1
     assert summary.wanted == 1
     assert summary.active_downloads == 5
-    assert summary.acquisition_issues == 2
+    assert summary.acquisition_issues == 3
     assert summary.awaiting_review == 1
     assert summary.rejected_sources == 1
-    assert summary.attention == 3
+    assert summary.attention == 4
 
 
 def test_activity_summary_attention_excludes_informational_counts() -> None:

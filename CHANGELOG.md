@@ -8,7 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- Send direct discography queue actions to Activity instead of a batch-status page, acknowledge the queue immediately, and show deduplicated not-yet-materialized work under Active downloads and in the Downloads queue.
+- Send direct discography queue actions to Activity instead of a batch-status page, acknowledge the queue immediately, show deduplicated not-yet-materialized work under Active downloads and in the polling Downloads queue, and surface pre-materialization failures with their existing retry controls.
 
 ## [0.26.0] - 2026-08-25
 
