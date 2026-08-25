@@ -274,6 +274,8 @@ async def test_poster_cards_and_dedicated_genre_use_operate_contract(client, mon
     assert 'method="post" action="/artists/catalog/open"' in genre.text
     assert 'href="?page=2"' in genre.text
     assert 'href="/discover/genres/132"' in genres.text
+    assert 'aria-label="Explore Pop genre"' in genres.text
+    assert "Explore Pop genre" in genres.text
     assert 'class="discover-poster-grid"' in genres.text
     assert "horizontal-scroller" not in genres.text
     assert "/artists/catalog/open?" not in genre.text

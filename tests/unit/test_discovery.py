@@ -834,8 +834,14 @@ async def test_non_genre_pagination_uses_display_offset_and_validated_continuati
             )
 
     provider = Provider()
-    section = await DiscoveryService(provider).get("popular", "US", page=2, limit=12)  # type: ignore[arg-type]
+    service = DiscoveryService(provider)  # type: ignore[arg-type]
+    first = await service.get("popular", "US", page=1, limit=12)
+    second = await service.get("popular", "US", page=2, limit=12)
 
-    assert provider.requests == [(25, 12)]
-    assert [item.provider_id for item in section.items] == [str(index) for index in range(22, 34)]
-    assert section.has_next is True
+    assert provider.requests == [(25, 0), (25, 25), (25, 0), (25, 25)]
+    assert [item.provider_id for item in first.items] == [str(index) for index in range(22, 34)]
+    assert [item.provider_id for item in second.items] == [str(index) for index in range(34, 46)]
+    assert set(item.provider_id for item in first.items).isdisjoint(
+        item.provider_id for item in second.items
+    )
+    assert first.has_next is second.has_next is True

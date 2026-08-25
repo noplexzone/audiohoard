@@ -247,41 +247,73 @@ class DiscoveryService:
                         break
                 items.extend(validated[index : index + limit])
                 has_next = page < 20 and len(validated) > index + limit
-            else:
-                items = await self.provider.discovery_feed(
+            elif feed == "genres":
+                genre_items = await self.provider.discovery_feed(
                     feed,
                     page=page,
                     limit=25,
                     genre_id=genre_id,
                     offset=(page - 1) * limit,
                 )
-            if feed == "popular":
-                artists = [item for item in items if isinstance(item, ArtistHit)]
-                validated = await validated_artist_hits(self.provider, "deezer", artists)
-                items.clear()
-                items.extend(validated)
-            elif feed in {"new", "trending"}:
-                releases = [item for item in items if isinstance(item, DiscoveryRelease)]
-                identities = {
-                    release.artist_provider_id: ArtistHit(
-                        provider="deezer",
-                        provider_id=release.artist_provider_id,
-                        deezer_id=release.artist_provider_id,
-                        name=release.artist_name,
+                has_next = page < 20 and len(genre_items) > limit
+                items.extend(genre_items[:limit])
+            else:
+                index = (page - 1) * limit
+                target = index + limit + 1
+                validated_items: list[ArtistHit | DiscoveryRelease] = []
+                seen_ids: set[str] = set()
+                for offset in range(0, 500, 25):
+                    raw_items = await self.provider.discovery_feed(
+                        feed,
+                        page=page,
+                        limit=25,
+                        genre_id=genre_id,
+                        offset=offset,
                     )
-                    for release in releases
-                }
-                validated = await validated_artist_hits(
-                    self.provider, "deezer", list(identities.values())
-                )
-                allowed = {artist.provider_id for artist in validated}
-                items.clear()
-                items.extend(
-                    release for release in releases if release.artist_provider_id in allowed
-                )
-            if feed != "genre":
-                has_next = page < 20 and len(items) > limit
-                items = items[:limit]
+                    unique_items: list[ArtistHit | DiscoveryRelease] = []
+                    for item in raw_items:
+                        if (
+                            isinstance(item, (ArtistHit, DiscoveryRelease))
+                            and item.provider_id not in seen_ids
+                        ):
+                            seen_ids.add(item.provider_id)
+                            unique_items.append(item)
+                    if feed == "popular":
+                        artists = [item for item in unique_items if isinstance(item, ArtistHit)]
+                        validated_items.extend(
+                            await validated_artist_hits(
+                                self.provider, "deezer", artists, preserve_order=True
+                            )
+                        )
+                    else:
+                        releases = [
+                            item for item in unique_items if isinstance(item, DiscoveryRelease)
+                        ]
+                        identities = {
+                            release.artist_provider_id: ArtistHit(
+                                provider="deezer",
+                                provider_id=release.artist_provider_id,
+                                deezer_id=release.artist_provider_id,
+                                name=release.artist_name,
+                            )
+                            for release in releases
+                        }
+                        valid_artists = await validated_artist_hits(
+                            self.provider,
+                            "deezer",
+                            list(identities.values()),
+                            preserve_order=True,
+                        )
+                        allowed = {artist.provider_id for artist in valid_artists}
+                        validated_items.extend(
+                            release
+                            for release in releases
+                            if release.artist_provider_id in allowed
+                        )
+                    if len(validated_items) >= target or len(raw_items) < 25:
+                        break
+                items.extend(validated_items[index : index + limit])
+                has_next = page < 20 and len(validated_items) > index + limit
         except Exception:
             if cached and cached[0] + self.stale_seconds > now:
                 return replace(
