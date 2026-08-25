@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+from html.parser import HTMLParser
+
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 
 import app.database as db_module
-from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
+from app.models.catalog_entities import (
+    CatalogAlbum,
+    CatalogAlbumTrack,
+    CatalogArtist,
+    CatalogArtistIdentity,
+)
 from app.models.discography_batch import (
     DiscographyBatch,
     DiscographyBatchItem,
@@ -13,6 +20,32 @@ from app.models.discography_batch import (
     DiscographyScopeKind,
 )
 from app.models.job import Job
+
+
+class _PreviewFormParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fields: list[tuple[str, str]] | None = None
+        self._current: list[tuple[str, str]] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = {key: value or "" for key, value in attrs}
+        if tag == "form" and attributes.get("action") == "/discography-batches/preview":
+            self._current = []
+        elif tag == "input" and self._current is not None and attributes.get("name"):
+            self._current.append((attributes["name"], attributes.get("value", "")))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form" and self._current is not None:
+            self.fields = self._current
+            self._current = None
+
+
+def _preview_form_fields(body: str) -> list[tuple[str, str]]:
+    parser = _PreviewFormParser()
+    parser.feed(body)
+    assert parser.fields is not None
+    return parser.fields
 
 
 async def _seed_wanted_album(title: str = "Native Preview") -> tuple[int, int]:
@@ -28,7 +61,14 @@ async def _seed_wanted_album(title: str = "Native Preview") -> tuple[int, int]:
             monitored=True,
         )
         album.tracks.append(CatalogAlbumTrack(position=1, disc=1, title="Missing Track"))
-        session.add(artist)
+        session.add(
+            CatalogArtistIdentity(
+                artist=artist,
+                provider="musicbrainz",
+                provider_artist_id="preview-artist",
+                name=artist.name,
+            )
+        )
         await session.commit()
         return artist.id, album.id
 
@@ -37,6 +77,12 @@ async def _job_count() -> int:
     factory = db_module.get_session_factory()
     async with factory() as session:
         return int(await session.scalar(select(func.count(Job.id))) or 0)
+
+
+async def _batch_count() -> int:
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        return int(await session.scalar(select(func.count(DiscographyBatch.id))) or 0)
 
 
 async def test_discography_batch_routes_require_auth(
@@ -85,6 +131,25 @@ async def test_wanted_forms_preview_exact_native_scopes_and_keep_direct_action(
     assert "Queue missing" in body
 
 
+async def test_default_artist_preview_form_posts_canonical_all_scope_without_jobs(
+    client: AsyncClient,
+) -> None:
+    artist_id, _ = await _seed_wanted_album("Default artist preview")
+    page = await client.get(f"/artists/catalog/{artist_id}")
+    assert page.status_code == 200
+    fields = _preview_form_fields(page.text)
+    assert ("release_type", "all") in fields
+    before = await _job_count()
+
+    response = await client.post(
+        "/discography-batches/preview", data=dict(fields), follow_redirects=False
+    )
+
+    assert response.status_code == 303, response.text
+    assert response.headers["location"].startswith("/discography-batches/")
+    assert await _job_count() == before
+
+
 async def test_selected_preview_creates_batch_items_but_no_jobs(client: AsyncClient) -> None:
     _, album_id = await _seed_wanted_album()
     before = await _job_count()
@@ -116,6 +181,19 @@ async def test_invalid_preview_returns_safe_actionable_html(client: AsyncClient)
     assert "Review the batch scope" in response.text
     assert "ValueError" not in response.text
     assert "Traceback" not in response.text
+
+
+async def test_empty_selected_and_page_preview_do_not_persist_batches(
+    client: AsyncClient,
+) -> None:
+    before = await _batch_count()
+    for scope_kind in ("wanted_selected", "wanted_page"):
+        response = await client.post(
+            "/discography-batches/preview", data={"scope_kind": scope_kind}
+        )
+        assert response.status_code == 400
+        assert "Select at least one release" in response.text
+        assert await _batch_count() == before
 
 
 async def test_confirm_unchanged_queues_and_wakes_runner(client: AsyncClient) -> None:
@@ -306,3 +384,119 @@ async def test_retry_route_resets_only_selected_failed_item_and_wakes(
         assert failed is not None and failed.state == DiscographyBatchItemState.pending
         assert failed.error_detail is None
         assert untouched is not None and untouched.state == DiscographyBatchItemState.failed
+
+
+async def test_cancelled_batch_renders_exact_retry_eligibility_and_retries_selected(
+    client: AsyncClient,
+) -> None:
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        batch = DiscographyBatch(
+            scope_kind=DiscographyScopeKind.wanted_selected,
+            scope_json='{"album_ids":[]}',
+            scope_hash="0" * 64,
+            state=DiscographyBatchState.cancelled,
+        )
+        cancelled = DiscographyBatchItem(
+            release_identity="retry:cancelled",
+            artist_name="Retry Artist",
+            release_title="Cancelled Album",
+            state=DiscographyBatchItemState.cancelled,
+            reason_code="batch_cancelled",
+        )
+        retryable_skip = DiscographyBatchItem(
+            release_identity="retry:hydration",
+            artist_name="Retry Artist",
+            release_title="Hydration Album",
+            state=DiscographyBatchItemState.skipped,
+            reason_code="hydration_failed",
+        )
+        ordinary_skip = DiscographyBatchItem(
+            release_identity="retry:duplicate",
+            artist_name="Retry Artist",
+            release_title="Duplicate Album",
+            state=DiscographyBatchItemState.skipped,
+            reason_code="duplicate_catalog_album",
+        )
+        batch.items.extend([cancelled, retryable_skip, ordinary_skip])
+        session.add(batch)
+        await session.commit()
+        batch_id = batch.id
+        cancelled_id = cancelled.id
+        retryable_skip_id = retryable_skip.id
+        ordinary_skip_id = ordinary_skip.id
+
+    page = await client.get(f"/discography-batches/{batch_id}")
+    assert page.status_code == 200
+    assert "Retry selected" in page.text
+    assert f'name="item_ids" value="{cancelled_id}"' in page.text
+    assert f'name="item_ids" value="{retryable_skip_id}"' in page.text
+    assert f'name="item_ids" value="{ordinary_skip_id}"' not in page.text
+
+    transport = client._transport
+    assert isinstance(transport, ASGITransport)
+    wake_count = 0
+
+    class RunnerSpy:
+        def wake(self) -> None:
+            nonlocal wake_count
+            wake_count += 1
+
+    transport.app.state.discography_batch_runner = RunnerSpy()
+    response = await client.post(
+        f"/discography-batches/{batch_id}/retry",
+        data={"item_ids": str(cancelled_id)},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert "notice=retried" in response.headers["location"]
+    assert wake_count == 1
+    async with factory() as session:
+        item = await session.get(DiscographyBatchItem, cancelled_id)
+        assert item is not None and item.state == DiscographyBatchItemState.pending
+
+
+async def test_ineligible_retry_selection_is_truthful_and_does_not_wake(
+    client: AsyncClient,
+) -> None:
+    factory = db_module.get_session_factory()
+    async with factory() as session:
+        batch = DiscographyBatch(
+            scope_kind=DiscographyScopeKind.wanted_selected,
+            scope_json='{"album_ids":[]}',
+            scope_hash="0" * 64,
+            state=DiscographyBatchState.completed_with_failures,
+        )
+        item = DiscographyBatchItem(
+            release_identity="retry:ineligible",
+            artist_name="Retry Artist",
+            release_title="Already Complete",
+            state=DiscographyBatchItemState.complete,
+            reason_code="verified_complete",
+        )
+        batch.items.append(item)
+        session.add(batch)
+        await session.commit()
+        batch_id, item_id = batch.id, item.id
+
+    transport = client._transport
+    assert isinstance(transport, ASGITransport)
+    wake_count = 0
+
+    class RunnerSpy:
+        def wake(self) -> None:
+            nonlocal wake_count
+            wake_count += 1
+
+    transport.app.state.discography_batch_runner = RunnerSpy()
+    response = await client.post(
+        f"/discography-batches/{batch_id}/retry",
+        data={"item_ids": str(item_id)},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert "notice=no-eligible-retries" in response.headers["location"]
+    assert "notice=retried" not in response.headers["location"]
+    assert wake_count == 0
+    page = await client.get(response.headers["location"])
+    assert "No selected releases were eligible for retry." in page.text

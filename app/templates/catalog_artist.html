@@ -70,7 +70,7 @@
           <input type="hidden" name="scope_kind" value="artist">
           <input type="hidden" name="artist_id" value="{{ artist.id }}">
           <input type="hidden" name="provider" value="{{ selected_provider }}">
-          <input type="hidden" name="release_type" value="{{ release_type }}">
+          <input type="hidden" name="release_type" value="{{ release_type or 'all' }}">
           <input type="hidden" name="year_from" value="">
           <input type="hidden" name="year_to" value="">
           <input type="hidden" name="monitoring_status" value="monitored">

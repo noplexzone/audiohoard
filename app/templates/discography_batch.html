@@ -36,7 +36,7 @@
     {% elif batch.state.value == 'paused' %}
     <form method="post" action="/discography-batches/{{ batch.id }}/resume"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn" type="submit">Resume batch</button></form>
     <form method="post" action="/discography-batches/{{ batch.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn danger" type="submit">Cancel pending</button></form>
-    {% elif batch.state.value == 'completed_with_failures' %}
+    {% elif batch.state.value in ['completed_with_failures', 'cancelled'] %}
     <form id="batch-retry-form" method="post" action="/discography-batches/{{ batch.id }}/retry">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button class="btn" type="submit">Retry selected</button>
@@ -83,7 +83,7 @@
   <div class="batch-items" role="list">
     {% for row in items %}{% set item = row.item %}
     <article class="batch-item" role="listitem">
-      {% if batch.state.value == 'completed_with_failures' and item.state in retryable_states %}
+      {% if batch.state.value in ['completed_with_failures', 'cancelled'] and row.retryable %}
       <label class="batch-item-select checkbox-control"><input type="checkbox" name="item_ids" value="{{ item.id }}" form="batch-retry-form"><span class="sr-only">Retry {{ item.release_title }}</span></label>
       {% endif %}
       <div class="batch-item-art" aria-hidden="true">

@@ -80,6 +80,7 @@ from app.services.discography_batches import (
     cancel_discography_batch,
     confirm_discography_batch,
     create_discography_batch_preview,
+    is_discography_batch_item_retryable,
     pause_discography_batch,
     resume_discography_batch,
     retry_discography_batch_items,
@@ -1599,6 +1600,7 @@ def _discography_notice(value: str) -> str | None:
         "resumed": "Batch resumed.",
         "cancelled": "Batch cancelled. Pending batch-owned jobs were cancelled.",
         "retried": "Selected releases were queued for retry.",
+        "no-eligible-retries": "No selected releases were eligible for retry.",
     }.get(value)
 
 
@@ -1680,6 +1682,7 @@ async def _render_discography_batch(
                 "artwork_url": album.artwork_url if album is not None else None,
                 "job_count": len(item.job_links),
                 "job_statuses": statuses,
+                "retryable": is_discography_batch_item_retryable(item.state, item.reason_code),
             }
         )
     return _templates(request).TemplateResponse(
@@ -1692,11 +1695,6 @@ async def _render_discography_batch(
             "scope_changed": scope_changed,
             "display_counts": display_counts,
             "notice": _discography_notice(request.query_params.get("notice", "")),
-            "retryable_states": {
-                DiscographyBatchItemState.failed,
-                DiscographyBatchItemState.cancelled,
-                DiscographyBatchItemState.skipped,
-            },
         },
     )
 
@@ -1723,7 +1721,10 @@ async def preview_discography_batch_page(
         DiscographyScopeKind.wanted_selected,
         DiscographyScopeKind.wanted_page,
     }:
-        payload = {"album_ids": list(form.getlist("catalog_album_ids"))}
+        album_ids = list(form.getlist("catalog_album_ids"))
+        if not album_ids:
+            return _discography_error("Select at least one release to preview.")
+        payload = {"album_ids": album_ids}
     elif scope_kind == DiscographyScopeKind.wanted_all_matching:
         payload = {
             "q": form.get("q", ""),
@@ -1833,7 +1834,10 @@ async def retry_discography_batch_page(
         return _discography_error(str(exc))
     if result.reset_item_ids:
         _wake_discography_batch_runner(request)
-    return RedirectResponse(f"/discography-batches/{batch_id}?notice=retried", status_code=303)
+        notice = "retried"
+    else:
+        notice = "no-eligible-retries"
+    return RedirectResponse(f"/discography-batches/{batch_id}?notice={notice}", status_code=303)
 
 
 @router.get("/wanted", response_class=HTMLResponse)

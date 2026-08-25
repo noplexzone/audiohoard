@@ -48,6 +48,18 @@ _MANIFEST_REASONS = {
     "catalog_tracks_overfull": "catalog_manifest_overfull",
     "catalog_tracks_invalid_positions": "catalog_manifest_invalid_positions",
 }
+_RETRYABLE_SKIP_REASONS = frozenset(
+    {"already_active", *_MANIFEST_REASONS.values(), "hydration_failed"}
+)
+
+
+def is_discography_batch_item_retryable(
+    state: DiscographyBatchItemState, reason_code: str | None
+) -> bool:
+    return state in {
+        DiscographyBatchItemState.failed,
+        DiscographyBatchItemState.cancelled,
+    } or (state == DiscographyBatchItemState.skipped and reason_code in _RETRYABLE_SKIP_REASONS)
 
 
 class DiscographyScopeError(ValueError):
@@ -780,15 +792,8 @@ async def retry_discography_batch_items(
     if len(items) != len(selected_ids) or any(item.batch_id != batch_id for item in items):
         raise DiscographyScopeError("selected item does not belong to batch")
     reset: list[int] = []
-    retryable_skips = {"already_active", *_MANIFEST_REASONS.values(), "hydration_failed"}
     for item in items:
-        eligible = item.state in {
-            DiscographyBatchItemState.failed,
-            DiscographyBatchItemState.cancelled,
-        } or (
-            item.state == DiscographyBatchItemState.skipped and item.reason_code in retryable_skips
-        )
-        if not eligible:
+        if not is_discography_batch_item_retryable(item.state, item.reason_code):
             continue
         item.state = DiscographyBatchItemState.pending
         item.error_detail = None
