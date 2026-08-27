@@ -69,7 +69,7 @@ def _seed(connection: sa.Connection) -> tuple[int, int, int, int]:
 
 def test_0033_schema_contract(tmp_path: Path) -> None:
     database = tmp_path / "schema.db"
-    command.upgrade(_config(database), "head")
+    command.upgrade(_config(database), "0033")
     engine = _engine(database)
     try:
         inspector = sa.inspect(engine)

@@ -65,6 +65,12 @@ class DiscographyBatch(Base):
     __table_args__ = (
         Index("ix_discography_batches_state", "state"),
         Index("ix_discography_batches_created_at", "created_at"),
+        Index(
+            "uq_discography_batches_active_scope",
+            "scope_hash",
+            unique=True,
+            sqlite_where=text("state IN ('queued', 'running', 'paused')"),
+        ),
         CheckConstraint("matching_count >= 0", name="ck_matching_count_nonnegative"),
         CheckConstraint("complete_count >= 0", name="ck_complete_count_nonnegative"),
         CheckConstraint("active_count >= 0", name="ck_active_count_nonnegative"),
@@ -133,6 +139,12 @@ class DiscographyBatchItem(Base):
             "trim(release_identity) <> ''",
             name="ck_discography_batch_item_identity",
         ),
+        CheckConstraint(
+            "(provider IS NULL AND provider_album_id IS NULL) OR "
+            "(provider IS NOT NULL AND trim(provider) <> '' AND "
+            "provider_album_id IS NOT NULL AND trim(provider_album_id) <> '')",
+            name="ck_discography_batch_item_provider_identity",
+        ),
         UniqueConstraint(
             "batch_id", "release_identity", name="uq_discography_batch_items_release_identity"
         ),
@@ -142,6 +154,7 @@ class DiscographyBatchItem(Base):
         CheckConstraint("skipped_count >= 0", name="ck_skipped_count_nonnegative"),
         CheckConstraint("estimated_job_count >= 0", name="ck_estimated_job_count_nonnegative"),
         CheckConstraint("attempt_count >= 0", name="ck_attempt_count_nonnegative"),
+        CheckConstraint("execution_generation >= 1", name="ck_execution_generation_positive"),
         Index(
             "uq_discography_batch_items_provider_release",
             "batch_id",
@@ -177,6 +190,7 @@ class DiscographyBatchItem(Base):
     release_year: Mapped[str | None] = mapped_column(String(4), nullable=True)
     release_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
     provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provider_album_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     expected_track_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     state: Mapped[DiscographyBatchItemState] = mapped_column(
         Enum(DiscographyBatchItemState, native_enum=False, create_constraint=True),
@@ -199,6 +213,9 @@ class DiscographyBatchItem(Base):
     )
     attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
+    )
+    execution_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
     )
     lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -224,7 +241,18 @@ class DiscographyBatchItemJob(Base):
     __tablename__ = "discography_batch_item_jobs"
     __table_args__ = (
         CheckConstraint("ownership IN ('created', 'observed')", name="discographyjobownership"),
-        UniqueConstraint("item_id", "job_id", name="uq_discography_batch_item_job"),
+        UniqueConstraint(
+            "item_id", "generation", "job_id", name="uq_discography_batch_item_generation_job"
+        ),
+        CheckConstraint("generation >= 1", name="ck_discography_batch_job_generation_positive"),
+        Index(
+            "uq_discography_batch_item_generation_track",
+            "item_id",
+            "generation",
+            "catalog_track_id",
+            unique=True,
+            sqlite_where=text("catalog_track_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -232,6 +260,8 @@ class DiscographyBatchItemJob(Base):
         ForeignKey("discography_batch_items.id", ondelete="CASCADE"), nullable=False
     )
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="RESTRICT"), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    catalog_track_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ownership: Mapped[DiscographyJobOwnership] = mapped_column(
         Enum(DiscographyJobOwnership, native_enum=False, create_constraint=False), nullable=False
     )

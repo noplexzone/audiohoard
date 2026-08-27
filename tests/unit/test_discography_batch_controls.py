@@ -86,6 +86,20 @@ async def test_confirmation_unchanged_queues_and_controls_cancel_created_pending
     observed_pending = Job(source="priority", query="observed", status=JobStatus.pending)
     db_session.add_all([created_pending, created_running, observed_pending])
     await db_session.flush()
+    created_descendant = Job(
+        source="priority",
+        query="created descendant",
+        status=JobStatus.pending,
+        parent_job_id=created_running.id,
+    )
+    observed_descendant = Job(
+        source="priority",
+        query="observed descendant",
+        status=JobStatus.pending,
+        parent_job_id=observed_pending.id,
+    )
+    db_session.add_all([created_descendant, observed_descendant])
+    await db_session.flush()
     db_session.add_all(
         [
             DiscographyBatchItemJob(
@@ -108,10 +122,18 @@ async def test_confirmation_unchanged_queues_and_controls_cancel_created_pending
     await db_session.commit()
     await pause_discography_batch(db_session, preview.id)
     cancelled = await cancel_discography_batch(db_session, preview.id)
-    assert cancelled.cancel_job_ids == (created_pending.id,)
+    assert cancelled.cancel_job_ids == tuple(sorted((created_pending.id, created_descendant.id)))
     assert (await db_session.get(Job, created_pending.id)).status == JobStatus.cancelled  # type: ignore[union-attr]
+    assert (await db_session.get(Job, created_pending.id)).queue_hidden is True  # type: ignore[union-attr]
     assert (await db_session.get(Job, created_running.id)).status == JobStatus.running  # type: ignore[union-attr]
+    assert (await db_session.get(Job, created_running.id)).queue_hidden is False  # type: ignore[union-attr]
     assert (await db_session.get(Job, observed_pending.id)).status == JobStatus.pending  # type: ignore[union-attr]
+    assert (await db_session.get(Job, observed_pending.id)).queue_hidden is False  # type: ignore[union-attr]
+    assert (await db_session.get(Job, created_descendant.id)).status == JobStatus.cancelled  # type: ignore[union-attr]
+    assert (await db_session.get(Job, created_descendant.id)).queue_hidden is True  # type: ignore[union-attr]
+    assert (await db_session.get(Job, observed_descendant.id)).status == JobStatus.pending  # type: ignore[union-attr]
+    assert (await db_session.get(Job, observed_descendant.id)).queue_hidden is False  # type: ignore[union-attr]
+    assert await db_session.scalar(select(func.count(DiscographyBatchItemJob.id))) == 3
 
 
 async def test_retry_resets_only_selected_retryable_item(db_session: AsyncSession) -> None:
@@ -143,7 +165,9 @@ async def test_retry_resets_only_selected_retryable_item(db_session: AsyncSessio
     result = await retry_discography_batch_items(db_session, batch.id, [failed.id])
     assert result.reset_item_ids == (failed.id,)
     assert failed.state == DiscographyBatchItemState.pending
+    assert failed.execution_generation == 2
     assert sibling.state == DiscographyBatchItemState.failed
+    assert sibling.execution_generation == 1
 
 
 async def test_confirmation_completes_empty_batch_without_queueing(

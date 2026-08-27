@@ -896,19 +896,30 @@ def _item_is_expansion_eligible(item: DiscographyBatchItem) -> bool:
 async def _link_discography_job(
     db: AsyncSession,
     item_id: int | None,
+    generation: int | None,
+    catalog_track_id: int,
     job_id: int,
     ownership: DiscographyJobOwnership,
 ) -> None:
-    if item_id is None:
+    if item_id is None or generation is None:
         return
     existing = await db.scalar(
         select(DiscographyBatchItemJob.id).where(
             DiscographyBatchItemJob.item_id == item_id,
-            DiscographyBatchItemJob.job_id == job_id,
+            DiscographyBatchItemJob.generation == generation,
+            DiscographyBatchItemJob.catalog_track_id == catalog_track_id,
         )
     )
     if existing is None:
-        db.add(DiscographyBatchItemJob(item_id=item_id, job_id=job_id, ownership=ownership))
+        db.add(
+            DiscographyBatchItemJob(
+                item_id=item_id,
+                generation=generation,
+                catalog_track_id=catalog_track_id,
+                job_id=job_id,
+                ownership=ownership,
+            )
+        )
 
 
 class DiscographyLeaseLostError(RuntimeError):
@@ -981,6 +992,7 @@ async def expand_catalog_album_missing_track_jobs(
             ).all()
         )
         expected_count = current_album.track_count
+        item_generation: int | None = None
         if batch_item_id is not None:
             item = await db.get(DiscographyBatchItem, batch_item_id)
             if item is None:
@@ -1000,6 +1012,7 @@ async def expand_catalog_album_missing_track_jobs(
                     raise DiscographyLeaseLostError("discography batch lease is no longer active")
             if not _item_is_expansion_eligible(item):
                 raise ValueError("discography batch item is not expansion-eligible")
+            item_generation = item.execution_generation
             expected_count = max(expected_count or 0, item.expected_track_count or 0) or None
             if item.provider_release_id is not None:
                 provider_expected = await db.scalar(
@@ -1025,9 +1038,31 @@ async def expand_catalog_album_missing_track_jobs(
         }
         missing_count = len(target_ids)
         complete_track_ids = frozenset(manifest_ids - target_ids)
+        generation_links: dict[int, Job] = {}
+        if batch_item_id is not None and item_generation is not None and target_ids:
+            generation_links = {
+                int(track_id): linked_job
+                for track_id, linked_job in (
+                    await db.execute(
+                        select(DiscographyBatchItemJob.catalog_track_id, Job)
+                        .join(Job, Job.id == DiscographyBatchItemJob.job_id)
+                        .where(
+                            DiscographyBatchItemJob.item_id == batch_item_id,
+                            DiscographyBatchItemJob.generation == item_generation,
+                            DiscographyBatchItemJob.catalog_track_id.in_(target_ids),
+                        )
+                    )
+                ).all()
+                if track_id is not None
+            }
 
         for track in tracks:
             if track.id not in target_ids:
+                continue
+            prior_attempt = generation_links.get(track.id)
+            if prior_attempt is not None:
+                if prior_attempt.status in _ACTIVE_JOB_STATUSES:
+                    observed.append(prior_attempt.id)
                 continue
             claim = (
                 await db.execute(
@@ -1044,7 +1079,12 @@ async def expand_catalog_album_missing_track_jobs(
                 if owner is not None and owner.status in _ACTIVE_JOB_STATUSES:
                     observed.append(owner.id)
                     await _link_discography_job(
-                        db, batch_item_id, owner.id, DiscographyJobOwnership.observed
+                        db,
+                        batch_item_id,
+                        item_generation,
+                        track.id,
+                        owner.id,
+                        DiscographyJobOwnership.observed,
                     )
                     continue
                 if owner is None:
@@ -1092,7 +1132,12 @@ async def expand_catalog_album_missing_track_jobs(
             if claimed_id == contender.id:
                 created.append(contender.id)
                 await _link_discography_job(
-                    db, batch_item_id, contender.id, DiscographyJobOwnership.created
+                    db,
+                    batch_item_id,
+                    item_generation,
+                    track.id,
+                    contender.id,
+                    DiscographyJobOwnership.created,
                 )
                 continue
 
@@ -1111,7 +1156,12 @@ async def expand_catalog_album_missing_track_jobs(
                 raise RuntimeError("exact acquisition claim lost without an active owner")
             observed.append(int(winner_id))
             await _link_discography_job(
-                db, batch_item_id, int(winner_id), DiscographyJobOwnership.observed
+                db,
+                batch_item_id,
+                item_generation,
+                track.id,
+                int(winner_id),
+                DiscographyJobOwnership.observed,
             )
         await db.commit()
 

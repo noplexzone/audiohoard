@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -25,7 +26,7 @@ from app.models.discography_batch import (
     DiscographyScopeKind,
 )
 from app.models.job import Job, JobStatus
-from app.services import catalog_metadata, discography_batch_runner
+from app.services import catalog_metadata, discography_batch_runner, discography_batches
 from app.services.catalog_metadata import hydrate_discography_batch_item
 from app.services.discography_batch_runner import DiscographyBatchRunner
 from app.services.discography_batches import (
@@ -138,6 +139,83 @@ async def test_terminal_link_without_verified_artifact_fails_item(tmp_path: Path
     await engine.dispose()
 
 
+async def test_terminal_track_is_not_reacquired_while_sibling_remains_active(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'generation.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    batch_id, item_id = await _seed(factory, tracks=2)
+    dispatched: list[int] = []
+    runner = DiscographyBatchRunner(factory, dispatcher=dispatched.append, quality_profile=PROFILE)
+
+    assert await runner.run_once()
+    async with factory() as db:
+        jobs = list((await db.scalars(select(Job).order_by(Job.catalog_track_id))).all())
+        assert len(jobs) == 2
+        jobs[0].status = JobStatus.failed
+        jobs[1].status = JobStatus.running
+        terminal_track_id = jobs[0].catalog_track_id
+        await db.commit()
+
+    for _ in range(3):
+        await runner.run_once()
+    async with factory() as db:
+        assert (
+            await db.scalar(
+                select(func.count(Job.id)).where(Job.catalog_track_id == terminal_track_id)
+            )
+            == 1
+        )
+        item = await db.get(DiscographyBatchItem, item_id)
+        assert item is not None and item.state == DiscographyBatchItemState.waiting
+        links = list(
+            (
+                await db.scalars(
+                    select(DiscographyBatchItemJob).where(
+                        DiscographyBatchItemJob.item_id == item_id
+                    )
+                )
+            ).all()
+        )
+        assert {(link.catalog_track_id, link.generation) for link in links} == {
+            (job.catalog_track_id, 1) for job in jobs
+        }
+        running_job = await db.scalar(select(Job).where(Job.status == JobStatus.running))
+        assert running_job is not None
+        running_job.status = JobStatus.done
+        await db.commit()
+
+    await runner.run_once()
+    async with factory() as db:
+        item = await db.get(DiscographyBatchItem, item_id)
+        batch = await db.get(DiscographyBatch, batch_id)
+        assert item is not None and item.state == DiscographyBatchItemState.failed
+        assert item.reason_code == "current_generation_attempts_exhausted"
+        assert batch is not None and batch.state == DiscographyBatchState.completed_with_failures
+
+    async with factory() as db:
+        await discography_batches.retry_discography_batch_items(db, batch_id, [item_id])
+    await runner.run_once()
+    async with factory() as db:
+        item = await db.get(DiscographyBatchItem, item_id)
+        assert item is not None and item.execution_generation == 2
+        assert await db.scalar(select(func.count(Job.id))) == 4
+        links = list(
+            (
+                await db.scalars(
+                    select(DiscographyBatchItemJob).where(
+                        DiscographyBatchItemJob.item_id == item_id
+                    )
+                )
+            ).all()
+        )
+        assert len(links) == 4
+        assert {link.generation for link in links} == {1, 2}
+    await engine.dispose()
+
+
 async def test_reconciliation_retains_snapshot_manifest_expectation(tmp_path: Path) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'snapshot.db'}")
     async with engine.begin() as connection:
@@ -194,9 +272,11 @@ async def test_production_hydration_fetches_without_open_runner_transaction(
         )
         item = DiscographyBatchItem(
             batch=batch,
-            release_identity="provider:album-1",
+            release_identity="provider:deezer:album-1",
             provider_release=release,
             catalog_album=album,
+            provider="deezer",
+            provider_album_id="album-1",
             artist_name=artist.name,
             release_title=album.title,
             state=DiscographyBatchItemState.pending,
@@ -205,7 +285,12 @@ async def test_production_hydration_fetches_without_open_runner_transaction(
         )
         db.add(item)
         await db.commit()
-        item_id, album_id = item.id, album.id
+        item_id, album_id, release_id = item.id, album.id, release.id
+    async with factory() as db:
+        release = await db.get(CatalogAlbumProvider, release_id)
+        assert release is not None
+        await db.delete(release)
+        await db.commit()
 
     class Provider:
         async def get_album(self, provider_id: str) -> AlbumDetail:
@@ -248,6 +333,68 @@ async def test_production_hydration_fetches_without_open_runner_transaction(
         current = await db.get(DiscographyBatchItem, item_id)
         assert current is not None and current.state == DiscographyBatchItemState.waiting
     assert len(dispatched) == 1
+    await engine.dispose()
+
+
+async def test_hydration_rejects_live_canonical_identity_change_during_provider_io(
+    tmp_path: Path, monkeypatch
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'canonical-race.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as db:
+        artist = CatalogArtist(name="Canonical race", monitored=True)
+        album = CatalogAlbum(
+            artist=artist, title="Canonical race", deezer_id="album-old", track_count=1
+        )
+        batch = DiscographyBatch(
+            scope_kind=DiscographyScopeKind.wanted_selected,
+            scope_json="{}",
+            scope_hash="1" * 64,
+            state=DiscographyBatchState.running,
+        )
+        item = DiscographyBatchItem(
+            batch=batch,
+            release_identity="provider:deezer:album-old",
+            catalog_album=album,
+            provider="deezer",
+            provider_album_id="album-old",
+            artist_name=artist.name,
+            release_title=album.title,
+            state=DiscographyBatchItemState.hydrating,
+            lease_token="lease-owner",
+            reason_code="catalog_manifest_missing",
+            expected_track_count=1,
+        )
+        db.add(item)
+        await db.commit()
+        item_id, album_id = item.id, album.id
+
+    class Provider:
+        async def get_album(self, provider_id: str) -> AlbumDetail:
+            async with factory() as db:
+                album = await db.get(CatalogAlbum, album_id)
+                assert album is not None
+                album.deezer_id = "album-new"
+                await db.commit()
+            return AlbumDetail(
+                provider="deezer",
+                provider_id=provider_id,
+                deezer_id=provider_id,
+                title="Canonical race",
+                track_count=1,
+                tracks=[AlbumTrack(position=1, title="Must not store")],
+            )
+
+    monkeypatch.setattr(catalog_metadata, "build_metadata_provider", lambda *_args: Provider())
+    with pytest.raises(RuntimeError, match="catalog identity changed"):
+        await hydrate_discography_batch_item(
+            factory, item_id, "lease-owner", Settings(secret_key="test-secret")
+        )
+    async with factory() as db:
+        assert await db.scalar(select(func.count(CatalogAlbumTrack.id))) == 0
+        assert await db.scalar(select(func.count(Job.id))) == 0
     await engine.dispose()
 
 
@@ -409,8 +556,9 @@ async def _assert_control_after_expansion(tmp_path: Path, monkeypatch, *, cancel
         else:
             assert batch.state == DiscographyBatchState.paused
             assert item.state == DiscographyBatchItemState.pending
+            assert item.execution_generation == 1
             assert item.lease_token is None
-            assert all(job.status == JobStatus.cancelled for job in jobs)
+            assert all(job.status == JobStatus.pending for job in jobs)
             await resume_discography_batch(db, batch_id, quality_profile=PROFILE)
 
     if not cancel:
@@ -420,6 +568,8 @@ async def _assert_control_after_expansion(tmp_path: Path, monkeypatch, *, cancel
         assert await runner.run_once()
         assert len(dispatched) == 2
         async with factory() as db:
+            item = await db.get(DiscographyBatchItem, item_id)
+            assert item is not None and item.execution_generation == 1
             active = list(
                 await db.scalars(
                     select(Job).where(Job.status.in_((JobStatus.pending, JobStatus.running)))
@@ -541,5 +691,5 @@ async def test_unchanged_waiting_page_does_not_starve_later_terminal_job(
         assert len(earlier) == 25
         assert all(item.state == DiscographyBatchItemState.waiting for item in earlier)
         assert later is not None and later.state == DiscographyBatchItemState.failed
-        assert later.reason_code == "targets_remain_without_active_jobs"
+        assert later.reason_code == "current_generation_attempts_exhausted"
     await engine.dispose()

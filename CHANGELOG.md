@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Fence durable discography batches by exact persisted provider identity, one acquisition attempt per track and execution generation, one equivalent active scope, transitive cancellation, and cancellation-aware continuation admission so bulk queue recovery cannot multiply work or outlive cancellation.
 - Send direct discography queue actions to Activity instead of a batch-status page, acknowledge the queue immediately, show deduplicated not-yet-materialized work under Active downloads and in the polling Downloads queue, and surface pre-materialization failures with their existing retry controls.
 
 ## [0.26.0] - 2026-08-25

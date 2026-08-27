@@ -2593,6 +2593,27 @@ async def _root_job(job: Job, db: AsyncSession) -> Job:
     return current
 
 
+async def _cancelled_batch_owns_job_ancestor(job_id: int, db: AsyncSession) -> bool:
+    """Return whether a cancelled batch created this job or one of its ancestors."""
+    blocked = await db.scalar(
+        text(
+            "WITH RECURSIVE ancestors(id, parent_job_id) AS ("
+            " SELECT id, parent_job_id FROM jobs WHERE id = :job_id"
+            " UNION"
+            " SELECT jobs.id, jobs.parent_job_id FROM jobs JOIN ancestors"
+            " ON ancestors.parent_job_id = jobs.id"
+            ") SELECT 1 FROM ancestors"
+            " JOIN discography_batch_item_jobs AS links"
+            " ON links.job_id = ancestors.id AND links.ownership = 'created'"
+            " JOIN discography_batch_items AS items ON items.id = links.item_id"
+            " JOIN discography_batches AS batches ON batches.id = items.batch_id"
+            " WHERE batches.state = 'cancelled' LIMIT 1"
+        ),
+        {"job_id": job_id},
+    )
+    return blocked is not None
+
+
 async def _spawn_continuation_jobs(
     parent_job_id: int,
     missing_catalog_track_ids: list[int],
@@ -2614,9 +2635,14 @@ async def _spawn_continuation_jobs(
         # query so a follower rechecks after the first commit.
         await db.execute(text("BEGIN IMMEDIATE"))
         parent_job = await db.get(Job, parent_job_id, populate_existing=True)
-        catalog_album = await _load_catalog_album(db, catalog_album_id)
-        if parent_job is None or catalog_album is None:
+        if parent_job is None or await _cancelled_batch_owns_job_ancestor(parent_job_id, db):
             committed_ids.clear()
+            await db.rollback()
+            return
+        catalog_album = await _load_catalog_album(db, catalog_album_id)
+        if catalog_album is None:
+            committed_ids.clear()
+            await db.rollback()
             return
 
         tracks_by_id = {track.id: track for track in catalog_album.tracks}
