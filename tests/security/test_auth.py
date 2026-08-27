@@ -5,10 +5,12 @@ import re
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.auth as auth
+from app.database import get_session_factory
 from app.models.auth import AuthSession
 
 
@@ -162,6 +164,12 @@ async def test_valid_login_retries_transient_sqlite_writer_lock(
     assert attempts == 1
     assert "session" in client.cookies
     assert "csrf" in client.cookies
+    me = await client.get("/api/auth/me")
+    assert me.status_code == 200
+    assert me.json()["username"] == "owner"
+    async with get_session_factory()() as db:
+        session_count = await db.scalar(select(func.count(AuthSession.id)))
+    assert session_count == 1
 
 
 def test_login_attempt_cleanup_removes_expired_high_cardinality_keys(

@@ -27,7 +27,7 @@ from app.config import Settings, get_settings
 from app.database import get_db, get_session_factory
 from app.display_names import display_name
 from app.jobs.dispatcher import job_dispatcher
-from app.models.job import Job, JobStatus
+from app.models.catalog_entities import CatalogArtist
 from app.routers import (
     activity,
     artwork,
@@ -45,10 +45,7 @@ from app.routers import (
 )
 from app.routers import catalog as catalog_router
 from app.routers import settings as settings_router
-from app.services.acquisition_cleanup import (
-    prune_orphaned_terminal_records,
-    wait_for_imported_source_cleanups,
-)
+from app.services.acquisition_cleanup import wait_for_imported_source_cleanups
 from app.services.acquisition_recovery import recover_approved_downloads
 from app.services.activity import get_activity_summary
 from app.services.artist_monitoring import DiscographyRefreshScheduler
@@ -123,33 +120,39 @@ async def _run_library_reconciliation_at_startup(
         logger.exception("Library file reconciliation failed at startup")
 
 
+async def _reconcile_catalog_state_at_startup(db: AsyncSession) -> tuple[int, int, int]:
+    merged_artists = 0
+    while True:
+        merged = await reconcile_duplicate_catalog_artists(db, max_merges=1)
+        await db.commit()
+        if not merged:
+            break
+        merged_artists += merged
+        await asyncio.sleep(0.1)
+
+    artist_ids = list(
+        (await db.scalars(select(CatalogArtist.id).order_by(CatalogArtist.id))).all()
+    )
+    await db.commit()
+    release_snapshots = 0
+    release_monitoring = 0
+    for artist_id in artist_ids:
+        snapshots = await reconcile_deezer_release_snapshots(db, artist_id)
+        monitoring = await reconcile_release_monitoring(db, artist_id)
+        await db.commit()
+        release_snapshots += snapshots
+        release_monitoring += monitoring
+        if snapshots or monitoring:
+            await asyncio.sleep(0.1)
+    return merged_artists, release_snapshots, release_monitoring
+
+
 async def _run_startup_database_maintenance(settings: Settings) -> None:
     try:
         async with get_session_factory()() as db:
-            active_job_id = await db.scalar(
-                select(Job.id)
-                .where(Job.status.in_((JobStatus.pending, JobStatus.running)))
-                .limit(1)
+            n, release_snapshots, release_monitoring = await _reconcile_catalog_state_at_startup(
+                db
             )
-            if active_job_id is None:
-                pruned = await prune_orphaned_terminal_records(db, commit_batches=True)
-                if pruned.tracks or pruned.releases or pruned.jobs:
-                    logger.info(
-                        "Pruned orphaned acquisition history at startup: "
-                        "%d track(s), %d release(s), %d job(s)",
-                        pruned.tracks,
-                        pruned.releases,
-                        pruned.jobs,
-                    )
-            else:
-                logger.info(
-                    "Skipping startup orphan pruning while acquisition jobs are queued "
-                    "so job recovery is not delayed"
-                )
-            n = await reconcile_duplicate_catalog_artists(db)
-            release_snapshots = await reconcile_deezer_release_snapshots(db)
-            release_monitoring = await reconcile_release_monitoring(db)
-            await db.commit()
             if n:
                 logger.info("Reconciled %d duplicate catalog artist(s) at startup", n)
             if release_snapshots:

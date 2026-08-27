@@ -1771,21 +1771,43 @@ def _track_has_file(track: Track) -> bool:
     return any(Path(raw).is_file() for raw in paths if raw)
 
 
+async def _yield_to_interactive_writers() -> None:
+    # A zero-duration yield lets this task reacquire SQLite immediately and can
+    # starve browser writes for the entire maintenance pass. Give already-waiting
+    # login/settings transactions a real scheduling window between prune batches.
+    await asyncio.sleep(0.1)
+
+
 async def prune_orphaned_terminal_records(
     db: AsyncSession,
     *,
     batch_size: int = 500,
     commit_batches: bool = False,
+    max_batches: int | None = None,
 ) -> OrphanPruneResult:
-    """Remove terminal history without monopolizing SQLite during startup maintenance."""
+    """Remove terminal history in optionally bounded writer-friendly batches."""
 
-    async def release_batch_lock() -> None:
-        if commit_batches:
+    async def release_batch_lock(*, changed: bool) -> None:
+        if not commit_batches:
+            return
+        if changed:
             await db.commit()
-            await asyncio.sleep(0)
+            await _yield_to_interactive_writers()
+        else:
+            await db.rollback()
 
     terminal = {JobStatus.done, JobStatus.failed, JobStatus.partial, JobStatus.cancelled}
     removed_tracks = 0
+    removed_releases = 0
+    removed_jobs = 0
+    batches = 0
+
+    def batch_limit_reached() -> bool:
+        return max_batches is not None and batches >= max_batches
+
+    def result() -> OrphanPruneResult:
+        return OrphanPruneResult(removed_tracks, removed_releases, removed_jobs)
+
     last_track_id = 0
     while True:
         tracks = list(
@@ -1806,6 +1828,7 @@ async def prune_orphaned_terminal_records(
         has_files = await asyncio.gather(
             *(asyncio.to_thread(_track_has_file, track) for track in tracks)
         )
+        removed_in_batch = 0
         for track, has_file in zip(tracks, has_files, strict=True):
             has_library_removal_evidence = any(
                 plan.file_state in {LibraryFileState.missing, LibraryFileState.removed}
@@ -1814,11 +1837,15 @@ async def prune_orphaned_terminal_records(
             if not has_file and not has_library_removal_evidence:
                 await db.delete(track)
                 removed_tracks += 1
+                removed_in_batch += 1
         await db.flush()
-        await release_batch_lock()
+        await release_batch_lock(changed=removed_in_batch > 0)
+        if removed_in_batch:
+            batches += 1
         db.expire_all()
+        if batch_limit_reached():
+            return result()
 
-    removed_releases = 0
     while True:
         releases = list(
             (
@@ -1841,10 +1868,12 @@ async def prune_orphaned_terminal_records(
             await db.delete(release)
         removed_releases += len(releases)
         await db.flush()
-        await release_batch_lock()
+        await release_batch_lock(changed=True)
+        batches += 1
         db.expire_all()
+        if batch_limit_reached():
+            return result()
 
-    removed_jobs = 0
     while True:
         jobs = list(
             (
@@ -1877,11 +1906,14 @@ async def prune_orphaned_terminal_records(
             await db.delete(job)
         removed_jobs += len(jobs)
         await db.flush()
-        await release_batch_lock()
+        await release_batch_lock(changed=True)
+        batches += 1
         db.expire_all()
+        if batch_limit_reached():
+            return result()
     if commit_batches:
         await db.rollback()
-    return OrphanPruneResult(removed_tracks, removed_releases, removed_jobs)
+    return result()
 
 
 def _file_sha256(path: Path) -> str:

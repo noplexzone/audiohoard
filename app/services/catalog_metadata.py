@@ -1111,10 +1111,12 @@ def _artists_should_merge(left: CatalogArtist, right: CatalogArtist) -> bool:
     )
 
 
-async def reconcile_duplicate_catalog_artists(db: AsyncSession) -> int:
-    """Repair legacy duplicate artist identities; safe to run repeatedly at startup."""
+async def reconcile_duplicate_catalog_artists(
+    db: AsyncSession, *, max_merges: int | None = None
+) -> int:
+    """Repair legacy duplicate artist identities with an optional transaction bound."""
     merged = 0
-    while True:
+    while max_merges is None or merged < max_merges:
         with db.no_autoflush:
             artists = list(
                 (
