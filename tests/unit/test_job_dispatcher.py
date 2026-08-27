@@ -878,11 +878,19 @@ async def test_periodic_cleanup_revisits_imported_attempt_files_with_effective_r
 
     monkeypatch.setattr(settings_service, "build_effective_settings", effective_settings)
     monkeypatch.setattr(acquisition_cleanup, "build_effective_settings", effective_settings)
+    prune_orphans = AsyncMock()
     monkeypatch.setattr(acquisition_cleanup, "cleanup_terminal_acquisitions", terminal_cleanup)
+    monkeypatch.setattr(acquisition_cleanup, "prune_orphaned_terminal_records", prune_orphans)
     dispatcher = JobDispatcher(runner=AsyncMock(), session_factory=session_factory)
 
     await dispatcher._cleanup_reconcile_tick()
 
+    prune_orphans.assert_awaited_once()
+    assert prune_orphans.await_args.kwargs == {
+        "batch_size": 1,
+        "commit_batches": True,
+        "max_batches": 100,
+    }
     assert not staged.exists()
     async with session_factory() as db:
         persisted_plan = await db.get(ImportPlan, plan_id)

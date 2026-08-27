@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import main
 from app.config import Settings
+from app.models.catalog_entities import CatalogArtist
 from app.models.job import Job, JobStatus
 
 
@@ -59,17 +60,15 @@ async def test_serialized_startup_recovery_does_not_delay_readiness(
     async def recover_deletions(*_args, **_kwargs) -> None:
         startup_order.append("recover-deletions")
 
-    async def prune(_db, *, batch_size: int, commit_batches: bool = False):
-        assert batch_size == 10
-        assert commit_batches is True
-        startup_order.append("prune")
+    async def reconcile_artists(_db, *, max_merges: int | None = None) -> int:
+        assert max_merges == 1
+        startup_order.append("catalog")
         maintenance_started.set()
         await asyncio.Event().wait()
-        return SimpleNamespace(tracks=0, releases=0, jobs=0)
+        return 0
 
     monkeypatch.setattr(main, "recover_deletion_operations", recover_deletions)
-    monkeypatch.setattr(main, "prune_orphaned_terminal_records", prune)
-    monkeypatch.setattr(main, "reconcile_duplicate_catalog_artists", AsyncMock(return_value=0))
+    monkeypatch.setattr(main, "reconcile_duplicate_catalog_artists", reconcile_artists)
     monkeypatch.setattr(main, "reconcile_deezer_release_snapshots", AsyncMock(return_value=0))
     monkeypatch.setattr(
         main,
@@ -114,10 +113,10 @@ async def test_serialized_startup_recovery_does_not_delay_readiness(
             assert cleanup_started.is_set() is False
 
     assert task.cancelled()
-    assert startup_order == ["recover-deletions", "prune"]
+    assert startup_order == ["recover-deletions", "catalog"]
 
 
-async def test_startup_database_maintenance_skips_orphan_prune_with_active_jobs(
+async def test_startup_database_maintenance_runs_reconciliation_with_active_jobs(
     db_session: AsyncSession, monkeypatch
 ) -> None:
     factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
@@ -125,13 +124,11 @@ async def test_startup_database_maintenance_skips_orphan_prune_with_active_jobs(
     db_session.add(job)
     await db_session.commit()
 
-    prune = AsyncMock(return_value=SimpleNamespace(tracks=0, releases=0, jobs=0))
     reconcile_artists = AsyncMock(return_value=0)
     reconcile_snapshots = AsyncMock(return_value=0)
     reconcile_monitoring = AsyncMock(return_value=0)
     recover_downloads = AsyncMock(return_value=0)
     monkeypatch.setattr(main, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(main, "prune_orphaned_terminal_records", prune)
     monkeypatch.setattr(main, "reconcile_duplicate_catalog_artists", reconcile_artists)
     monkeypatch.setattr(main, "reconcile_deezer_release_snapshots", reconcile_snapshots)
     monkeypatch.setattr(main, "reconcile_release_monitoring", reconcile_monitoring)
@@ -142,14 +139,39 @@ async def test_startup_database_maintenance_skips_orphan_prune_with_active_jobs(
     await db_session.commit()
     await main._run_startup_database_maintenance(Settings(secret_key="test-secret"))
 
-    prune.assert_not_awaited()
-    for reconciliation in (
-        reconcile_artists,
-        reconcile_snapshots,
-        reconcile_monitoring,
-        recover_downloads,
-    ):
-        assert reconciliation.await_count == 2
+    assert reconcile_artists.await_count == 2
+    assert all(call.kwargs == {"max_merges": 1} for call in reconcile_artists.await_args_list)
+    reconcile_snapshots.assert_not_awaited()
+    reconcile_monitoring.assert_not_awaited()
+    assert recover_downloads.await_count == 2
+
+
+async def test_startup_catalog_reconciliation_commits_per_artist(
+    db_session: AsyncSession, monkeypatch
+) -> None:
+    artists = [CatalogArtist(name="First"), CatalogArtist(name="Second")]
+    db_session.add_all(artists)
+    await db_session.commit()
+    artist_ids = [artist.id for artist in artists]
+
+    duplicate_calls: list[int | None] = []
+
+    async def reconcile_artists(_db, *, max_merges: int | None = None) -> int:
+        duplicate_calls.append(max_merges)
+        return 1 if len(duplicate_calls) == 1 else 0
+
+    snapshots = AsyncMock(side_effect=[1, 1])
+    monitoring = AsyncMock(side_effect=[0, 0])
+    monkeypatch.setattr(main, "reconcile_duplicate_catalog_artists", reconcile_artists)
+    monkeypatch.setattr(main, "reconcile_deezer_release_snapshots", snapshots)
+    monkeypatch.setattr(main, "reconcile_release_monitoring", monitoring)
+
+    result = await main._reconcile_catalog_state_at_startup(db_session)
+
+    assert result == (1, 2, 0)
+    assert duplicate_calls == [1, 1]
+    assert [call.args[1] for call in snapshots.await_args_list] == artist_ids
+    assert [call.args[1] for call in monitoring.await_args_list] == artist_ids
 
 
 async def test_startup_recovery_pipeline_serializes_database_writers(monkeypatch) -> None:

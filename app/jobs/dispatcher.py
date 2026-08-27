@@ -388,7 +388,13 @@ class JobDispatcher:
         from app.services.acquisition_cleanup import (
             cleanup_imported_sources,
             pending_imported_source_cleanups,
+            prune_orphaned_terminal_records,
         )
+
+        async with factory() as db:
+            await prune_orphaned_terminal_records(
+                db, batch_size=1, commit_batches=True, max_batches=100
+            )
 
         async with factory() as db:
             pending_cleanups = await pending_imported_source_cleanups(db)

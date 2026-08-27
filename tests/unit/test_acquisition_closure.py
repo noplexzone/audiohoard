@@ -868,6 +868,61 @@ async def test_failed_bounded_cleanup_rotates_past_low_id_prefix(
     assert all(value is not None for value in attempted)
 
 
+async def test_prune_orphaned_terminal_records_honors_batch_limit(
+    db_session: AsyncSession,
+) -> None:
+    job = Job(source="slskd", query="bounded prune", status=JobStatus.done)
+    release = Release(job=job, source="slskd", title="Album")
+    release.tracks.extend(
+        [
+            Track(job=job, release=release, source="slskd", title="One"),
+            Track(job=job, release=release, source="slskd", title="Two"),
+        ]
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    result = await prune_orphaned_terminal_records(
+        db_session, batch_size=1, commit_batches=True, max_batches=1
+    )
+
+    remaining = list((await db_session.scalars(select(Track))).all())
+    assert result.tracks == 1
+    assert result.releases == 0
+    assert result.jobs == 0
+    assert len(remaining) == 1
+
+
+async def test_prune_batch_limit_does_not_starve_orphans_behind_retained_tracks(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    retained_file = tmp_path / "retained.flac"
+    retained_file.write_bytes(b"audio")
+    job = Job(source="slskd", query="rotating prune", status=JobStatus.done)
+    release = Release(job=job, source="slskd", title="Album")
+    retained = Track(
+        job=job,
+        release=release,
+        source="slskd",
+        title="Retained",
+        source_path=str(retained_file),
+    )
+    orphan = Track(job=job, release=release, source="slskd", title="Orphan")
+    release.tracks.extend([retained, orphan])
+    db_session.add(job)
+    await db_session.commit()
+    retained_id = retained.id
+    orphan_id = orphan.id
+
+    result = await prune_orphaned_terminal_records(
+        db_session, batch_size=1, commit_batches=True, max_batches=1
+    )
+
+    assert result.tracks == 1
+    assert await db_session.get(Track, retained_id) is not None
+    assert await db_session.get(Track, orphan_id) is None
+
+
 async def test_prune_orphaned_terminal_records_removes_only_rows_without_files(
     db_session: AsyncSession, tmp_path, monkeypatch
 ) -> None:
