@@ -27,7 +27,7 @@ from app.auth import (
     verify_password,
 )
 from app.config import Settings, get_settings
-from app.database import get_db
+from app.database import get_db, run_with_sqlite_lock_retry
 from app.models.auth import AppUser, AuthSession, UserRole
 from app.schemas.settings import SettingsSaveRequest
 from app.settings_service import save_settings
@@ -106,8 +106,21 @@ async def _authenticate_login(
         record_login_failure(key)
         raise HTTPException(status_code=401, detail="Invalid username or password")
     clear_login_failures(key)
-    token, session = await create_session(db, user, settings)
-    return token, session, user
+    user_id = user.id
+    result: tuple[str, AuthSession, AppUser] | None = None
+
+    async def persist_session() -> None:
+        nonlocal result
+        current_user = await db.get(AppUser, user_id)
+        if current_user is None:
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        token, session = await create_session(db, current_user, settings)
+        await db.commit()
+        result = token, session, current_user
+
+    await run_with_sqlite_lock_retry(db, persist_session, attempts=6, delay_seconds=0.2)
+    assert result is not None
+    return result
 
 
 @router.get("/setup", response_class=HTMLResponse, include_in_schema=False)
