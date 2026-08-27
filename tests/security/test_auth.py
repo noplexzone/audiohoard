@@ -5,8 +5,11 @@ import re
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.auth as auth
+from app.models.auth import AuthSession
 
 
 @pytest.mark.parametrize(
@@ -117,6 +120,48 @@ async def test_login_abuse_controls_and_no_password_hash_disclosure(
     )
     assert blocked.status_code == 429
     assert not re.search(r"argon2|password_hash", blocked.text, re.IGNORECASE)
+
+
+@pytest.mark.asyncio
+async def test_valid_login_retries_transient_sqlite_writer_lock(
+    unauthenticated_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = unauthenticated_client
+    auth._attempts.clear()
+    password = "Correct-Horse-Battery-Staple-42"
+    await client.post(
+        "/api/auth/setup",
+        json={"username": "owner", "password": password},
+    )
+    await client.post("/api/auth/logout", headers={"X-CSRF-Token": client.cookies["csrf"]})
+    client.cookies.clear()
+
+    original_flush = AsyncSession.flush
+    attempts = 0
+
+    async def lock_first_session_insert(self, *args, **kwargs):
+        nonlocal attempts
+        if attempts == 0 and any(isinstance(obj, AuthSession) for obj in self.new):
+            attempts += 1
+            raise OperationalError(
+                "INSERT INTO auth_sessions", {}, Exception("database is locked")
+            )
+        return await original_flush(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "flush", lock_first_session_insert)
+
+    response = await client.post(
+        "/login",
+        data={"username": "owner", "password": password, "next": "/"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert attempts == 1
+    assert "session" in client.cookies
+    assert "csrf" in client.cookies
 
 
 def test_login_attempt_cleanup_removes_expired_high_cardinality_keys(

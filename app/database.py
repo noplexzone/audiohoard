@@ -167,6 +167,18 @@ def _make_engine(url: str | None = None) -> AsyncEngine:
         finally:
             cursor.close()
 
+    @event.listens_for(engine.sync_engine, "checkin")
+    def _reset_sqlite_busy_timeout(
+        dbapi_connection: object | None, _connection_record: object
+    ) -> None:
+        if dbapi_connection is None:
+            return
+        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
+        try:
+            cursor.execute("PRAGMA busy_timeout=30000")
+        finally:
+            cursor.close()
+
     return engine
 
 
