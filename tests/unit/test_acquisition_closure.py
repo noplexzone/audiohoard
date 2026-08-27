@@ -869,8 +869,17 @@ async def test_failed_bounded_cleanup_rotates_past_low_id_prefix(
 
 
 async def test_prune_orphaned_terminal_records_removes_only_rows_without_files(
-    db_session: AsyncSession, tmp_path
+    db_session: AsyncSession, tmp_path, monkeypatch
 ) -> None:
+    writer_handoffs = 0
+
+    async def record_writer_handoff() -> None:
+        nonlocal writer_handoffs
+        writer_handoffs += 1
+
+    monkeypatch.setattr(
+        acquisition_cleanup, "_yield_to_interactive_writers", record_writer_handoff
+    )
     kept_source = tmp_path / "kept.flac"
     kept_source.write_bytes(b"audio")
     imported_destination = tmp_path / "library" / "imported.flac"
@@ -943,6 +952,7 @@ async def test_prune_orphaned_terminal_records_removes_only_rows_without_files(
     assert await db_session.get(Track, ids["imported_track"]) is not None
     assert await db_session.get(Track, ids["active_track"]) is not None
     assert await db_session.get(Job, ids["mixed_job"]) is not None
+    assert writer_handoffs >= 3
 
 
 async def test_prune_preserves_no_track_job_with_unresolved_attempt_cleanup(

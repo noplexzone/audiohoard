@@ -59,7 +59,8 @@ async def test_serialized_startup_recovery_does_not_delay_readiness(
     async def recover_deletions(*_args, **_kwargs) -> None:
         startup_order.append("recover-deletions")
 
-    async def prune(_db, *, commit_batches: bool = False):
+    async def prune(_db, *, batch_size: int, commit_batches: bool = False):
+        assert batch_size == 10
         assert commit_batches is True
         startup_order.append("prune")
         maintenance_started.set()

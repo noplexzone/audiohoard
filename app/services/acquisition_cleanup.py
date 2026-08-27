@@ -1771,6 +1771,13 @@ def _track_has_file(track: Track) -> bool:
     return any(Path(raw).is_file() for raw in paths if raw)
 
 
+async def _yield_to_interactive_writers() -> None:
+    # A zero-duration yield lets this task reacquire SQLite immediately and can
+    # starve browser writes for the entire maintenance pass. Give already-waiting
+    # login/settings transactions a real scheduling window between prune batches.
+    await asyncio.sleep(0.1)
+
+
 async def prune_orphaned_terminal_records(
     db: AsyncSession,
     *,
@@ -1782,7 +1789,7 @@ async def prune_orphaned_terminal_records(
     async def release_batch_lock() -> None:
         if commit_batches:
             await db.commit()
-            await asyncio.sleep(0)
+            await _yield_to_interactive_writers()
 
     terminal = {JobStatus.done, JobStatus.failed, JobStatus.partial, JobStatus.cancelled}
     removed_tracks = 0
