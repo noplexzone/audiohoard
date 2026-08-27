@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.database import _make_engine, is_sqlite_database_locked
+from app.database import _make_engine, is_sqlite_database_locked, run_with_sqlite_lock_retry
 
 
 def test_sqlite_lock_classifier_finds_nested_operational_error() -> None:
@@ -48,6 +50,28 @@ async def test_file_sqlite_connections_enable_integrity_and_concurrency_pragmas(
             assert foreign_keys.scalar_one() == 1
             assert busy_timeout.scalar_one() == 30_000
             assert journal_mode.scalar_one().casefold() == "wal"
+    finally:
+        await engine.dispose()
+
+
+async def test_lock_retry_commit_restores_busy_timeout_before_pool_reuse(
+    tmp_path: Path,
+) -> None:
+    engine = _make_engine(f"sqlite+aiosqlite:///{tmp_path / 'retry-pragmas.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text("CREATE TABLE values_table (value INTEGER)"))
+        async with factory() as session:
+
+            async def commit_value() -> None:
+                await session.execute(text("INSERT INTO values_table VALUES (1)"))
+                await session.commit()
+
+            await run_with_sqlite_lock_retry(session, commit_value)
+            connection = await session.connection()
+            busy_timeout = await connection.exec_driver_sql("PRAGMA busy_timeout")
+            assert busy_timeout.scalar_one() == 30_000
     finally:
         await engine.dispose()
 
