@@ -16,6 +16,14 @@ from app.jobs.runner import (
 )
 from app.metadata.filename_parse import parsed_position_evidence
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
+from app.models.discography_batch import (
+    DiscographyBatch,
+    DiscographyBatchItem,
+    DiscographyBatchItemJob,
+    DiscographyBatchState,
+    DiscographyJobOwnership,
+    DiscographyScopeKind,
+)
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.staging_review import StagingReviewItem
@@ -440,6 +448,49 @@ async def test_missing_track_continuations_are_targeted_and_idempotent(
     assert children[0].query == "Artist Two"
     assert children[0].source == "priority"
     assert dispatched == [children[0].id]
+
+
+async def test_cancelled_batch_created_ancestor_blocks_late_continuation(
+    db_session: AsyncSession,
+) -> None:
+    artist = CatalogArtist(name="Artist")
+    album = CatalogAlbum(artist=artist, title="Album", track_count=1)
+    track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+    parent = Job(
+        source="slskd",
+        query="Artist Album",
+        status=JobStatus.partial,
+        catalog_album=album,
+    )
+    batch = DiscographyBatch(
+        scope_kind=DiscographyScopeKind.wanted_selected,
+        scope_json="{}",
+        scope_hash="b" * 64,
+        state=DiscographyBatchState.cancelled,
+    )
+    item = DiscographyBatchItem(
+        batch=batch,
+        release_identity="catalog_album:1",
+        catalog_album=album,
+        artist_name="Artist",
+        release_title="Album",
+    )
+    db_session.add_all([artist, album, track, parent, batch, item])
+    await db_session.flush()
+    db_session.add(
+        DiscographyBatchItemJob(
+            item_id=item.id,
+            job_id=parent.id,
+            ownership=DiscographyJobOwnership.created,
+        )
+    )
+    await db_session.commit()
+    parent_id, track_id, album_id = parent.id, track.id, album.id
+
+    continuation_ids = await _spawn_continuation_jobs(parent_id, [track_id], album_id, db_session)
+
+    assert continuation_ids == []
+    assert await db_session.scalar(select(Job.id).where(Job.parent_job_id == parent_id)) is None
 
 
 async def test_continuation_locked_commit_reconstructs_without_committing_caller_mutation(

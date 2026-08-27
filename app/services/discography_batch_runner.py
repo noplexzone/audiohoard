@@ -17,7 +17,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.database import is_sqlite_database_locked
-from app.models.acquisition_claim import AcquisitionDispatchClaim
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumProvider
 from app.models.discography_batch import (
     DiscographyBatch,
@@ -25,7 +24,6 @@ from app.models.discography_batch import (
     DiscographyBatchItemJob,
     DiscographyBatchItemState,
     DiscographyBatchState,
-    DiscographyJobOwnership,
 )
 from app.models.job import Job, JobStatus
 from app.services.catalog import (
@@ -205,6 +203,7 @@ class DiscographyBatchRunner:
                     await self._finish_batch(db, item.batch_id)
                     await db.commit()
                     return True
+                renotify_observed = item.reason_code == "resume_pending_dispatch"
                 profile = self._quality_profile or (await get_runtime_settings(db)).quality_profile
                 outcome = await expand_catalog_album_missing_track_jobs(
                     db,
@@ -215,13 +214,22 @@ class DiscographyBatchRunner:
                     max_new_jobs=25,
                     library_root=self._library_root,
                 )
-                created_ids = outcome.created_job_ids
+                dispatch_ids = tuple(
+                    dict.fromkeys(
+                        (
+                            *outcome.created_job_ids,
+                            *(outcome.observed_job_ids if renotify_observed else ()),
+                        )
+                    )
+                )
 
             # Expansion commits links and jobs. Dispatch is deliberately
-            # after the session closes.
-            for job_id in created_ids:
+            # after the session closes. Pending observed jobs are included so
+            # pause/resume and restart can re-notify durable work without
+            # consuming a new execution generation.
+            for job_id in dispatch_ids:
                 if not await self._may_dispatch(item_id, lease_token, job_id):
-                    break
+                    continue
                 dispatch_result = self._dispatcher(job_id)
                 if inspect.isawaitable(dispatch_result):
                     await dispatch_result
@@ -395,15 +403,6 @@ class DiscographyBatchRunner:
             ):
                 return False
             if batch_state == DiscographyBatchState.paused:
-                created_ids = select(DiscographyBatchItemJob.job_id).where(
-                    DiscographyBatchItemJob.item_id == item_id,
-                    DiscographyBatchItemJob.ownership == DiscographyJobOwnership.created,
-                )
-                await db.execute(
-                    update(Job)
-                    .where(Job.id.in_(created_ids), Job.status == JobStatus.pending)
-                    .values(status=JobStatus.cancelled)
-                )
                 item.state = DiscographyBatchItemState.pending
                 item.lease_token = None
                 item.heartbeat_at = None
@@ -504,37 +503,48 @@ class DiscographyBatchRunner:
             )
         )[item.catalog_album.id]
         targets = set(projection.target_track_ids)
-        active = (
-            set(
-                int(value)
-                for value in (
-                    await db.scalars(
-                        select(AcquisitionDispatchClaim.catalog_track_id)
-                        .join(Job, Job.id == AcquisitionDispatchClaim.job_id)
-                        .where(
-                            AcquisitionDispatchClaim.catalog_album_id == item.catalog_album.id,
-                            AcquisitionDispatchClaim.catalog_track_id.in_(targets),
-                            Job.status.in_((JobStatus.pending, JobStatus.running)),
-                        )
+        generation_rows = (
+            (
+                await db.execute(
+                    select(DiscographyBatchItemJob.catalog_track_id, Job.status)
+                    .join(Job, Job.id == DiscographyBatchItemJob.job_id)
+                    .where(
+                        DiscographyBatchItemJob.item_id == item.id,
+                        DiscographyBatchItemJob.generation == item.execution_generation,
+                        DiscographyBatchItemJob.catalog_track_id.in_(targets),
                     )
-                ).all()
-            )
+                )
+            ).all()
             if targets
-            else set()
+            else []
         )
+        attempted_track_ids = {
+            int(track_id) for track_id, _status in generation_rows if track_id is not None
+        }
+        active = {
+            int(track_id)
+            for track_id, status in generation_rows
+            if track_id is not None and status in (JobStatus.pending, JobStatus.running)
+        }
+        unattempted = targets - attempted_track_ids
         item.target_count = len(targets)
         item.active_count = len(active)
-        item.estimated_job_count = max(len(targets) - len(active), 0)
+        item.estimated_job_count = len(unattempted)
         if not targets:
             item.state = DiscographyBatchItemState.complete
             item.reason_code = "verified_complete"
             item.completed_at = now
-        elif active and len(active) == len(targets):
-            item.state = DiscographyBatchItemState.waiting
-            item.reason_code = "active_jobs"
-        elif active:
+        elif unattempted:
             item.state = DiscographyBatchItemState.pending
             item.reason_code = "targets_remain"
+        elif active:
+            item.state = DiscographyBatchItemState.waiting
+            item.reason_code = "active_jobs"
+        elif attempted_track_ids:
+            item.state = DiscographyBatchItemState.failed
+            item.reason_code = "current_generation_attempts_exhausted"
+            item.error_detail = "acquisition work ended without verified library artifacts"
+            item.completed_at = now
         elif attempted:
             item.state = DiscographyBatchItemState.failed
             item.reason_code = "targets_remain_without_active_jobs"

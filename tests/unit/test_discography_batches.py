@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.database import Base
 from app.models.acquisition_claim import AcquisitionDispatchClaim
 from app.models.catalog_entities import (
     CatalogAlbum,
@@ -412,6 +414,164 @@ async def test_wanted_scopes_intersect_server_missing_and_retain_semantics(
     assert all_matching.matching_count == 3
 
 
+async def test_wanted_incomplete_album_binds_exact_owned_provider_context(
+    db_session: AsyncSession,
+) -> None:
+    artist, identity = await _artist(db_session)
+    artist.primary_metadata_provider = "deezer"
+    album = CatalogAlbum(
+        artist=artist,
+        title="Needs hydration",
+        track_count=2,
+        monitored=True,
+        deezer_id="exact-release",
+    )
+    album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Only"))
+    provider = _release(identity, "exact-release", album.title, "2026", "album", True, album, 2)
+    db_session.add(provider)
+    await db_session.flush()
+
+    queued = await queue_discography_batch(
+        db_session,
+        DiscographyScopeKind.wanted_selected,
+        {"album_ids": [album.id]},
+        quality_profile=PROFILE,
+    )
+    item = await db_session.scalar(
+        select(DiscographyBatchItem).where(DiscographyBatchItem.batch_id == queued.id)
+    )
+
+    assert item is not None
+    assert item.provider_release_id == provider.id
+    assert item.provider == "deezer"
+    assert item.provider_album_id == "exact-release"
+    assert item.release_identity == "provider:deezer:exact-release"
+    assert item.state == DiscographyBatchItemState.pending
+    assert item.reason_code == "catalog_manifest_incomplete"
+
+
+@pytest.mark.parametrize(
+    ("provider", "identity_field", "provider_album_id"),
+    [
+        ("musicbrainz", "mbid", "00000000-0000-0000-0000-000000000123"),
+        ("itunes", "itunes_id", "itunes-release"),
+    ],
+)
+async def test_wanted_hydration_uses_supported_canonical_fallback(
+    db_session: AsyncSession,
+    provider: str,
+    identity_field: str,
+    provider_album_id: str,
+) -> None:
+    artist = CatalogArtist(name="Canonical fallback", monitored=True)
+    album = CatalogAlbum(
+        artist=artist,
+        title="Fallback",
+        track_count=1,
+        monitored=True,
+        **{identity_field: provider_album_id},
+    )
+    db_session.add(artist)
+    await db_session.flush()
+
+    queued = await queue_discography_batch(
+        db_session,
+        DiscographyScopeKind.wanted_selected,
+        {"album_ids": [album.id]},
+        quality_profile=PROFILE,
+    )
+    item = await db_session.scalar(
+        select(DiscographyBatchItem).where(DiscographyBatchItem.batch_id == queued.id)
+    )
+
+    assert item is not None
+    assert item.provider_release_id is None
+    assert item.provider == provider
+    assert item.provider_album_id == provider_album_id
+    assert item.release_identity == f"provider:{provider}:{provider_album_id}"
+    assert item.reason_code == "catalog_manifest_missing"
+
+
+async def test_wanted_incomplete_album_without_exact_provider_fails_closed(
+    db_session: AsyncSession,
+) -> None:
+    artist = CatalogArtist(name="No exact provider", monitored=True)
+    album = CatalogAlbum(artist=artist, title="Unresolvable", track_count=2, monitored=True)
+    album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Only"))
+    db_session.add(artist)
+    await db_session.flush()
+
+    queued = await queue_discography_batch(
+        db_session,
+        DiscographyScopeKind.wanted_selected,
+        {"album_ids": [album.id]},
+        quality_profile=PROFILE,
+    )
+    item = await db_session.scalar(
+        select(DiscographyBatchItem).where(DiscographyBatchItem.batch_id == queued.id)
+    )
+
+    assert item is not None
+    assert item.state == DiscographyBatchItemState.skipped
+    assert item.reason_code == "hydration_provider_unavailable"
+    assert (
+        item.error_detail == "No exact catalog-owned provider release is available for hydration."
+    )
+    assert queued.state == DiscographyBatchState.completed
+    assert await db_session.scalar(select(func.count(Job.id))) == 0
+
+
+async def test_concurrent_equivalent_scope_returns_one_active_batch(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'scope-race.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as seed:
+        artist = CatalogArtist(name="Equivalent", monitored=True)
+        album = CatalogAlbum(artist=artist, title="Only", track_count=1, monitored=True)
+        album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Track"))
+        seed.add(artist)
+        await seed.commit()
+        album_id = album.id
+
+    gate = asyncio.Event()
+    ready = 0
+    mutex = asyncio.Lock()
+
+    async def queue() -> int:
+        nonlocal ready
+        async with factory() as db:
+            async with mutex:
+                ready += 1
+                if ready == 2:
+                    gate.set()
+            await gate.wait()
+            result = await queue_discography_batch(
+                db,
+                DiscographyScopeKind.wanted_selected,
+                {"album_ids": [album_id]},
+                quality_profile=PROFILE,
+            )
+            return result.id
+
+    ids = await asyncio.gather(queue(), queue())
+    async with factory() as observer:
+        active_count = await observer.scalar(
+            select(func.count(DiscographyBatch.id)).where(
+                DiscographyBatch.state.in_(
+                    (
+                        DiscographyBatchState.queued,
+                        DiscographyBatchState.running,
+                        DiscographyBatchState.paused,
+                    )
+                )
+            )
+        )
+    assert ids[0] == ids[1]
+    assert active_count == 1
+    await engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("tracks", "expected", "reason"),
     [
@@ -426,7 +586,13 @@ async def test_preview_manifest_hydration_without_jobs(
     db_session: AsyncSession, tracks: list[tuple[int, int]], expected: int, reason: str
 ) -> None:
     artist = CatalogArtist(name="Manifest", monitored=True)
-    album = CatalogAlbum(artist=artist, title="Manifest", monitored=True, track_count=expected)
+    album = CatalogAlbum(
+        artist=artist,
+        title="Manifest",
+        monitored=True,
+        track_count=expected,
+        deezer_id="manifest-release",
+    )
     for disc, position in tracks:
         album.tracks.append(CatalogAlbumTrack(disc=disc, position=position, title="Track"))
     db_session.add(artist)
@@ -442,7 +608,9 @@ async def test_preview_manifest_hydration_without_jobs(
     )
     assert item is not None and item.reason_code == reason
     assert item.expected_track_count == expected
-    assert item.release_identity == f"catalog_album:{album.id}"
+    assert item.release_identity == "provider:deezer:manifest-release"
+    assert item.provider == "deezer"
+    assert item.provider_album_id == "manifest-release"
     assert preview.hydration_required_count == 1
     assert preview.missing_count == expected and preview.estimated_job_count == expected
     assert await db_session.scalar(select(func.count(Job.id))) == 0
@@ -469,6 +637,8 @@ async def test_provider_preview_snapshots_strongest_manifest_expectation(
 
     assert item is not None
     assert item.expected_track_count == 2
+    assert item.provider == "deezer"
+    assert item.provider_album_id == "provider-manifest"
     assert item.reason_code == "catalog_manifest_incomplete"
     assert preview.hydration_required_count == 1
 
@@ -495,7 +665,13 @@ async def test_preview_rejects_unrelated_pending_catalog_album(
 
 async def test_preview_counts_active_missing_and_estimates(db_session: AsyncSession) -> None:
     artist = CatalogArtist(name="Counts", monitored=True)
-    unknown = CatalogAlbum(artist=artist, title="Unknown", monitored=True, track_count=None)
+    unknown = CatalogAlbum(
+        artist=artist,
+        title="Unknown",
+        monitored=True,
+        track_count=None,
+        itunes_id="unknown-release",
+    )
     active = CatalogAlbum(artist=artist, title="Active", monitored=True, track_count=2)
     for index in range(1, 3):
         active.tracks.append(CatalogAlbumTrack(disc=1, position=index, title=f"T{index}"))

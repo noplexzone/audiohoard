@@ -7,7 +7,8 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -188,6 +189,7 @@ def canonicalize_scope(
 @dataclass(frozen=True, slots=True)
 class _SelectedRelease:
     provider_release_id: int | None
+    provider_album_id: str | None
     release_identity: str
     album: CatalogAlbum | None
     artist_name: str
@@ -243,6 +245,7 @@ async def _select_artist_releases(
     return [
         _SelectedRelease(
             provider_release_id=release.id,
+            provider_album_id=release.provider_album_id,
             release_identity=f"provider:{scope.provider}:{release.provider_album_id}",
             album=release.catalog_album,
             artist_name=artist.name,
@@ -302,21 +305,73 @@ async def _select_wanted_releases(
         ).all()
     )
     by_id = {album.id: album for album in albums}
-    return [
-        _SelectedRelease(
-            provider_release_id=None,
-            release_identity=f"catalog_album:{album_id}",
-            album=by_id[album_id],
-            artist_name=by_id[album_id].artist.name,
-            title=by_id[album_id].title,
-            year=by_id[album_id].year,
-            release_kind=by_id[album_id].release_type,
-            provider=None,
-            expected_count=by_id[album_id].track_count,
+    provider_rows = (
+        await db.execute(
+            select(CatalogAlbumProvider, CatalogArtistIdentity.provider)
+            .join(
+                CatalogArtistIdentity,
+                CatalogArtistIdentity.id == CatalogAlbumProvider.artist_identity_id,
+            )
+            .join(CatalogAlbum, CatalogAlbum.id == CatalogAlbumProvider.catalog_album_id)
+            .where(
+                CatalogAlbumProvider.catalog_album_id.in_(ids),
+                CatalogArtistIdentity.artist_id == CatalogAlbum.artist_id,
+            )
         )
-        for album_id in ids
-        if album_id in by_id
-    ]
+    ).all()
+    exact_provider_rows = {
+        (
+            int(provider_release.catalog_album_id),
+            str(provider_name),
+            provider_release.provider_album_id,
+        ): provider_release
+        for provider_release, provider_name in provider_rows
+        if provider_release.catalog_album_id is not None
+    }
+    selected: list[_SelectedRelease] = []
+    for album_id in ids:
+        album = by_id.get(album_id)
+        if album is None:
+            continue
+        provider_name: str | None = None
+        provider_album_id: str | None = None
+        for candidate_provider, candidate_id in (
+            ("deezer", album.deezer_id),
+            ("musicbrainz", album.mbid),
+            ("itunes", album.itunes_id),
+        ):
+            if candidate_id is not None and candidate_id.strip():
+                provider_name = candidate_provider
+                provider_album_id = candidate_id.strip()
+                break
+        provider_release = (
+            exact_provider_rows.get((album_id, provider_name, provider_album_id))
+            if provider_name is not None and provider_album_id is not None
+            else None
+        )
+        selected.append(
+            _SelectedRelease(
+                provider_release_id=provider_release.id if provider_release is not None else None,
+                provider_album_id=provider_album_id,
+                release_identity=(
+                    f"provider:{provider_name}:{provider_album_id}"
+                    if provider_name is not None and provider_album_id is not None
+                    else f"catalog_album:{album_id}"
+                ),
+                album=album,
+                artist_name=album.artist.name,
+                title=album.title,
+                year=album.year,
+                release_kind=album.release_type,
+                provider=provider_name,
+                expected_count=max(
+                    album.track_count or 0,
+                    provider_release.track_count or 0 if provider_release is not None else 0,
+                )
+                or None,
+            )
+        )
+    return selected
 
 
 def _hash(scope_json: str, identities: list[str]) -> str:
@@ -365,6 +420,7 @@ async def _populate_batch_items(
                     release_year=release.year,
                     release_kind=release.release_kind,
                     provider=release.provider,
+                    provider_album_id=release.provider_album_id,
                     expected_track_count=release.expected_count,
                     state=DiscographyBatchItemState.skipped,
                     reason_code=reason,
@@ -409,7 +465,13 @@ async def _populate_batch_items(
         state = DiscographyBatchItemState.preview
         reason = None
         target_count = item_active = item_estimated = 0
-        if issue is not None:
+        if issue is not None and (release.provider is None or release.provider_album_id is None):
+            skipped_count += 1
+            state = DiscographyBatchItemState.skipped
+            reason = "hydration_provider_unavailable"
+            target_count = 0
+            error_detail = "No exact catalog-owned provider release is available for hydration."
+        elif issue is not None:
             hydration_count += 1
             reason = _MANIFEST_REASONS[issue]
             target_count = max(
@@ -418,7 +480,9 @@ async def _populate_batch_items(
             missing_count += target_count
             item_estimated = target_count
             estimated += item_estimated
+            error_detail = None
         else:
+            error_detail = None
             targets = set(projection.target_track_ids)
             target_count = len(targets)
             item_active = len(targets & active_track_ids)
@@ -443,6 +507,7 @@ async def _populate_batch_items(
             release_year=release.year,
             release_kind=release.release_kind,
             provider=release.provider,
+            provider_album_id=release.provider_album_id,
             expected_track_count=release.expected_count,
             state=state,
             reason_code=reason,
@@ -450,6 +515,7 @@ async def _populate_batch_items(
             active_count=item_active,
             skipped_count=0,
             estimated_job_count=item_estimated,
+            error_detail=error_detail,
         )
         db.add(item)
         await db.flush()
@@ -459,6 +525,8 @@ async def _populate_batch_items(
                     DiscographyBatchItemJob(
                         item_id=item.id,
                         job_id=active_jobs_by_track[track_id],
+                        generation=item.execution_generation,
+                        catalog_track_id=track_id,
                         ownership=DiscographyJobOwnership.observed,
                     )
                 )
@@ -626,6 +694,23 @@ async def queue_discography_batch(
                     else DiscographyBatchState.completed
                 )
                 batch.completed_at = datetime.now(UTC)
+    except IntegrityError:
+        await db.rollback()
+        existing = await db.scalar(
+            select(DiscographyBatch).where(
+                DiscographyBatch.scope_hash == batch.scope_hash,
+                DiscographyBatch.state.in_(
+                    (
+                        DiscographyBatchState.queued,
+                        DiscographyBatchState.running,
+                        DiscographyBatchState.paused,
+                    )
+                ),
+            )
+        )
+        if existing is None:
+            raise
+        return _preview_result(existing)
     except Exception:
         await db.rollback()
         raise
@@ -736,28 +821,34 @@ async def cancel_discography_batch(
         DiscographyBatchState.paused,
     }:
         raise DiscographyScopeError("batch is not cancellable")
-    created_ids = (
-        select(DiscographyBatchItemJob.job_id)
-        .join(
-            DiscographyBatchItem,
-            DiscographyBatchItem.id == DiscographyBatchItemJob.item_id,
-        )
-        .where(
-            DiscographyBatchItem.batch_id == batch_id,
-            DiscographyBatchItemJob.ownership == DiscographyJobOwnership.created,
-        )
-    )
     cancelled = tuple(
-        int(value)
-        for value in (
-            await db.scalars(
-                update(Job)
-                .where(Job.id.in_(created_ids), Job.status == JobStatus.pending)
-                .values(status=JobStatus.cancelled)
-                .returning(Job.id)
+        int(row.id)
+        for row in (
+            await db.execute(
+                text(
+                    "WITH RECURSIVE batch_created(id) AS ("
+                    " SELECT links.job_id FROM discography_batch_item_jobs AS links"
+                    " JOIN discography_batch_items AS items ON items.id = links.item_id"
+                    " WHERE items.batch_id = :batch_id AND links.ownership = 'created'"
+                    " UNION"
+                    " SELECT jobs.id FROM jobs JOIN batch_created"
+                    " ON jobs.parent_job_id = batch_created.id"
+                    ") UPDATE jobs SET status = 'cancelled', queue_hidden = 1"
+                    " WHERE id IN (SELECT id FROM batch_created) AND status = 'pending'"
+                    " RETURNING id"
+                ),
+                {"batch_id": batch_id},
             )
         ).all()
     )
+    # The recursive statement bypasses ORM synchronization. Mirror its result
+    # into any Job identities already loaded by the caller so the committed
+    # session cannot retain stale pending/visible state.
+    if cancelled:
+        loaded_cancelled = list((await db.scalars(select(Job).where(Job.id.in_(cancelled)))).all())
+        for job in loaded_cancelled:
+            job.status = JobStatus.cancelled
+            job.queue_hidden = True
     await db.execute(
         update(DiscographyBatchItem)
         .where(
@@ -856,9 +947,32 @@ async def resume_discography_batch(
             if targets
             else set()
         )
+        pending = (
+            set(
+                int(value)
+                for value in (
+                    await db.scalars(
+                        select(AcquisitionDispatchClaim.catalog_track_id)
+                        .join(Job, Job.id == AcquisitionDispatchClaim.job_id)
+                        .where(
+                            AcquisitionDispatchClaim.catalog_album_id == album.id,
+                            AcquisitionDispatchClaim.catalog_track_id.in_(targets),
+                            Job.status == JobStatus.pending,
+                        )
+                    )
+                ).all()
+            )
+            if targets
+            else set()
+        )
         if not targets:
             item.state = DiscographyBatchItemState.complete
             item.reason_code = "verified_complete"
+        elif pending:
+            # Re-notify durable pending work after pause without spending a retry generation.
+            item.state = DiscographyBatchItemState.pending
+            item.reason_code = "resume_pending_dispatch"
+            reset.append(item.id)
         elif active:
             item.state = DiscographyBatchItemState.waiting
             item.reason_code = "active_jobs"
@@ -899,6 +1013,7 @@ async def retry_discography_batch_items(
         if not is_discography_batch_item_retryable(item.state, item.reason_code):
             continue
         item.state = DiscographyBatchItemState.pending
+        item.execution_generation += 1
         item.error_detail = None
         item.lease_token = None
         item.heartbeat_at = None

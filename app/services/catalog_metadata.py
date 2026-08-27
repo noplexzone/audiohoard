@@ -756,11 +756,8 @@ async def store_album_detail(
 
 @dataclass(frozen=True, slots=True)
 class _BatchHydrationSnapshot:
-    provider_release_id: int
     catalog_album_id: int
-    artist_identity_id: int
     provider: str
-    provider_artist_id: str
     provider_album_id: str
 
 
@@ -772,45 +769,47 @@ async def _load_batch_hydration_snapshot(
             select(
                 DiscographyBatchItem.state,
                 DiscographyBatchItem.lease_token,
-                DiscographyBatchItem.provider_release_id,
                 DiscographyBatchItem.catalog_album_id,
+                DiscographyBatchItem.provider,
+                DiscographyBatchItem.provider_album_id,
                 DiscographyBatch.state,
-                CatalogAlbumProvider.artist_identity_id,
-                CatalogAlbumProvider.provider_album_id,
-                CatalogAlbumProvider.catalog_album_id,
-                CatalogArtistIdentity.provider,
-                CatalogArtistIdentity.provider_artist_id,
+                CatalogAlbum.id.label("live_catalog_album_id"),
+                CatalogAlbum.deezer_id,
+                CatalogAlbum.mbid,
+                CatalogAlbum.itunes_id,
             )
             .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
-            .join(
-                CatalogAlbumProvider,
-                CatalogAlbumProvider.id == DiscographyBatchItem.provider_release_id,
-            )
-            .join(
-                CatalogArtistIdentity,
-                CatalogArtistIdentity.id == CatalogAlbumProvider.artist_identity_id,
-            )
+            .join(CatalogAlbum, CatalogAlbum.id == DiscographyBatchItem.catalog_album_id)
             .where(DiscographyBatchItem.id == item_id)
         )
     ).one_or_none()
     if row is None:
         raise RuntimeError("batch hydration identity is no longer available")
+    provider = str(row.provider).strip() if row.provider is not None else ""
+    provider_album_id = (
+        str(row.provider_album_id).strip() if row.provider_album_id is not None else ""
+    )
+    live_provider_album_id = {
+        "deezer": row.deezer_id,
+        "musicbrainz": row.mbid,
+        "itunes": row.itunes_id,
+    }.get(provider)
     if (
         row.state != DiscographyBatchItemState.hydrating
         or row.lease_token != lease_token
-        or row[4] not in (DiscographyBatchState.queued, DiscographyBatchState.running)
-        or row.provider_release_id is None
+        or row[5] not in (DiscographyBatchState.queued, DiscographyBatchState.running)
         or row.catalog_album_id is None
-        or row[7] != row.catalog_album_id
+        or row.live_catalog_album_id != row.catalog_album_id
+        or not provider
+        or not provider_album_id
+        or live_provider_album_id is None
+        or str(live_provider_album_id).strip() != provider_album_id
     ):
-        raise RuntimeError("batch hydration lease or catalog ownership changed")
+        raise RuntimeError("batch hydration lease or catalog identity changed")
     return _BatchHydrationSnapshot(
-        provider_release_id=int(row.provider_release_id),
         catalog_album_id=int(row.catalog_album_id),
-        artist_identity_id=int(row.artist_identity_id),
-        provider=str(row.provider),
-        provider_artist_id=str(row.provider_artist_id),
-        provider_album_id=str(row.provider_album_id),
+        provider=provider,
+        provider_album_id=provider_album_id,
     )
 
 
@@ -820,7 +819,7 @@ async def hydrate_discography_batch_item(
     lease_token: str,
     settings: Settings,
 ) -> None:
-    """Fetch provider metadata session-free, then reconcile behind the exact lease."""
+    """Fetch immutable queued provider identity, then reconcile behind the exact lease."""
     async with session_factory() as db:
         expected = await _load_batch_hydration_snapshot(db, item_id, lease_token)
 
@@ -834,13 +833,17 @@ async def hydrate_discography_batch_item(
     async with session_factory() as db:
         current = await _load_batch_hydration_snapshot(db, item_id, lease_token)
         if current != expected:
-            raise RuntimeError("batch hydration catalog ownership changed")
+            raise RuntimeError("batch hydration catalog identity changed")
         album = await db.get(CatalogAlbum, expected.catalog_album_id)
         if album is None:
             raise RuntimeError("batch hydration catalog album was deleted")
         stored = await store_album_detail(db, album, detail, provider_name=expected.provider)
         if stored.id != expected.catalog_album_id:
             raise RuntimeError("metadata detail resolved to a different catalog album")
+        current = await _load_batch_hydration_snapshot(db, item_id, lease_token)
+        if current != expected:
+            await db.rollback()
+            raise RuntimeError("batch hydration catalog identity changed")
         await db.commit()
 
 
