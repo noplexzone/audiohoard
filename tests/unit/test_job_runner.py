@@ -2620,3 +2620,129 @@ async def test_pending_job_claim_is_atomic_across_sessions(
     persisted = await db_session.get(Job, job_id)
     assert persisted is not None
     assert persisted.status == JobStatus.running
+
+
+def test_release_root_reconciliation_is_exact_and_rejects_ambiguous_duplicates() -> None:
+    catalog = [
+        CatalogAlbumTrack(id=1, album_id=1, position=1, disc=1, title="Intro"),
+        CatalogAlbumTrack(id=2, album_id=1, position=2, disc=1, title="Song"),
+        CatalogAlbumTrack(id=3, album_id=1, position=1, disc=2, title="Intro"),
+    ]
+    exact = SearchResult(source="slskd", title="2-01 - Intro", metadata={"disc": 2, "track_no": 1})
+    ambiguous = SearchResult(source="slskd", title="Intro")
+    unmatched = SearchResult(source="slskd", title="Bonus Audio")
+
+    reconciled, failures = runner._reconcile_release_root_results(
+        [exact, ambiguous, unmatched], catalog
+    )
+
+    assert [(result.title, track.id) for result, track in reconciled] == [("2-01 - Intro", 3)]
+    assert {failure["code"] for failure in failures} == {
+        "catalog_result_ambiguous",
+        "catalog_result_unmatched",
+    }
+
+
+def test_release_root_reconciliation_rejects_every_duplicate_file_for_one_identity() -> None:
+    catalog = [CatalogAlbumTrack(id=1, album_id=1, position=1, disc=1, title="Song")]
+    results = [
+        SearchResult(
+            source="slskd",
+            title="01 Song",
+            metadata={"disc": 1, "track_no": 1, "filename": "Album/01 Song.flac"},
+        ),
+        SearchResult(
+            source="slskd",
+            title="Song copy",
+            metadata={"disc": 1, "track_no": 1, "filename": "Album/01 Song copy.flac"},
+        ),
+    ]
+
+    reconciled, failures = runner._reconcile_release_root_results(results, catalog)
+
+    assert reconciled == []
+    assert [failure["code"] for failure in failures] == [
+        "catalog_result_duplicate_identity",
+        "catalog_result_duplicate_identity",
+    ]
+
+
+async def test_release_root_unmatched_audio_never_reaches_acquisition(
+    db_session: AsyncSession,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artist = CatalogArtist(name="Root Artist")
+    album = CatalogAlbum(artist=artist, title="Root Album", track_count=2)
+    album.tracks.extend(
+        [
+            CatalogAlbumTrack(position=1, disc=1, title="One"),
+            CatalogAlbumTrack(position=2, disc=1, title="Two"),
+        ]
+    )
+    root = Job(
+        source="slskd",
+        query="Root Artist Root Album",
+        status=JobStatus.pending,
+        catalog_album=album,
+        catalog_track_id=None,
+    )
+    db_session.add_all([artist, root])
+    await db_session.flush()
+    results = [
+        SearchResult(
+            source="slskd",
+            title="01 One",
+            metadata={"disc": 1, "track_no": 1, "username": "peer"},
+        ),
+        SearchResult(
+            source="slskd",
+            title="02 Two",
+            metadata={"disc": 1, "track_no": 2, "username": "peer"},
+        ),
+        SearchResult(
+            source="slskd",
+            title="Bonus Audio",
+            metadata={"disc": 1, "track_no": 99, "username": "peer"},
+        ),
+    ]
+    acquired: list[str] = []
+
+    async def fake_fetch(*args: object, **kwargs: object) -> Sequence[SearchResult]:
+        return results
+
+    async def fake_prepare(
+        result: SearchResult,
+        source: str,
+        cfg: Settings,
+        track: Track,
+        **kwargs: object,
+    ) -> tuple[None, str]:
+        del source, cfg, kwargs
+        acquired.append(result.title)
+        track.acquisition_state = AcquisitionState.downloaded
+        track.source_path = f"/staging/{result.title}.flac"
+        return None, "downloaded"
+
+    async def noop(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(runner, "_prepare_acquisition", fake_prepare)
+    monkeypatch.setattr(runner, "_enrich_musicbrainz", noop)
+    monkeypatch.setattr(runner, "_enrich_deezer", noop)
+    monkeypatch.setattr(runner, "_run_fingerprint_and_verify", noop)
+    monkeypatch.setattr(runner, "_compute_path_preview", noop)
+    monkeypatch.setattr(runner, "_try_auto_import", noop)
+
+    await runner.run_job(root.id, db_session, test_settings)
+
+    stored = list((await db_session.scalars(select(Track).where(Track.job_id == root.id))).all())
+    assert acquired == ["01 One", "02 Two"]
+    assert {track.catalog_track_id for track in stored} == {
+        album.tracks[0].id,
+        album.tracks[1].id,
+    }
+    assert None not in {track.catalog_track_id for track in stored}
+    assert root.result_json is not None
+    assert "catalog_result_unmatched" in root.result_json

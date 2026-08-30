@@ -1174,6 +1174,22 @@ async def _run_job_in_session(
             await db.flush()
             return None
 
+        root_catalog_matches: dict[int, CatalogAlbumTrack] = {}
+        reconciliation_failures: list[dict[str, object]] = []
+        if catalog_album is not None and job.catalog_track_id is None:
+            slskd_results = [result for result in results if result.source == "slskd"]
+            if slskd_results:
+                reconciled, reconciliation_failures = _reconcile_release_root_results(
+                    slskd_results, catalog_tracks
+                )
+                root_catalog_matches = {id(result): track for result, track in reconciled}
+                accepted = set(root_catalog_matches)
+                results = [
+                    result
+                    for result in results
+                    if result.source != "slskd" or id(result) in accepted
+                ]
+
         if (
             catalog_album is not None
             and job.catalog_track_id is None
@@ -1185,7 +1201,7 @@ async def _run_job_in_session(
             # every NZB and assigning candidates to tracks by position.
             results = results[:1]
         tracks_created = 0
-        failures: list[dict[str, object]] = []
+        failures: list[dict[str, object]] = list(reconciliation_failures)
         artifact_missing_gate: dict[str, object] | None = None
         root_job = await _root_job(job, db)
         existing_releases = list(
@@ -1234,7 +1250,9 @@ async def _run_job_in_session(
                     }
                 )
                 continue
-            catalog_track = _catalog_track_for_result(result, catalog_tracks, job.catalog_track_id)
+            catalog_track = root_catalog_matches.get(id(result)) or _catalog_track_for_result(
+                result, catalog_tracks, job.catalog_track_id
+            )
             track_title = catalog_track.title if catalog_track is not None else result.title
             track_album = catalog_album.title if catalog_album is not None else result.album
             track = _existing_track_for_result(
@@ -1615,6 +1633,105 @@ def _catalog_disc_total(tracks: list[CatalogAlbumTrack]) -> int | None:
     discs = [track.disc for track in tracks if track.disc and track.disc > 0]
     total = max(discs, default=1)
     return total if total > 1 else None
+
+
+def _result_disc_position(result: SearchResult) -> tuple[int, int] | None:
+    raw_title = result.title or ""
+    metadata = result.metadata or {}
+    disc: int | None = None
+    position: int | None = None
+    try:
+        raw_position = metadata.get("track_no")
+        if isinstance(raw_position, (int, str, float)):
+            position = int(raw_position)
+    except (ValueError, TypeError):
+        position = None
+    try:
+        raw_disc = metadata.get("disc")
+        if isinstance(raw_disc, (int, str, float)):
+            disc = int(raw_disc)
+    except (ValueError, TypeError):
+        disc = None
+    if position is None:
+        compound = _DISC_TRACK_PREFIX_RE.match(raw_title)
+        if compound:
+            disc = int(compound.group(1))
+            position = int(compound.group(2))
+        else:
+            single = _SINGLE_TRACK_PREFIX_RE.match(raw_title)
+            if single:
+                position = int(single.group(1))
+    if position is None or position <= 0:
+        return None
+    return (disc if disc is not None and disc > 0 else 1, position)
+
+
+def _release_root_title_matches(
+    raw_title: str, tracks: list[CatalogAlbumTrack]
+) -> list[CatalogAlbumTrack]:
+    exact = [
+        track for track in tracks if track.title.casefold().strip() == raw_title.casefold().strip()
+    ]
+    if exact:
+        return exact
+    normalized = normalize_for_catalog_match(raw_title)
+    matches = [track for track in tracks if normalize_for_catalog_match(track.title) == normalized]
+    if matches:
+        return matches
+    stripped = normalize_for_catalog_match(strip_non_identity_descriptors(raw_title))
+    if not stripped:
+        return []
+    return [
+        track
+        for track in tracks
+        if normalize_for_catalog_match(strip_non_identity_descriptors(track.title)) == stripped
+    ]
+
+
+def _reconcile_release_root_results(
+    results: Sequence[SearchResult],
+    tracks: list[CatalogAlbumTrack],
+) -> tuple[list[tuple[SearchResult, CatalogAlbumTrack]], list[dict[str, object]]]:
+    """Bind folder files to exact manifest identities before any provider/file work."""
+    provisional: list[tuple[SearchResult, CatalogAlbumTrack | None, str | None]] = []
+    for result in results:
+        position = _result_disc_position(result)
+        if position is not None:
+            matches = [track for track in tracks if (track.disc, track.position) == position]
+        else:
+            matches = _release_root_title_matches(result.title or "", tracks)
+        if len(matches) == 1:
+            provisional.append((result, matches[0], None))
+        elif len(matches) > 1:
+            provisional.append((result, None, "catalog_result_ambiguous"))
+        elif position is None and len(tracks) == 1:
+            provisional.append((result, tracks[0], None))
+        else:
+            provisional.append((result, None, "catalog_result_unmatched"))
+
+    identity_counts: dict[int, int] = {}
+    for _result, track, _error in provisional:
+        if track is not None:
+            identity_counts[track.id] = identity_counts.get(track.id, 0) + 1
+
+    reconciled: list[tuple[SearchResult, CatalogAlbumTrack]] = []
+    failures: list[dict[str, object]] = []
+    for result, track, error in provisional:
+        if track is not None and identity_counts.get(track.id, 0) > 1:
+            error = "catalog_result_duplicate_identity"
+            track = None
+        if track is not None:
+            reconciled.append((result, track))
+            continue
+        failures.append(
+            {
+                "code": error or "catalog_result_unmatched",
+                "operation": "catalog_reconciliation",
+                "retryable": False,
+                "result_title": result.title,
+            }
+        )
+    return reconciled, failures
 
 
 def _catalog_track_for_result(
