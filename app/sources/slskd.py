@@ -6,7 +6,7 @@ import json
 import logging
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
@@ -69,6 +69,43 @@ class _SearchSnapshot:
     eviction_task: asyncio.Task[None] | None = None
 
 
+@dataclass
+class _SearchCacheState:
+    snapshots: dict[_SearchKey, _SearchSnapshot] = field(default_factory=dict)
+    condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    order: int = 0
+
+
+_SEARCH_CACHE_STATE_ATTRIBUTE = "_audiohoard_search_cache_state"
+
+
+def _get_search_cache_state() -> _SearchCacheState:
+    """Return cache state owned exclusively by the current running event loop."""
+    loop = asyncio.get_running_loop()
+    state = getattr(loop, _SEARCH_CACHE_STATE_ATTRIBUTE, None)
+    if state is None:
+        state = _SearchCacheState()
+        setattr(loop, _SEARCH_CACHE_STATE_ATTRIBUTE, state)
+    return state
+
+
+async def _clear_search_snapshot_cache() -> None:
+    """Cancel and clear only the current loop's cache tasks (primarily for tests)."""
+    state = _get_search_cache_state()
+    current = asyncio.current_task()
+    tasks: list[asyncio.Task[object]] = []
+    async with state.condition:
+        for snapshot in state.snapshots.values():
+            for task in (snapshot.in_flight, snapshot.eviction_task):
+                if task is not None and task is not current and not task.done():
+                    task.cancel()
+                    tasks.append(task)
+        state.snapshots.clear()
+        state.condition.notify_all()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 @dataclass(frozen=True)
 class ProvisionalTransferMatch:
     """Evidence for an exact provisional peer/path lookup."""
@@ -78,8 +115,6 @@ class ProvisionalTransferMatch:
 
 
 _download_snapshots: dict[tuple[str, bytes], _DownloadSnapshot] = {}
-_search_snapshots: dict[_SearchKey, _SearchSnapshot] = {}
-_search_snapshot_order = 0
 
 
 def _search_state_tokens(value: object) -> set[str]:
@@ -241,10 +276,13 @@ class SlskdAdapter:
             return json.dumps(files_resp.json(), separators=(",", ":")).encode()
 
     @staticmethod
-    def _remove_search_snapshot(key: _SearchKey, snapshot: _SearchSnapshot) -> None:
-        if _search_snapshots.get(key) is not snapshot:
+    def _remove_search_snapshot(
+        state: _SearchCacheState, key: _SearchKey, snapshot: _SearchSnapshot
+    ) -> None:
+        """Remove an identity-matching entry while holding its loop-local condition."""
+        if state.snapshots.get(key) is not snapshot:
             return
-        _search_snapshots.pop(key)
+        state.snapshots.pop(key)
         eviction_task = snapshot.eviction_task
         if (
             eviction_task is not None
@@ -254,12 +292,12 @@ class SlskdAdapter:
             eviction_task.cancel()
 
     @classmethod
-    def _prune_search_snapshots(cls, *, reserve: int = 0) -> None:
-        """Remove deterministic completed entries without touching live producers."""
+    def _prune_search_snapshots(cls, state: _SearchCacheState, *, reserve: int = 0) -> None:
+        """Remove expired/oldest completed entries without touching live producers."""
         now = _monotonic()
         completed = [
             (key, snapshot)
-            for key, snapshot in _search_snapshots.items()
+            for key, snapshot in state.snapshots.items()
             if snapshot.payload is not None
         ]
         expired = sorted(
@@ -267,88 +305,103 @@ class SlskdAdapter:
             key=lambda item: (item[1].expires_at, item[1].order),
         )
         for key, snapshot in expired:
-            cls._remove_search_snapshot(key, snapshot)
+            cls._remove_search_snapshot(state, key, snapshot)
 
-        target = max(0, _SEARCH_SNAPSHOT_MAX_ENTRIES - reserve)
-        if len(_search_snapshots) <= target:
+        target = max(0, max(1, _SEARCH_SNAPSHOT_MAX_ENTRIES) - reserve)
+        if len(state.snapshots) <= target:
             return
         oldest_completed = sorted(
             (
                 (key, snapshot)
-                for key, snapshot in _search_snapshots.items()
+                for key, snapshot in state.snapshots.items()
                 if snapshot.completed_at is not None
             ),
             key=lambda item: (item[1].completed_at or 0.0, item[1].order),
         )
         for key, snapshot in oldest_completed:
-            if len(_search_snapshots) <= target:
+            if len(state.snapshots) <= target:
                 break
-            cls._remove_search_snapshot(key, snapshot)
+            cls._remove_search_snapshot(state, key, snapshot)
 
     @classmethod
-    async def _evict_search_snapshot(cls, key: _SearchKey, snapshot: _SearchSnapshot) -> None:
-        await asyncio.sleep(_SEARCH_SNAPSHOT_TTL_SEC)
-        if _monotonic() >= snapshot.expires_at:
-            cls._remove_search_snapshot(key, snapshot)
-
-    @classmethod
-    def _search_producer_done(
-        cls,
-        key: _SearchKey,
-        snapshot: _SearchSnapshot,
-        task: asyncio.Task[bytes],
+    async def _evict_search_snapshot(
+        cls, state: _SearchCacheState, key: _SearchKey, snapshot: _SearchSnapshot
     ) -> None:
-        if _search_snapshots.get(key) is not snapshot:
-            return
-        if task.cancelled() or task.exception() is not None:
-            cls._remove_search_snapshot(key, snapshot)
-            return
-        snapshot.payload = task.result()
-        snapshot.completed_at = _monotonic()
-        snapshot.expires_at = snapshot.completed_at + _SEARCH_SNAPSHOT_TTL_SEC
-        snapshot.eviction_task = asyncio.create_task(cls._evict_search_snapshot(key, snapshot))
-        cls._prune_search_snapshots()
+        await asyncio.sleep(_SEARCH_SNAPSHOT_TTL_SEC)
+        async with state.condition:
+            if _monotonic() >= snapshot.expires_at:
+                cls._remove_search_snapshot(state, key, snapshot)
+                state.condition.notify_all()
+
+    async def _produce_search(
+        self,
+        state: _SearchCacheState,
+        key: _SearchKey,
+        search_text: str,
+        file_limit: int,
+    ) -> bytes:
+        producer = asyncio.current_task()
+        try:
+            payload = await self._fetch_raw_search(search_text, file_limit)
+        except BaseException:
+            async with state.condition:
+                snapshot = state.snapshots.get(key)
+                if snapshot is not None and snapshot.in_flight is producer:
+                    self._remove_search_snapshot(state, key, snapshot)
+                    state.condition.notify_all()
+            raise
+
+        async with state.condition:
+            snapshot = state.snapshots.get(key)
+            if snapshot is not None and snapshot.in_flight is producer:
+                snapshot.payload = payload
+                snapshot.completed_at = _monotonic()
+                snapshot.expires_at = snapshot.completed_at + _SEARCH_SNAPSHOT_TTL_SEC
+                snapshot.eviction_task = asyncio.create_task(
+                    self._evict_search_snapshot(state, key, snapshot)
+                )
+                self._prune_search_snapshots(state)
+                state.condition.notify_all()
+        return payload
 
     async def _raw_search(
         self, search_text: str, *, mode: str, file_limit: int
     ) -> list[dict[str, object]]:
-        """Return an independent copy of a short-lived coalesced raw search."""
-        global _search_snapshot_order
-
+        """Return an independent copy of a bounded, loop-local coalesced search."""
+        state = _get_search_cache_state()
         key = self._search_snapshot_key(search_text, mode, file_limit)
-        snapshot = _search_snapshots.get(key)
-        if snapshot is not None and snapshot.payload is not None:
-            if _monotonic() < snapshot.expires_at:
-                decoded: list[dict[str, object]] = json.loads(snapshot.payload)
-                return decoded
-            self._remove_search_snapshot(key, snapshot)
-            snapshot = None
+        payload: bytes | None = None
+        producer: asyncio.Task[bytes] | None = None
 
-        if snapshot is None:
-            self._prune_search_snapshots(reserve=1)
-            producer = asyncio.create_task(self._fetch_raw_search(search_text, file_limit))
-            if len(_search_snapshots) >= _SEARCH_SNAPSHOT_MAX_ENTRIES:
-                # Keep a hard bound without evicting or cancelling existing live
-                # producers. This overflow request remains cancellation-shielded,
-                # but is intentionally not inserted into the shared cache.
-                producer.add_done_callback(
-                    lambda task: None if task.cancelled() else task.exception()
-                )
-                payload = await asyncio.shield(producer)
-                overflow_decoded: list[dict[str, object]] = json.loads(payload)
-                return overflow_decoded
+        async with state.condition:
+            while payload is None and producer is None:
+                snapshot = state.snapshots.get(key)
+                if snapshot is not None:
+                    if snapshot.payload is not None:
+                        if _monotonic() < snapshot.expires_at:
+                            payload = snapshot.payload
+                            continue
+                        self._remove_search_snapshot(state, key, snapshot)
+                        state.condition.notify_all()
+                        continue
+                    producer = snapshot.in_flight
+                    continue
 
-            _search_snapshot_order += 1
-            snapshot = _SearchSnapshot(in_flight=producer, order=_search_snapshot_order)
-            _search_snapshots[key] = snapshot
+                self._prune_search_snapshots(state, reserve=1)
+                if len(state.snapshots) < max(1, _SEARCH_SNAPSHOT_MAX_ENTRIES):
+                    state.order += 1
+                    producer = asyncio.create_task(
+                        self._produce_search(state, key, search_text, file_limit)
+                    )
+                    state.snapshots[key] = _SearchSnapshot(in_flight=producer, order=state.order)
+                    continue
 
-            def producer_done(task: asyncio.Task[bytes]) -> None:
-                self._search_producer_done(key, snapshot, task)
+                await state.condition.wait()
 
-            producer.add_done_callback(producer_done)
-
-        payload = await asyncio.shield(snapshot.in_flight)
-        decoded = json.loads(payload)
+        if payload is None:
+            assert producer is not None
+            payload = await asyncio.shield(producer)
+        decoded: list[dict[str, object]] = json.loads(payload)
         return decoded
 
     async def search_album_folders(
