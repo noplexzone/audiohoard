@@ -17,7 +17,10 @@ from sqlalchemy.orm import selectinload
 
 from app.database import run_with_sqlite_lock_retry
 from app.media_formats import IMPORTABLE_AUDIO_SUFFIXES
-from app.models.acquisition_claim import AcquisitionDispatchClaim
+from app.models.acquisition_claim import (
+    AcquisitionDispatchClaim,
+    CatalogReleaseAcquisitionClaim,
+)
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -1038,6 +1041,31 @@ async def expand_catalog_album_missing_track_jobs(
         }
         missing_count = len(target_ids)
         complete_track_ids = frozenset(manifest_ids - target_ids)
+
+        # A release-root owns the physical folder acquisition for the whole album.
+        # This check shares the same BEGIN IMMEDIATE reservation as exact-track
+        # claims, so root-first and track-first races serialize without overlap.
+        release_claim = (
+            await db.execute(
+                select(CatalogReleaseAcquisitionClaim, Job)
+                .outerjoin(Job, Job.id == CatalogReleaseAcquisitionClaim.job_id)
+                .where(CatalogReleaseAcquisitionClaim.catalog_album_id == album_id)
+            )
+        ).one_or_none()
+        if release_claim is not None:
+            _claim, release_owner = release_claim
+            if release_owner is not None and release_owner.status in _ACTIVE_JOB_STATUSES:
+                if (
+                    release_owner.catalog_album_id != album_id
+                    or release_owner.catalog_track_id is not None
+                ):
+                    raise ValueError(
+                        "active catalog release claim does not own an exact release root"
+                    )
+                observed.append(release_owner.id)
+                await db.commit()
+                return
+
         generation_links: dict[int, Job] = {}
         if batch_item_id is not None and item_generation is not None and target_ids:
             generation_links = {
