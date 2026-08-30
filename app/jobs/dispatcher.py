@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Callable, Coroutine
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -39,6 +40,38 @@ def _default_runner(job_id: int) -> Coroutine[Any, Any, None]:  # pragma: no cov
     from app.jobs.runner import run_job
 
     return run_job(job_id)
+
+
+_current_acquisition_permit: ContextVar[AcquisitionPermit | None] = ContextVar(
+    "current_acquisition_permit", default=None
+)
+
+
+def current_acquisition_permit() -> AcquisitionPermit | None:
+    return _current_acquisition_permit.get()
+
+
+class AcquisitionPermit:
+    """Task-local lease over the dispatcher's runtime-resizable limit."""
+
+    def __init__(self, dispatcher: JobDispatcher) -> None:
+        self._dispatcher = dispatcher
+        self._held = False
+
+    async def acquire(self) -> None:
+        if self._held:
+            return
+        await self._dispatcher._acquire_slot()
+        self._held = True
+
+    async def yield_permit(self) -> None:
+        if not self._held:
+            return
+        self._held = False
+        await self._dispatcher._release_slot()
+
+    async def release(self) -> None:
+        await self.yield_permit()
 
 
 class JobDispatcher:
@@ -89,11 +122,14 @@ class JobDispatcher:
             self._limit_condition.notify_all()
 
     async def _run_with_limit(self, job_id: int) -> None:
-        await self._acquire_slot()
+        permit = AcquisitionPermit(self)
+        await permit.acquire()
+        token = _current_acquisition_permit.set(permit)
         try:
             await self._runner(job_id)
         finally:
-            await self._release_slot()
+            _current_acquisition_permit.reset(token)
+            await permit.release()
 
     async def dispatch(self, job_id: int) -> asyncio.Task[None]:
         existing = self._tasks.get(job_id)

@@ -954,7 +954,7 @@ async def test_increasing_parallel_limit_starts_waiting_jobs() -> None:
     await dispatcher.shutdown()
 
 
-async def test_queued_transfer_keeps_slot_until_terminal_completion(tmp_path: Path) -> None:
+async def test_queued_transfer_yields_slot_so_later_job_starts(tmp_path: Path) -> None:
     first_queued = asyncio.Event()
     allow_first_to_finish = asyncio.Event()
     second_started = asyncio.Event()
@@ -993,14 +993,140 @@ async def test_queued_transfer_keeps_slot_until_terminal_completion(tmp_path: Pa
     second = await dispatcher.dispatch(2)
 
     await asyncio.wait_for(first_queued.wait(), timeout=1)
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(second_started.wait(), timeout=0.05)
+    await asyncio.wait_for(second_started.wait(), timeout=1)
     assert not first.done()
 
     allow_first_to_finish.set()
     await asyncio.wait_for(second_started.wait(), timeout=1)
     await asyncio.gather(first, second)
     await dispatcher.shutdown()
+
+
+async def test_queued_transfer_reacquires_before_active_completion(tmp_path: Path) -> None:
+    queued = asyncio.Event()
+    allow_active = asyncio.Event()
+    second_holds_slot = asyncio.Event()
+    release_second = asyncio.Event()
+    staged = tmp_path / "song.flac"
+    staged.write_bytes(b"audio")
+    status_calls = 0
+
+    class Adapter:
+        async def status(self, transfer_id: str) -> CapabilityState:
+            nonlocal status_calls
+            status_calls += 1
+            if status_calls == 1:
+                queued.set()
+                return CapabilityState(True, "Queued")
+            await allow_active.wait()
+            return CapabilityState(True, "Completed")
+
+        async def cancel(self, *args, **kwargs) -> bool:
+            return True
+
+    async def controlled_runner(job_id: int) -> None:
+        if job_id == 1:
+            await job_runner._poll_slskd_transfer(
+                "transfer-1", "peer", staged.name, Adapter(), tmp_path, 0.001, 1
+            )
+        else:
+            second_holds_slot.set()
+            await release_second.wait()
+
+    dispatcher = JobDispatcher(runner=controlled_runner, max_concurrent_jobs=1)
+    first = await dispatcher.dispatch(1)
+    second = await dispatcher.dispatch(2)
+    await asyncio.wait_for(queued.wait(), timeout=1)
+    await asyncio.wait_for(second_holds_slot.wait(), timeout=1)
+    allow_active.set()
+    await asyncio.sleep(0.02)
+    assert not first.done()
+    release_second.set()
+    await asyncio.gather(first, second)
+    assert dispatcher._active_jobs == 0
+
+
+async def test_queued_transfer_reacquires_before_non_cancellation_error(tmp_path: Path) -> None:
+    queued = asyncio.Event()
+    fail = asyncio.Event()
+    second_holds_slot = asyncio.Event()
+    release_second = asyncio.Event()
+    calls = 0
+
+    class Adapter:
+        async def status(self, transfer_id: str) -> CapabilityState:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                queued.set()
+                return CapabilityState(True, "Queued")
+            await fail.wait()
+            raise RuntimeError("provider failed")
+
+        async def cancel(self, *args, **kwargs) -> bool:
+            return True
+
+    async def controlled_runner(job_id: int) -> None:
+        if job_id == 1:
+            await job_runner._poll_slskd_transfer(
+                "transfer-1", "peer", "song.flac", Adapter(), tmp_path, 0.001, 1
+            )
+        else:
+            second_holds_slot.set()
+            await release_second.wait()
+
+    dispatcher = JobDispatcher(runner=controlled_runner, max_concurrent_jobs=1)
+    first = await dispatcher.dispatch(1)
+    second = await dispatcher.dispatch(2)
+    await asyncio.wait_for(queued.wait(), timeout=1)
+    await asyncio.wait_for(second_holds_slot.wait(), timeout=1)
+    fail.set()
+    await asyncio.sleep(0.02)
+    assert not first.done()
+    release_second.set()
+    with pytest.raises(RuntimeError, match="provider failed"):
+        await first
+    await second
+    assert dispatcher._active_jobs == 0
+
+
+async def test_cancellation_while_queue_permit_is_yielded_does_not_deadlock(
+    tmp_path: Path,
+) -> None:
+    queued = asyncio.Event()
+    second_holds_slot = asyncio.Event()
+    release_second = asyncio.Event()
+
+    class Adapter:
+        async def status(self, transfer_id: str) -> CapabilityState:
+            queued.set()
+            return CapabilityState(True, "Queued")
+
+        async def cancel(self, *args, **kwargs) -> bool:
+            return True
+
+    async def controlled_runner(job_id: int) -> None:
+        if job_id == 1:
+            await job_runner._poll_slskd_transfer(
+                "transfer-1", "peer", "song.flac", Adapter(), tmp_path, 1, 10
+            )
+        else:
+            second_holds_slot.set()
+            await release_second.wait()
+
+    dispatcher = JobDispatcher(runner=controlled_runner, max_concurrent_jobs=1)
+    first = await dispatcher.dispatch(1)
+    second = await dispatcher.dispatch(2)
+    await asyncio.wait_for(queued.wait(), timeout=1)
+    await asyncio.wait_for(second_holds_slot.wait(), timeout=1)
+    assert dispatcher._active_jobs == dispatcher._configured_limit() == 1
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(first, timeout=0.2)
+    assert dispatcher._active_jobs == dispatcher._configured_limit() == 1
+    release_second.set()
+    await second
+    assert dispatcher._active_jobs == 0
 
 
 async def test_decreasing_parallel_limit_does_not_cancel_active_jobs() -> None:

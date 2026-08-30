@@ -350,6 +350,9 @@ async def _poll_slskd_transfer(
     """Poll slskd until terminal and return the staged path plus exact provider ID."""
     import time as _time
 
+    from app.jobs.dispatcher import current_acquisition_permit
+
+    permit = current_acquisition_permit()
     deadline = _time.monotonic() + poll_timeout
     try:
         while True:
@@ -367,8 +370,16 @@ async def _poll_slskd_transfer(
                     await on_provider_id(transfer_id)
 
             acq_state = map_slskd_transfer_state(state)
+            externally_queued = acq_state in {
+                AcquisitionState.queued,
+                AcquisitionState.searching,
+            }
+            if permit is not None and not externally_queued:
+                await permit.acquire()
             if on_provider_state is not None:
                 await on_provider_state(acq_state)
+            if permit is not None and externally_queued:
+                await permit.yield_permit()
             if acq_state != AcquisitionState.downloaded and on_partial_path is not None:
                 partial_path = _provider_local_path(state.extra)
                 if partial_path is not None:
@@ -398,6 +409,10 @@ async def _poll_slskd_transfer(
             await asyncio.shield(on_cancelled())
         with contextlib.suppress(Exception):
             await asyncio.shield(adapter.cancel(username, filename, transfer_id))
+        raise
+    except Exception:
+        if permit is not None:
+            await permit.acquire()
         raise
 
 
@@ -1607,12 +1622,7 @@ def _slskd_search_timeout_seconds(runtime: object | None) -> float:
     if runtime is None:
         return 300.0
     configured_budget = float(getattr(runtime, "source_search_budget_seconds", 300) or 300)
-    download_timeout = float(getattr(runtime, "slskd_download_timeout_seconds", 600) or 600)
-    # slskd can keep valid searches active for several minutes during bulk dispatch.
-    # Never let a legacy low UI value turn those in-flight searches into false
-    # sources_exhausted failures, but cap search waiting at fifteen minutes so a
-    # dead search cannot monopolize the queue forever.
-    return min(900.0, max(configured_budget, min(download_timeout, 900.0)))
+    return min(900.0, max(3.0, configured_budget))
 
 
 def _source_adapter(source: str, cfg: Settings, runtime: object | None = None) -> SourceAdapter:
