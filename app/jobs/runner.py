@@ -88,7 +88,7 @@ from app.sources.youtube import ProviderError, YouTubeAdapter
 logger = logging.getLogger(__name__)
 
 
-class ExecutionLeaseLost(BaseException):
+class ExecutionLeaseLost(Exception):
     """Raised when a background runner no longer owns its job execution lease."""
 
 
@@ -566,24 +566,39 @@ async def _heartbeat_execution_lease(
     factory = get_session_factory()
     interval = max(0.01, lease_duration.total_seconds() / 3)
     while not stop.is_set():
+        # The committed claim already covers the first interval. Waiting before
+        # the first refresh avoids overlapping a short execution transaction and
+        # still renews at no more than one-third of the lease duration.
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return
+        except TimeoutError:
+            pass
+        alive = False
         async with factory() as db:
-            now = _now()
-            result = await db.execute(
-                update(Job)
-                .where(
-                    Job.id == job_id,
-                    Job.status == JobStatus.running,
-                    Job.execution_token == token,
+
+            async def heartbeat_once() -> None:
+                nonlocal alive
+                now = _now()
+                result = await db.execute(
+                    update(Job)
+                    .where(
+                        Job.id == job_id,
+                        Job.status == JobStatus.running,
+                        Job.execution_token == token,
+                    )
+                    .values(
+                        execution_lease_expires_at=now + lease_duration,
+                        updated_at=now,
+                    )
+                    .execution_options(synchronize_session=False)
                 )
-                .values(execution_lease_expires_at=now + lease_duration, updated_at=now)
-                .execution_options(synchronize_session=False)
-            )
-            alive = isinstance(result, CursorResult) and result.rowcount == 1
-            await db.commit()
+                alive = isinstance(result, CursorResult) and result.rowcount == 1
+                await db.commit()
+
+            await run_with_sqlite_lock_retry(db, heartbeat_once)
         if not alive:
             return
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), timeout=interval)
 
 
 async def _prove_execution_lease(db: AsyncSession, job_id: int, token: str) -> None:
@@ -609,21 +624,32 @@ async def _prove_execution_lease(db: AsyncSession, job_id: int, token: str) -> N
 
 async def _commit_job_progress(db: AsyncSession, job: Job, expected_token: str) -> None:
     """Fence and commit one complete background progress or terminal transaction."""
-    await _prove_execution_lease(db, job.id, expected_token)
-    if job.status in _TERMINAL_JOB_STATUSES:
-        job.execution_token = None
-        job.execution_lease_expires_at = None
+    connection = await db.connection()
+    with contextlib.suppress(Exception):
+        await connection.exec_driver_sql("PRAGMA busy_timeout=200")
     try:
-        await db.commit()
-    except Exception as exc:
-        # Test doubles and pre-flush SQLite lock injections leave the transaction
-        # usable. Re-prove and retry only this DB commit; never replay execution I/O.
-        if is_sqlite_database_locked(exc) and db.is_active:
-            await _prove_execution_lease(db, job.id, expected_token)
-            await db.commit()
-            return
-        await db.rollback()
-        raise
+        for attempt in range(4):
+            try:
+                await _prove_execution_lease(db, job.id, expected_token)
+                if job.status in _TERMINAL_JOB_STATUSES:
+                    job.execution_token = None
+                    job.execution_lease_expires_at = None
+                await db.commit()
+                return
+            except Exception as exc:
+                if not is_sqlite_database_locked(exc):
+                    await db.rollback()
+                    raise
+                # The no-op fence runs before autoflush. If SQLite leaves this
+                # transaction usable, retry only that database boundary and retain
+                # every pending sibling mutation. Never replay execution/provider I/O.
+                if not db.is_active or attempt == 3:
+                    await db.rollback()
+                    raise
+                await asyncio.sleep(0.25 * (attempt + 1))
+    finally:
+        with contextlib.suppress(Exception):
+            await connection.exec_driver_sql("PRAGMA busy_timeout=30000")
 
 
 async def _persist_job_envelope(
@@ -811,7 +837,8 @@ async def run_job(
         name=f"job-{job_id}-heartbeat",
     )
     lease_lost = False
-    try:
+
+    async def execute_owned_work() -> None:
         continuation_ids: list[int] = []
         async with factory() as session:
             continuation = await _invoke_job_execution(
@@ -844,12 +871,30 @@ async def run_job(
                     session,
                 )
         await _dispatch_continuation_jobs(continuation_ids)
+
+    execution_task = asyncio.create_task(execute_owned_work(), name=f"job-{job_id}-execution")
+    try:
+        done, _ = await asyncio.wait(
+            {execution_task, heartbeat}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if heartbeat in done:
+            heartbeat_error = heartbeat.exception()
+            if heartbeat_error is not None:
+                lease_lost = True
+                execution_task.cancel()
+                await asyncio.gather(execution_task, return_exceptions=True)
+                raise ExecutionLeaseLost(
+                    f"job {job_id} execution heartbeat failed"
+                ) from heartbeat_error
+        await execution_task
     except ExecutionLeaseLost:
         lease_lost = True
         raise
     except asyncio.CancelledError:
+        execution_task.cancel()
+        await asyncio.gather(execution_task, return_exceptions=True)
         async with factory() as session:
-            await _persist_job_envelope(
+            transitioned = await _persist_job_envelope(
                 session,
                 job_id,
                 expected_statuses={JobStatus.pending, JobStatus.running},
@@ -858,11 +903,13 @@ async def run_job(
                 cancel_active_tracks=True,
                 expected_token=execution_token,
             )
+        if not transitioned:
+            lease_lost = True
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception("Job %d failed", job_id)
         async with factory() as session:
-            await _persist_job_envelope(
+            transitioned = await _persist_job_envelope(
                 session,
                 job_id,
                 expected_statuses={JobStatus.pending, JobStatus.running},
@@ -870,10 +917,19 @@ async def run_job(
                 result_json=_job_error_result("job_failed", "job", retryable=True),
                 expected_token=execution_token,
             )
+        if not transitioned:
+            lease_lost = True
+            raise ExecutionLeaseLost(
+                f"job {job_id} execution lease was replaced during failure handling"
+            ) from exc
     finally:
         heartbeat_stop.set()
-        with contextlib.suppress(Exception):
-            await heartbeat
+        heartbeat_results = await asyncio.gather(heartbeat, return_exceptions=True)
+        heartbeat_error = heartbeat_results[0]
+        if isinstance(heartbeat_error, BaseException) and not lease_lost:
+            logger.error(
+                "Job %d heartbeat task failed during teardown: %s", job_id, heartbeat_error
+            )
         if not lease_lost:
             try:
                 from app.services.acquisition_cleanup import cleanup_terminal_acquisitions

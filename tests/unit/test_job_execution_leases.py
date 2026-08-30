@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import Settings
@@ -493,3 +494,277 @@ async def test_direct_run_remains_tokenless_and_does_not_force_commit(
             persisted = await observer.get(Job, job_id)
             assert persisted is not None
             assert persisted.status == JobStatus.pending
+
+
+async def test_stale_token_then_ordinary_failure_skips_cleanup_and_surfaces_lease_loss(
+    lease_factory, test_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = await _seed(lease_factory)
+    cleanup_calls = []
+
+    async def fail(current_job_id, session, cfg, **kwargs):
+        async with lease_factory() as takeover:
+            await takeover.execute(
+                update(Job)
+                .where(Job.id == current_job_id)
+                .values(execution_token="replacement-token")
+            )
+            await takeover.commit()
+        raise RuntimeError("provider failed after takeover")
+
+    async def cleanup(*args, job_ids, **kwargs):
+        cleanup_calls.append(job_ids)
+
+    from app.services import acquisition_cleanup
+
+    monkeypatch.setattr(runner, "get_session_factory", lambda: lease_factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", fail)
+    monkeypatch.setattr(acquisition_cleanup, "cleanup_terminal_acquisitions", cleanup)
+    with pytest.raises(runner.ExecutionLeaseLost):
+        await runner.run_job(job_id, settings=_fast_settings(test_settings))
+    assert cleanup_calls == []
+
+
+async def test_stale_token_then_cancellation_retains_cancellation_without_cleanup(
+    lease_factory, test_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = await _seed(lease_factory)
+    cleanup_calls = []
+
+    async def cancel(current_job_id, session, cfg, **kwargs):
+        async with lease_factory() as takeover:
+            await takeover.execute(
+                update(Job)
+                .where(Job.id == current_job_id)
+                .values(execution_token="replacement-token")
+            )
+            await takeover.commit()
+        raise asyncio.CancelledError
+
+    async def cleanup(*args, job_ids, **kwargs):
+        cleanup_calls.append(job_ids)
+
+    from app.services import acquisition_cleanup
+
+    monkeypatch.setattr(runner, "get_session_factory", lambda: lease_factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", cancel)
+    monkeypatch.setattr(acquisition_cleanup, "cleanup_terminal_acquisitions", cleanup)
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run_job(job_id, settings=_fast_settings(test_settings))
+    assert cleanup_calls == []
+
+
+async def test_real_sqlite_fence_lock_retries_without_replaying_execution(lease_factory) -> None:
+    job_id = await _seed(lease_factory)
+    token = "owned-token"
+    async with lease_factory() as owner:
+        current = await owner.get(Job, job_id)
+        current.status = JobStatus.running
+        current.execution_token = token
+        await owner.commit()
+
+    provider_calls = 0
+    locked = asyncio.Event()
+    release_lock = asyncio.Event()
+
+    async def competing_writer():
+        async with lease_factory() as blocker:
+            connection = await blocker.connection()
+            await connection.exec_driver_sql("PRAGMA busy_timeout=0")
+            await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            locked.set()
+            await release_lock.wait()
+            await blocker.rollback()
+
+    blocker = asyncio.create_task(competing_writer())
+    await asyncio.wait_for(locked.wait(), 1)
+    async with lease_factory() as execution:
+        current = await execution.get(Job, job_id)
+        provider_calls += 1
+        current.status = JobStatus.done
+        execution.add(Job(source="youtube", query="preserved sibling", status=JobStatus.pending))
+        asyncio.get_running_loop().call_later(1.2, release_lock.set)
+        await runner._commit_job_progress(execution, current, token)
+    await blocker
+    assert provider_calls == 1
+    async with lease_factory() as observer:
+        current = await observer.get(Job, job_id)
+        assert current.status == JobStatus.done and current.execution_token is None
+        assert (
+            await observer.scalar(
+                select(func.count(Job.id)).where(Job.query == "preserved sibling")
+            )
+            == 1
+        )
+
+
+async def test_heartbeat_retries_transient_sqlite_lock(lease_factory, monkeypatch) -> None:
+    job_id = await _seed(lease_factory)
+    monkeypatch.setattr(runner, "get_session_factory", lambda: lease_factory)
+    token = "heartbeat-token"
+    async with lease_factory() as session:
+        current = await session.get(Job, job_id)
+        current.status = JobStatus.running
+        current.execution_token = token
+        await session.commit()
+    original_execute = AsyncSession.execute
+    attempts = 0
+    retried = asyncio.Event()
+
+    async def lock_once(session, statement, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OperationalError("UPDATE jobs", {}, Exception("database is locked"))
+        retried.set()
+        return await original_execute(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", lock_once)
+    stop = asyncio.Event()
+    heartbeat = asyncio.create_task(
+        runner._heartbeat_execution_lease(job_id, token, timedelta(seconds=0.03), stop)
+    )
+    await asyncio.wait_for(retried.wait(), 1)
+    stop.set()
+    await asyncio.wait_for(heartbeat, 1)
+    assert attempts >= 2
+
+
+async def test_terminal_heartbeat_failure_cancels_execution_and_surfaces_lease_loss(
+    lease_factory, test_settings, monkeypatch
+) -> None:
+    job_id = await _seed(lease_factory)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    cleanup_calls = []
+
+    async def blocked(*args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async def failed_heartbeat(*args, **kwargs):
+        await entered.wait()
+        raise RuntimeError("heartbeat database failed")
+
+    async def cleanup(*args, job_ids, **kwargs):
+        cleanup_calls.append(job_ids)
+
+    from app.services import acquisition_cleanup
+
+    monkeypatch.setattr(runner, "get_session_factory", lambda: lease_factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", blocked)
+    monkeypatch.setattr(runner, "_heartbeat_execution_lease", failed_heartbeat)
+    monkeypatch.setattr(acquisition_cleanup, "cleanup_terminal_acquisitions", cleanup)
+    with pytest.raises(runner.ExecutionLeaseLost, match="heartbeat"):
+        await runner.run_job(job_id, settings=_fast_settings(test_settings))
+    assert cancelled.is_set()
+    assert cleanup_calls == []
+
+
+async def test_tokenized_watchdog_recovery_provenance_survives_pending_gap(
+    lease_factory, monkeypatch
+) -> None:
+    now = datetime.now(UTC)
+    async with lease_factory() as session:
+        job = Job(
+            source="slskd",
+            query="gap",
+            status=JobStatus.running,
+            execution_token="expired",
+            execution_lease_expires_at=now - timedelta(seconds=1),
+            updated_at=now,
+        )
+        session.add(job)
+        await session.commit()
+        job_id = job.id
+    dispatcher = JobDispatcher(session_factory=lease_factory)
+    dispatched = []
+
+    async def record(job_id):
+        dispatched.append(job_id)
+
+    monkeypatch.setattr(dispatcher, "dispatch", record)
+    await dispatcher._watchdog_tick(1)
+    async with lease_factory() as session:
+        current = await session.get(Job, job_id)
+        payload = __import__("json").loads(current.result_json)
+        assert payload["watchdog_recovery"]["origin"] == "tokenized"
+        current.updated_at = now - timedelta(seconds=5)
+        await session.commit()
+    await dispatcher._watchdog_tick(1)
+    async with lease_factory() as session:
+        current = await session.get(Job, job_id)
+        payload = __import__("json").loads(current.result_json)
+        assert current.status == JobStatus.pending
+        assert payload["watchdog_recovery"] == {"attempt": 2, "origin": "tokenized"}
+    assert dispatched == [job_id, job_id]
+
+
+async def test_malformed_watchdog_attempt_does_not_poison_other_recovery(
+    lease_factory, monkeypatch
+) -> None:
+    now = datetime.now(UTC)
+    async with lease_factory() as session:
+        jobs = [
+            Job(
+                source="slskd",
+                query="bad",
+                status=JobStatus.running,
+                result_json='{\\"watchdog_recovery\\":{\\"attempt\\":null}}',
+                execution_token="bad-token",
+                execution_lease_expires_at=now - timedelta(seconds=1),
+            ),
+            Job(
+                source="slskd",
+                query="good",
+                status=JobStatus.running,
+                execution_token="good-token",
+                execution_lease_expires_at=now - timedelta(seconds=1),
+            ),
+        ]
+        session.add_all(jobs)
+        await session.commit()
+        ids = [job.id for job in jobs]
+    dispatcher = JobDispatcher(session_factory=lease_factory)
+
+    async def ignore(job_id):
+        pass
+
+    monkeypatch.setattr(dispatcher, "dispatch", ignore)
+    await dispatcher._watchdog_tick(1)
+    async with lease_factory() as session:
+        rows = [await session.get(Job, job_id) for job_id in ids]
+        assert all(row.status == JobStatus.pending for row in rows)
+        assert all(
+            __import__("json").loads(row.result_json)["watchdog_recovery"]["attempt"] == 1
+            for row in rows
+        )
+
+
+async def test_startup_repairs_pending_row_with_stranded_token(lease_factory, monkeypatch) -> None:
+    async with lease_factory() as session:
+        job = Job(
+            source="youtube",
+            query="stranded",
+            status=JobStatus.pending,
+            execution_token="malformed-token",
+            execution_lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+        session.add(job)
+        await session.commit()
+        job_id = job.id
+    dispatcher = JobDispatcher(session_factory=lease_factory)
+    dispatched = []
+
+    async def record(current_job_id):
+        dispatched.append(current_job_id)
+
+    monkeypatch.setattr(dispatcher, "dispatch", record)
+    assert await dispatcher.recover() == [job_id]
+    async with lease_factory() as session:
+        current = await session.get(Job, job_id)
+        assert current.execution_token is None and current.execution_lease_expires_at is None
+    assert dispatched == [job_id]

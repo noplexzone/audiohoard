@@ -338,16 +338,25 @@ class JobDispatcher:
                         else Job.result_json == result_json
                     )
                     if status == JobStatus.pending:
+                        token_match = (
+                            Job.execution_token.is_(None)
+                            if token is None
+                            else Job.execution_token == token
+                        )
                         result = await db.execute(
                             update(Job)
                             .where(
                                 Job.id == job_id,
                                 Job.status == JobStatus.pending,
-                                Job.execution_token.is_(None),
+                                token_match,
                                 func.julianday(Job.updated_at) == func.julianday(updated_at),
                                 result_match,
                             )
-                            .values(updated_at=now)
+                            .values(
+                                execution_token=None,
+                                execution_lease_expires_at=None,
+                                updated_at=now,
+                            )
                             .execution_options(synchronize_session=False)
                         )
                         if isinstance(result, CursorResult) and result.rowcount == 1:
@@ -428,7 +437,6 @@ class JobDispatcher:
                             or_(
                                 and_(
                                     Job.status == JobStatus.pending,
-                                    Job.execution_token.is_(None),
                                     Job.updated_at < threshold_dt,
                                 ),
                                 and_(
@@ -455,17 +463,18 @@ class JobDispatcher:
                     live = self._tasks.get(job_id)
                     if live is not None and not live.done():
                         continue
-                    if status == JobStatus.pending:
-                        if _as_utc(updated_at) >= threshold_dt or token is not None:
+                    if (status == JobStatus.pending or token is None) and _as_utc(
+                        updated_at
+                    ) >= threshold_dt:
+                        continue
+                    if (
+                        status != JobStatus.pending
+                        and token is not None
+                        and lease_expires_at is not None
+                    ):
+                        comparable_expiry = _as_utc(lease_expires_at)
+                        if comparable_expiry > now:
                             continue
-                    elif token is None:
-                        if _as_utc(updated_at) >= threshold_dt:
-                            continue
-                    else:
-                        if lease_expires_at is not None:
-                            comparable_expiry = _as_utc(lease_expires_at)
-                            if comparable_expiry > now:
-                                continue
                     try:
                         current: dict[str, Any] = json.loads(result_json) if result_json else {}
                     except (json.JSONDecodeError, TypeError):
@@ -473,7 +482,14 @@ class JobDispatcher:
                     if not isinstance(current, dict):
                         current = {}
 
-                    recurrent_legacy = token is None and "watchdog_recovery" in current
+                    recovery = current.get("watchdog_recovery")
+                    recovery_origin = (
+                        recovery.get("origin") if isinstance(recovery, dict) else None
+                    )
+                    tokenized_recovery = token is not None or recovery_origin == "tokenized"
+                    recurrent_legacy = (
+                        token is None and "watchdog_recovery" in current and not tokenized_recovery
+                    )
                     if recurrent_legacy:
                         next_status = JobStatus.failed
                         next_result = json.dumps(
@@ -487,11 +503,20 @@ class JobDispatcher:
                         )
                     else:
                         next_status = JobStatus.pending if status == JobStatus.running else status
-                        recovery = current.get("watchdog_recovery")
-                        prior_attempt = (
-                            int(recovery.get("attempt", 0)) if isinstance(recovery, dict) else 0
+                        raw_attempt = (
+                            recovery.get("attempt", 0) if isinstance(recovery, dict) else 0
                         )
-                        current["watchdog_recovery"] = {"attempt": prior_attempt + 1}
+                        prior_attempt = (
+                            raw_attempt
+                            if isinstance(raw_attempt, int)
+                            and not isinstance(raw_attempt, bool)
+                            and raw_attempt >= 0
+                            else 0
+                        )
+                        marker: dict[str, object] = {"attempt": prior_attempt + 1}
+                        if tokenized_recovery:
+                            marker["origin"] = "tokenized"
+                        current["watchdog_recovery"] = marker
                         next_result = json.dumps(current)
                     result_match = (
                         Job.result_json.is_(None)
@@ -503,7 +528,17 @@ class JobDispatcher:
                         Job.status == status,
                         result_match,
                     ]
-                    if token is None:
+                    if status == JobStatus.pending:
+                        predicates.extend(
+                            [
+                                Job.execution_token.is_(None)
+                                if token is None
+                                else Job.execution_token == token,
+                                func.julianday(Job.updated_at) == func.julianday(updated_at),
+                                Job.updated_at < threshold_dt,
+                            ]
+                        )
+                    elif token is None:
                         predicates.extend(
                             [
                                 Job.execution_token.is_(None),

@@ -1868,3 +1868,17 @@ async def test_cancel_waiting_job_persists_cancelled_before_task_exit(
     release_first.set()
     await first_task
     await dispatcher.shutdown()
+
+
+async def test_dispatcher_logs_and_consumes_execution_lease_loss(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def lost_runner(job_id: int) -> None:
+        raise job_runner.ExecutionLeaseLost(f"job {job_id} lease lost")
+
+    dispatcher = JobDispatcher(runner=lost_runner)
+    with caplog.at_level("ERROR"):
+        task = await dispatcher.dispatch(73)
+        await asyncio.gather(task, return_exceptions=True)
+    assert isinstance(task.exception(), job_runner.ExecutionLeaseLost)
+    assert "Job 73 task raised unhandled exception" in caplog.text
