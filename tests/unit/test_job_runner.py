@@ -17,6 +17,7 @@ import app.database as _db_module
 from app.config import Settings
 from app.database import Base
 from app.jobs import runner
+from app.models.acquisition_attempt import AcquisitionAttempt
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.release import Release
@@ -2667,6 +2668,135 @@ def test_release_root_reconciliation_rejects_every_duplicate_file_for_one_identi
     ]
 
 
+def test_release_root_reconciliation_rejects_contradictory_position_and_title() -> None:
+    catalog = [
+        CatalogAlbumTrack(id=1, album_id=1, position=1, disc=1, title="One"),
+        CatalogAlbumTrack(id=2, album_id=1, position=2, disc=1, title="Two"),
+    ]
+    contradictory = SearchResult(
+        source="tidal",
+        title="02 Two",
+        metadata={"disc": 1, "track_no": 1, "filename": "Album/02 Two.flac"},
+    )
+
+    reconciled, failures = runner._reconcile_release_root_results([contradictory], catalog)
+
+    assert reconciled == []
+    assert [failure["code"] for failure in failures] == ["catalog_result_identity_contradiction"]
+
+
+def test_release_root_reconciliation_rejects_duplicate_provider_artifact() -> None:
+    catalog = [
+        CatalogAlbumTrack(id=1, album_id=1, position=1, disc=1, title="One"),
+        CatalogAlbumTrack(id=2, album_id=1, position=2, disc=1, title="Two"),
+    ]
+    duplicated_artifact = [
+        SearchResult(
+            source="slskd",
+            title="01 One",
+            metadata={
+                "disc": 1,
+                "track_no": 1,
+                "username": "peer",
+                "filename": "Album\\Shared.flac",
+            },
+        ),
+        SearchResult(
+            source="slskd",
+            title="02 Two",
+            metadata={
+                "disc": 1,
+                "track_no": 2,
+                "username": "peer",
+                "filename": "Album/Shared.flac",
+            },
+        ),
+    ]
+
+    reconciled, failures = runner._reconcile_release_root_results(duplicated_artifact, catalog)
+
+    assert reconciled == []
+    assert [failure["code"] for failure in failures] == [
+        "catalog_result_duplicate_artifact",
+        "catalog_result_duplicate_artifact",
+    ]
+
+
+async def test_release_root_rejects_all_mixed_source_invalid_results_before_side_effects(
+    db_session: AsyncSession,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artist = CatalogArtist(name="Root Artist")
+    album = CatalogAlbum(artist=artist, title="Root Album", track_count=2)
+    album.tracks.extend(
+        [
+            CatalogAlbumTrack(position=1, disc=1, title="One"),
+            CatalogAlbumTrack(position=2, disc=1, title="Two"),
+        ]
+    )
+    root = Job(
+        source="priority",
+        query="Root Artist Root Album",
+        status=JobStatus.pending,
+        catalog_album=album,
+        catalog_track_id=None,
+    )
+    db_session.add_all([artist, root])
+    await db_session.flush()
+    results = [
+        SearchResult(source="youtube", title="Bonus Audio"),
+        SearchResult(
+            source="tidal",
+            title="02 Two",
+            metadata={"disc": 1, "track_no": 1, "filename": "Album/02 Two.flac"},
+        ),
+        SearchResult(
+            source="slskd",
+            title="01 One",
+            metadata={
+                "disc": 1,
+                "track_no": 1,
+                "username": "peer",
+                "filename": "Album/Shared.flac",
+            },
+        ),
+        SearchResult(
+            source="slskd",
+            title="02 Two",
+            metadata={
+                "disc": 1,
+                "track_no": 2,
+                "username": "peer",
+                "filename": "Album\\Shared.flac",
+            },
+        ),
+    ]
+
+    async def fake_fetch(*args: object, **kwargs: object) -> Sequence[SearchResult]:
+        return results
+
+    async def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("rejected release-root result reached a downstream side effect")
+
+    monkeypatch.setattr(runner, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(runner, "_prepare_acquisition", forbidden)
+    monkeypatch.setattr(runner, "_enrich_musicbrainz", forbidden)
+    monkeypatch.setattr(runner, "_enrich_deezer", forbidden)
+    monkeypatch.setattr(runner, "_run_fingerprint_and_verify", forbidden)
+    monkeypatch.setattr(runner, "_compute_path_preview", forbidden)
+    monkeypatch.setattr(runner, "_try_auto_import", forbidden)
+
+    await runner.run_job(root.id, db_session, test_settings)
+
+    assert await db_session.scalar(select(AcquisitionAttempt.id)) is None
+    assert await db_session.scalar(select(Track.id).where(Track.job_id == root.id)) is None
+    assert root.result_json is not None
+    assert "catalog_result_unmatched" in root.result_json
+    assert "catalog_result_identity_contradiction" in root.result_json
+    assert "catalog_result_duplicate_artifact" in root.result_json
+
+
 async def test_release_root_unmatched_audio_never_reaches_acquisition(
     db_session: AsyncSession,
     test_settings: Settings,
@@ -2696,7 +2826,7 @@ async def test_release_root_unmatched_audio_never_reaches_acquisition(
             metadata={"disc": 1, "track_no": 1, "username": "peer"},
         ),
         SearchResult(
-            source="slskd",
+            source="tidal",
             title="02 Two",
             metadata={"disc": 1, "track_no": 2, "username": "peer"},
         ),
@@ -2706,7 +2836,7 @@ async def test_release_root_unmatched_audio_never_reaches_acquisition(
             metadata={"disc": 1, "track_no": 99, "username": "peer"},
         ),
     ]
-    acquired: list[str] = []
+    acquired: list[tuple[str, str]] = []
 
     async def fake_fetch(*args: object, **kwargs: object) -> Sequence[SearchResult]:
         return results
@@ -2718,8 +2848,8 @@ async def test_release_root_unmatched_audio_never_reaches_acquisition(
         track: Track,
         **kwargs: object,
     ) -> tuple[None, str]:
-        del source, cfg, kwargs
-        acquired.append(result.title)
+        del cfg, kwargs
+        acquired.append((result.title, source))
         track.acquisition_state = AcquisitionState.downloaded
         track.source_path = f"/staging/{result.title}.flac"
         return None, "downloaded"
@@ -2738,7 +2868,7 @@ async def test_release_root_unmatched_audio_never_reaches_acquisition(
     await runner.run_job(root.id, db_session, test_settings)
 
     stored = list((await db_session.scalars(select(Track).where(Track.job_id == root.id))).all())
-    assert acquired == ["01 One", "02 Two"]
+    assert acquired == [("01 One", "slskd"), ("02 Two", "tidal")]
     assert {track.catalog_track_id for track in stored} == {
         album.tracks[0].id,
         album.tracks[1].id,

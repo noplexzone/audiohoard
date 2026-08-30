@@ -45,6 +45,15 @@ from app.models.acquisition_attempt import (
     RetentionDisposition,
 )
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
+from app.models.discography_batch import (
+    DiscographyBatch,
+    DiscographyBatchItem,
+    DiscographyBatchItemJob,
+    DiscographyBatchItemState,
+    DiscographyBatchJobRole,
+    DiscographyBatchState,
+    DiscographyJobOwnership,
+)
 from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
 from app.models.path_preview import PathPreview
@@ -1176,25 +1185,25 @@ async def _run_job_in_session(
 
         root_catalog_matches: dict[int, CatalogAlbumTrack] = {}
         reconciliation_failures: list[dict[str, object]] = []
-        if catalog_album is not None and job.catalog_track_id is None:
-            slskd_results = [result for result in results if result.source == "slskd"]
-            if slskd_results:
-                reconciled, reconciliation_failures = _reconcile_release_root_results(
-                    slskd_results, catalog_tracks
-                )
-                root_catalog_matches = {id(result): track for result, track in reconciled}
-                accepted = set(root_catalog_matches)
-                results = [
-                    result
-                    for result in results
-                    if result.source != "slskd" or id(result) in accepted
-                ]
+        prowlarr_release_candidates = bool(results) and all(
+            result.source == "prowlarr" for result in results
+        )
+        if (
+            catalog_album is not None
+            and job.catalog_track_id is None
+            and not prowlarr_release_candidates
+        ):
+            reconciled, reconciliation_failures = _reconcile_release_root_results(
+                results, catalog_tracks
+            )
+            root_catalog_matches = {id(result): track for result, track in reconciled}
+            accepted = set(root_catalog_matches)
+            results = [result for result in results if id(result) in accepted]
 
         if (
             catalog_album is not None
             and job.catalog_track_id is None
-            and results
-            and all(result.source == "prowlarr" for result in results)
+            and prowlarr_release_candidates
         ):
             # Prowlarr results are alternative release candidates, not tracks.
             # Acquire one candidate and report manifest gaps rather than enqueueing
@@ -1364,7 +1373,7 @@ async def _run_job_in_session(
                     prepare_kwargs["attempt"] = attempt
                 source_job_id, source_status = await _call_prepare_acquisition(
                     result,
-                    job.source,
+                    result.source,
                     cfg,
                     track,
                     **prepare_kwargs,  # type: ignore[arg-type]
@@ -1688,36 +1697,85 @@ def _release_root_title_matches(
     ]
 
 
+def _release_root_result_identity_evidence(result: SearchResult) -> tuple[str, ...]:
+    evidence: list[str] = []
+    if result.title and result.title.strip():
+        evidence.append(result.title.strip())
+    filename = (result.metadata or {}).get("filename")
+    if isinstance(filename, str) and filename.strip():
+        normalized_filename = filename.strip().replace("\\", "/").rsplit("/", 1)[-1]
+        if normalized_filename not in evidence:
+            evidence.append(normalized_filename)
+    return tuple(evidence)
+
+
+def _release_root_result_matches_track(result: SearchResult, track: CatalogAlbumTrack) -> bool:
+    evidence = _release_root_result_identity_evidence(result)
+    return not evidence or all(
+        _targeted_title_matches(value, value, track.title) for value in evidence
+    )
+
+
+def _release_root_artifact_identity(result: SearchResult) -> tuple[str, str, str] | None:
+    metadata = result.metadata or {}
+    return normalize_source_candidate_identity(
+        result.source,
+        metadata.get("username"),
+        metadata.get("filename"),
+    )
+
+
 def _reconcile_release_root_results(
     results: Sequence[SearchResult],
     tracks: list[CatalogAlbumTrack],
 ) -> tuple[list[tuple[SearchResult, CatalogAlbumTrack]], list[dict[str, object]]]:
-    """Bind folder files to exact manifest identities before any provider/file work."""
-    provisional: list[tuple[SearchResult, CatalogAlbumTrack | None, str | None]] = []
+    """Bind per-file results to exact manifest and physical artifact identities."""
+    provisional: list[
+        tuple[
+            SearchResult,
+            CatalogAlbumTrack | None,
+            str | None,
+            tuple[str, str, str] | None,
+        ]
+    ] = []
     for result in results:
         position = _result_disc_position(result)
         if position is not None:
             matches = [track for track in tracks if (track.disc, track.position) == position]
         else:
             matches = _release_root_title_matches(result.title or "", tracks)
-        if len(matches) == 1:
-            provisional.append((result, matches[0], None))
+        error: str | None = None
+        track = matches[0] if len(matches) == 1 else None
+        if track is not None and not _release_root_result_matches_track(result, track):
+            track = None
+            error = "catalog_result_identity_contradiction"
         elif len(matches) > 1:
-            provisional.append((result, None, "catalog_result_ambiguous"))
-        elif position is None and len(tracks) == 1:
-            provisional.append((result, tracks[0], None))
-        else:
-            provisional.append((result, None, "catalog_result_unmatched"))
+            error = "catalog_result_ambiguous"
+        elif (
+            track is None
+            and not _release_root_result_identity_evidence(result)
+            and len(tracks) == 1
+        ):
+            track = tracks[0]
+        elif track is None:
+            error = error or "catalog_result_unmatched"
+        provisional.append((result, track, error, _release_root_artifact_identity(result)))
 
     identity_counts: dict[int, int] = {}
-    for _result, track, _error in provisional:
+    artifact_counts: dict[tuple[str, str, str], int] = {}
+    for _result, track, _error, artifact_identity in provisional:
         if track is not None:
             identity_counts[track.id] = identity_counts.get(track.id, 0) + 1
+        if artifact_identity is not None:
+            artifact_counts[artifact_identity] = artifact_counts.get(artifact_identity, 0) + 1
 
     reconciled: list[tuple[SearchResult, CatalogAlbumTrack]] = []
     failures: list[dict[str, object]] = []
-    for result, track, error in provisional:
-        if track is not None and identity_counts.get(track.id, 0) > 1:
+    for result, track, error, artifact_identity in provisional:
+        if artifact_identity is not None and artifact_counts.get(artifact_identity, 0) > 1:
+            error = "catalog_result_duplicate_artifact"
+            track = None
+        elif track is not None and identity_counts.get(track.id, 0) > 1:
             error = "catalog_result_duplicate_identity"
             track = None
         if track is not None:
@@ -3045,14 +3103,69 @@ async def _spawn_continuation_jobs(
             await db.rollback()
             return
 
+        if parent_job.catalog_album_id != catalog_album_id:
+            raise ValueError("continuation parent owns a different catalog album")
+        parent_track_id = parent_job.catalog_track_id
+        if parent_track_id is not None and requested_track_ids != (parent_track_id,):
+            raise ValueError("exact-track continuation requested a different catalog track")
+        expected_role = (
+            DiscographyBatchJobRole.release_root
+            if parent_track_id is None
+            else DiscographyBatchJobRole.track_fallback
+        )
+        context_rows = (
+            await db.execute(
+                select(
+                    DiscographyBatchItemJob,
+                    DiscographyBatchItem,
+                    DiscographyBatch,
+                )
+                .join(
+                    DiscographyBatchItem,
+                    DiscographyBatchItem.id == DiscographyBatchItemJob.item_id,
+                )
+                .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+                .where(
+                    DiscographyBatchItemJob.job_id == parent_job_id,
+                    DiscographyBatchItemJob.role == expected_role,
+                )
+                .order_by(DiscographyBatchItemJob.id)
+            )
+        ).all()
+        active_contexts: list[tuple[DiscographyBatchItemJob, DiscographyBatchItem]] = []
+        active_item_states = {
+            DiscographyBatchItemState.pending,
+            DiscographyBatchItemState.hydrating,
+            DiscographyBatchItemState.expanding,
+            DiscographyBatchItemState.waiting,
+        }
+        for context_link, item, batch in context_rows:
+            expected_track_id = None if parent_track_id is None else parent_track_id
+            if context_link.catalog_track_id != expected_track_id:
+                raise ValueError("batch continuation link carries the wrong catalog track")
+            if item.catalog_album_id != catalog_album_id:
+                raise ValueError("batch continuation item owns a different album")
+            if (
+                context_link.generation != item.execution_generation
+                or batch.state not in (DiscographyBatchState.queued, DiscographyBatchState.running)
+                or item.state not in active_item_states
+            ):
+                continue
+            active_contexts.append((context_link, item))
+        if context_rows and not active_contexts:
+            committed_ids.clear()
+            await db.rollback()
+            return
+
         tracks_by_id = {track.id: track for track in catalog_album.tracks}
         next_attempt = parent_job.partial_attempt + 1
         for track_id in requested_track_ids:
             catalog_track = tracks_by_id.get(track_id)
             if catalog_track is None:
-                continue
-            duplicate = await db.scalar(
-                select(Job.id).where(
+                raise ValueError("continuation track does not belong to the release root")
+            continuation = await db.scalar(
+                select(Job)
+                .where(
                     Job.catalog_album_id == catalog_album_id,
                     Job.catalog_track_id == track_id,
                     (
@@ -3063,26 +3176,80 @@ async def _spawn_continuation_jobs(
                         | Job.status.in_([JobStatus.pending, JobStatus.running])
                     ),
                 )
+                .order_by(Job.id)
+                .limit(1)
             )
-            if duplicate is not None:
-                continue
-            continuation = Job(
-                source="priority",
-                query=_targeted_query_variants(
-                    _catalog_track_artist_name(catalog_album, catalog_track),
-                    catalog_album.title,
-                    catalog_track.title,
-                )[0],
-                status=JobStatus.pending,
-                catalog_album_id=catalog_album_id,
-                catalog_track_id=track_id,
-                parent_job_id=parent_job_id,
-                partial_attempt=next_attempt,
-                result_json=json.dumps({"continuation_of": parent_job_id}, sort_keys=True),
-            )
-            db.add(continuation)
-            await db.flush()
-            attempt_ids.append(continuation.id)
+            created = continuation is None
+            if continuation is None:
+                continuation = Job(
+                    source="priority",
+                    query=_targeted_query_variants(
+                        _catalog_track_artist_name(catalog_album, catalog_track),
+                        catalog_album.title,
+                        catalog_track.title,
+                    )[0],
+                    status=JobStatus.pending,
+                    catalog_album_id=catalog_album_id,
+                    catalog_track_id=track_id,
+                    parent_job_id=parent_job_id,
+                    partial_attempt=next_attempt,
+                    result_json=json.dumps({"continuation_of": parent_job_id}, sort_keys=True),
+                )
+                db.add(continuation)
+                await db.flush()
+                attempt_ids.append(continuation.id)
+            if (
+                continuation.catalog_album_id != catalog_album_id
+                or continuation.catalog_track_id != track_id
+            ):
+                raise ValueError("continuation job does not own the exact requested track")
+            for context_link, item in active_contexts:
+                existing_link = await db.scalar(
+                    select(DiscographyBatchItemJob).where(
+                        DiscographyBatchItemJob.item_id == item.id,
+                        DiscographyBatchItemJob.generation == item.execution_generation,
+                        DiscographyBatchItemJob.catalog_track_id == track_id,
+                    )
+                )
+                if existing_link is not None:
+                    existing_job = await db.get(Job, existing_link.job_id)
+                    if (
+                        existing_link.role != DiscographyBatchJobRole.track_fallback
+                        or existing_job is None
+                        or existing_job.catalog_album_id != catalog_album_id
+                        or existing_job.catalog_track_id != track_id
+                    ):
+                        raise ValueError("batch fallback link does not own the exact track")
+                    if parent_track_id is not None:
+                        if existing_link.job_id != parent_job_id:
+                            raise ValueError(
+                                "batch fallback retry does not advance its current owner"
+                            )
+                        existing_link.job_id = continuation.id
+                        existing_link.ownership = (
+                            DiscographyJobOwnership.created
+                            if created
+                            and context_link.ownership == DiscographyJobOwnership.created
+                            else DiscographyJobOwnership.observed
+                        )
+                    continue
+                if parent_track_id is not None:
+                    raise ValueError("batch fallback retry lost its current role link")
+                db.add(
+                    DiscographyBatchItemJob(
+                        item_id=item.id,
+                        job_id=continuation.id,
+                        generation=item.execution_generation,
+                        catalog_track_id=track_id,
+                        ownership=(
+                            DiscographyJobOwnership.created
+                            if created
+                            and context_link.ownership == DiscographyJobOwnership.created
+                            else DiscographyJobOwnership.observed
+                        ),
+                        role=DiscographyBatchJobRole.track_fallback,
+                    )
+                )
         await db.commit()
         committed_ids[:] = attempt_ids
 

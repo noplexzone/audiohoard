@@ -12,7 +12,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.acquisition_claim import AcquisitionDispatchClaim
+from app.models.acquisition_claim import (
+    AcquisitionDispatchClaim,
+    CatalogReleaseAcquisitionClaim,
+)
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -947,6 +950,14 @@ async def resume_discography_batch(
             if targets
             else set()
         )
+        release_root_status = await db.scalar(
+            select(Job.status)
+            .join(
+                CatalogReleaseAcquisitionClaim,
+                CatalogReleaseAcquisitionClaim.job_id == Job.id,
+            )
+            .where(CatalogReleaseAcquisitionClaim.catalog_album_id == album.id)
+        )
         pending = (
             set(
                 int(value)
@@ -968,11 +979,14 @@ async def resume_discography_batch(
         if not targets:
             item.state = DiscographyBatchItemState.complete
             item.reason_code = "verified_complete"
-        elif pending:
+        elif release_root_status == JobStatus.pending or pending:
             # Re-notify durable pending work after pause without spending a retry generation.
             item.state = DiscographyBatchItemState.pending
             item.reason_code = "resume_pending_dispatch"
             reset.append(item.id)
+        elif release_root_status == JobStatus.running:
+            item.state = DiscographyBatchItemState.waiting
+            item.reason_code = "active_release_root"
         elif active:
             item.state = DiscographyBatchItemState.waiting
             item.reason_code = "active_jobs"

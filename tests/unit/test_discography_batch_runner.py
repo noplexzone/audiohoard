@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -22,7 +23,9 @@ from app.models.discography_batch import (
     DiscographyBatchItem,
     DiscographyBatchItemJob,
     DiscographyBatchItemState,
+    DiscographyBatchJobRole,
     DiscographyBatchState,
+    DiscographyJobOwnership,
     DiscographyScopeKind,
 )
 from app.models.job import Job, JobStatus
@@ -71,12 +74,14 @@ async def _seed(factory: async_sessionmaker[AsyncSession], tracks: int = 1) -> t
         return batch.id, item.id
 
 
-async def test_runner_commits_created_jobs_before_dispatch_and_bounds_tick(tmp_path: Path) -> None:
+async def test_runner_materializes_one_release_root_and_second_pass_is_idempotent(
+    tmp_path: Path,
+) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'runner.db'}")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    batch_id, item_id = await _seed(factory, tracks=30)
+    batch_id, item_id = await _seed(factory, tracks=25)
     observed: list[int] = []
 
     async def dispatch(job_id: int) -> None:
@@ -95,21 +100,28 @@ async def test_runner_commits_created_jobs_before_dispatch_and_bounds_tick(tmp_p
 
     runner = DiscographyBatchRunner(factory, dispatcher=dispatch, quality_profile=PROFILE)
     assert await runner.run_once()
-    assert len(observed) == 25
+    assert len(observed) == 1
     async with factory() as db:
         batch = await db.get(DiscographyBatch, batch_id)
         item = await db.get(DiscographyBatchItem, item_id)
         assert batch is not None and batch.state == DiscographyBatchState.running
-        assert item is not None and item.state == DiscographyBatchItemState.pending
-        assert await db.scalar(select(func.count(Job.id))) == 25
-    assert await runner.run_once()
-    assert len(observed) == 30
+        assert item is not None and item.state == DiscographyBatchItemState.waiting
+        root_job = await db.scalar(select(Job))
+        assert root_job is not None
+        assert root_job.catalog_album_id == item.catalog_album_id
+        assert root_job.catalog_track_id is None
+        link = await db.scalar(select(DiscographyBatchItemJob))
+        assert link is not None
+        assert link.role == DiscographyBatchJobRole.release_root
+        assert link.catalog_track_id is None
+        assert link.ownership == DiscographyJobOwnership.created
+        assert await db.scalar(select(func.count(Job.id))) == 1
+    assert not await runner.run_once()
+    assert len(observed) == 1
     async with factory() as db:
-        batch = await db.get(DiscographyBatch, batch_id)
         item = await db.get(DiscographyBatchItem, item_id)
         assert item is not None and item.state == DiscographyBatchItemState.waiting
-        assert batch is not None and batch.state == DiscographyBatchState.running
-        assert await db.scalar(select(func.count(Job.id))) == 30
+        assert await db.scalar(select(func.count(Job.id))) == 1
     await engine.dispose()
 
 
@@ -147,17 +159,49 @@ async def test_terminal_track_is_not_reacquired_while_sibling_remains_active(
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     batch_id, item_id = await _seed(factory, tracks=2)
-    dispatched: list[int] = []
-    runner = DiscographyBatchRunner(factory, dispatcher=dispatched.append, quality_profile=PROFILE)
-
-    assert await runner.run_once()
     async with factory() as db:
-        jobs = list((await db.scalars(select(Job).order_by(Job.catalog_track_id))).all())
-        assert len(jobs) == 2
+        item = await db.get(DiscographyBatchItem, item_id)
+        assert item is not None and item.catalog_album_id is not None
+        tracks = list(
+            await db.scalars(
+                select(CatalogAlbumTrack)
+                .where(CatalogAlbumTrack.album_id == item.catalog_album_id)
+                .order_by(CatalogAlbumTrack.id)
+            )
+        )
+        jobs = [
+            Job(
+                source="priority",
+                query=track.title,
+                status=JobStatus.pending,
+                catalog_album_id=item.catalog_album_id,
+                catalog_track_id=track.id,
+            )
+            for track in tracks
+        ]
+        db.add_all(jobs)
+        await db.flush()
+        db.add_all(
+            [
+                DiscographyBatchItemJob(
+                    item_id=item.id,
+                    job_id=job.id,
+                    generation=1,
+                    catalog_track_id=job.catalog_track_id,
+                    ownership=DiscographyJobOwnership.created,
+                    role=DiscographyBatchJobRole.legacy_track,
+                )
+                for job in jobs
+            ]
+        )
+        item.state = DiscographyBatchItemState.waiting
         jobs[0].status = JobStatus.failed
         jobs[1].status = JobStatus.running
         terminal_track_id = jobs[0].catalog_track_id
         await db.commit()
+
+    dispatched: list[int] = []
+    runner = DiscographyBatchRunner(factory, dispatcher=dispatched.append, quality_profile=PROFILE)
 
     for _ in range(3):
         await runner.run_once()
@@ -201,7 +245,7 @@ async def test_terminal_track_is_not_reacquired_while_sibling_remains_active(
     async with factory() as db:
         item = await db.get(DiscographyBatchItem, item_id)
         assert item is not None and item.execution_generation == 2
-        assert await db.scalar(select(func.count(Job.id))) == 4
+        assert await db.scalar(select(func.count(Job.id))) == 3
         links = list(
             (
                 await db.scalars(
@@ -211,7 +255,7 @@ async def test_terminal_track_is_not_reacquired_while_sibling_remains_active(
                 )
             ).all()
         )
-        assert len(links) == 4
+        assert len(links) == 3
         assert {link.generation for link in links} == {1, 2}
     await engine.dispose()
 
@@ -468,7 +512,7 @@ async def test_expired_hydration_lease_retries_hydration(tmp_path: Path) -> None
     async with factory() as db:
         current = await db.get(DiscographyBatchItem, item_id)
         assert current is not None
-        assert current.reason_code == "active_jobs"
+        assert current.reason_code == "active_release_root"
     await engine.dispose()
 
 
@@ -526,7 +570,7 @@ async def _assert_control_after_expansion(tmp_path: Path, monkeypatch, *, cancel
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     batch_id, item_id = await _seed(factory, tracks=2)
-    real_expand = discography_batch_runner.expand_catalog_album_missing_track_jobs
+    real_expand = discography_batch_runner.materialize_batch_release_root_job
 
     async def expand_then_control(*args, **kwargs):
         outcome = await real_expand(*args, **kwargs)
@@ -538,7 +582,7 @@ async def _assert_control_after_expansion(tmp_path: Path, monkeypatch, *, cancel
         return outcome
 
     monkeypatch.setattr(
-        discography_batch_runner, "expand_catalog_album_missing_track_jobs", expand_then_control
+        discography_batch_runner, "materialize_batch_release_root_job", expand_then_control
     )
     dispatched: list[int] = []
     runner = DiscographyBatchRunner(factory, dispatcher=dispatched.append, quality_profile=PROFILE)
@@ -548,7 +592,7 @@ async def _assert_control_after_expansion(tmp_path: Path, monkeypatch, *, cancel
         item = await db.get(DiscographyBatchItem, item_id)
         batch = await db.get(DiscographyBatch, batch_id)
         jobs = list((await db.scalars(select(Job).order_by(Job.id))).all())
-        assert item is not None and batch is not None and len(jobs) == 2
+        assert item is not None and batch is not None and len(jobs) == 1
         if cancel:
             assert batch.state == DiscographyBatchState.cancelled
             assert item.state == DiscographyBatchItemState.cancelled
@@ -563,10 +607,10 @@ async def _assert_control_after_expansion(tmp_path: Path, monkeypatch, *, cancel
 
     if not cancel:
         monkeypatch.setattr(
-            discography_batch_runner, "expand_catalog_album_missing_track_jobs", real_expand
+            discography_batch_runner, "materialize_batch_release_root_job", real_expand
         )
         assert await runner.run_once()
-        assert len(dispatched) == 2
+        assert len(dispatched) == 1
         async with factory() as db:
             item = await db.get(DiscographyBatchItem, item_id)
             assert item is not None and item.execution_generation == 1
@@ -575,7 +619,7 @@ async def _assert_control_after_expansion(tmp_path: Path, monkeypatch, *, cancel
                     select(Job).where(Job.status.in_((JobStatus.pending, JobStatus.running)))
                 )
             )
-            assert len(active) == 2
+            assert len(active) == 1
     await engine.dispose()
 
 
@@ -692,4 +736,110 @@ async def test_unchanged_waiting_page_does_not_starve_later_terminal_job(
         assert all(item.state == DiscographyBatchItemState.waiting for item in earlier)
         assert later is not None and later.state == DiscographyBatchItemState.failed
         assert later.reason_code == "current_generation_attempts_exhausted"
+    await engine.dispose()
+
+
+async def test_partial_release_root_repairs_missing_fallback_materialization(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'fallback-repair.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    _batch_id, item_id = await _seed(factory, tracks=2)
+    dispatched: list[int] = []
+    runner = DiscographyBatchRunner(factory, dispatcher=dispatched.append, quality_profile=PROFILE)
+
+    assert await runner.run_once()
+    async with factory() as db:
+        root = await db.scalar(select(Job))
+        assert root is not None and root.catalog_track_id is None
+        track_ids = list(
+            await db.scalars(
+                select(CatalogAlbumTrack.id)
+                .where(CatalogAlbumTrack.album_id == root.catalog_album_id)
+                .order_by(CatalogAlbumTrack.id)
+            )
+        )
+        root.status = JobStatus.partial
+        root.result_json = json.dumps({"missing_catalog_track_ids": track_ids})
+        await db.commit()
+
+    assert await runner.run_once()
+    async with factory() as db:
+        jobs = list((await db.scalars(select(Job).order_by(Job.id))).all())
+        links = list(
+            (
+                await db.scalars(
+                    select(DiscographyBatchItemJob)
+                    .where(DiscographyBatchItemJob.item_id == item_id)
+                    .order_by(DiscographyBatchItemJob.id)
+                )
+            ).all()
+        )
+        item = await db.get(DiscographyBatchItem, item_id)
+        assert len(jobs) == 3
+        assert [job.catalog_track_id for job in jobs[1:]] == track_ids
+        assert [link.role for link in links] == [
+            DiscographyBatchJobRole.release_root,
+            DiscographyBatchJobRole.track_fallback,
+            DiscographyBatchJobRole.track_fallback,
+        ]
+        assert item is not None and item.state == DiscographyBatchItemState.waiting
+        assert item.active_count == 2
+    assert dispatched == [jobs[0].id, jobs[1].id, jobs[2].id]
+
+    await runner.run_once()
+    async with factory() as db:
+        assert await db.scalar(select(func.count(Job.id))) == 3
+        assert await db.scalar(select(func.count(DiscographyBatchItemJob.id))) == 3
+    assert dispatched == [jobs[0].id, jobs[1].id, jobs[2].id]
+    await engine.dispose()
+
+
+async def test_active_root_with_fallback_link_fails_closed(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'mixed-owners.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    _batch_id, item_id = await _seed(factory)
+    runner = DiscographyBatchRunner(
+        factory, dispatcher=lambda _job_id: None, quality_profile=PROFILE
+    )
+    assert await runner.run_once()
+    async with factory() as db:
+        item = await db.get(DiscographyBatchItem, item_id)
+        root = await db.scalar(select(Job))
+        assert item is not None and root is not None and item.catalog_album_id is not None
+        track_id = await db.scalar(
+            select(CatalogAlbumTrack.id).where(CatalogAlbumTrack.album_id == item.catalog_album_id)
+        )
+        assert track_id is not None
+        fallback = Job(
+            source="priority",
+            query="fallback",
+            status=JobStatus.pending,
+            catalog_album_id=item.catalog_album_id,
+            catalog_track_id=track_id,
+            parent_job_id=root.id,
+        )
+        db.add(fallback)
+        await db.flush()
+        db.add(
+            DiscographyBatchItemJob(
+                item_id=item.id,
+                job_id=fallback.id,
+                generation=item.execution_generation,
+                catalog_track_id=track_id,
+                ownership=DiscographyJobOwnership.created,
+                role=DiscographyBatchJobRole.track_fallback,
+            )
+        )
+        await db.commit()
+
+    assert await runner.run_once()
+    async with factory() as db:
+        item = await db.get(DiscographyBatchItem, item_id)
+        assert item is not None and item.state == DiscographyBatchItemState.failed
+        assert item.reason_code == "malformed_batch_job_evidence"
     await engine.dispose()
