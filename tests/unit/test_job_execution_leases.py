@@ -768,3 +768,113 @@ async def test_startup_repairs_pending_row_with_stranded_token(lease_factory, mo
         current = await session.get(Job, job_id)
         assert current.execution_token is None and current.execution_lease_expires_at is None
     assert dispatched == [job_id]
+
+
+async def test_heartbeat_ownership_loss_cancels_blocked_execution(
+    lease_factory, test_settings, monkeypatch
+) -> None:
+    job_id = await _seed(lease_factory)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    cleanup_calls = []
+
+    async def blocked(*args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async def cleanup(*args, job_ids, **kwargs):
+        cleanup_calls.append(job_ids)
+
+    from app.services import acquisition_cleanup
+
+    monkeypatch.setattr(runner, "get_session_factory", lambda: lease_factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", blocked)
+    monkeypatch.setattr(acquisition_cleanup, "cleanup_terminal_acquisitions", cleanup)
+    run = asyncio.create_task(runner.run_job(job_id, settings=_fast_settings(test_settings)))
+    await asyncio.wait_for(entered.wait(), 1)
+    async with lease_factory() as takeover:
+        await takeover.execute(
+            update(Job).where(Job.id == job_id).values(execution_token="replacement-token")
+        )
+        await takeover.commit()
+    with pytest.raises(runner.ExecutionLeaseLost, match="heartbeat"):
+        await asyncio.wait_for(run, 1)
+    assert cancelled.is_set()
+    assert cleanup_calls == []
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_terminal_persistence_failure_never_enables_cleanup_or_masks_cancellation(
+    lease_factory, test_settings, monkeypatch, cancelled: bool
+) -> None:
+    job_id = await _seed(lease_factory)
+    cleanup_calls = []
+
+    async def fail(*args, **kwargs):
+        if cancelled:
+            raise asyncio.CancelledError
+        raise RuntimeError("original execution failure")
+
+    async def persistence_failure(*args, **kwargs):
+        raise RuntimeError("terminal persistence failed")
+
+    async def cleanup(*args, job_ids, **kwargs):
+        cleanup_calls.append(job_ids)
+
+    from app.services import acquisition_cleanup
+
+    monkeypatch.setattr(runner, "get_session_factory", lambda: lease_factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", fail)
+    monkeypatch.setattr(runner, "_persist_job_envelope", persistence_failure)
+    monkeypatch.setattr(acquisition_cleanup, "cleanup_terminal_acquisitions", cleanup)
+    expected = asyncio.CancelledError if cancelled else runner.ExecutionLeaseLost
+    with pytest.raises(expected):
+        await runner.run_job(job_id, settings=_fast_settings(test_settings))
+    assert cleanup_calls == []
+    async with lease_factory() as observer:
+        current = await observer.get(Job, job_id)
+        assert current is not None and current.status == JobStatus.running
+
+
+async def test_startup_tokenized_recovery_provenance_survives_watchdog_gaps(
+    lease_factory, monkeypatch
+) -> None:
+    now = datetime.now(UTC)
+    async with lease_factory() as session:
+        job = Job(
+            source="slskd",
+            query="startup gap",
+            status=JobStatus.running,
+            execution_token="expired-startup-owner",
+            execution_lease_expires_at=now - timedelta(seconds=1),
+            updated_at=now,
+        )
+        session.add(job)
+        await session.commit()
+        job_id = job.id
+    dispatcher = JobDispatcher(session_factory=lease_factory)
+    dispatched = []
+
+    async def record(current_job_id):
+        dispatched.append(current_job_id)
+
+    monkeypatch.setattr(dispatcher, "dispatch", record)
+    assert await dispatcher.recover() == [job_id]
+    for expected_attempt in (1, 2):
+        async with lease_factory() as session:
+            current = await session.get(Job, job_id)
+            current.updated_at = datetime.now(UTC) - timedelta(seconds=5)
+            await session.commit()
+        await dispatcher._watchdog_tick(1)
+        async with lease_factory() as session:
+            current = await session.get(Job, job_id)
+            payload = __import__("json").loads(current.result_json)
+            assert current.status == JobStatus.pending
+            assert payload["watchdog_recovery"] == {
+                "attempt": expected_attempt,
+                "origin": "tokenized",
+            }
+    assert dispatched == [job_id, job_id, job_id]

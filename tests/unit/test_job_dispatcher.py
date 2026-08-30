@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 from collections.abc import AsyncGenerator
@@ -1882,3 +1883,27 @@ async def test_dispatcher_logs_and_consumes_execution_lease_loss(
         await asyncio.gather(task, return_exceptions=True)
     assert isinstance(task.exception(), job_runner.ExecutionLeaseLost)
     assert "Job 73 task raised unhandled exception" in caplog.text
+
+
+async def test_fire_and_forget_dispatch_consumes_logged_lease_loss() -> None:
+    contexts: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+
+    async def lost_runner(job_id: int) -> None:
+        raise job_runner.ExecutionLeaseLost(f"job {job_id} lease lost")
+
+    try:
+        dispatcher = JobDispatcher(runner=lost_runner)
+        task = await dispatcher.dispatch(74)
+        await asyncio.wait({task})
+        await asyncio.sleep(0)
+        del task
+        gc.collect()
+        await asyncio.sleep(0)
+        assert not any(
+            context.get("message") == "Task exception was never retrieved" for context in contexts
+        )
+    finally:
+        loop.set_exception_handler(previous_handler)

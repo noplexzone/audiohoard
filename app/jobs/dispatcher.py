@@ -214,6 +214,10 @@ class JobDispatcher:
         def _remove(done_task: asyncio.Task[None]) -> None:
             if self._tasks.get(job_id) is done_task:
                 del self._tasks[job_id]
+            if not done_task.cancelled():
+                # Retrieve the already-logged exception so fire-and-forget dispatch
+                # does not emit "Task exception was never retrieved".
+                done_task.exception()
 
         task.add_done_callback(_remove)
         self._tasks[job_id] = task
@@ -379,6 +383,22 @@ class JobDispatcher:
                         "code": "interrupted_by_restart",
                         "retryable": True,
                     }
+                    if token is not None:
+                        recovery = payload.get("watchdog_recovery")
+                        raw_attempt = (
+                            recovery.get("attempt", 0) if isinstance(recovery, dict) else 0
+                        )
+                        prior_attempt = (
+                            raw_attempt
+                            if isinstance(raw_attempt, int)
+                            and not isinstance(raw_attempt, bool)
+                            and raw_attempt >= 0
+                            else 0
+                        )
+                        payload["watchdog_recovery"] = {
+                            "attempt": prior_attempt,
+                            "origin": "tokenized",
+                        }
                     predicates = [
                         Job.id == job_id,
                         Job.status == JobStatus.running,

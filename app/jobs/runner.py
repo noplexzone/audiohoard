@@ -598,7 +598,7 @@ async def _heartbeat_execution_lease(
 
             await run_with_sqlite_lock_retry(db, heartbeat_once)
         if not alive:
-            return
+            raise ExecutionLeaseLost(f"job {job_id} execution heartbeat lost ownership")
 
 
 async def _prove_execution_lease(db: AsyncSession, job_id: int, token: str) -> None:
@@ -837,8 +837,10 @@ async def run_job(
         name=f"job-{job_id}-heartbeat",
     )
     lease_lost = False
+    terminal_persisted = False
 
     async def execute_owned_work() -> None:
+        nonlocal terminal_persisted
         continuation_ids: list[int] = []
         async with factory() as session:
             continuation = await _invoke_job_execution(
@@ -848,6 +850,10 @@ async def run_job(
                 commit_progress=True,
                 expected_token=execution_token,
             )
+            # Provider/filesystem execution is complete. Stop refreshing before the
+            # terminal token is cleared so a normal terminal commit cannot look like
+            # heartbeat ownership loss while continuations are created.
+            heartbeat_stop.set()
             current = await session.get(Job, job_id)
             if current is None:
                 return
@@ -863,6 +869,7 @@ async def run_job(
             # implementations may leave it pending, so finish that same transaction.
             if current.execution_token == execution_token:
                 await _commit_job_progress(session, current, execution_token)
+            terminal_persisted = True
             if continuation is not None:
                 continuation_ids = await _spawn_continuation_jobs(
                     continuation.parent_job_id,
@@ -893,34 +900,44 @@ async def run_job(
     except asyncio.CancelledError:
         execution_task.cancel()
         await asyncio.gather(execution_task, return_exceptions=True)
-        async with factory() as session:
-            transitioned = await _persist_job_envelope(
-                session,
-                job_id,
-                expected_statuses={JobStatus.pending, JobStatus.running},
-                status=JobStatus.cancelled,
-                result_json=_job_error_result("cancelled", "job", retryable=True),
-                cancel_active_tracks=True,
-                expected_token=execution_token,
-            )
+        try:
+            async with factory() as session:
+                transitioned = await _persist_job_envelope(
+                    session,
+                    job_id,
+                    expected_statuses={JobStatus.pending, JobStatus.running},
+                    status=JobStatus.cancelled,
+                    result_json=_job_error_result("cancelled", "job", retryable=True),
+                    cancel_active_tracks=True,
+                    expected_token=execution_token,
+                )
+        except Exception:
+            logger.exception("Job %d cancellation persistence failed", job_id)
+            transitioned = False
+        terminal_persisted = transitioned
         if not transitioned:
             lease_lost = True
         raise
     except Exception as exc:
         logger.exception("Job %d failed", job_id)
-        async with factory() as session:
-            transitioned = await _persist_job_envelope(
-                session,
-                job_id,
-                expected_statuses={JobStatus.pending, JobStatus.running},
-                status=JobStatus.failed,
-                result_json=_job_error_result("job_failed", "job", retryable=True),
-                expected_token=execution_token,
-            )
+        try:
+            async with factory() as session:
+                transitioned = await _persist_job_envelope(
+                    session,
+                    job_id,
+                    expected_statuses={JobStatus.pending, JobStatus.running},
+                    status=JobStatus.failed,
+                    result_json=_job_error_result("job_failed", "job", retryable=True),
+                    expected_token=execution_token,
+                )
+        except Exception:
+            logger.exception("Job %d failure persistence failed", job_id)
+            transitioned = False
+        terminal_persisted = transitioned
         if not transitioned:
             lease_lost = True
             raise ExecutionLeaseLost(
-                f"job {job_id} execution lease was replaced during failure handling"
+                f"job {job_id} execution lease was replaced or could not be persisted"
             ) from exc
     finally:
         heartbeat_stop.set()
@@ -930,7 +947,7 @@ async def run_job(
             logger.error(
                 "Job %d heartbeat task failed during teardown: %s", job_id, heartbeat_error
             )
-        if not lease_lost:
+        if terminal_persisted and not lease_lost:
             try:
                 from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
 
