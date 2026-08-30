@@ -103,18 +103,23 @@ class BatchFailure:
 
 
 def _batch_failures_query() -> Select[tuple[int, int, str, str, str | None, datetime]]:
-    return select(
-        DiscographyBatchItem.batch_id,
-        DiscographyBatchItem.id.label("item_id"),
-        DiscographyBatchItem.artist_name,
-        DiscographyBatchItem.release_title,
-        DiscographyBatchItem.error_detail,
-        DiscographyBatchItem.updated_at,
-    ).where(
-        DiscographyBatchItem.state == DiscographyBatchItemState.failed,
-        ~DiscographyBatchItem.job_links.any(
-            DiscographyBatchItemJob.ownership == DiscographyJobOwnership.created
-        ),
+    return (
+        select(
+            DiscographyBatchItem.batch_id,
+            DiscographyBatchItem.id.label("item_id"),
+            DiscographyBatchItem.artist_name,
+            DiscographyBatchItem.release_title,
+            DiscographyBatchItem.error_detail,
+            DiscographyBatchItem.updated_at,
+        )
+        .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+        .where(
+            DiscographyBatch.state != DiscographyBatchState.cancelled,
+            DiscographyBatchItem.state == DiscographyBatchItemState.failed,
+            ~DiscographyBatchItem.job_links.any(
+                DiscographyBatchItemJob.ownership == DiscographyJobOwnership.created
+            ),
+        )
     )
 
 

@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Exclude preserved failure history from cancelled discography batches from Activity issue counts and queue-failure pages.
 - Move orphan-history pruning out of startup into bounded writer-friendly periodic batches, and commit legacy catalog reconciliation in small units so background repair cannot starve valid logins.
 - Retry the complete valid-login session transaction across transient SQLite writer locks so startup maintenance cannot turn correct credentials into an internal server error.
 - Fence durable discography batches by exact persisted provider identity, one acquisition attempt per track and execution generation, one equivalent active scope, transitive cancellation, and cancellation-aware continuation admission so bulk queue recovery cannot multiply work or outlive cancellation.
