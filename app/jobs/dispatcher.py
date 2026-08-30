@@ -80,14 +80,21 @@ class JobDispatcher:
         runner: Callable[[int], Coroutine[Any, Any, None]] | None = None,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
         max_concurrent_jobs: int | None = None,
+        max_inflight_jobs: int | None = None,
     ) -> None:
+        if max_inflight_jobs is not None and max_inflight_jobs < 1:
+            raise ValueError("In-flight acquisition limit must be at least 1")
         self._runner: Callable[[int], Coroutine[Any, Any, None]] = (
             runner if runner is not None else _default_runner
         )
         self._session_factory = session_factory
         self._max_concurrent_jobs = max_concurrent_jobs
+        self._max_inflight_jobs = max_inflight_jobs
+        self._derived_inflight_limit = max_inflight_jobs is None
         self._active_jobs = 0
+        self._inflight_jobs = 0
         self._limit_condition = asyncio.Condition()
+        self._inflight_condition = asyncio.Condition()
         self._tasks: dict[int, asyncio.Task[None]] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
@@ -102,12 +109,34 @@ class JobDispatcher:
             self._max_concurrent_jobs = get_settings().max_concurrent_jobs
         return self._max_concurrent_jobs
 
+    def _configured_inflight_limit(self) -> int:
+        if self._derived_inflight_limit:
+            local_limit = self._configured_limit()
+            return max(local_limit, local_limit * 5)
+        assert self._max_inflight_jobs is not None
+        return self._max_inflight_jobs
+
+    @property
+    def active_jobs(self) -> int:
+        return self._active_jobs
+
+    @property
+    def inflight_jobs(self) -> int:
+        return self._inflight_jobs
+
+    @property
+    def max_inflight_jobs(self) -> int:
+        return self._configured_inflight_limit()
+
     async def set_max_concurrent_jobs(self, value: int) -> None:
         if not 1 <= value <= 16:
             raise ValueError("Parallel acquisition limit must be between 1 and 16")
         async with self._limit_condition:
             self._max_concurrent_jobs = value
             self._limit_condition.notify_all()
+        if self._derived_inflight_limit:
+            async with self._inflight_condition:
+                self._inflight_condition.notify_all()
 
     async def _acquire_slot(self) -> None:
         async with self._limit_condition:
@@ -121,15 +150,33 @@ class JobDispatcher:
             self._active_jobs -= 1
             self._limit_condition.notify_all()
 
+    async def _acquire_inflight(self) -> None:
+        async with self._inflight_condition:
+            await self._inflight_condition.wait_for(
+                lambda: self._inflight_jobs < self._configured_inflight_limit()
+            )
+            self._inflight_jobs += 1
+
+    async def _release_inflight(self) -> None:
+        async with self._inflight_condition:
+            self._inflight_jobs -= 1
+            self._inflight_condition.notify_all()
+
     async def _run_with_limit(self, job_id: int) -> None:
+        await self._acquire_inflight()
         permit = AcquisitionPermit(self)
-        await permit.acquire()
-        token = _current_acquisition_permit.set(permit)
+        token: Any = None
         try:
+            await permit.acquire()
+            token = _current_acquisition_permit.set(permit)
             await self._runner(job_id)
         finally:
-            _current_acquisition_permit.reset(token)
-            await permit.release()
+            if token is not None:
+                _current_acquisition_permit.reset(token)
+            try:
+                await permit.release()
+            finally:
+                await self._release_inflight()
 
     async def dispatch(self, job_id: int) -> asyncio.Task[None]:
         existing = self._tasks.get(job_id)

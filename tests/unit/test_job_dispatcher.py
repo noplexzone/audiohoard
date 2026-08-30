@@ -18,7 +18,12 @@ os.environ.setdefault("SECRET_KEY", "test-secret")
 
 from app.database import Base
 from app.jobs import runner as job_runner
-from app.jobs.dispatcher import JobDispatcher, JobNotFoundError, JobNotRetryableError
+from app.jobs.dispatcher import (
+    JobDispatcher,
+    JobNotFoundError,
+    JobNotRetryableError,
+    current_acquisition_permit,
+)
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.track import Track
@@ -927,6 +932,254 @@ async def test_dispatcher_respects_max_concurrent_jobs() -> None:
     release.set()
     await asyncio.gather(*tasks)
     await dispatcher.shutdown()
+
+
+async def _assert_dispatcher_counts(
+    dispatcher: JobDispatcher, *, active: int, inflight: int
+) -> None:
+    await asyncio.sleep(0.02)
+    assert dispatcher.active_jobs == active
+    assert dispatcher.inflight_jobs == inflight
+
+
+async def test_derived_inflight_limit_bounds_yielded_workflows() -> None:
+    entered: list[int] = []
+    five_entered = asyncio.Event()
+    sixth_entered = asyncio.Event()
+    releases = {job_id: asyncio.Event() for job_id in range(1, 7)}
+
+    async def yielded_runner(job_id: int) -> None:
+        permit = current_acquisition_permit()
+        assert permit is not None
+        await permit.yield_permit()
+        entered.append(job_id)
+        if len(entered) == 5:
+            five_entered.set()
+        if job_id == 6:
+            sixth_entered.set()
+        await releases[job_id].wait()
+
+    dispatcher = JobDispatcher(runner=yielded_runner, max_concurrent_jobs=1)
+    tasks = [await dispatcher.dispatch(job_id) for job_id in range(1, 7)]
+
+    await asyncio.wait_for(five_entered.wait(), timeout=1)
+    await asyncio.sleep(0.02)
+    assert 6 not in entered
+    assert not sixth_entered.is_set()
+    assert dispatcher.active_jobs == 0
+    assert dispatcher.inflight_jobs == dispatcher.max_inflight_jobs == 5
+
+    releases[entered[0]].set()
+    await asyncio.wait_for(sixth_entered.wait(), timeout=1)
+
+    for release in releases.values():
+        release.set()
+    await asyncio.gather(*tasks)
+    assert dispatcher.active_jobs == dispatcher.inflight_jobs == 0
+
+
+async def test_yielded_provider_wait_is_inflight_but_not_active_local() -> None:
+    yielded = asyncio.Event()
+    release = asyncio.Event()
+
+    async def yielded_runner(job_id: int) -> None:
+        permit = current_acquisition_permit()
+        assert permit is not None
+        await permit.yield_permit()
+        yielded.set()
+        await release.wait()
+
+    dispatcher = JobDispatcher(runner=yielded_runner, max_concurrent_jobs=1)
+    task = await dispatcher.dispatch(1)
+    await asyncio.wait_for(yielded.wait(), timeout=1)
+
+    assert dispatcher.active_jobs == 0
+    assert dispatcher.inflight_jobs == 1
+
+    release.set()
+    await task
+    assert dispatcher.active_jobs == dispatcher.inflight_jobs == 0
+
+
+async def test_local_resize_updates_derived_inflight_limit_and_admission() -> None:
+    entered: list[int] = []
+    five_entered = asyncio.Event()
+    ten_entered = asyncio.Event()
+    eleventh_entered = asyncio.Event()
+    releases = {job_id: asyncio.Event() for job_id in range(1, 12)}
+
+    async def yielded_runner(job_id: int) -> None:
+        permit = current_acquisition_permit()
+        assert permit is not None
+        await permit.yield_permit()
+        entered.append(job_id)
+        if len(entered) == 5:
+            five_entered.set()
+        if len(entered) == 10:
+            ten_entered.set()
+        if job_id == 11:
+            eleventh_entered.set()
+        await releases[job_id].wait()
+
+    dispatcher = JobDispatcher(runner=yielded_runner, max_concurrent_jobs=1)
+    tasks = [await dispatcher.dispatch(job_id) for job_id in range(1, 11)]
+    await asyncio.wait_for(five_entered.wait(), timeout=1)
+    assert dispatcher.max_inflight_jobs == dispatcher.inflight_jobs == 5
+
+    await dispatcher.set_max_concurrent_jobs(2)
+    await asyncio.wait_for(ten_entered.wait(), timeout=1)
+    assert dispatcher.max_inflight_jobs == dispatcher.inflight_jobs == 10
+
+    await dispatcher.set_max_concurrent_jobs(1)
+    eleventh = await dispatcher.dispatch(11)
+    await asyncio.sleep(0.02)
+    assert dispatcher.max_inflight_jobs == 5
+    assert dispatcher.inflight_jobs == 10
+    assert not eleventh_entered.is_set()
+
+    for job_id in entered[:5]:
+        releases[job_id].set()
+    await asyncio.gather(*(tasks[job_id - 1] for job_id in entered[:5]))
+    assert dispatcher.inflight_jobs == 5
+    assert not eleventh_entered.is_set()
+
+    releases[entered[5]].set()
+    await asyncio.wait_for(eleventh_entered.wait(), timeout=1)
+
+    for release in releases.values():
+        release.set()
+    await asyncio.gather(*tasks, eleventh)
+    assert dispatcher.active_jobs == dispatcher.inflight_jobs == 0
+
+
+async def test_explicit_inflight_limit_stays_fixed_across_local_resize() -> None:
+    entered: list[int] = []
+    two_entered = asyncio.Event()
+    third_entered = asyncio.Event()
+    releases = {job_id: asyncio.Event() for job_id in (1, 2, 3)}
+
+    async def yielded_runner(job_id: int) -> None:
+        permit = current_acquisition_permit()
+        assert permit is not None
+        await permit.yield_permit()
+        entered.append(job_id)
+        if len(entered) == 2:
+            two_entered.set()
+        if job_id == 3:
+            third_entered.set()
+        await releases[job_id].wait()
+
+    dispatcher = JobDispatcher(runner=yielded_runner, max_concurrent_jobs=1, max_inflight_jobs=2)
+    tasks = [await dispatcher.dispatch(job_id) for job_id in (1, 2, 3)]
+    await asyncio.wait_for(two_entered.wait(), timeout=1)
+
+    await dispatcher.set_max_concurrent_jobs(2)
+    await asyncio.sleep(0.02)
+    assert dispatcher.max_inflight_jobs == dispatcher.inflight_jobs == 2
+    assert not third_entered.is_set()
+
+    releases[entered[0]].set()
+    await asyncio.wait_for(third_entered.wait(), timeout=1)
+    for release in releases.values():
+        release.set()
+    await asyncio.gather(*tasks)
+    assert dispatcher.active_jobs == dispatcher.inflight_jobs == 0
+
+
+@pytest.mark.parametrize("boundary", ["workflow", "local", "yielded", "runner"])
+async def test_cancellation_at_admission_boundaries_releases_owned_capacity(
+    boundary: str,
+) -> None:
+    first_started = asyncio.Event()
+    yielded = asyncio.Event()
+    release_first = asyncio.Event()
+    later_ran = asyncio.Event()
+
+    async def controlled_runner(job_id: int) -> None:
+        if job_id == 99:
+            later_ran.set()
+            return
+        if job_id == 1:
+            first_started.set()
+        if boundary == "yielded":
+            permit = current_acquisition_permit()
+            assert permit is not None
+            await permit.yield_permit()
+            yielded.set()
+        await release_first.wait()
+
+    explicit_inflight = 1 if boundary == "workflow" else 2
+    dispatcher = JobDispatcher(
+        runner=controlled_runner,
+        max_concurrent_jobs=1,
+        max_inflight_jobs=explicit_inflight,
+    )
+    first = await dispatcher.dispatch(1)
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    if boundary == "workflow":
+        target = await dispatcher.dispatch(2)
+        await _assert_dispatcher_counts(dispatcher, active=1, inflight=1)
+    elif boundary == "local":
+        target = await dispatcher.dispatch(2)
+        await _assert_dispatcher_counts(dispatcher, active=1, inflight=2)
+    else:
+        target = first
+        if boundary == "yielded":
+            await asyncio.wait_for(yielded.wait(), timeout=1)
+            await _assert_dispatcher_counts(dispatcher, active=0, inflight=1)
+        else:
+            await _assert_dispatcher_counts(dispatcher, active=1, inflight=1)
+
+    target.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await target
+    release_first.set()
+    if first is not target:
+        await first
+    await _assert_dispatcher_counts(dispatcher, active=0, inflight=0)
+
+    later = await dispatcher.dispatch(99)
+    await asyncio.wait_for(later, timeout=1)
+    assert later_ran.is_set()
+    assert dispatcher.active_jobs == dispatcher.inflight_jobs == 0
+
+
+async def test_all_yielded_inflight_workflows_do_not_block_local_reacquisition() -> None:
+    yielded_jobs: set[int] = set()
+    all_yielded = asyncio.Event()
+    reacquire = asyncio.Event()
+    reacquired = asyncio.Event()
+    release_others = asyncio.Event()
+
+    async def yielded_runner(job_id: int) -> None:
+        permit = current_acquisition_permit()
+        assert permit is not None
+        await permit.yield_permit()
+        yielded_jobs.add(job_id)
+        if len(yielded_jobs) == 3:
+            all_yielded.set()
+        if job_id == 1:
+            await reacquire.wait()
+            await permit.acquire()
+            reacquired.set()
+            return
+        await release_others.wait()
+
+    dispatcher = JobDispatcher(runner=yielded_runner, max_concurrent_jobs=1, max_inflight_jobs=3)
+    tasks = [await dispatcher.dispatch(job_id) for job_id in (1, 2, 3)]
+    await asyncio.wait_for(all_yielded.wait(), timeout=1)
+    assert dispatcher.active_jobs == 0
+    assert dispatcher.inflight_jobs == 3
+
+    reacquire.set()
+    await asyncio.wait_for(reacquired.wait(), timeout=1)
+    await tasks[0]
+    assert dispatcher.inflight_jobs == 2
+
+    release_others.set()
+    await asyncio.gather(*tasks)
+    assert dispatcher.active_jobs == dispatcher.inflight_jobs == 0
 
 
 async def test_increasing_parallel_limit_starts_waiting_jobs() -> None:
