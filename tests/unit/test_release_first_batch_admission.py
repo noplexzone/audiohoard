@@ -651,3 +651,62 @@ async def test_active_release_claim_cannot_mask_malformed_track_claim(tmp_path: 
         async with factory() as observer:
             assert await observer.scalar(select(func.count(Job.id))) == 2
             assert await observer.scalar(select(func.count(DiscographyBatchItemJob.id))) == 0
+
+
+async def test_no_work_cannot_mask_malformed_same_generation_root_link(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "library" / "owned.flac"
+    destination.parent.mkdir()
+    destination.write_bytes(b"owned")
+    async with _database(tmp_path / "no-work-malformed-link.db") as factory:
+        async with factory() as seed:
+            album, (item,) = await _seed(seed, track_count=1)
+            exact_track_job = Job(
+                source="fixture",
+                query="owned",
+                status=JobStatus.done,
+                catalog_album=album,
+                catalog_track=album.tracks[0],
+            )
+            release = Release(job=exact_track_job, source="fixture", title=album.title)
+            track = Track(
+                job=exact_track_job,
+                release=release,
+                source="fixture",
+                catalog_album=album,
+                catalog_track=album.tracks[0],
+                import_state=ImportWorkflowState.imported,
+                acquisition_state=AcquisitionState.downloaded,
+                file_format="flac",
+                file_size_bytes=5,
+            )
+            seed.add(
+                ImportPlan(
+                    release=release,
+                    track=track,
+                    source_path=str(destination),
+                    destination_path=str(destination),
+                    status=ImportWorkflowState.imported,
+                    file_state=LibraryFileState.present,
+                )
+            )
+            await seed.flush()
+            seed.add(
+                DiscographyBatchItemJob(
+                    item_id=item.id,
+                    job_id=exact_track_job.id,
+                    generation=1,
+                    catalog_track_id=None,
+                    ownership=DiscographyJobOwnership.created,
+                    role=DiscographyBatchJobRole.release_root,
+                )
+            )
+            await seed.commit()
+            item_id = item.id
+        async with factory() as db:
+            with pytest.raises(ValueError, match="release-root link"):
+                await _admit(db, item_id, library_root=destination.parent)
+        async with factory() as observer:
+            assert await observer.scalar(select(func.count(Job.id))) == 1
+            assert await observer.scalar(select(func.count(DiscographyBatchItemJob.id))) == 1

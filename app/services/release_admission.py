@@ -307,15 +307,6 @@ async def materialize_batch_release_root_job(
         if active_release_owner is not None and blocking_job_ids:
             raise ValueError("competing active release and exact-track claims")
 
-        if not target_track_ids:
-            await db.commit()
-            result = ReleaseRootAdmissionResult(
-                status=ReleaseRootAdmissionStatus.no_work,
-                job_id=None,
-                target_track_ids=(),
-            )
-            return
-
         existing_root = (
             await db.execute(
                 select(DiscographyBatchItemJob.job_id, Job)
@@ -340,6 +331,15 @@ async def materialize_batch_release_root_job(
                 status=ReleaseRootAdmissionStatus.observed,
                 job_id=int(existing_job_id),
                 target_track_ids=target_track_ids,
+            )
+            return
+
+        if not target_track_ids:
+            await db.commit()
+            result = ReleaseRootAdmissionResult(
+                status=ReleaseRootAdmissionStatus.no_work,
+                job_id=None,
+                target_track_ids=(),
             )
             return
 
