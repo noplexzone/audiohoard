@@ -598,6 +598,8 @@ async def _heartbeat_execution_lease(
 
             await run_with_sqlite_lock_retry(db, heartbeat_once)
         if not alive:
+            if stop.is_set():
+                return
             raise ExecutionLeaseLost(f"job {job_id} execution heartbeat lost ownership")
 
 
@@ -622,8 +624,18 @@ async def _prove_execution_lease(db: AsyncSession, job_id: int, token: str) -> N
         raise ExecutionLeaseLost(f"job {job_id} execution lease was replaced")
 
 
-async def _commit_job_progress(db: AsyncSession, job: Job, expected_token: str) -> None:
+async def _commit_job_progress(
+    db: AsyncSession,
+    job: Job,
+    expected_token: str,
+    heartbeat_stop: asyncio.Event | None = None,
+) -> None:
     """Fence and commit one complete background progress or terminal transaction."""
+    if job.status in _TERMINAL_JOB_STATUSES and heartbeat_stop is not None:
+        # Stop renewal before the terminal CAS clears the token. The token fence
+        # serializes any heartbeat already inside its update; a zero-row heartbeat
+        # after this request is therefore normal terminal shutdown, not lease loss.
+        heartbeat_stop.set()
     connection = await db.connection()
     with contextlib.suppress(Exception):
         await connection.exec_driver_sql("PRAGMA busy_timeout=200")
@@ -724,9 +736,19 @@ async def _invoke_job_execution(
     *,
     commit_progress: bool,
     expected_token: str | None,
+    heartbeat_stop: asyncio.Event | None = None,
 ) -> _ContinuationRequest | None:
     """Invoke the execution seam without replaying work to infer hook compatibility."""
     parameters = inspect.signature(_run_job_in_session).parameters
+    if "heartbeat_stop" in parameters:
+        return await _run_job_in_session(
+            job_id,
+            db,
+            cfg,
+            commit_progress=commit_progress,
+            expected_token=expected_token,
+            heartbeat_stop=heartbeat_stop,
+        )
     if "expected_token" in parameters:
         return await _run_job_in_session(
             job_id,
@@ -849,6 +871,7 @@ async def run_job(
                 cfg,
                 commit_progress=True,
                 expected_token=execution_token,
+                heartbeat_stop=heartbeat_stop,
             )
             # Provider/filesystem execution is complete. Stop refreshing before the
             # terminal token is cleared so a normal terminal commit cannot look like
@@ -973,6 +996,7 @@ async def _run_job_in_session(
     *,
     commit_progress: bool = False,
     expected_token: str | None = None,
+    heartbeat_stop: asyncio.Event | None = None,
 ) -> _ContinuationRequest | None:
     job = await db.get(Job, job_id)
     if job is None:
@@ -983,7 +1007,7 @@ async def _run_job_in_session(
         if expected_token is None:
             await db.commit()
         else:
-            await _commit_job_progress(db, job, expected_token)
+            await _commit_job_progress(db, job, expected_token, heartbeat_stop=heartbeat_stop)
 
     if job.catalog_album_id is not None and job.catalog_track_id is not None:
         from app.services.acquisition_ownership import (

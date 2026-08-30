@@ -878,3 +878,67 @@ async def test_startup_tokenized_recovery_provenance_survives_watchdog_gaps(
                 "origin": "tokenized",
             }
     assert dispatched == [job_id, job_id, job_id]
+
+
+async def test_normal_terminal_token_clear_cannot_cancel_continuation_creation(
+    lease_factory, test_settings, monkeypatch
+) -> None:
+    job_id = await _seed(lease_factory)
+    terminal_committed = asyncio.Event()
+    allow_return = asyncio.Event()
+    spawned = asyncio.Event()
+    dispatched: list[int] = []
+
+    async def terminal_then_pause(
+        current_job_id,
+        session,
+        cfg,
+        *,
+        commit_progress=False,
+        expected_token=None,
+        heartbeat_stop=None,
+    ):
+        assert expected_token is not None and heartbeat_stop is not None
+        current = await session.get(Job, current_job_id)
+        assert current is not None
+        current.status = JobStatus.partial
+        await runner._commit_job_progress(
+            session,
+            current,
+            expected_token,
+            heartbeat_stop=heartbeat_stop,
+        )
+        terminal_committed.set()
+        await allow_return.wait()
+        return runner._ContinuationRequest(
+            parent_job_id=current_job_id,
+            catalog_album_id=123,
+            missing_catalog_track_ids=(456,),
+        )
+
+    async def spawn(*args, **kwargs):
+        spawned.set()
+        return [789]
+
+    async def dispatch(ids):
+        dispatched.extend(ids)
+
+    await _disable_cleanup(monkeypatch)
+    monkeypatch.setattr(runner, "get_session_factory", lambda: lease_factory)
+    monkeypatch.setattr(runner, "_run_job_in_session", terminal_then_pause)
+    monkeypatch.setattr(runner, "_spawn_continuation_jobs", spawn)
+    monkeypatch.setattr(runner, "_dispatch_continuation_jobs", dispatch)
+
+    run = asyncio.create_task(runner.run_job(job_id, settings=_fast_settings(test_settings)))
+    await asyncio.wait_for(terminal_committed.wait(), 1)
+    await asyncio.sleep(0.25)
+    assert not run.done()
+    allow_return.set()
+    await asyncio.wait_for(run, 1)
+    assert spawned.is_set()
+    assert dispatched == [789]
+    async with lease_factory() as observer:
+        current = await observer.get(Job, job_id)
+        assert current is not None
+        assert current.status == JobStatus.partial
+        assert current.execution_token is None
