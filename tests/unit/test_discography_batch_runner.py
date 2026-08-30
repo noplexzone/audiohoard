@@ -843,3 +843,55 @@ async def test_active_root_with_fallback_link_fails_closed(tmp_path: Path) -> No
         assert item is not None and item.state == DiscographyBatchItemState.failed
         assert item.reason_code == "malformed_batch_job_evidence"
     await engine.dispose()
+
+
+async def test_resume_redispatches_pending_fallback_suppressed_while_paused(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'resume-fallback.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    batch_id, item_id = await _seed(factory)
+    dispatched: list[int] = []
+    runner = DiscographyBatchRunner(factory, dispatcher=dispatched.append, quality_profile=PROFILE)
+    assert await runner.run_once()
+    async with factory() as db:
+        item = await db.get(DiscographyBatchItem, item_id)
+        root = await db.scalar(select(Job))
+        assert item is not None and root is not None and item.catalog_album_id is not None
+        track_id = await db.scalar(
+            select(CatalogAlbumTrack.id).where(CatalogAlbumTrack.album_id == item.catalog_album_id)
+        )
+        assert track_id is not None
+        root.status = JobStatus.partial
+        fallback = Job(
+            source="priority",
+            query="fallback",
+            status=JobStatus.pending,
+            catalog_album_id=item.catalog_album_id,
+            catalog_track_id=track_id,
+            parent_job_id=root.id,
+        )
+        db.add(fallback)
+        await db.flush()
+        db.add(
+            DiscographyBatchItemJob(
+                item_id=item.id,
+                job_id=fallback.id,
+                generation=item.execution_generation,
+                catalog_track_id=track_id,
+                ownership=DiscographyJobOwnership.created,
+                role=DiscographyBatchJobRole.track_fallback,
+            )
+        )
+        await db.commit()
+        fallback_id = fallback.id
+    async with factory() as db:
+        await pause_discography_batch(db, batch_id)
+        outcome = await resume_discography_batch(db, batch_id, quality_profile=PROFILE)
+        assert outcome.reset_item_ids == (item_id,)
+
+    assert await runner.run_once()
+    assert dispatched == [1, fallback_id]
+    await engine.dispose()

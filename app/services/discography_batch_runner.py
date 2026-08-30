@@ -223,7 +223,7 @@ class DiscographyBatchRunner:
                     quality_profile=profile,
                     library_root=self._library_root,
                 )
-                dispatch_ids = (
+                root_dispatch_ids = (
                     (outcome.job_id,)
                     if outcome.job_id is not None
                     and (
@@ -235,6 +235,31 @@ class DiscographyBatchRunner:
                     )
                     else ()
                 )
+                fallback_dispatch_ids: tuple[int, ...] = ()
+                if renotify_observed and outcome.job_id is not None:
+                    root_status = await db.scalar(
+                        select(Job.status).where(Job.id == outcome.job_id)
+                    )
+                    if root_status == JobStatus.partial:
+                        fallback_dispatch_ids = tuple(
+                            int(value)
+                            for value in (
+                                await db.scalars(
+                                    select(DiscographyBatchItemJob.job_id)
+                                    .join(Job, Job.id == DiscographyBatchItemJob.job_id)
+                                    .where(
+                                        DiscographyBatchItemJob.item_id == item.id,
+                                        DiscographyBatchItemJob.generation
+                                        == item.execution_generation,
+                                        DiscographyBatchItemJob.role
+                                        == DiscographyBatchJobRole.track_fallback,
+                                        Job.status == JobStatus.pending,
+                                    )
+                                    .order_by(DiscographyBatchItemJob.id)
+                                )
+                            ).all()
+                        )
+                dispatch_ids = tuple(dict.fromkeys((*root_dispatch_ids, *fallback_dispatch_ids)))
 
             # Expansion commits links and jobs. Dispatch is deliberately
             # after the session closes. Pending observed jobs are included so
