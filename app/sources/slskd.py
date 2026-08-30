@@ -56,7 +56,7 @@ class _DownloadSnapshot:
     in_flight: asyncio.Task[list[dict[str, object]]] | None = None
 
 
-_SearchKey = tuple[str, bytes, str, str, int]
+_SearchKey = tuple[str, bytes, str, str, int, float]
 
 
 @dataclass
@@ -247,7 +247,14 @@ class SlskdAdapter:
     def _search_snapshot_key(self, search_text: str, mode: str, file_limit: int) -> _SearchKey:
         normalized_endpoint = str(httpx.URL(self._base_url)).rstrip("/")
         credential_digest = hashlib.sha256(self._api_key.encode()).digest()
-        return normalized_endpoint, credential_digest, search_text, mode, file_limit
+        return (
+            normalized_endpoint,
+            credential_digest,
+            search_text,
+            mode,
+            file_limit,
+            self._search_timeout_sec,
+        )
 
     async def _fetch_raw_search(self, search_text: str, file_limit: int) -> bytes:
         """Run one provider search and serialize its raw JSON as immutable bytes."""

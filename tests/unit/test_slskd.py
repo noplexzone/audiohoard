@@ -1130,3 +1130,13 @@ class TestSlskdTransfers:
         assert "key123" not in exc_info.value.message
         assert "do-not-expose" not in exc_info.value.message
         assert "?" not in exc_info.value.message
+
+
+async def test_search_coalescing_key_isolates_timeout_policy() -> None:
+    interactive = SlskdAdapter("http://slskd.local", "key", search_timeout_sec=60)
+    durable = SlskdAdapter("http://slskd.local", "key", search_timeout_sec=900)
+
+    interactive_key = interactive._search_snapshot_key("same query", "ordinary", 100)
+    durable_key = durable._search_snapshot_key("same query", "ordinary", 100)
+
+    assert interactive_key != durable_key

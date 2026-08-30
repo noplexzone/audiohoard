@@ -1054,14 +1054,13 @@ async def expand_catalog_album_missing_track_jobs(
         ).one_or_none()
         if release_claim is not None:
             _claim, release_owner = release_claim
-            if release_owner is not None and release_owner.status in _ACTIVE_JOB_STATUSES:
-                if (
-                    release_owner.catalog_album_id != album_id
-                    or release_owner.catalog_track_id is not None
-                ):
-                    raise ValueError(
-                        "active catalog release claim does not own an exact release root"
-                    )
+            if (
+                release_owner is None
+                or release_owner.catalog_album_id != album_id
+                or release_owner.catalog_track_id is not None
+            ):
+                raise ValueError("catalog release claim does not own an exact release root")
+            if release_owner.status in _ACTIVE_JOB_STATUSES:
                 observed.append(release_owner.id)
                 await db.commit()
                 return
@@ -1103,8 +1102,14 @@ async def expand_catalog_album_missing_track_jobs(
                 )
             ).one_or_none()
             if claim is not None:
-                claim_row, owner = claim
-                if owner is not None and owner.status in _ACTIVE_JOB_STATUSES:
+                _claim_row, owner = claim
+                if (
+                    owner is None
+                    or owner.catalog_album_id != album_id
+                    or owner.catalog_track_id != track.id
+                ):
+                    raise ValueError("catalog acquisition claim does not own the exact track")
+                if owner.status in _ACTIVE_JOB_STATUSES:
                     observed.append(owner.id)
                     await _link_discography_job(
                         db,
@@ -1115,9 +1120,6 @@ async def expand_catalog_album_missing_track_jobs(
                         DiscographyJobOwnership.observed,
                     )
                     continue
-                if owner is None:
-                    await db.delete(claim_row)
-                    await db.flush()
             if len(created) >= new_job_limit:
                 continue
 
