@@ -116,6 +116,64 @@ async def test_serialized_startup_recovery_does_not_delay_readiness(
     assert startup_order == ["recover-deletions", "catalog"]
 
 
+async def test_discography_batch_runner_starts_before_blocked_service_initial_cycles(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    batch_started = asyncio.Event()
+    maintenance_started = asyncio.Event()
+
+    class _BlockedMaintenance(_Service):
+        async def start(self, **kwargs) -> None:
+            assert kwargs == {"wait_for_initial_cycle": True}
+            maintenance_started.set()
+            await asyncio.Event().wait()
+
+    class _BatchRunner(_Service):
+        async def start(self, **kwargs) -> None:
+            assert kwargs == {"wait_for_initial_cycle": False}
+            batch_started.set()
+
+    monkeypatch.setattr(main, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(
+        main,
+        "get_runtime_settings",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                max_parallel_acquisitions=1,
+                acoustid_acceptance_threshold=0.91,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "build_effective_settings",
+        AsyncMock(return_value=Settings(secret_key="test-secret")),
+    )
+    monkeypatch.setattr(main, "recover_deletion_operations", AsyncMock())
+    monkeypatch.setattr(main, "_run_startup_database_maintenance", AsyncMock())
+    monkeypatch.setattr(main, "_reconcile_catalog_ownership_at_startup", AsyncMock())
+    monkeypatch.setattr(main, "_run_library_reconciliation_at_startup", AsyncMock())
+    monkeypatch.setattr(main, "DiscographyRefreshScheduler", _Service)
+    monkeypatch.setattr(main, "MaintenanceScheduler", _BlockedMaintenance)
+    monkeypatch.setattr(main, "MonitoringScheduler", _Service)
+    monkeypatch.setattr(main, "QualityUpgradeCycleScheduler", _Service)
+    monkeypatch.setattr(main, "ReviewAutomationScheduler", _Service)
+    monkeypatch.setattr(main, "LibraryAdoptionRunner", _Service)
+    monkeypatch.setattr(main, "DiscographyBatchRunner", _BatchRunner)
+    monkeypatch.setattr(main, "LibraryReconciliationService", _Service)
+    monkeypatch.setattr(main, "get_health_status_service", lambda: _Service())
+    monkeypatch.setattr(main.job_dispatcher, "set_max_concurrent_jobs", AsyncMock())
+    monkeypatch.setattr(main.job_dispatcher, "shutdown", AsyncMock())
+
+    app = FastAPI()
+    async with main.lifespan(app):
+        async with asyncio.timeout(1):
+            await maintenance_started.wait()
+            await batch_started.wait()
+
+
 async def test_startup_database_maintenance_runs_reconciliation_with_active_jobs(
     db_session: AsyncSession, monkeypatch
 ) -> None:
