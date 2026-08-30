@@ -363,12 +363,6 @@ async def _poll_slskd_transfer(
                 )
             state = await adapter.status(transfer_id)
 
-            provider_id = state.extra.get("id") or state.extra.get("transferId")
-            if provider_id is not None and str(provider_id) != transfer_id:
-                transfer_id = str(provider_id)
-                if on_provider_id is not None:
-                    await on_provider_id(transfer_id)
-
             acq_state = map_slskd_transfer_state(state)
             externally_queued = acq_state in {
                 AcquisitionState.queued,
@@ -376,6 +370,12 @@ async def _poll_slskd_transfer(
             }
             if permit is not None and not externally_queued:
                 await permit.acquire()
+
+            provider_id = state.extra.get("id") or state.extra.get("transferId")
+            if provider_id is not None and str(provider_id) != transfer_id:
+                transfer_id = str(provider_id)
+                if on_provider_id is not None:
+                    await on_provider_id(transfer_id)
             if on_provider_state is not None:
                 await on_provider_state(acq_state)
             if permit is not None and externally_queued:

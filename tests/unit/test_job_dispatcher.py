@@ -1299,6 +1299,75 @@ async def test_queued_transfer_reacquires_before_active_completion(tmp_path: Pat
     assert dispatcher._active_jobs == 0
 
 
+@pytest.mark.parametrize("transition_state", ["InProgress", "Completed"])
+async def test_queued_transfer_reacquires_before_provider_id_checkpoint(
+    tmp_path: Path, transition_state: str
+) -> None:
+    queued = asyncio.Event()
+    allow_transition = asyncio.Event()
+    second_holds_slot = asyncio.Event()
+    release_second = asyncio.Event()
+    provider_id_checkpointed = asyncio.Event()
+    checkpoint_active_jobs: list[int] = []
+    staged = tmp_path / "song.flac"
+    staged.write_bytes(b"audio")
+    status_calls = 0
+
+    class Adapter:
+        async def status(self, transfer_id: str) -> CapabilityState:
+            nonlocal status_calls
+            status_calls += 1
+            if status_calls == 1:
+                queued.set()
+                return CapabilityState(True, "Queued")
+            await allow_transition.wait()
+            if status_calls == 2:
+                return CapabilityState(True, transition_state, {"id": "canonical-provider-uuid"})
+            return CapabilityState(True, "Completed", {"id": "canonical-provider-uuid"})
+
+        async def cancel(self, *args, **kwargs) -> bool:
+            return True
+
+    dispatcher: JobDispatcher
+
+    async def on_provider_id(provider_id: str) -> None:
+        assert provider_id == "canonical-provider-uuid"
+        checkpoint_active_jobs.append(dispatcher._active_jobs)
+        provider_id_checkpointed.set()
+
+    async def controlled_runner(job_id: int) -> None:
+        if job_id == 1:
+            await job_runner._poll_slskd_transfer(
+                "transfer-1",
+                "peer",
+                staged.name,
+                Adapter(),  # type: ignore[arg-type]
+                tmp_path,
+                0.001,
+                1,
+                on_provider_id,
+            )
+        else:
+            second_holds_slot.set()
+            await release_second.wait()
+
+    dispatcher = JobDispatcher(runner=controlled_runner, max_concurrent_jobs=1)
+    first = await dispatcher.dispatch(1)
+    second = await dispatcher.dispatch(2)
+    await asyncio.wait_for(queued.wait(), timeout=1)
+    await asyncio.wait_for(second_holds_slot.wait(), timeout=1)
+    allow_transition.set()
+    await asyncio.sleep(0.02)
+
+    assert not provider_id_checkpointed.is_set()
+    assert not first.done()
+
+    release_second.set()
+    await asyncio.gather(first, second)
+    assert checkpoint_active_jobs == [1]
+    assert dispatcher._active_jobs == 0
+
+
 async def test_queued_transfer_reacquires_before_non_cancellation_error(tmp_path: Path) -> None:
     queued = asyncio.Event()
     fail = asyncio.Event()

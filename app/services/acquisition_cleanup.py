@@ -1302,29 +1302,39 @@ async def reconcile_terminal_slskd_intents(
                     ProviderTransferState.queued,
                     ProviderTransferState.downloading,
                 )
-                owned = await db.scalar(
-                    select(AcquisitionAttempt.id).where(
-                        AcquisitionAttempt.id != attempt.id,
-                        AcquisitionAttempt.provider == "slskd",
-                        or_(
-                            AcquisitionAttempt.provider_uuid == discovered,
-                            and_(
+                ownership_candidates = list(
+                    (
+                        await db.scalars(
+                            select(AcquisitionAttempt).where(
+                                AcquisitionAttempt.id != attempt.id,
+                                AcquisitionAttempt.provider == "slskd",
                                 or_(
-                                    AcquisitionAttempt.provisional_transfer_id == fallback_id,
+                                    AcquisitionAttempt.provider_uuid == discovered,
                                     and_(
                                         AcquisitionAttempt.peer == peer,
-                                        AcquisitionAttempt.remote_path == remote_path,
+                                        or_(
+                                            AcquisitionAttempt.terminal_at.is_(None),
+                                            AcquisitionAttempt.provider_state.in_(
+                                                active_provider_states
+                                            ),
+                                        ),
                                     ),
                                 ),
-                                or_(
-                                    AcquisitionAttempt.terminal_at.is_(None),
-                                    AcquisitionAttempt.provider_state.in_(active_provider_states),
-                                ),
-                            ),
-                        ),
-                    )
+                            )
+                        )
+                    ).all()
                 )
-                if owned is not None:
+                normalized_remote_path = _normalized_remote_path(remote_path)
+                owned = any(
+                    canonical_provider_uuid(candidate.provider_uuid) == discovered
+                    or (
+                        candidate.peer == peer
+                        and _normalized_remote_path(candidate.remote_path)
+                        == normalized_remote_path
+                    )
+                    for candidate in ownership_candidates
+                )
+                if owned:
                     logger.warning(
                         "terminal slskd enqueue-intent UUID or provisional "
                         "generation already owned"
