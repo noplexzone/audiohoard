@@ -276,7 +276,7 @@ class DiscographyBatchItemJob(Base):
             unique=True,
             sqlite_where=text("role = 'release_root'"),
             postgresql_where=text("role = 'release_root'"),
-        ),
+        ).ddl_if(dialect=("sqlite", "postgresql")),  # type: ignore[arg-type]
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
