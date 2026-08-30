@@ -13,6 +13,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Reconcile terminal jobs whose exact durable slskd attempts remain queued or downloading through fresh canonical UUID, peer, and normalized-path ownership checks before centralized provider cleanup.
 - Fence background job execution with durable tokens, expiring leases, independent heartbeats, atomic terminal ownership checks, and cancellation-safe dispatcher admission release.
 - Bound externally queued provider workflows separately from active local acquisition slots without leaking capacity during cancellation.
+- Coalesce identical raw slskd searches through event-loop-local immutable snapshots and bounded saturation backpressure without sharing tasks across event loops.
 - Start the durable discography batch runner non-blockingly after serialized startup recovery so long maintenance and reconciliation initial cycles cannot leave persisted batches queued.
 - Exclude preserved failure history from cancelled discography batches from Activity issue counts and queue-failure pages.
 - Move orphan-history pruning out of startup into bounded writer-friendly periodic batches, and commit legacy catalog reconciliation in small units so background repair cannot starve valid logins.
