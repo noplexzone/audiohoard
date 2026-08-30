@@ -904,9 +904,19 @@ async def _transfer_shared_created_job_ownership(db: AsyncSession, batch_id: int
 async def cancel_discography_batch(
     db: AsyncSession, batch_id: int
 ) -> DiscographyBatchControlResult:
+    reject_pending_orm_changes(db)
+    await db.rollback()
+    if db.get_bind().dialect.name == "sqlite":
+        # Ownership transfer and physical cancellation form one writer decision.
+        # A deferred SQLite transaction lets concurrent cancellations both act on
+        # stale ownership, so reserve the writer before reading either batch.
+        await db.execute(text("BEGIN IMMEDIATE"))
     batch = await db.get(DiscographyBatch, batch_id)
     if batch is None:
         raise DiscographyScopeError("discography batch does not exist")
+    if batch.state == DiscographyBatchState.cancelled:
+        await db.commit()
+        return DiscographyBatchControlResult(batch.id, batch.state)
     if batch.state not in {
         DiscographyBatchState.queued,
         DiscographyBatchState.running,

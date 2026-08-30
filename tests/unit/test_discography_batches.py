@@ -885,3 +885,82 @@ async def test_cancel_fails_closed_on_malformed_created_ownership(
         assert stored_batch is not None and stored_batch.state == DiscographyBatchState.running
         assert stored_root is not None and stored_root.status == JobStatus.pending
     await engine.dispose()
+
+
+async def test_concurrent_shared_owner_cancellation_cannot_strand_pending_job(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'concurrent-cancel.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as db:
+        artist = CatalogArtist(name="Artist")
+        album = CatalogAlbum(artist=artist, title="Album", track_count=1)
+        track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+        root = Job(
+            source="priority",
+            query="Artist Album",
+            status=JobStatus.pending,
+            catalog_album=album,
+        )
+        batches = [
+            DiscographyBatch(
+                scope_kind=DiscographyScopeKind.wanted_selected,
+                scope_json="{}",
+                scope_hash=character * 64,
+                state=DiscographyBatchState.running,
+            )
+            for character in ("a", "b")
+        ]
+        items = [
+            DiscographyBatchItem(
+                batch=batch,
+                release_identity=f"catalog_album:concurrent-{index}",
+                catalog_album=album,
+                artist_name="Artist",
+                release_title="Album",
+                state=DiscographyBatchItemState.waiting,
+            )
+            for index, batch in enumerate(batches)
+        ]
+        db.add_all([artist, album, track, root, *batches, *items])
+        await db.flush()
+        db.add_all(
+            [
+                DiscographyBatchItemJob(
+                    item_id=item.id,
+                    job_id=root.id,
+                    generation=1,
+                    ownership=ownership,
+                    role=DiscographyBatchJobRole.release_root,
+                )
+                for item, ownership in zip(
+                    items,
+                    (DiscographyJobOwnership.created, DiscographyJobOwnership.observed),
+                    strict=True,
+                )
+            ]
+        )
+        await db.commit()
+        batch_ids = [batch.id for batch in batches]
+        root_id = root.id
+
+    async def cancel(batch_id: int) -> None:
+        async with factory() as db:
+            await cancel_discography_batch(db, batch_id)
+
+    await asyncio.gather(*(cancel(batch_id) for batch_id in batch_ids))
+
+    async with factory() as db:
+        stored_root = await db.get(Job, root_id)
+        states = list(
+            await db.scalars(
+                select(DiscographyBatch.state)
+                .where(DiscographyBatch.id.in_(batch_ids))
+                .order_by(DiscographyBatch.id)
+            )
+        )
+        assert stored_root is not None and stored_root.status == JobStatus.cancelled
+        assert states == [DiscographyBatchState.cancelled, DiscographyBatchState.cancelled]
+    await engine.dispose()
