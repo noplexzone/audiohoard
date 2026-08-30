@@ -1216,7 +1216,12 @@ async def reconcile_terminal_slskd_intents(
                 AcquisitionAttempt.provider == "slskd",
                 AcquisitionAttempt.provisional_transfer_id.is_not(None),
                 AcquisitionAttempt.provider_state.in_(
-                    {ProviderTransferState.pending, ProviderTransferState.enqueued}
+                    {
+                        ProviderTransferState.pending,
+                        ProviderTransferState.enqueued,
+                        ProviderTransferState.queued,
+                        ProviderTransferState.downloading,
+                    }
                 ),
                 AcquisitionAttempt.provider_cleanup_state != CleanupState.completed,
             )
@@ -1274,7 +1279,12 @@ async def reconcile_terminal_slskd_intents(
                     job is None
                     or job.status not in terminal_jobs
                     or attempt.provider_state
-                    not in {ProviderTransferState.pending, ProviderTransferState.enqueued}
+                    not in {
+                        ProviderTransferState.pending,
+                        ProviderTransferState.enqueued,
+                        ProviderTransferState.queued,
+                        ProviderTransferState.downloading,
+                    }
                     or attempt.provisional_transfer_id != fallback_id
                     or attempt.peer != peer
                     or _normalized_remote_path(attempt.remote_path)
