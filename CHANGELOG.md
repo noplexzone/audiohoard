@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Start the durable discography batch runner non-blockingly after serialized startup recovery so long maintenance and reconciliation initial cycles cannot leave persisted batches queued.
 - Exclude preserved failure history from cancelled discography batches from Activity issue counts and queue-failure pages.
 - Move orphan-history pruning out of startup into bounded writer-friendly periodic batches, and commit legacy catalog reconciliation in small units so background repair cannot starve valid logins.
 - Retry the complete valid-login session transaction across transient SQLite writer locks so startup maintenance cannot turn correct credentials into an internal server error.

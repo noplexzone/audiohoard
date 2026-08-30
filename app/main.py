@@ -295,6 +295,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await _start_background_services(
             (
                 (
+                    "discography batch runner",
+                    lambda: discography_batch_runner.start(wait_for_initial_cycle=False),
+                ),
+                (
                     "maintenance scheduler",
                     lambda: maintenance_scheduler.start(wait_for_initial_cycle=True),
                 ),
@@ -319,10 +323,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 (
                     "library adoption runner",
                     lambda: library_adoption_runner.start(wait_for_initial_cycle=True),
-                ),
-                (
-                    "discography batch runner",
-                    lambda: discography_batch_runner.start(wait_for_initial_cycle=True),
                 ),
                 (
                     "job watchdog",
