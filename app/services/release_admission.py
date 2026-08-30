@@ -23,7 +23,9 @@ from app.models.discography_batch import (
     DiscographyBatchState,
     DiscographyJobOwnership,
 )
+from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
+from app.models.track import Track
 from app.services.catalog import (
     DiscographyLeaseLostError,
     get_release_progress,
@@ -55,6 +57,35 @@ class ReleaseRootAdmissionResult:
     job_id: int | None
     target_track_ids: tuple[int, ...]
     blocking_job_ids: tuple[int, ...] = ()
+
+
+class _ReleaseProjectionChanged(RuntimeError):
+    """Database-backed quality evidence changed after filesystem projection."""
+
+
+async def _projection_db_snapshot(
+    db: AsyncSession, album_id: int
+) -> tuple[tuple[object, ...], ...]:
+    rows = (
+        await db.execute(
+            select(
+                Track.id,
+                Track.catalog_track_id,
+                Track.acquisition_state,
+                Track.import_state,
+                Track.file_size_bytes,
+                Track.file_format,
+                ImportPlan.id,
+                ImportPlan.status,
+                ImportPlan.file_state,
+                ImportPlan.destination_path,
+            )
+            .outerjoin(ImportPlan, ImportPlan.track_id == Track.id)
+            .where(Track.catalog_album_id == album_id)
+            .order_by(Track.id, ImportPlan.id)
+        )
+    ).all()
+    return tuple(tuple(row) for row in rows)
 
 
 async def _validate_preprojection_lease(
@@ -120,6 +151,7 @@ async def materialize_batch_release_root_job(
     batch_lease_token: str,
     quality_profile: QualityProfile,
     library_root: Path | None = None,
+    _projection_attempt: int = 0,
 ) -> ReleaseRootAdmissionResult:
     """Atomically create or observe the release root for an owned batch item.
 
@@ -143,6 +175,7 @@ async def materialize_batch_release_root_job(
     projected_quality_targets = set(projection.target_track_ids) & set(
         projection.imported_track_ids
     )
+    projection_snapshot = await _projection_db_snapshot(db, album_id)
     await db.commit()
 
     result: ReleaseRootAdmissionResult | None = None
@@ -171,6 +204,10 @@ async def materialize_batch_release_root_job(
             raise DiscographyLeaseLostError("discography batch lease is no longer active")
         if item.catalog_album_id != album_id:
             raise ValueError("discography batch item catalog album changed")
+        if await _projection_db_snapshot(db, album_id) != projection_snapshot:
+            raise _ReleaseProjectionChanged(
+                "release quality evidence changed before writer reservation"
+            )
 
         album = await db.scalar(
             select(CatalogAlbum)
@@ -246,46 +283,61 @@ async def materialize_batch_release_root_job(
         ).one_or_none()
         if claim_row is not None:
             claim, owner = claim_row
-            if owner is not None and owner.status in _ACTIVE_JOB_STATUSES:
-                if owner.catalog_album_id != album_id or owner.catalog_track_id is not None:
-                    raise ValueError(
-                        "active catalog release claim does not own an exact release root"
-                    )
-                await _add_release_root_link(
-                    db,
-                    item_id=batch_item_id,
-                    execution_generation=execution_generation,
-                    job_id=owner.id,
-                    ownership=DiscographyJobOwnership.observed,
-                )
-                await db.commit()
-                result = ReleaseRootAdmissionResult(
-                    status=ReleaseRootAdmissionStatus.observed,
-                    job_id=owner.id,
-                    target_track_ids=target_track_ids,
-                )
-                return
             if owner is None:
                 await db.delete(claim)
                 await db.flush()
                 claim_row = None
-
-        blocking_job_ids = tuple(
-            int(job_id)
-            for job_id in (
-                await db.scalars(
-                    select(Job.id)
-                    .join(AcquisitionDispatchClaim, AcquisitionDispatchClaim.job_id == Job.id)
-                    .where(
-                        AcquisitionDispatchClaim.catalog_album_id == album_id,
-                        Job.catalog_album_id == AcquisitionDispatchClaim.catalog_album_id,
-                        Job.catalog_track_id == AcquisitionDispatchClaim.catalog_track_id,
-                        Job.status.in_(_ACTIVE_JOB_STATUSES),
+            else:
+                if owner.catalog_album_id != album_id or owner.catalog_track_id is not None:
+                    raise ValueError("catalog release claim does not own an exact release root")
+                if owner.status in _ACTIVE_JOB_STATUSES:
+                    await _add_release_root_link(
+                        db,
+                        item_id=batch_item_id,
+                        execution_generation=execution_generation,
+                        job_id=owner.id,
+                        ownership=DiscographyJobOwnership.observed,
                     )
-                    .order_by(Job.id)
+                    await db.commit()
+                    result = ReleaseRootAdmissionResult(
+                        status=ReleaseRootAdmissionStatus.observed,
+                        job_id=owner.id,
+                        target_track_ids=target_track_ids,
+                    )
+                    return
+
+        blocking: list[int] = []
+        track_claim_rows = (
+            await db.execute(
+                select(
+                    AcquisitionDispatchClaim,
+                    Job,
+                    CatalogAlbumTrack.album_id,
                 )
-            ).all()
-        )
+                .outerjoin(Job, Job.id == AcquisitionDispatchClaim.job_id)
+                .outerjoin(
+                    CatalogAlbumTrack,
+                    CatalogAlbumTrack.id == AcquisitionDispatchClaim.catalog_track_id,
+                )
+                .where(AcquisitionDispatchClaim.catalog_album_id == album_id)
+                .order_by(AcquisitionDispatchClaim.id)
+            )
+        ).all()
+        for track_claim, track_owner, track_album_id in track_claim_rows:
+            if track_owner is None:
+                await db.delete(track_claim)
+                continue
+            if (
+                track_album_id != album_id
+                or track_owner.catalog_album_id != track_claim.catalog_album_id
+                or track_owner.catalog_track_id != track_claim.catalog_track_id
+            ):
+                raise ValueError("catalog acquisition claim does not own an exact track")
+            if track_owner.status in _ACTIVE_JOB_STATUSES:
+                blocking.append(track_owner.id)
+        if track_claim_rows:
+            await db.flush()
+        blocking_job_ids = tuple(sorted(set(blocking)))
         if blocking_job_ids:
             await db.commit()
             result = ReleaseRootAdmissionResult(
@@ -331,6 +383,19 @@ async def materialize_batch_release_root_job(
 
     try:
         await run_with_sqlite_lock_retry(db, reserve, attempts=6, delay_seconds=0.2)
+    except _ReleaseProjectionChanged as exc:
+        await db.rollback()
+        if _projection_attempt >= 2:
+            raise RuntimeError("release quality projection changed repeatedly") from exc
+        return await materialize_batch_release_root_job(
+            db,
+            batch_item_id,
+            execution_generation=execution_generation,
+            batch_lease_token=batch_lease_token,
+            quality_profile=quality_profile,
+            library_root=library_root,
+            _projection_attempt=_projection_attempt + 1,
+        )
     except Exception:
         await db.rollback()
         raise

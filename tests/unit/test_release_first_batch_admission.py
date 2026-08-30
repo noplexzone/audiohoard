@@ -478,3 +478,134 @@ async def test_root_and_direct_track_admission_race_never_overlap(tmp_path: Path
         else:
             assert root.status == ReleaseRootAdmissionStatus.waiting_for_tracks
             assert len(tracks.created_job_ids) == 2
+
+
+async def test_malformed_active_track_claim_fails_closed(tmp_path: Path) -> None:
+    async with _database(tmp_path / "malformed-track-claim.db") as factory:
+        async with factory() as seed:
+            album, (item,) = await _seed(seed)
+            malformed_owner = Job(
+                source="priority",
+                query="wrong track",
+                status=JobStatus.running,
+                catalog_album=album,
+                catalog_track=album.tracks[1],
+            )
+            seed.add(malformed_owner)
+            await seed.flush()
+            seed.add(
+                AcquisitionDispatchClaim(
+                    catalog_album_id=album.id,
+                    catalog_track_id=album.tracks[0].id,
+                    job_id=malformed_owner.id,
+                )
+            )
+            await seed.commit()
+            item_id = item.id
+        async with factory() as db:
+            with pytest.raises(ValueError, match="exact track"):
+                await _admit(db, item_id)
+        async with factory() as observer:
+            assert await observer.scalar(select(func.count(Job.id))) == 1
+            assert (
+                await observer.scalar(select(func.count(CatalogReleaseAcquisitionClaim.job_id)))
+                == 0
+            )
+
+
+async def test_malformed_terminal_release_claim_fails_closed(tmp_path: Path) -> None:
+    async with _database(tmp_path / "malformed-release-claim.db") as factory:
+        async with factory() as seed:
+            album, (item,) = await _seed(seed)
+            other_artist = CatalogArtist(name="Other", monitored=True)
+            other_album = CatalogAlbum(
+                artist=other_artist, title="Other", monitored=True, track_count=1
+            )
+            other_album.tracks.append(CatalogAlbumTrack(disc=1, position=1, title="Other"))
+            malformed_owner = Job(
+                source="priority",
+                query="wrong release",
+                status=JobStatus.failed,
+                catalog_album=other_album,
+            )
+            seed.add_all([other_artist, malformed_owner])
+            await seed.flush()
+            seed.add(
+                CatalogReleaseAcquisitionClaim(
+                    catalog_album_id=album.id,
+                    job_id=malformed_owner.id,
+                )
+            )
+            await seed.commit()
+            item_id, malformed_owner_id = item.id, malformed_owner.id
+        async with factory() as db:
+            with pytest.raises(ValueError, match="exact release root"):
+                await _admit(db, item_id)
+        async with factory() as observer:
+            claim = await observer.get(CatalogReleaseAcquisitionClaim, album.id)
+            assert claim is not None and claim.job_id == malformed_owner_id
+            assert await observer.scalar(select(func.count(Job.id))) == 1
+
+
+async def test_quality_projection_retries_when_db_state_changes_before_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "library" / "owned.mp3"
+    destination.parent.mkdir()
+    destination.write_bytes(b"owned")
+    async with _database(tmp_path / "projection-race.db") as factory:
+        async with factory() as seed:
+            album, (item,) = await _seed(seed, track_count=1)
+            source_job = Job(source="fixture", query="owned", status=JobStatus.done)
+            release = Release(job=source_job, source="fixture", title=album.title)
+            track = Track(
+                job=source_job,
+                release=release,
+                source="fixture",
+                catalog_album=album,
+                catalog_track=album.tracks[0],
+                import_state=ImportWorkflowState.imported,
+                acquisition_state=AcquisitionState.downloaded,
+                file_format="mp3 128 kbps",
+                file_size_bytes=5,
+            )
+            seed.add(
+                ImportPlan(
+                    release=release,
+                    track=track,
+                    source_path=str(destination),
+                    destination_path=str(destination),
+                    status=ImportWorkflowState.imported,
+                    file_state=LibraryFileState.present,
+                )
+            )
+            await seed.commit()
+            item_id, track_id = item.id, track.id
+
+        original_commit = AsyncSession.commit
+        upgraded = False
+
+        async def upgrade_after_projection_commit(session: AsyncSession) -> None:
+            nonlocal upgraded
+            await original_commit(session)
+            if upgraded:
+                return
+            upgraded = True
+            async with factory() as concurrent:
+                current = await concurrent.get(Track, track_id)
+                assert current is not None
+                current.file_format = "flac"
+                await original_commit(concurrent)
+
+        monkeypatch.setattr(AsyncSession, "commit", upgrade_after_projection_commit)
+        async with factory() as db:
+            outcome = await _admit(db, item_id, library_root=destination.parent)
+        assert upgraded
+        assert outcome.status == ReleaseRootAdmissionStatus.no_work
+        assert outcome.target_track_ids == ()
+        async with factory() as observer:
+            assert await observer.scalar(select(func.count(Job.id))) == 1
+            assert (
+                await observer.scalar(select(func.count(CatalogReleaseAcquisitionClaim.job_id)))
+                == 0
+            )
