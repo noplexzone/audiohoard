@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import random
 import time
@@ -33,6 +34,8 @@ _SEARCH_POLL_INTERVAL_MAX = 10.0
 _SEARCH_TIMEOUT_SEC = 300
 _HTTP_TIMEOUT = httpx.Timeout(10.0)
 _DOWNLOAD_SNAPSHOT_TTL_SEC = 1.0
+_SEARCH_SNAPSHOT_TTL_SEC = 1.5
+_SEARCH_SNAPSHOT_MAX_ENTRIES = 128
 _TRANSFER_429_MAX_ATTEMPTS = 4
 _TRANSFER_429_BACKOFF_INITIAL_SEC = 0.25
 _TRANSFER_429_BACKOFF_MAX_SEC = 2.0
@@ -53,6 +56,19 @@ class _DownloadSnapshot:
     in_flight: asyncio.Task[list[dict[str, object]]] | None = None
 
 
+_SearchKey = tuple[str, bytes, str, str, int]
+
+
+@dataclass
+class _SearchSnapshot:
+    in_flight: asyncio.Task[bytes]
+    order: int
+    payload: bytes | None = None
+    completed_at: float | None = None
+    expires_at: float = 0.0
+    eviction_task: asyncio.Task[None] | None = None
+
+
 @dataclass(frozen=True)
 class ProvisionalTransferMatch:
     """Evidence for an exact provisional peer/path lookup."""
@@ -62,6 +78,8 @@ class ProvisionalTransferMatch:
 
 
 _download_snapshots: dict[tuple[str, bytes], _DownloadSnapshot] = {}
+_search_snapshots: dict[_SearchKey, _SearchSnapshot] = {}
+_search_snapshot_order = 0
 
 
 def _search_state_tokens(value: object) -> set[str]:
@@ -191,6 +209,148 @@ class SlskdAdapter:
             logger.warning("slskd health check failed: %s", exc)
             return CapabilityState(available=False, reason=str(exc))
 
+    def _search_snapshot_key(self, search_text: str, mode: str, file_limit: int) -> _SearchKey:
+        normalized_endpoint = str(httpx.URL(self._base_url)).rstrip("/")
+        credential_digest = hashlib.sha256(self._api_key.encode()).digest()
+        return normalized_endpoint, credential_digest, search_text, mode, file_limit
+
+    async def _fetch_raw_search(self, search_text: str, file_limit: int) -> bytes:
+        """Run one provider search and serialize its raw JSON as immutable bytes."""
+        async with self._client() as client:
+            resp = await request_with_retry(
+                client,
+                "POST",
+                "/api/v0/searches",
+                json={"searchText": search_text, "fileLimit": file_limit},
+            )
+            resp.raise_for_status()
+            search_id = resp.json().get("id") or resp.json().get("searchId", "")
+            if not search_id:
+                raise ProviderError(
+                    "missing_search_id",
+                    "slskd create-search response did not include an id",
+                    "search",
+                )
+
+            await self._wait_for_search(client, search_id)
+            files_resp = await request_with_retry(
+                client, "GET", f"/api/v0/searches/{search_id}/responses"
+            )
+            if files_resp.status_code != 200:
+                return b"[]"
+            return json.dumps(files_resp.json(), separators=(",", ":")).encode()
+
+    @staticmethod
+    def _remove_search_snapshot(key: _SearchKey, snapshot: _SearchSnapshot) -> None:
+        if _search_snapshots.get(key) is not snapshot:
+            return
+        _search_snapshots.pop(key)
+        eviction_task = snapshot.eviction_task
+        if (
+            eviction_task is not None
+            and eviction_task is not asyncio.current_task()
+            and not eviction_task.done()
+        ):
+            eviction_task.cancel()
+
+    @classmethod
+    def _prune_search_snapshots(cls, *, reserve: int = 0) -> None:
+        """Remove deterministic completed entries without touching live producers."""
+        now = _monotonic()
+        completed = [
+            (key, snapshot)
+            for key, snapshot in _search_snapshots.items()
+            if snapshot.payload is not None
+        ]
+        expired = sorted(
+            ((key, snapshot) for key, snapshot in completed if snapshot.expires_at <= now),
+            key=lambda item: (item[1].expires_at, item[1].order),
+        )
+        for key, snapshot in expired:
+            cls._remove_search_snapshot(key, snapshot)
+
+        target = max(0, _SEARCH_SNAPSHOT_MAX_ENTRIES - reserve)
+        if len(_search_snapshots) <= target:
+            return
+        oldest_completed = sorted(
+            (
+                (key, snapshot)
+                for key, snapshot in _search_snapshots.items()
+                if snapshot.completed_at is not None
+            ),
+            key=lambda item: (item[1].completed_at or 0.0, item[1].order),
+        )
+        for key, snapshot in oldest_completed:
+            if len(_search_snapshots) <= target:
+                break
+            cls._remove_search_snapshot(key, snapshot)
+
+    @classmethod
+    async def _evict_search_snapshot(cls, key: _SearchKey, snapshot: _SearchSnapshot) -> None:
+        await asyncio.sleep(_SEARCH_SNAPSHOT_TTL_SEC)
+        if _monotonic() >= snapshot.expires_at:
+            cls._remove_search_snapshot(key, snapshot)
+
+    @classmethod
+    def _search_producer_done(
+        cls,
+        key: _SearchKey,
+        snapshot: _SearchSnapshot,
+        task: asyncio.Task[bytes],
+    ) -> None:
+        if _search_snapshots.get(key) is not snapshot:
+            return
+        if task.cancelled() or task.exception() is not None:
+            cls._remove_search_snapshot(key, snapshot)
+            return
+        snapshot.payload = task.result()
+        snapshot.completed_at = _monotonic()
+        snapshot.expires_at = snapshot.completed_at + _SEARCH_SNAPSHOT_TTL_SEC
+        snapshot.eviction_task = asyncio.create_task(cls._evict_search_snapshot(key, snapshot))
+        cls._prune_search_snapshots()
+
+    async def _raw_search(
+        self, search_text: str, *, mode: str, file_limit: int
+    ) -> list[dict[str, object]]:
+        """Return an independent copy of a short-lived coalesced raw search."""
+        global _search_snapshot_order
+
+        key = self._search_snapshot_key(search_text, mode, file_limit)
+        snapshot = _search_snapshots.get(key)
+        if snapshot is not None and snapshot.payload is not None:
+            if _monotonic() < snapshot.expires_at:
+                decoded: list[dict[str, object]] = json.loads(snapshot.payload)
+                return decoded
+            self._remove_search_snapshot(key, snapshot)
+            snapshot = None
+
+        if snapshot is None:
+            self._prune_search_snapshots(reserve=1)
+            producer = asyncio.create_task(self._fetch_raw_search(search_text, file_limit))
+            if len(_search_snapshots) >= _SEARCH_SNAPSHOT_MAX_ENTRIES:
+                # Keep a hard bound without evicting or cancelling existing live
+                # producers. This overflow request remains cancellation-shielded,
+                # but is intentionally not inserted into the shared cache.
+                producer.add_done_callback(
+                    lambda task: None if task.cancelled() else task.exception()
+                )
+                payload = await asyncio.shield(producer)
+                overflow_decoded: list[dict[str, object]] = json.loads(payload)
+                return overflow_decoded
+
+            _search_snapshot_order += 1
+            snapshot = _SearchSnapshot(in_flight=producer, order=_search_snapshot_order)
+            _search_snapshots[key] = snapshot
+
+            def producer_done(task: asyncio.Task[bytes]) -> None:
+                self._search_producer_done(key, snapshot, task)
+
+            producer.add_done_callback(producer_done)
+
+        payload = await asyncio.shield(snapshot.in_flight)
+        decoded = json.loads(payload)
+        return decoded
+
     async def search_album_folders(
         self,
         query: SearchRequest,
@@ -198,109 +358,59 @@ class SlskdAdapter:
         """Search slskd and return (album_folders, raw_responses).
 
         Raw responses are returned so the caller can inspect individual files for
-        per-track enqueueing.  Audio-only grouping is performed here; the caller
+        per-track enqueueing. Audio-only grouping is performed here; the caller
         applies scoring and selection.
         """
         from app.services.slskd_scoring import group_slskd_files_into_folders
 
         if not self._base_url or not self._api_key:
             return [], []
-        async with self._client() as client:
-            resp = await request_with_retry(
-                client,
-                "POST",
-                "/api/v0/searches",
-                json={
-                    "searchText": compose_search_query(
-                        query.query, query.artist, query.album, query.track
-                    ),
-                    "fileLimit": 500,
-                },
-            )
-            resp.raise_for_status()
-            search_id = resp.json().get("id") or resp.json().get("searchId", "")
-            if not search_id:
-                raise ProviderError(
-                    "missing_search_id",
-                    "slskd create-search response did not include an id",
-                    "search",
-                )
-
-            await self._wait_for_search(client, search_id)
-
-            files_resp = await request_with_retry(
-                client, "GET", f"/api/v0/searches/{search_id}/responses"
-            )
-            if files_resp.status_code != 200:
-                return [], []
-
-            raw_responses: list[dict[str, object]] = files_resp.json()
-            folders = group_slskd_files_into_folders(raw_responses)
-            return folders, raw_responses
+        search_text = compose_search_query(query.query, query.artist, query.album, query.track)
+        raw_responses = await self._raw_search(search_text, mode="album", file_limit=500)
+        folders = group_slskd_files_into_folders(raw_responses)
+        return folders, raw_responses
 
     async def search(self, query: SearchRequest) -> list[SearchResult]:
         if not self._base_url or not self._api_key:
             return []
-        async with self._client() as client:
-            resp = await request_with_retry(
-                client,
-                "POST",
-                "/api/v0/searches",
-                json={
-                    "searchText": compose_search_query(
-                        query.query, query.artist, query.album, query.track
-                    ),
-                    "fileLimit": 100,
-                },
-            )
-            resp.raise_for_status()
-            search_id = resp.json().get("id") or resp.json().get("searchId", "")
-            if not search_id:
-                raise ProviderError(
-                    "missing_search_id",
-                    "slskd create-search response did not include an id",
-                    "search",
-                )
-
-            await self._wait_for_search(client, search_id)
-
-            files_resp = await request_with_retry(
-                client, "GET", f"/api/v0/searches/{search_id}/responses"
-            )
-            if files_resp.status_code != 200:
-                return []
-
-            results: list[SearchResult] = []
-            for response in files_resp.json():
-                username = response.get("username", "")
-                for f in response.get("files", []):
-                    filename: str = f.get("filename", "")
-                    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-                    if not is_importable_audio(filename):
-                        continue
-                    guess = parse_filename(filename)
-                    results.append(
-                        SearchResult(
-                            source="slskd",
-                            title=guess.title,
-                            artist=guess.artist,
-                            album=guess.album,
-                            duration_sec=slskd_file_duration_seconds(f),
-                            size_bytes=f.get("size"),
-                            format=ext or None,
-                            url=f"slskd://{username}/{filename}",
-                            metadata={
-                                "username": username,
-                                "filename": filename,
-                                "parse_confidence": guess.confidence,
-                                "parse_hints": list(guess.hints),
-                                "bit_rate": f.get("bitRate"),
-                                "sample_rate": f.get("sampleRate"),
-                                **parsed_position_evidence(filename),
-                            },
-                        )
+        search_text = compose_search_query(query.query, query.artist, query.album, query.track)
+        raw_responses = await self._raw_search(search_text, mode="ordinary", file_limit=100)
+        results: list[SearchResult] = []
+        for response in raw_responses:
+            username = response.get("username", "")
+            files = response.get("files", [])
+            if not isinstance(files, list):
+                continue
+            for f in files:
+                if not isinstance(f, dict):
+                    continue
+                filename = str(f.get("filename", ""))
+                ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+                if not is_importable_audio(filename):
+                    continue
+                guess = parse_filename(filename)
+                results.append(
+                    SearchResult(
+                        source="slskd",
+                        title=guess.title,
+                        artist=guess.artist,
+                        album=guess.album,
+                        duration_sec=slskd_file_duration_seconds(f),
+                        size_bytes=f.get("size"),
+                        format=ext or None,
+                        url=f"slskd://{username}/{filename}",
+                        metadata={
+                            "username": username,
+                            "filename": filename,
+                            "parse_confidence": guess.confidence,
+                            "parse_hints": list(guess.hints),
+                            "bit_rate": f.get("bitRate"),
+                            "sample_rate": f.get("sampleRate"),
+                            **parsed_position_evidence(filename),
+                        },
                     )
-            return results
+                )
+        return results
 
     async def enqueue(self, username: str, filename: str, size: int | None = None) -> str:
         if not username or not filename:

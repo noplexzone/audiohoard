@@ -14,8 +14,25 @@ from app.sources.youtube import ProviderError
 
 
 @pytest.fixture(autouse=True)
-def clear_download_snapshot_cache() -> None:
+async def clear_snapshot_caches() -> None:
     getattr(slskd_module, "_download_snapshots", {}).clear()
+
+    async def clear_search_snapshots() -> None:
+        snapshots = getattr(slskd_module, "_search_snapshots", {})
+        tasks = []
+        for snapshot in snapshots.values():
+            for attribute in ("in_flight", "eviction_task"):
+                task = getattr(snapshot, attribute, None)
+                if task is not None and not task.done():
+                    task.cancel()
+                    tasks.append(task)
+        snapshots.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    await clear_search_snapshots()
+    yield
+    await clear_search_snapshots()
 
 
 class TestSlskdHealth:
@@ -49,6 +66,46 @@ class TestSlskdHealth:
 
 
 class TestSlskdSearch:
+    @staticmethod
+    def _completed_search_request(
+        *,
+        responses: list[dict[str, object]] | None = None,
+        wait_before_responses: asyncio.Event | None = None,
+        responses_started: asyncio.Event | None = None,
+    ):
+        counts = {"POST": 0, "poll": 0, "responses": 0}
+        bodies: list[dict[str, object]] = []
+
+        async def fake_request(
+            client: httpx.AsyncClient, method: str, path: str, **kwargs: object
+        ) -> httpx.Response:
+            request = httpx.Request(method, f"{str(client.base_url).rstrip('/')}{path}")
+            if method == "POST":
+                counts["POST"] += 1
+                body = kwargs["json"]
+                assert isinstance(body, dict)
+                bodies.append(body)
+                return httpx.Response(
+                    200, json={"id": f"search-{counts['POST']}"}, request=request
+                )
+            if path.endswith("/responses"):
+                counts["responses"] += 1
+                if responses_started is not None:
+                    responses_started.set()
+                if wait_before_responses is not None:
+                    await wait_before_responses.wait()
+                return httpx.Response(200, json=responses or [], request=request)
+            counts["poll"] += 1
+            return httpx.Response(200, json={"state": "Completed"}, request=request)
+
+        async def poll_once(
+            adapter: SlskdAdapter, client: httpx.AsyncClient, search_id: str
+        ) -> None:
+            del adapter
+            await slskd_module.request_with_retry(client, "GET", f"/api/v0/searches/{search_id}")
+
+        return fake_request, poll_once, counts, bodies
+
     def test_search_state_accepts_compound_terminal_variants(self) -> None:
         assert _search_state_is_terminal("Completed, FileLimitReached")
         assert _search_state_is_terminal("Completed, TimedOut")
@@ -189,6 +246,230 @@ class TestSlskdSearch:
 
         assert [result.format for result in results] == ["flac"]
         assert results[0].metadata["filename"].endswith(".flac")
+
+    async def test_simultaneous_identical_searches_share_one_provider_sequence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        release = asyncio.Event()
+        responses_started = asyncio.Event()
+        fake_request, poll_once, counts, _ = self._completed_search_request(
+            wait_before_responses=release, responses_started=responses_started
+        )
+        monkeypatch.setattr(slskd_module, "request_with_retry", fake_request)
+        monkeypatch.setattr(SlskdAdapter, "_wait_for_search", poll_once)
+        adapter = SlskdAdapter("http://slskd.local/", "key123")
+        request = SearchRequest(query="same query")
+
+        first = asyncio.create_task(adapter.search(request))
+        second = asyncio.create_task(adapter.search(request))
+        await responses_started.wait()
+        release.set()
+
+        assert await asyncio.gather(first, second) == [[], []]
+        assert counts == {"POST": 1, "poll": 1, "responses": 1}
+
+    async def test_search_coalescing_key_isolates_configuration_query_and_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_request, poll_once, counts, bodies = self._completed_search_request()
+        monkeypatch.setattr(slskd_module, "request_with_retry", fake_request)
+        monkeypatch.setattr(SlskdAdapter, "_wait_for_search", poll_once)
+        ordinary = SearchRequest(query="same query")
+
+        await SlskdAdapter("http://slskd.local", "first-key").search(ordinary)
+        await SlskdAdapter("http://other.local", "first-key").search(ordinary)
+        await SlskdAdapter("http://slskd.local", "second-key").search(ordinary)
+        await SlskdAdapter("http://slskd.local", "first-key").search(
+            SearchRequest(query="different query")
+        )
+        await SlskdAdapter("http://slskd.local", "first-key").search_album_folders(ordinary)
+        await SlskdAdapter("http://slskd.local", "first-key").search(
+            SearchRequest(query="same query", expected_duration_sec=123, preferred_format="flac")
+        )
+
+        assert counts == {"POST": 5, "poll": 5, "responses": 5}
+        assert [body["fileLimit"] for body in bodies] == [100, 100, 100, 100, 500]
+
+    async def test_cancelled_search_waiter_does_not_cancel_shared_producer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        release = asyncio.Event()
+        responses_started = asyncio.Event()
+        fake_request, poll_once, counts, _ = self._completed_search_request(
+            wait_before_responses=release, responses_started=responses_started
+        )
+        monkeypatch.setattr(slskd_module, "request_with_retry", fake_request)
+        monkeypatch.setattr(SlskdAdapter, "_wait_for_search", poll_once)
+        adapter = SlskdAdapter("http://slskd.local", "key123")
+        request = SearchRequest(query="same query")
+        cancelled = asyncio.create_task(adapter.search(request))
+        survivor = asyncio.create_task(adapter.search(request))
+        await responses_started.wait()
+
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        release.set()
+
+        assert await survivor == []
+        assert counts == {"POST": 1, "poll": 1, "responses": 1}
+
+    async def test_failed_shared_search_is_evicted_and_next_call_refetches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first_started = asyncio.Event()
+        release_failure = asyncio.Event()
+        posts = 0
+
+        async def fake_request(
+            client: httpx.AsyncClient, method: str, path: str, **kwargs: object
+        ) -> httpx.Response:
+            nonlocal posts
+            request = httpx.Request(method, f"{str(client.base_url).rstrip('/')}{path}")
+            if method == "POST":
+                posts += 1
+                if posts == 1:
+                    first_started.set()
+                    await release_failure.wait()
+                    return httpx.Response(400, request=request)
+                return httpx.Response(200, json={"id": "recovered"}, request=request)
+            if path.endswith("/responses"):
+                return httpx.Response(200, json=[], request=request)
+            return httpx.Response(200, json={"state": "Completed"}, request=request)
+
+        async def poll_once(
+            adapter: SlskdAdapter, client: httpx.AsyncClient, search_id: str
+        ) -> None:
+            del adapter
+            await slskd_module.request_with_retry(client, "GET", f"/api/v0/searches/{search_id}")
+
+        monkeypatch.setattr(slskd_module, "request_with_retry", fake_request)
+        monkeypatch.setattr(SlskdAdapter, "_wait_for_search", poll_once)
+        adapter = SlskdAdapter("http://slskd.local", "key123")
+        request = SearchRequest(query="retry me")
+        first = asyncio.create_task(adapter.search(request))
+        second = asyncio.create_task(adapter.search(request))
+        await first_started.wait()
+        await asyncio.sleep(0)
+        release_failure.set()
+
+        failures = await asyncio.gather(first, second, return_exceptions=True)
+        assert all(isinstance(failure, httpx.HTTPStatusError) for failure in failures)
+        assert posts == 1
+        assert await adapter.search(request) == []
+        assert posts == 2
+
+    async def test_search_snapshot_reuses_ttl_then_refreshes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = 100.0
+        fake_request, poll_once, counts, _ = self._completed_search_request()
+        monkeypatch.setattr(slskd_module, "_monotonic", lambda: now)
+        monkeypatch.setattr(slskd_module, "request_with_retry", fake_request)
+        monkeypatch.setattr(SlskdAdapter, "_wait_for_search", poll_once)
+        adapter = SlskdAdapter("http://slskd.local", "key123")
+        request = SearchRequest(query="ttl query")
+
+        await adapter.search(request)
+        now += slskd_module._SEARCH_SNAPSHOT_TTL_SEC / 2
+        await adapter.search(request)
+        now += slskd_module._SEARCH_SNAPSHOT_TTL_SEC
+        await adapter.search(request)
+
+        assert counts == {"POST": 2, "poll": 2, "responses": 2}
+
+    async def test_album_search_consumers_receive_independent_raw_copies(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider_responses: list[dict[str, object]] = [
+            {
+                "username": "peer1",
+                "files": [{"filename": "Artist/Album/01 Song.flac", "size": 123}],
+            }
+        ]
+        fake_request, poll_once, counts, _ = self._completed_search_request(
+            responses=provider_responses
+        )
+        monkeypatch.setattr(slskd_module, "request_with_retry", fake_request)
+        monkeypatch.setattr(SlskdAdapter, "_wait_for_search", poll_once)
+        adapter = SlskdAdapter("http://slskd.local", "key123")
+        request = SearchRequest(query="copy query")
+
+        _, first_raw = await adapter.search_album_folders(request)
+        first_raw[0]["username"] = "mutated"
+        first_files = first_raw[0]["files"]
+        assert isinstance(first_files, list)
+        first_file = first_files[0]
+        assert isinstance(first_file, dict)
+        first_file["filename"] = "mutated.mp3"
+        _, second_raw = await adapter.search_album_folders(request)
+
+        assert second_raw == provider_responses
+        assert first_raw is not second_raw
+        assert counts == {"POST": 1, "poll": 1, "responses": 1}
+
+    async def test_search_cache_bound_never_cancels_live_producers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slskd_module, "_SEARCH_SNAPSHOT_MAX_ENTRIES", 3)
+        release = asyncio.Event()
+        all_started = asyncio.Event()
+        started = 0
+
+        async def fake_request(
+            client: httpx.AsyncClient, method: str, path: str, **kwargs: object
+        ) -> httpx.Response:
+            nonlocal started
+            request = httpx.Request(method, f"{str(client.base_url).rstrip('/')}{path}")
+            if method == "POST":
+                started += 1
+                search_id = f"search-{started}"
+                if started == 4:
+                    all_started.set()
+                await release.wait()
+                return httpx.Response(200, json={"id": search_id}, request=request)
+            if path.endswith("/responses"):
+                return httpx.Response(200, json=[], request=request)
+            return httpx.Response(200, json={"state": "Completed"}, request=request)
+
+        async def poll_once(
+            adapter: SlskdAdapter, client: httpx.AsyncClient, search_id: str
+        ) -> None:
+            del adapter
+            await slskd_module.request_with_retry(client, "GET", f"/api/v0/searches/{search_id}")
+
+        monkeypatch.setattr(slskd_module, "request_with_retry", fake_request)
+        monkeypatch.setattr(SlskdAdapter, "_wait_for_search", poll_once)
+        adapter = SlskdAdapter("http://slskd.local", "key123")
+        searches = [
+            asyncio.create_task(adapter.search(SearchRequest(query=f"query {index}")))
+            for index in range(4)
+        ]
+        await all_started.wait()
+
+        assert len(slskd_module._search_snapshots) == 3
+        assert not any(task.done() for task in searches)
+        release.set()
+        await asyncio.gather(*searches)
+
+        assert len(slskd_module._search_snapshots) <= 3
+
+    async def test_search_request_bodies_preserve_mode_file_limits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_request, poll_once, _, bodies = self._completed_search_request()
+        monkeypatch.setattr(slskd_module, "request_with_retry", fake_request)
+        monkeypatch.setattr(SlskdAdapter, "_wait_for_search", poll_once)
+        adapter = SlskdAdapter("http://slskd.local", "key123")
+        request = SearchRequest(query="limits")
+
+        await adapter.search(request)
+        await adapter.search_album_folders(request)
+
+        assert bodies == [
+            {"searchText": "limits", "fileLimit": 100},
+            {"searchText": "limits", "fileLimit": 500},
+        ]
 
 
 class TestSlskdTransfers:
