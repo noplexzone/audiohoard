@@ -609,3 +609,45 @@ async def test_quality_projection_retries_when_db_state_changes_before_reservati
                 await observer.scalar(select(func.count(CatalogReleaseAcquisitionClaim.job_id)))
                 == 0
             )
+
+
+async def test_active_release_claim_cannot_mask_malformed_track_claim(tmp_path: Path) -> None:
+    async with _database(tmp_path / "masked-malformed-track.db") as factory:
+        async with factory() as seed:
+            album, (item,) = await _seed(seed)
+            root_owner = Job(
+                source="priority",
+                query="root",
+                status=JobStatus.running,
+                catalog_album=album,
+            )
+            malformed_track_owner = Job(
+                source="priority",
+                query="wrong track",
+                status=JobStatus.running,
+                catalog_album=album,
+                catalog_track=album.tracks[1],
+            )
+            seed.add_all([root_owner, malformed_track_owner])
+            await seed.flush()
+            seed.add_all(
+                [
+                    CatalogReleaseAcquisitionClaim(
+                        catalog_album_id=album.id,
+                        job_id=root_owner.id,
+                    ),
+                    AcquisitionDispatchClaim(
+                        catalog_album_id=album.id,
+                        catalog_track_id=album.tracks[0].id,
+                        job_id=malformed_track_owner.id,
+                    ),
+                ]
+            )
+            await seed.commit()
+            item_id = item.id
+        async with factory() as db:
+            with pytest.raises(ValueError, match="exact track"):
+                await _admit(db, item_id)
+        async with factory() as observer:
+            assert await observer.scalar(select(func.count(Job.id))) == 2
+            assert await observer.scalar(select(func.count(DiscographyBatchItemJob.id))) == 0

@@ -249,31 +249,10 @@ async def materialize_batch_release_root_job(
             for track in tracks
             if track.id not in imported_ids or track.id in projected_quality_targets
         )
-        if not target_track_ids:
-            await db.commit()
-            result = ReleaseRootAdmissionResult(
-                status=ReleaseRootAdmissionStatus.no_work,
-                job_id=None,
-                target_track_ids=(),
-            )
-            return
 
-        existing_job_id = await db.scalar(
-            select(DiscographyBatchItemJob.job_id).where(
-                DiscographyBatchItemJob.item_id == batch_item_id,
-                DiscographyBatchItemJob.generation == execution_generation,
-                DiscographyBatchItemJob.role == DiscographyBatchJobRole.release_root,
-            )
-        )
-        if existing_job_id is not None:
-            await db.commit()
-            result = ReleaseRootAdmissionResult(
-                status=ReleaseRootAdmissionStatus.observed,
-                job_id=int(existing_job_id),
-                target_track_ids=target_track_ids,
-            )
-            return
-
+        # Validate every persisted ownership claim before any lifecycle-based
+        # early return. A valid root must never mask a malformed track owner (or
+        # vice versa), even when this item already has a link or no targets remain.
         claim_row = (
             await db.execute(
                 select(CatalogReleaseAcquisitionClaim, Job)
@@ -281,30 +260,17 @@ async def materialize_batch_release_root_job(
                 .where(CatalogReleaseAcquisitionClaim.catalog_album_id == album_id)
             )
         ).one_or_none()
+        active_release_owner: Job | None = None
         if claim_row is not None:
             claim, owner = claim_row
             if owner is None:
                 await db.delete(claim)
-                await db.flush()
                 claim_row = None
             else:
                 if owner.catalog_album_id != album_id or owner.catalog_track_id is not None:
                     raise ValueError("catalog release claim does not own an exact release root")
                 if owner.status in _ACTIVE_JOB_STATUSES:
-                    await _add_release_root_link(
-                        db,
-                        item_id=batch_item_id,
-                        execution_generation=execution_generation,
-                        job_id=owner.id,
-                        ownership=DiscographyJobOwnership.observed,
-                    )
-                    await db.commit()
-                    result = ReleaseRootAdmissionResult(
-                        status=ReleaseRootAdmissionStatus.observed,
-                        job_id=owner.id,
-                        target_track_ids=target_track_ids,
-                    )
-                    return
+                    active_release_owner = owner
 
         blocking: list[int] = []
         track_claim_rows = (
@@ -335,9 +301,64 @@ async def materialize_batch_release_root_job(
                 raise ValueError("catalog acquisition claim does not own an exact track")
             if track_owner.status in _ACTIVE_JOB_STATUSES:
                 blocking.append(track_owner.id)
-        if track_claim_rows:
+        if claim_row is None or track_claim_rows:
             await db.flush()
         blocking_job_ids = tuple(sorted(set(blocking)))
+        if active_release_owner is not None and blocking_job_ids:
+            raise ValueError("competing active release and exact-track claims")
+
+        if not target_track_ids:
+            await db.commit()
+            result = ReleaseRootAdmissionResult(
+                status=ReleaseRootAdmissionStatus.no_work,
+                job_id=None,
+                target_track_ids=(),
+            )
+            return
+
+        existing_root = (
+            await db.execute(
+                select(DiscographyBatchItemJob.job_id, Job)
+                .outerjoin(Job, Job.id == DiscographyBatchItemJob.job_id)
+                .where(
+                    DiscographyBatchItemJob.item_id == batch_item_id,
+                    DiscographyBatchItemJob.generation == execution_generation,
+                    DiscographyBatchItemJob.role == DiscographyBatchJobRole.release_root,
+                )
+            )
+        ).one_or_none()
+        if existing_root is not None:
+            existing_job_id, existing_owner = existing_root
+            if (
+                existing_owner is None
+                or existing_owner.catalog_album_id != album_id
+                or existing_owner.catalog_track_id is not None
+            ):
+                raise ValueError("release-root link does not own an exact release root")
+            await db.commit()
+            result = ReleaseRootAdmissionResult(
+                status=ReleaseRootAdmissionStatus.observed,
+                job_id=int(existing_job_id),
+                target_track_ids=target_track_ids,
+            )
+            return
+
+        if active_release_owner is not None:
+            await _add_release_root_link(
+                db,
+                item_id=batch_item_id,
+                execution_generation=execution_generation,
+                job_id=active_release_owner.id,
+                ownership=DiscographyJobOwnership.observed,
+            )
+            await db.commit()
+            result = ReleaseRootAdmissionResult(
+                status=ReleaseRootAdmissionStatus.observed,
+                job_id=active_release_owner.id,
+                target_track_ids=target_track_ids,
+            )
+            return
+
         if blocking_job_ids:
             await db.commit()
             result = ReleaseRootAdmissionResult(
