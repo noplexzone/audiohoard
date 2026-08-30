@@ -39,6 +39,7 @@ from app.models.workflow import (
 from app.schemas.search import SearchRequest, SearchResult
 from app.services.acoustid_verification import run_acoustid_verification
 from app.services.auto_import import try_auto_import_release
+from app.services.discography_batches import cancel_discography_batch
 from app.services.slskd_scoring import (
     group_slskd_files_into_folders,
     select_best_folder,
@@ -814,3 +815,86 @@ async def test_stale_release_root_generation_cannot_spawn_orphan_fallback(
 
     assert continuation_ids == []
     assert await db_session.scalar(select(Job.id).where(Job.parent_job_id == root_id)) is None
+
+
+async def test_cancelling_shared_root_creator_transfers_ownership_to_active_observer(
+    db_session: AsyncSession,
+) -> None:
+    artist = CatalogArtist(name="Artist")
+    album = CatalogAlbum(artist=artist, title="Album", track_count=1)
+    track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+    root = Job(
+        source="priority", query="Artist Album", status=JobStatus.pending, catalog_album=album
+    )
+    batches = [
+        DiscographyBatch(
+            scope_kind=DiscographyScopeKind.wanted_selected,
+            scope_json="{}",
+            scope_hash=character * 64,
+            state=DiscographyBatchState.running,
+        )
+        for character in ("1", "2")
+    ]
+    items = [
+        DiscographyBatchItem(
+            batch=batch,
+            release_identity=f"catalog_album:shared-{index}",
+            catalog_album=album,
+            artist_name="Artist",
+            release_title="Album",
+            state=DiscographyBatchItemState.waiting,
+        )
+        for index, batch in enumerate(batches)
+    ]
+    db_session.add_all([artist, album, track, root, *batches, *items])
+    await db_session.flush()
+    links = [
+        DiscographyBatchItemJob(
+            item_id=item.id,
+            job_id=root.id,
+            generation=1,
+            ownership=ownership,
+            role=DiscographyBatchJobRole.release_root,
+        )
+        for item, ownership in zip(
+            items,
+            (DiscographyJobOwnership.created, DiscographyJobOwnership.observed),
+            strict=True,
+        )
+    ]
+    db_session.add_all(links)
+    await db_session.commit()
+    root_id = root.id
+    track_id = track.id
+    album_id = album.id
+    creator_batch_id = batches[0].id
+    observer_item_id = items[1].id
+
+    await cancel_discography_batch(db_session, creator_batch_id)
+    db_session.expire_all()
+    stored_root = await db_session.get(Job, root_id)
+    stored_links = list(
+        (
+            await db_session.scalars(
+                select(DiscographyBatchItemJob).order_by(DiscographyBatchItemJob.item_id)
+            )
+        ).all()
+    )
+    assert stored_root is not None and stored_root.status == JobStatus.pending
+    assert [link.ownership for link in stored_links] == [
+        DiscographyJobOwnership.observed,
+        DiscographyJobOwnership.created,
+    ]
+
+    stored_root.status = JobStatus.partial
+    await db_session.commit()
+    fallback_ids = await _spawn_continuation_jobs(stored_root.id, [track_id], album_id, db_session)
+    assert len(fallback_ids) == 1
+    fallback_link = await db_session.scalar(
+        select(DiscographyBatchItemJob).where(
+            DiscographyBatchItemJob.item_id == observer_item_id,
+            DiscographyBatchItemJob.role == DiscographyBatchJobRole.track_fallback,
+        )
+    )
+    assert fallback_link is not None
+    assert fallback_link.ownership == DiscographyJobOwnership.created

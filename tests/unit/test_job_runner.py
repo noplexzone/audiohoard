@@ -19,6 +19,16 @@ from app.database import Base
 from app.jobs import runner
 from app.models.acquisition_attempt import AcquisitionAttempt
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
+from app.models.discography_batch import (
+    DiscographyBatch,
+    DiscographyBatchItem,
+    DiscographyBatchItemJob,
+    DiscographyBatchItemState,
+    DiscographyBatchJobRole,
+    DiscographyBatchState,
+    DiscographyJobOwnership,
+    DiscographyScopeKind,
+)
 from app.models.job import Job, JobStatus
 from app.models.release import Release
 from app.models.source_candidate_block import SourceCandidateBlock
@@ -986,6 +996,7 @@ async def test_concurrent_equivalent_continuations_create_and_dispatch_once(
         async def fake_dispatch(continuation_id: int) -> None:
             dispatched.append(continuation_id)
 
+        monkeypatch.setattr(runner, "get_session_factory", lambda: factory)
         monkeypatch.setattr(dispatcher_module.job_dispatcher, "dispatch", fake_dispatch)
         for continuation_ids in created_by_call:
             await runner._dispatch_continuation_jobs(continuation_ids)
@@ -2682,7 +2693,7 @@ def test_release_root_reconciliation_rejects_contradictory_position_and_title() 
     reconciled, failures = runner._reconcile_release_root_results([contradictory], catalog)
 
     assert reconciled == []
-    assert [failure["code"] for failure in failures] == ["catalog_result_identity_contradiction"]
+    assert [failure["code"] for failure in failures] == ["catalog_result_position_contradiction"]
 
 
 def test_release_root_reconciliation_rejects_duplicate_provider_artifact() -> None:
@@ -2793,7 +2804,7 @@ async def test_release_root_rejects_all_mixed_source_invalid_results_before_side
     assert await db_session.scalar(select(Track.id).where(Track.job_id == root.id)) is None
     assert root.result_json is not None
     assert "catalog_result_unmatched" in root.result_json
-    assert "catalog_result_identity_contradiction" in root.result_json
+    assert "catalog_result_position_contradiction" in root.result_json
     assert "catalog_result_duplicate_artifact" in root.result_json
 
 
@@ -2876,3 +2887,96 @@ async def test_release_root_unmatched_audio_never_reaches_acquisition(
     assert None not in {track.catalog_track_id for track in stored}
     assert root.result_json is not None
     assert "catalog_result_unmatched" in root.result_json
+
+
+@pytest.mark.parametrize(
+    ("title", "filename"),
+    [
+        ("2-01 Intro", "Album/2-01 Intro.flac"),
+        ("01 Intro", "Album/02 Intro.flac"),
+    ],
+)
+def test_release_root_rejects_conflicting_independent_position_evidence(
+    title: str, filename: str
+) -> None:
+    catalog = [
+        CatalogAlbumTrack(id=1, album_id=1, position=1, disc=1, title="Intro"),
+        CatalogAlbumTrack(id=2, album_id=1, position=2, disc=1, title="Intro"),
+        CatalogAlbumTrack(id=3, album_id=1, position=1, disc=2, title="Intro"),
+    ]
+    result = SearchResult(
+        source="slskd",
+        title=title,
+        metadata={
+            "disc": 1,
+            "track_no": 1,
+            "username": "peer",
+            "filename": filename,
+        },
+    )
+
+    reconciled, failures = runner._reconcile_release_root_results([result], catalog)
+
+    assert reconciled == []
+    assert [failure["code"] for failure in failures] == ["catalog_result_position_contradiction"]
+
+
+async def test_continuation_dispatch_is_suppressed_when_all_batch_observers_paused(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'paused-fallback.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as db:
+        artist = CatalogArtist(name="Artist")
+        album = CatalogAlbum(artist=artist, title="Album", track_count=1)
+        track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+        fallback = Job(
+            source="priority",
+            query="Artist One",
+            status=JobStatus.pending,
+            catalog_album=album,
+            catalog_track=track,
+        )
+        batch = DiscographyBatch(
+            scope_kind=DiscographyScopeKind.wanted_selected,
+            scope_json="{}",
+            scope_hash="9" * 64,
+            state=DiscographyBatchState.paused,
+        )
+        item = DiscographyBatchItem(
+            batch=batch,
+            release_identity="catalog_album:paused",
+            catalog_album=album,
+            artist_name="Artist",
+            release_title="Album",
+            state=DiscographyBatchItemState.waiting,
+        )
+        db.add_all([artist, album, track, fallback, batch, item])
+        await db.flush()
+        db.add(
+            DiscographyBatchItemJob(
+                item_id=item.id,
+                job_id=fallback.id,
+                generation=1,
+                catalog_track_id=track.id,
+                ownership=DiscographyJobOwnership.created,
+                role=DiscographyBatchJobRole.track_fallback,
+            )
+        )
+        await db.commit()
+        fallback_id = fallback.id
+    dispatched: list[int] = []
+
+    async def fake_dispatch(job_id: int) -> None:
+        dispatched.append(job_id)
+
+    from app.jobs import dispatcher as dispatcher_module
+
+    monkeypatch.setattr(runner, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(dispatcher_module.job_dispatcher, "dispatch", fake_dispatch)
+    await runner._dispatch_continuation_jobs([fallback_id])
+
+    assert dispatched == []
+    await engine.dispose()

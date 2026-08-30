@@ -789,7 +789,7 @@ async def run_job(
                 continuation.catalog_album_id,
                 db,
             )
-            await _dispatch_continuation_jobs(direct_continuation_ids or [])
+            await _dispatch_continuation_jobs(direct_continuation_ids or [], db=db)
         return
 
     # Background path: short independent sessions with committed checkpoints.
@@ -1675,6 +1675,44 @@ def _result_disc_position(result: SearchResult) -> tuple[int, int] | None:
     return (disc if disc is not None and disc > 0 else 1, position)
 
 
+def _position_from_text(value: str) -> tuple[int, int] | None:
+    compound = _DISC_TRACK_PREFIX_RE.match(value)
+    if compound:
+        disc, position = int(compound.group(1)), int(compound.group(2))
+        return (disc, position) if disc > 0 and position > 0 else None
+    single = _SINGLE_TRACK_PREFIX_RE.match(value)
+    if single:
+        position = int(single.group(1))
+        return (1, position) if position > 0 else None
+    return None
+
+
+def _release_root_position_evidence(result: SearchResult) -> set[tuple[int, int]]:
+    evidence: set[tuple[int, int]] = set()
+    metadata = result.metadata or {}
+    try:
+        raw_position = metadata.get("track_no")
+        position = int(raw_position) if isinstance(raw_position, (int, str, float)) else None
+        raw_disc = metadata.get("disc")
+        disc = int(raw_disc) if isinstance(raw_disc, (int, str, float)) else 1
+    except (ValueError, TypeError):
+        position = None
+        disc = 1
+    if position is not None and position > 0 and disc > 0:
+        evidence.add((disc, position))
+    if result.title:
+        parsed = _position_from_text(result.title)
+        if parsed is not None:
+            evidence.add(parsed)
+    filename = metadata.get("filename")
+    if isinstance(filename, str) and filename.strip():
+        basename = filename.strip().replace("\\", "/").rsplit("/", 1)[-1]
+        parsed = _position_from_text(basename)
+        if parsed is not None:
+            evidence.add(parsed)
+    return evidence
+
+
 def _release_root_title_matches(
     raw_title: str, tracks: list[CatalogAlbumTrack]
 ) -> list[CatalogAlbumTrack]:
@@ -1739,12 +1777,16 @@ def _reconcile_release_root_results(
         ]
     ] = []
     for result in results:
-        position = _result_disc_position(result)
-        if position is not None:
+        position_evidence = _release_root_position_evidence(result)
+        error: str | None = None
+        if len(position_evidence) > 1:
+            matches: list[CatalogAlbumTrack] = []
+            error = "catalog_result_position_contradiction"
+        elif position_evidence:
+            position = next(iter(position_evidence))
             matches = [track for track in tracks if (track.disc, track.position) == position]
         else:
             matches = _release_root_title_matches(result.title or "", tracks)
-        error: str | None = None
         track = matches[0] if len(matches) == 1 else None
         if track is not None and not _release_root_result_matches_track(result, track):
             track = None
@@ -3257,12 +3299,57 @@ async def _spawn_continuation_jobs(
     return committed_ids
 
 
-async def _dispatch_continuation_jobs(continuation_ids: Sequence[int]) -> None:
-    """Dispatch only continuation rows returned by a successful creation commit."""
+async def _continuation_dispatch_allowed(
+    continuation_id: int, *, db: AsyncSession | None = None
+) -> bool:
+    """Fence batch fallback dispatch against pause/cancel after child commit."""
+    if db is None:
+        async with get_session_factory()() as owned_db:
+            return await _continuation_dispatch_allowed(continuation_id, db=owned_db)
+    linked = await db.scalar(
+        select(DiscographyBatchItemJob.id).where(DiscographyBatchItemJob.job_id == continuation_id)
+    )
+    if linked is None:
+        return True
+    return bool(
+        await db.scalar(
+            select(DiscographyBatchItemJob.id)
+            .join(
+                DiscographyBatchItem,
+                DiscographyBatchItem.id == DiscographyBatchItemJob.item_id,
+            )
+            .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+            .join(Job, Job.id == DiscographyBatchItemJob.job_id)
+            .where(
+                DiscographyBatchItemJob.job_id == continuation_id,
+                DiscographyBatchItemJob.role == DiscographyBatchJobRole.track_fallback,
+                DiscographyBatchItemJob.generation == DiscographyBatchItem.execution_generation,
+                DiscographyBatchItem.state.in_(
+                    (
+                        DiscographyBatchItemState.pending,
+                        DiscographyBatchItemState.hydrating,
+                        DiscographyBatchItemState.expanding,
+                        DiscographyBatchItemState.waiting,
+                    )
+                ),
+                DiscographyBatch.state.in_(
+                    (DiscographyBatchState.queued, DiscographyBatchState.running)
+                ),
+                Job.status == JobStatus.pending,
+            )
+        )
+    )
+
+
+async def _dispatch_continuation_jobs(
+    continuation_ids: Sequence[int], *, db: AsyncSession | None = None
+) -> None:
+    """Dispatch committed continuations only while durable ownership permits it."""
     from app.jobs.dispatcher import job_dispatcher
 
     for continuation_id in continuation_ids:
-        await job_dispatcher.dispatch(continuation_id)
+        if await _continuation_dispatch_allowed(continuation_id, db=db):
+            await job_dispatcher.dispatch(continuation_id)
 
 
 async def _compute_path_preview(track: Track, db: AsyncSession, cfg: Settings) -> None:

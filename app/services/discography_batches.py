@@ -812,6 +812,68 @@ async def pause_discography_batch(
     return DiscographyBatchControlResult(batch.id, batch.state)
 
 
+async def _transfer_shared_created_job_ownership(db: AsyncSession, batch_id: int) -> None:
+    """Keep shared physical work owned when its original batch is cancelled."""
+    creator_links = list(
+        (
+            await db.scalars(
+                select(DiscographyBatchItemJob)
+                .join(
+                    DiscographyBatchItem,
+                    DiscographyBatchItem.id == DiscographyBatchItemJob.item_id,
+                )
+                .where(
+                    DiscographyBatchItem.batch_id == batch_id,
+                    DiscographyBatchItemJob.ownership == DiscographyJobOwnership.created,
+                )
+                .order_by(DiscographyBatchItemJob.id)
+            )
+        ).all()
+    )
+    active_item_states = (
+        DiscographyBatchItemState.pending,
+        DiscographyBatchItemState.hydrating,
+        DiscographyBatchItemState.expanding,
+        DiscographyBatchItemState.waiting,
+    )
+    active_batch_states = (
+        DiscographyBatchState.queued,
+        DiscographyBatchState.running,
+        DiscographyBatchState.paused,
+    )
+    for creator_link in creator_links:
+        observer_link = await db.scalar(
+            select(DiscographyBatchItemJob)
+            .join(
+                DiscographyBatchItem,
+                DiscographyBatchItem.id == DiscographyBatchItemJob.item_id,
+            )
+            .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+            .where(
+                DiscographyBatchItemJob.job_id == creator_link.job_id,
+                DiscographyBatchItemJob.id != creator_link.id,
+                DiscographyBatchItemJob.ownership == DiscographyJobOwnership.observed,
+                DiscographyBatchItemJob.role == creator_link.role,
+                (
+                    DiscographyBatchItemJob.catalog_track_id.is_(None)
+                    if creator_link.catalog_track_id is None
+                    else DiscographyBatchItemJob.catalog_track_id == creator_link.catalog_track_id
+                ),
+                DiscographyBatchItemJob.generation == DiscographyBatchItem.execution_generation,
+                DiscographyBatchItem.state.in_(active_item_states),
+                DiscographyBatch.state.in_(active_batch_states),
+                DiscographyBatch.id != batch_id,
+            )
+            .order_by(DiscographyBatchItemJob.id)
+            .limit(1)
+        )
+        if observer_link is None:
+            continue
+        creator_link.ownership = DiscographyJobOwnership.observed
+        observer_link.ownership = DiscographyJobOwnership.created
+    await db.flush()
+
+
 async def cancel_discography_batch(
     db: AsyncSession, batch_id: int
 ) -> DiscographyBatchControlResult:
@@ -824,6 +886,7 @@ async def cancel_discography_batch(
         DiscographyBatchState.paused,
     }:
         raise DiscographyScopeError("batch is not cancellable")
+    await _transfer_shared_created_job_ownership(db, batch_id)
     cancelled = tuple(
         int(row.id)
         for row in (
