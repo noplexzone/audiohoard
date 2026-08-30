@@ -173,31 +173,45 @@ class JobDispatcher:
         finally:
             if token is not None:
                 _current_acquisition_permit.reset(token)
-            try:
-                await permit.release()
-            finally:
-                await self._release_inflight()
+
+            async def release_owned_resources() -> None:
+                try:
+                    await permit.release()
+                finally:
+                    await self._release_inflight()
+
+            release_task = asyncio.create_task(release_owned_resources())
+            deferred_cancellation: asyncio.CancelledError | None = None
+            while not release_task.done():
+                try:
+                    await asyncio.shield(release_task)
+                except asyncio.CancelledError as exc:
+                    deferred_cancellation = exc
+            release_task.result()
+            if deferred_cancellation is not None:
+                raise deferred_cancellation
 
     async def dispatch(self, job_id: int) -> asyncio.Task[None]:
         existing = self._tasks.get(job_id)
         if existing is not None and not existing.done():
             return existing
 
-        task = asyncio.create_task(self._run_with_limit(job_id), name=f"job-{job_id}")
+        async def run_and_log() -> None:
+            try:
+                await self._run_with_limit(job_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("Job %d task raised unhandled exception: %s", job_id, exc)
+                raise
+
+        task = asyncio.create_task(run_and_log(), name=f"job-{job_id}")
 
         def _remove(done_task: asyncio.Task[None]) -> None:
             if self._tasks.get(job_id) is done_task:
                 del self._tasks[job_id]
 
-        def _log_exception(done_task: asyncio.Task[None]) -> None:
-            if done_task.cancelled():
-                return
-            exc = done_task.exception()
-            if exc is not None:
-                logger.error("Job %d task raised unhandled exception: %s", job_id, exc)
-
         task.add_done_callback(_remove)
-        task.add_done_callback(_log_exception)
         self._tasks[job_id] = task
         return task
 

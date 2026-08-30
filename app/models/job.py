@@ -4,7 +4,18 @@ from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, false, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    false,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -27,6 +38,9 @@ class JobStatus(StrEnum):
 
 class Job(Base):
     __tablename__ = "jobs"
+    __table_args__ = (
+        Index("ix_jobs_status_execution_lease_expires_at", "status", "execution_lease_expires_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     source: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -46,6 +60,10 @@ class Job(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+    execution_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    execution_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     selected_result_json: Mapped[str | None] = mapped_column(Text, nullable=True)

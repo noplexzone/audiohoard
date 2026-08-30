@@ -1052,6 +1052,51 @@ async def test_local_resize_updates_derived_inflight_limit_and_admission() -> No
     assert dispatcher.active_jobs == dispatcher.inflight_jobs == 0
 
 
+async def test_cancellation_during_inflight_finalizer_cannot_leak_capacity() -> None:
+    runner_entered = asyncio.Event()
+    finalizer_entered = asyncio.Event()
+    release_finalizer = asyncio.Event()
+    later_ran = asyncio.Event()
+
+    async def runner(job_id: int) -> None:
+        if job_id == 1:
+            runner_entered.set()
+            await asyncio.Event().wait()
+        else:
+            later_ran.set()
+
+    dispatcher = JobDispatcher(runner=runner, max_concurrent_jobs=1, max_inflight_jobs=1)
+    original_release_inflight = dispatcher._release_inflight
+
+    async def blocked_release_inflight() -> None:
+        finalizer_entered.set()
+        await release_finalizer.wait()
+        await original_release_inflight()
+
+    dispatcher._release_inflight = blocked_release_inflight  # type: ignore[method-assign]
+    task = await dispatcher.dispatch(1)
+    await asyncio.wait_for(runner_entered.wait(), timeout=1)
+    task.cancel()
+    await asyncio.wait_for(finalizer_entered.wait(), timeout=1)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert dispatcher.active_jobs == 0
+    assert dispatcher.inflight_jobs == 1
+
+    release_finalizer.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert dispatcher.active_jobs == 0
+    assert dispatcher.inflight_jobs == 0
+
+    later = await dispatcher.dispatch(2)
+    await asyncio.wait_for(later, timeout=1)
+    assert later_ran.is_set()
+    assert dispatcher.active_jobs == 0
+    assert dispatcher.inflight_jobs == 0
+
+
 async def test_explicit_inflight_limit_stays_fixed_across_local_resize() -> None:
     entered: list[int] = []
     two_entered = asyncio.Event()

@@ -2078,10 +2078,17 @@ async def test_background_phase2_get_raises_persists_failed(
 async def test_dispatcher_done_callback_logs_error_on_exception(
     bg_factory: async_sessionmaker,
     test_settings: Settings,
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from app.jobs import dispatcher as dispatcher_module
     from app.jobs.dispatcher import JobDispatcher
 
+    logged: list[str] = []
+    monkeypatch.setattr(
+        dispatcher_module.logger,
+        "error",
+        lambda message, *args: logged.append(message % args),
+    )
     async with bg_factory() as s:
         job = Job(source="youtube", query="test", status=JobStatus.pending)
         s.add(job)
@@ -2097,8 +2104,8 @@ async def test_dispatcher_done_callback_logs_error_on_exception(
         await asyncio.gather(task, return_exceptions=True)
     await asyncio.sleep(0)  # let callbacks fire
 
-    assert any(str(job_id) in r.message and r.levelname == "ERROR" for r in caplog.records), (
-        f"Expected ERROR log for job {job_id}; got: {[r.message for r in caplog.records]}"
+    assert any(str(job_id) in message for message in logged), (
+        f"Expected ERROR log for job {job_id}; got: {logged}"
     )
 
 

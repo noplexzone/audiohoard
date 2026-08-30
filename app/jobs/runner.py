@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import ParseResult, urlparse
+from uuid import uuid4
 
 from sqlalchemy import select, text, update
 from sqlalchemy.engine import CursorResult
@@ -85,6 +86,10 @@ from app.sources.tidal import TidalAdapter
 from app.sources.youtube import ProviderError, YouTubeAdapter
 
 logger = logging.getLogger(__name__)
+
+
+class ExecutionLeaseLost(BaseException):
+    """Raised when a background runner no longer owns its job execution lease."""
 
 
 @dataclass(frozen=True)
@@ -503,6 +508,124 @@ async def _poll_sab_job(
         await asyncio.sleep(min(poll_interval, max(0.01, remaining)))
 
 
+_TERMINAL_JOB_STATUSES = {
+    JobStatus.done,
+    JobStatus.partial,
+    JobStatus.failed,
+    JobStatus.cancelled,
+}
+
+
+def _lease_duration(cfg: Settings) -> timedelta:
+    return timedelta(seconds=float(cfg.job_watchdog_threshold_seconds))
+
+
+async def _claim_execution_lease(
+    db: AsyncSession, job_id: int, token: str, lease_duration: timedelta
+) -> bool:
+    claimed = False
+
+    async def operation() -> None:
+        nonlocal claimed
+        claimed = False
+        now = _now()
+        result = await db.execute(
+            update(Job)
+            .where(
+                Job.id == job_id,
+                Job.status == JobStatus.pending,
+                Job.execution_token.is_(None),
+            )
+            .values(
+                status=JobStatus.running,
+                execution_token=token,
+                execution_lease_expires_at=now + lease_duration,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        claimed = isinstance(result, CursorResult) and result.rowcount == 1
+        claimed_job: Job | None = None
+        if claimed:
+            # Keep retry instrumentation and session observers aligned with the
+            # conditional SQL claim without making the loaded row part of the CAS.
+            claimed_job = await db.get(Job, job_id, populate_existing=True)
+        await db.commit()
+        _ = claimed_job
+
+    await run_with_sqlite_lock_retry(db, operation)
+    return claimed
+
+
+async def _heartbeat_execution_lease(
+    job_id: int,
+    token: str,
+    lease_duration: timedelta,
+    stop: asyncio.Event,
+) -> None:
+    factory = get_session_factory()
+    interval = max(0.01, lease_duration.total_seconds() / 3)
+    while not stop.is_set():
+        async with factory() as db:
+            now = _now()
+            result = await db.execute(
+                update(Job)
+                .where(
+                    Job.id == job_id,
+                    Job.status == JobStatus.running,
+                    Job.execution_token == token,
+                )
+                .values(execution_lease_expires_at=now + lease_duration, updated_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            alive = isinstance(result, CursorResult) and result.rowcount == 1
+            await db.commit()
+        if not alive:
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+
+
+async def _prove_execution_lease(db: AsyncSession, job_id: int, token: str) -> None:
+    # A token-filtered no-op UPDATE is the transaction fence: it acquires the
+    # database write boundary before any dirty sibling rows are flushed. A SELECT
+    # followed by commit would leave a takeover window between proof and write.
+    with db.no_autoflush:
+        result = await db.execute(
+            update(Job)
+            .where(
+                Job.id == job_id,
+                Job.status == JobStatus.running,
+                Job.execution_token == token,
+            )
+            .values(execution_token=Job.execution_token)
+            .execution_options(synchronize_session=False)
+        )
+    owned = isinstance(result, CursorResult) and result.rowcount == 1
+    if not owned:
+        await db.rollback()
+        raise ExecutionLeaseLost(f"job {job_id} execution lease was replaced")
+
+
+async def _commit_job_progress(db: AsyncSession, job: Job, expected_token: str) -> None:
+    """Fence and commit one complete background progress or terminal transaction."""
+    await _prove_execution_lease(db, job.id, expected_token)
+    if job.status in _TERMINAL_JOB_STATUSES:
+        job.execution_token = None
+        job.execution_lease_expires_at = None
+    try:
+        await db.commit()
+    except Exception as exc:
+        # Test doubles and pre-flush SQLite lock injections leave the transaction
+        # usable. Re-prove and retry only this DB commit; never replay execution I/O.
+        if is_sqlite_database_locked(exc) and db.is_active:
+            await _prove_execution_lease(db, job.id, expected_token)
+            await db.commit()
+            return
+        await db.rollback()
+        raise
+
+
 async def _persist_job_envelope(
     db: AsyncSession,
     job_id: int,
@@ -511,6 +634,7 @@ async def _persist_job_envelope(
     status: JobStatus,
     result_json: str | None = None,
     cancel_active_tracks: bool = False,
+    expected_token: str | None = None,
 ) -> bool:
     """Persist one short job-envelope transition with rollback-safe retries."""
     transitioned = False
@@ -519,11 +643,17 @@ async def _persist_job_envelope(
         nonlocal transitioned
         transitioned = False
         values: dict[str, object] = {"status": status, "updated_at": _now()}
+        if status in _TERMINAL_JOB_STATUSES:
+            values["execution_token"] = None
+            values["execution_lease_expires_at"] = None
         if result_json is not None:
             values["result_json"] = result_json
+        conditions = [Job.id == job_id, Job.status.in_(expected_statuses)]
+        if expected_token is not None:
+            conditions.append(Job.execution_token == expected_token)
         result = await db.execute(
             update(Job)
-            .where(Job.id == job_id, Job.status.in_(expected_statuses))
+            .where(*conditions)
             .values(**values)
             .execution_options(synchronize_session=False)
         )
@@ -561,12 +691,37 @@ def _job_error_result(code: str, operation: str, *, retryable: bool) -> str:
     return json.dumps({"error": {"code": code, "operation": operation, "retryable": retryable}})
 
 
+async def _invoke_job_execution(
+    job_id: int,
+    db: AsyncSession,
+    cfg: Settings,
+    *,
+    commit_progress: bool,
+    expected_token: str | None,
+) -> _ContinuationRequest | None:
+    """Invoke the execution seam without replaying work to infer hook compatibility."""
+    parameters = inspect.signature(_run_job_in_session).parameters
+    if "expected_token" in parameters:
+        return await _run_job_in_session(
+            job_id,
+            db,
+            cfg,
+            commit_progress=commit_progress,
+            expected_token=expected_token,
+        )
+    if "commit_progress" in parameters:
+        return await _run_job_in_session(job_id, db, cfg, commit_progress=commit_progress)
+    return await _run_job_in_session(job_id, db, cfg)
+
+
 async def run_job(
     job_id: int, db: AsyncSession | None = None, settings: Settings | None = None
 ) -> None:
     if db is not None:
         cfg = settings or await build_effective_settings(db, get_settings())
-        continuation = await _run_job_in_session(job_id, db, cfg)
+        continuation = await _invoke_job_execution(
+            job_id, db, cfg, commit_progress=False, expected_token=None
+        )
         if continuation is not None:
             # This legacy caller-owned session path intentionally commits execution
             # state before continuation creation starts its isolated transaction.
@@ -617,14 +772,13 @@ async def run_job(
 
     cfg = cfg_built
 
-    # Phase 2: commit pending->running before any provider work so observers see it.
+    # Phase 2: atomically claim pending work before any provider boundary is crossed.
+    execution_token = str(uuid4())
+    lease_duration = _lease_duration(cfg)
     try:
         async with factory() as session:
-            claimed = await _persist_job_envelope(
-                session,
-                job_id,
-                expected_statuses={JobStatus.pending},
-                status=JobStatus.running,
+            claimed = await _claim_execution_lease(
+                session, job_id, execution_token, lease_duration
             )
         if not claimed:
             return
@@ -649,17 +803,28 @@ async def run_job(
                 )
         return
 
-    # Phase 3: provider/filesystem execution occurs once. Only primitive terminal
-    # envelope data crosses into the rollback-safe persistence closure.
+    # Phase 3: heartbeat in its own short sessions while provider/filesystem work
+    # executes exactly once in the execution session.
+    heartbeat_stop = asyncio.Event()
+    heartbeat = asyncio.create_task(
+        _heartbeat_execution_lease(job_id, execution_token, lease_duration, heartbeat_stop),
+        name=f"job-{job_id}-heartbeat",
+    )
+    lease_lost = False
     try:
         continuation_ids: list[int] = []
         async with factory() as session:
-            continuation = await _run_job_in_session(job_id, session, cfg, commit_progress=True)
+            continuation = await _invoke_job_execution(
+                job_id,
+                session,
+                cfg,
+                commit_progress=True,
+                expected_token=execution_token,
+            )
             current = await session.get(Job, job_id)
             if current is None:
                 return
             terminal_status = current.status
-            terminal_result = current.result_json
             if terminal_status not in {
                 JobStatus.done,
                 JobStatus.partial,
@@ -667,24 +832,10 @@ async def run_job(
                 JobStatus.cancelled,
             }:
                 raise RuntimeError(f"job {job_id} execution did not reach a terminal status")
-            # Real execution has already committed the complete terminal unit. This
-            # extra commit supports caller/test implementations; if it alone locks,
-            # reconstruct only their terminal envelope without replaying execution.
-            try:
-                await session.commit()
-            except Exception as exc:
-                await session.rollback()
-                if not is_sqlite_database_locked(exc):
-                    raise
-                committed = await _persist_job_envelope(
-                    session,
-                    job_id,
-                    expected_statuses={JobStatus.running},
-                    status=terminal_status,
-                    result_json=terminal_result,
-                )
-                if not committed:
-                    return
+            # The real runner commits terminal state through the fenced seam. Test
+            # implementations may leave it pending, so finish that same transaction.
+            if current.execution_token == execution_token:
+                await _commit_job_progress(session, current, execution_token)
             if continuation is not None:
                 continuation_ids = await _spawn_continuation_jobs(
                     continuation.parent_job_id,
@@ -693,6 +844,9 @@ async def run_job(
                     session,
                 )
         await _dispatch_continuation_jobs(continuation_ids)
+    except ExecutionLeaseLost:
+        lease_lost = True
+        raise
     except asyncio.CancelledError:
         async with factory() as session:
             await _persist_job_envelope(
@@ -702,6 +856,7 @@ async def run_job(
                 status=JobStatus.cancelled,
                 result_json=_job_error_result("cancelled", "job", retryable=True),
                 cancel_active_tracks=True,
+                expected_token=execution_token,
             )
         raise
     except Exception:
@@ -713,31 +868,49 @@ async def run_job(
                 expected_statuses={JobStatus.pending, JobStatus.running},
                 status=JobStatus.failed,
                 result_json=_job_error_result("job_failed", "job", retryable=True),
+                expected_token=execution_token,
             )
     finally:
-        try:
-            from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
+        heartbeat_stop.set()
+        with contextlib.suppress(Exception):
+            await heartbeat
+        if not lease_lost:
+            try:
+                from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
 
-            await cleanup_terminal_acquisitions(
-                factory,
-                slskd_url=cfg.slskd_url,
-                slskd_api_key=cfg.slskd_api_key,
-                job_ids={job_id},
-                slskd_complete_root=cfg.slskd_complete_root,
-                slskd_incomplete_root=cfg.slskd_incomplete_root,
-                partial_minimum_age=timedelta(seconds=cfg.slskd_directory_sweep_min_age_seconds),
-            )
-        except Exception:
-            logger.exception("Job %d terminal acquisition cleanup failed", job_id)
+                await cleanup_terminal_acquisitions(
+                    factory,
+                    slskd_url=cfg.slskd_url,
+                    slskd_api_key=cfg.slskd_api_key,
+                    job_ids={job_id},
+                    slskd_complete_root=cfg.slskd_complete_root,
+                    slskd_incomplete_root=cfg.slskd_incomplete_root,
+                    partial_minimum_age=timedelta(
+                        seconds=cfg.slskd_directory_sweep_min_age_seconds
+                    ),
+                )
+            except Exception:
+                logger.exception("Job %d terminal acquisition cleanup failed", job_id)
 
 
 async def _run_job_in_session(
-    job_id: int, db: AsyncSession, cfg: Settings, *, commit_progress: bool = False
+    job_id: int,
+    db: AsyncSession,
+    cfg: Settings,
+    *,
+    commit_progress: bool = False,
+    expected_token: str | None = None,
 ) -> _ContinuationRequest | None:
     job = await db.get(Job, job_id)
     if job is None:
         logger.error("Job %d not found", job_id)
         return None
+
+    async def persist_progress() -> None:
+        if expected_token is None:
+            await db.commit()
+        else:
+            await _commit_job_progress(db, job, expected_token)
 
     if job.catalog_album_id is not None and job.catalog_track_id is not None:
         from app.services.acquisition_ownership import (
@@ -753,9 +926,10 @@ async def _run_job_in_session(
                 {"tracks_created": 0, "skipped": "exact_catalog_track_owned"}, sort_keys=True
             )
             job.updated_at = _now()
-            await db.flush()
             if commit_progress:
-                await db.commit()
+                await persist_progress()
+            else:
+                await db.flush()
             return None
         claimed = await claim_catalog_acquisition(
             db, job.catalog_album_id, job.catalog_track_id, job.id
@@ -768,9 +942,10 @@ async def _run_job_in_session(
                 sort_keys=True,
             )
             job.updated_at = _now()
-            await db.flush()
             if commit_progress:
-                await db.commit()
+                await persist_progress()
+            else:
+                await db.flush()
             return None
 
     job.status = JobStatus.running
@@ -779,7 +954,7 @@ async def _run_job_in_session(
     # Bug 5: release the SQLite write lock before long provider HTTP/search/polling so
     # concurrent settings writes are not blocked during the acquisition wait.
     if commit_progress:
-        await db.commit()
+        await persist_progress()
 
     continuation_request: _ContinuationRequest | None = None
     try:
@@ -803,7 +978,7 @@ async def _run_job_in_session(
 
                 catalog_album = await _fetch_and_store_album(db, cfg, catalog_album)
                 if commit_progress:
-                    await db.commit()
+                    await persist_progress()
             except Exception:
                 logger.warning(
                     "Compilation artist-credit hydration failed for album %d (job %d)",
@@ -817,7 +992,7 @@ async def _run_job_in_session(
             job,
             cfg,
             db,
-            checkpoint=db.commit if commit_progress else None,
+            checkpoint=persist_progress if commit_progress else None,
         )
         catalog_album = await _load_catalog_album(db, job.catalog_album_id)
         catalog_tracks = list(catalog_album.tracks) if catalog_album is not None else []
@@ -835,7 +1010,7 @@ async def _run_job_in_session(
 
                 catalog_album = await _fetch_and_store_album(db, cfg, catalog_album)
                 if commit_progress:
-                    await db.commit()
+                    await persist_progress()
                 catalog_album = await _load_catalog_album(db, job.catalog_album_id)
                 if catalog_album is not None:
                     catalog_tracks = list(catalog_album.tracks)
@@ -941,7 +1116,7 @@ async def _run_job_in_session(
         for result in results:
             attempt = await _candidate_attempt(db, job, result)
             if commit_progress:
-                await db.commit()
+                await persist_progress()
             if (
                 result.source == "slskd"
                 and selected_catalog_track is not None
@@ -1061,11 +1236,11 @@ async def _run_job_in_session(
                 attempt.track_id = track.id
                 if commit_progress:
                     job.updated_at = _now()
-                    await db.commit()
+                    await persist_progress()
 
                 async def checkpoint() -> None:
                     job.updated_at = _now()
-                    await db.commit()
+                    await persist_progress()
 
                 prepare_kwargs: dict[str, object] = {
                     "checkpoint": checkpoint if commit_progress else None,
@@ -1174,7 +1349,7 @@ async def _run_job_in_session(
                             )
                         await db.flush()
                         if commit_progress:
-                            await db.commit()
+                            await persist_progress()
                 logger.warning("Provider result processing failed with code %s", exc.code)
                 if artifact_missing_gate is not None:
                     break
@@ -1193,7 +1368,7 @@ async def _run_job_in_session(
                 failures.append({"code": "result_processing_failed"})
             if commit_progress:
                 job.updated_at = _now()
-                await db.commit()
+                await persist_progress()
 
         if artifact_missing_gate is not None:
             job.status = JobStatus.failed
@@ -1321,9 +1496,10 @@ async def _run_job_in_session(
         )
         job.updated_at = _now()
 
-    await db.flush()
     if commit_progress:
-        await db.commit()
+        await persist_progress()
+    else:
+        await db.flush()
     return continuation_request
 
 
