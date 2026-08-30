@@ -34,7 +34,10 @@ def _insert_job(
     return result.lastrowid
 
 
-def test_0036_release_first_schema_preserves_links_and_roundtrips(tmp_path: Path) -> None:
+def test_0036_release_first_schema_preserves_links_and_roundtrips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     database = tmp_path / "migration-0036.db"
     cfg = _config(database)
     command.upgrade(cfg, "0035")
@@ -261,4 +264,14 @@ def test_0036_release_first_schema_preserves_links_and_roundtrips(tmp_path: Path
         column["name"] for column in reupgraded.get_columns("discography_batch_item_jobs")
     }
     assert "catalog_release_acquisition_claims" in reupgraded.get_table_names()
+    with engine.connect() as connection:
+        # Downgrade to 0035 cannot encode release-first roles. The row survives,
+        # and re-upgrade deliberately classifies it as legacy compatibility work.
+        assert (
+            connection.scalar(
+                sa.text("SELECT role FROM discography_batch_item_jobs WHERE job_id=:job"),
+                {"job": root_job_id},
+            )
+            == "legacy_track"
+        )
     engine.dispose()

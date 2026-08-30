@@ -32,6 +32,9 @@ _ROLE_TRACK_CHECK = (
 
 
 def upgrade() -> None:
+    dialect = op.get_bind().dialect.name
+    if dialect not in {"sqlite", "postgresql"}:
+        raise RuntimeError("release-first admission requires SQLite or PostgreSQL partial indexes")
     with op.batch_alter_table("discography_batch_item_jobs") as batch:
         batch.add_column(
             sa.Column(
@@ -83,6 +86,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Revision 0035 has no column capable of preserving release-first roles.
+    # Downgrade is therefore intentionally lossy: surviving links re-upgrade as
+    # legacy_track. Jobs and links themselves are retained unchanged.
     op.drop_table("catalog_release_acquisition_claims")
     op.drop_index(
         "uq_discography_batch_item_generation_release_root",
