@@ -9,7 +9,7 @@ from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -17,6 +17,10 @@ from app.database import get_session_factory, run_with_sqlite_lock_retry
 from app.models.job import Job, JobStatus
 
 logger = logging.getLogger(__name__)
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 class JobNotFoundError(LookupError):
@@ -263,6 +267,8 @@ class JobDispatcher:
             job.status = JobStatus.pending
             job.queue_hidden = False
             job.result_json = None
+            job.execution_token = None
+            job.execution_lease_expires_at = None
             job.updated_at = datetime.now(UTC)
             await db.commit()
         return await self.dispatch(job_id)
@@ -312,6 +318,7 @@ class JobDispatcher:
 
             async def recover_jobs() -> None:
                 attempt_ids: list[int] = []
+                now = datetime.now(UTC)
                 rows = (
                     await db.execute(
                         select(
@@ -319,10 +326,12 @@ class JobDispatcher:
                             Job.status,
                             Job.result_json,
                             Job.updated_at,
+                            Job.execution_token,
+                            Job.execution_lease_expires_at,
                         ).where(Job.status.in_([JobStatus.pending, JobStatus.running]))
                     )
                 ).all()
-                for job_id, status, result_json, updated_at in rows:
+                for job_id, status, result_json, updated_at, token, lease_expires_at in rows:
                     result_match = (
                         Job.result_json.is_(None)
                         if result_json is None
@@ -334,15 +343,23 @@ class JobDispatcher:
                             .where(
                                 Job.id == job_id,
                                 Job.status == JobStatus.pending,
+                                Job.execution_token.is_(None),
                                 func.julianday(Job.updated_at) == func.julianday(updated_at),
                                 result_match,
                             )
-                            .values(updated_at=datetime.now(UTC))
+                            .values(updated_at=now)
                             .execution_options(synchronize_session=False)
                         )
                         if isinstance(result, CursorResult) and result.rowcount == 1:
                             attempt_ids.append(job_id)
                         continue
+
+                    # A token with an unexpired lease may still belong to a healthy
+                    # worker in another process. Startup recovery waits for expiry.
+                    if token is not None and lease_expires_at is not None:
+                        comparable_expiry = _as_utc(lease_expires_at)
+                        if comparable_expiry > now:
+                            continue
                     try:
                         payload = json.loads(result_json) if result_json else {}
                     except (json.JSONDecodeError, TypeError):
@@ -353,17 +370,30 @@ class JobDispatcher:
                         "code": "interrupted_by_restart",
                         "retryable": True,
                     }
+                    predicates = [
+                        Job.id == job_id,
+                        Job.status == JobStatus.running,
+                        result_match,
+                    ]
+                    if token is None:
+                        predicates.append(Job.execution_token.is_(None))
+                    else:
+                        predicates.append(Job.execution_token == token)
+                        predicates.append(
+                            or_(
+                                Job.execution_lease_expires_at.is_(None),
+                                Job.execution_lease_expires_at <= now,
+                            )
+                        )
                     result = await db.execute(
                         update(Job)
-                        .where(
-                            Job.id == job_id,
-                            Job.status == JobStatus.running,
-                            func.julianday(Job.updated_at) == func.julianday(updated_at),
-                        )
+                        .where(*predicates)
                         .values(
                             status=JobStatus.pending,
                             result_json=json.dumps(payload),
-                            updated_at=datetime.now(UTC),
+                            execution_token=None,
+                            execution_lease_expires_at=None,
+                            updated_at=now,
                         )
                         .execution_options(synchronize_session=False)
                     )
@@ -378,7 +408,8 @@ class JobDispatcher:
         return recovered_ids
 
     async def _watchdog_tick(self, threshold_seconds: int) -> None:
-        threshold_dt = datetime.now(UTC) - timedelta(seconds=threshold_seconds)
+        now = datetime.now(UTC)
+        threshold_dt = now - timedelta(seconds=threshold_seconds)
         committed_actions: list[tuple[int, bool]] = []
         async with self._factory()() as db:
 
@@ -391,22 +422,59 @@ class JobDispatcher:
                             Job.status,
                             Job.result_json,
                             Job.updated_at,
+                            Job.execution_token,
+                            Job.execution_lease_expires_at,
                         ).where(
-                            Job.status.in_([JobStatus.pending, JobStatus.running]),
-                            Job.updated_at < threshold_dt,
+                            or_(
+                                and_(
+                                    Job.status == JobStatus.pending,
+                                    Job.execution_token.is_(None),
+                                    Job.updated_at < threshold_dt,
+                                ),
+                                and_(
+                                    Job.status == JobStatus.running,
+                                    or_(
+                                        and_(
+                                            Job.execution_token.is_(None),
+                                            Job.updated_at < threshold_dt,
+                                        ),
+                                        and_(
+                                            Job.execution_token.is_not(None),
+                                            or_(
+                                                Job.execution_lease_expires_at.is_(None),
+                                                Job.execution_lease_expires_at <= now,
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            )
                         )
                     )
                 ).all()
-                for job_id, status, result_json, updated_at in rows:
+                for job_id, status, result_json, updated_at, token, lease_expires_at in rows:
                     live = self._tasks.get(job_id)
                     if live is not None and not live.done():
                         continue
+                    if status == JobStatus.pending:
+                        if _as_utc(updated_at) >= threshold_dt or token is not None:
+                            continue
+                    elif token is None:
+                        if _as_utc(updated_at) >= threshold_dt:
+                            continue
+                    else:
+                        if lease_expires_at is not None:
+                            comparable_expiry = _as_utc(lease_expires_at)
+                            if comparable_expiry > now:
+                                continue
                     try:
                         current: dict[str, Any] = json.loads(result_json) if result_json else {}
                     except (json.JSONDecodeError, TypeError):
                         current = {}
-                    recurrent = "watchdog_recovery" in current
-                    if recurrent:
+                    if not isinstance(current, dict):
+                        current = {}
+
+                    recurrent_legacy = token is None and "watchdog_recovery" in current
+                    if recurrent_legacy:
                         next_status = JobStatus.failed
                         next_result = json.dumps(
                             {
@@ -419,37 +487,60 @@ class JobDispatcher:
                         )
                     else:
                         next_status = JobStatus.pending if status == JobStatus.running else status
-                        current["watchdog_recovery"] = {"attempt": 1}
+                        recovery = current.get("watchdog_recovery")
+                        prior_attempt = (
+                            int(recovery.get("attempt", 0)) if isinstance(recovery, dict) else 0
+                        )
+                        current["watchdog_recovery"] = {"attempt": prior_attempt + 1}
                         next_result = json.dumps(current)
                     result_match = (
                         Job.result_json.is_(None)
                         if result_json is None
                         else Job.result_json == result_json
                     )
+                    predicates = [
+                        Job.id == job_id,
+                        Job.status == status,
+                        result_match,
+                    ]
+                    if token is None:
+                        predicates.extend(
+                            [
+                                Job.execution_token.is_(None),
+                                func.julianday(Job.updated_at) == func.julianday(updated_at),
+                                Job.updated_at < threshold_dt,
+                            ]
+                        )
+                    else:
+                        predicates.extend(
+                            [
+                                Job.execution_token == token,
+                                or_(
+                                    Job.execution_lease_expires_at.is_(None),
+                                    Job.execution_lease_expires_at <= now,
+                                ),
+                            ]
+                        )
                     result = await db.execute(
                         update(Job)
-                        .where(
-                            Job.id == job_id,
-                            Job.status == status,
-                            func.julianday(Job.updated_at) == func.julianday(updated_at),
-                            Job.updated_at < threshold_dt,
-                            result_match,
-                        )
+                        .where(*predicates)
                         .values(
                             status=next_status,
                             result_json=next_result,
-                            updated_at=datetime.now(UTC),
+                            execution_token=None,
+                            execution_lease_expires_at=None,
+                            updated_at=now,
                         )
                         .execution_options(synchronize_session=False)
                     )
                     if isinstance(result, CursorResult) and result.rowcount == 1:
-                        attempt_actions.append((job_id, recurrent))
+                        attempt_actions.append((job_id, recurrent_legacy))
                 await db.commit()
                 committed_actions[:] = attempt_actions
 
             await run_with_sqlite_lock_retry(db, claim_stale_jobs)
-        for job_id, recurrent in committed_actions:
-            if recurrent:
+        for job_id, recurrent_legacy in committed_actions:
+            if recurrent_legacy:
                 logger.error(
                     "Job %d lost after watchdog recovery attempt; marking dispatch_lost",
                     job_id,

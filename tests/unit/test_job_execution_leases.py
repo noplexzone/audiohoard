@@ -14,7 +14,7 @@ from app.config import Settings
 from app.database import Base
 from app.jobs import runner
 from app.jobs.dispatcher import JobDispatcher
-from app.models.acquisition_attempt import AcquisitionAttempt
+from app.models.acquisition_attempt import AcquisitionAttempt, ProviderTransferState
 from app.models.job import Job, JobStatus
 from app.models.track import Track
 
@@ -149,6 +149,175 @@ async def test_heartbeat_extends_lease_and_keeps_updated_at_fresh_for_current_wa
         assert current.status == JobStatus.running
     release.set()
     await task
+
+
+async def test_watchdog_takes_over_only_expired_lease_and_preserves_active_attempt(
+    lease_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    async with lease_factory() as session:
+        job = Job(
+            source="slskd",
+            query="expired lease",
+            status=JobStatus.running,
+            execution_token="expired-owner",
+            execution_lease_expires_at=now - timedelta(seconds=1),
+            updated_at=now,
+        )
+        session.add(job)
+        await session.flush()
+        attempt = AcquisitionAttempt(
+            job_id=job.id,
+            provider="slskd",
+            peer="peer",
+            remote_path="Album/01.flac",
+            provider_uuid="11111111-1111-1111-1111-111111111111",
+            provider_state=ProviderTransferState.queued,
+        )
+        session.add(attempt)
+        await session.commit()
+        job_id = job.id
+        attempt_id = attempt.id
+
+    dispatched: list[int] = []
+    dispatcher = JobDispatcher(session_factory=lease_factory)
+
+    async def record_dispatch(current_job_id: int) -> None:
+        dispatched.append(current_job_id)
+
+    monkeypatch.setattr(dispatcher, "dispatch", record_dispatch)
+    await dispatcher._watchdog_tick(threshold_seconds=300)
+
+    assert dispatched == [job_id]
+    async with lease_factory() as observer:
+        current = await observer.get(Job, job_id)
+        attempt = await observer.get(AcquisitionAttempt, attempt_id)
+        assert current is not None
+        assert current.status == JobStatus.pending
+        assert current.execution_token is None
+        assert current.execution_lease_expires_at is None
+        assert '"attempt": 1' in (current.result_json or "")
+        assert attempt is not None
+        assert attempt.provider_state == ProviderTransferState.queued
+        assert attempt.provider_uuid == "11111111-1111-1111-1111-111111111111"
+
+
+async def test_watchdog_does_not_take_over_unexpired_lease_even_when_updated_at_is_stale(
+    lease_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    async with lease_factory() as session:
+        job = Job(
+            source="slskd",
+            query="healthy lease",
+            status=JobStatus.running,
+            execution_token="healthy-owner",
+            execution_lease_expires_at=now + timedelta(minutes=5),
+            updated_at=now - timedelta(hours=1),
+        )
+        session.add(job)
+        await session.commit()
+        job_id = job.id
+
+    dispatched: list[int] = []
+    dispatcher = JobDispatcher(session_factory=lease_factory)
+
+    async def record_dispatch(current_job_id: int) -> None:
+        dispatched.append(current_job_id)
+
+    monkeypatch.setattr(dispatcher, "dispatch", record_dispatch)
+    await dispatcher._watchdog_tick(threshold_seconds=1)
+
+    assert dispatched == []
+    async with lease_factory() as observer:
+        current = await observer.get(Job, job_id)
+        assert current is not None
+        assert current.status == JobStatus.running
+        assert current.execution_token == "healthy-owner"
+
+
+async def test_repeated_expired_tokenized_recovery_remains_retryable(
+    lease_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    async with lease_factory() as session:
+        job = Job(
+            source="slskd",
+            query="second recovery",
+            status=JobStatus.running,
+            result_json='{"watchdog_recovery": {"attempt": 1}}',
+            execution_token="second-expired-owner",
+            execution_lease_expires_at=now - timedelta(seconds=1),
+            updated_at=now,
+        )
+        session.add(job)
+        await session.commit()
+        job_id = job.id
+
+    dispatched: list[int] = []
+    dispatcher = JobDispatcher(session_factory=lease_factory)
+
+    async def record_dispatch(current_job_id: int) -> None:
+        dispatched.append(current_job_id)
+
+    monkeypatch.setattr(dispatcher, "dispatch", record_dispatch)
+    await dispatcher._watchdog_tick(threshold_seconds=300)
+
+    assert dispatched == [job_id]
+    async with lease_factory() as observer:
+        current = await observer.get(Job, job_id)
+        assert current is not None
+        assert current.status == JobStatus.pending
+        assert '"attempt": 2' in (current.result_json or "")
+        assert "dispatch_lost" not in (current.result_json or "")
+
+
+async def test_startup_recovery_waits_for_live_lease_and_reclaims_expired_owner(
+    lease_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    async with lease_factory() as session:
+        live = Job(
+            source="slskd",
+            query="live lease",
+            status=JobStatus.running,
+            execution_token="live-owner",
+            execution_lease_expires_at=now + timedelta(minutes=5),
+        )
+        expired = Job(
+            source="slskd",
+            query="expired owner",
+            status=JobStatus.running,
+            execution_token="expired-owner",
+            execution_lease_expires_at=now - timedelta(seconds=1),
+        )
+        session.add_all([live, expired])
+        await session.commit()
+        live_id, expired_id = live.id, expired.id
+
+    dispatched: list[int] = []
+    dispatcher = JobDispatcher(session_factory=lease_factory)
+
+    async def record_dispatch(current_job_id: int) -> None:
+        dispatched.append(current_job_id)
+
+    monkeypatch.setattr(dispatcher, "dispatch", record_dispatch)
+    recovered = await dispatcher.recover()
+
+    assert recovered == [expired_id]
+    assert dispatched == [expired_id]
+    async with lease_factory() as observer:
+        live = await observer.get(Job, live_id)
+        expired = await observer.get(Job, expired_id)
+        assert live is not None and live.status == JobStatus.running
+        assert live.execution_token == "live-owner"
+        assert expired is not None and expired.status == JobStatus.pending
+        assert expired.execution_token is None
+        assert expired.execution_lease_expires_at is None
 
 
 async def test_token_replacement_before_progress_rolls_back_all_execution_writes(
