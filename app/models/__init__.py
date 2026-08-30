@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from app.models.acquisition_attempt import AcquisitionAttempt
-from app.models.acquisition_claim import AcquisitionDispatchClaim
+from app.models.acquisition_claim import (
+    AcquisitionDispatchClaim,
+    CatalogReleaseAcquisitionClaim,
+)
 from app.models.auth import AppUser, AuthSession, UserRole
 from app.models.catalog_entities import (
     CatalogAlbum,
@@ -15,6 +18,7 @@ from app.models.discography_batch import (
     DiscographyBatchItem,
     DiscographyBatchItemJob,
     DiscographyBatchItemState,
+    DiscographyBatchJobRole,
     DiscographyBatchState,
     DiscographyJobOwnership,
     DiscographyScopeKind,
@@ -48,12 +52,14 @@ __all__ = [
     "CatalogAlbumTrack",
     "CatalogArtist",
     "CatalogArtistIdentity",
+    "CatalogReleaseAcquisitionClaim",
     "AdoptionCandidateState",
     "AdoptionScanState",
     "AdoptionScopeKind",
     "DiscographyBatch",
     "DiscographyBatchItem",
     "DiscographyBatchItemJob",
+    "DiscographyBatchJobRole",
     "DiscographyBatchItemState",
     "DiscographyBatchState",
     "DiscographyJobOwnership",

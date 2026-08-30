@@ -28,6 +28,7 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "catalog_albums",
         "catalog_artist_identities",
         "catalog_artists",
+        "catalog_release_acquisition_claims",
         "deletion_operations",
         "discography_batch_item_jobs",
         "discography_batch_items",

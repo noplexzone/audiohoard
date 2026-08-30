@@ -33,3 +33,18 @@ class AcquisitionDispatchClaim(Base):
     )
 
     job: Mapped[Job] = relationship("Job")
+
+
+class CatalogReleaseAcquisitionClaim(Base):
+    __tablename__ = "catalog_release_acquisition_claims"
+    __table_args__ = (UniqueConstraint("job_id", name="uq_catalog_release_acquisition_claim_job"),)
+
+    catalog_album_id: Mapped[int] = mapped_column(
+        ForeignKey("catalog_albums.id", ondelete="CASCADE"), primary_key=True
+    )
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    job: Mapped[Job] = relationship("Job")
