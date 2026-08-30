@@ -92,6 +92,21 @@ async def test_activity_summary_counts_actionable_work_in_one_query(
             error_detail="Provider hydration failed",
         )
     )
+    cancelled_batch = DiscographyBatch(
+        scope_kind=DiscographyScopeKind.wanted_all_matching,
+        scope_json="{}",
+        scope_hash="cancelled-failure-history",
+        state=DiscographyBatchState.cancelled,
+    )
+    cancelled_batch.items.append(
+        DiscographyBatchItem(
+            release_identity="catalog_album:cancelled-failure-history",
+            artist_name="Cancelled artist",
+            release_title="Cancelled album",
+            state=DiscographyBatchItemState.failed,
+            error_detail="Historical failure before cancellation",
+        )
+    )
     failed = Job(source="slskd", query="failed", status=JobStatus.failed)
     partial = Job(source="slskd", query="retrying", status=JobStatus.partial)
     hidden_failed = Job(source="slskd", query="hidden", status=JobStatus.failed, queue_hidden=True)
@@ -122,6 +137,7 @@ async def test_activity_summary_counts_actionable_work_in_one_query(
             queued_batch,
             duplicate_batch,
             failed_batch,
+            cancelled_batch,
             failed,
             partial,
             hidden_failed,
