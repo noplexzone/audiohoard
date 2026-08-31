@@ -47,8 +47,11 @@ async def db_session(test_settings: Settings) -> AsyncGenerator[AsyncSession, No
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with factory() as session:
         yield session
+        from app.jobs.dispatcher import job_dispatcher
         from app.services.acquisition_cleanup import wait_for_imported_source_cleanups
 
+        # Join dispatched jobs before dropping the fixture-owned schema.
+        await job_dispatcher.shutdown()
         await wait_for_imported_source_cleanups(raise_errors=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
@@ -74,8 +77,11 @@ async def unauthenticated_client(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
 
+    from app.jobs.dispatcher import job_dispatcher
     from app.services.acquisition_cleanup import wait_for_imported_source_cleanups
 
+    # ASGITransport does not run the application's lifespan shutdown hook.
+    await job_dispatcher.shutdown()
     await wait_for_imported_source_cleanups(raise_errors=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
