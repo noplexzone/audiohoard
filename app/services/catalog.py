@@ -1042,6 +1042,27 @@ async def expand_catalog_album_missing_track_jobs(
         missing_count = len(target_ids)
         complete_track_ids = frozenset(manifest_ids - target_ids)
 
+        # Validate every exact-track claim before any root/link lifecycle exit can
+        # mask malformed ownership. This shares the same BEGIN IMMEDIATE writer
+        # reservation as the admission decisions below.
+        exact_claims_by_track: dict[int, tuple[AcquisitionDispatchClaim, Job]] = {}
+        exact_claim_rows = (
+            await db.execute(
+                select(AcquisitionDispatchClaim, Job)
+                .outerjoin(Job, Job.id == AcquisitionDispatchClaim.job_id)
+                .where(AcquisitionDispatchClaim.catalog_album_id == album_id)
+            )
+        ).all()
+        for exact_claim, exact_owner in exact_claim_rows:
+            if (
+                exact_owner is None
+                or exact_owner.catalog_album_id != album_id
+                or exact_owner.catalog_track_id != exact_claim.catalog_track_id
+                or exact_claim.catalog_track_id not in manifest_ids
+            ):
+                raise ValueError("catalog acquisition claim does not own the exact track")
+            exact_claims_by_track[exact_claim.catalog_track_id] = (exact_claim, exact_owner)
+
         # A release-root owns the physical folder acquisition for the whole album.
         # This check shares the same BEGIN IMMEDIATE reservation as exact-track
         # claims, so root-first and track-first races serialize without overlap.
@@ -1091,24 +1112,9 @@ async def expand_catalog_album_missing_track_jobs(
                 if prior_attempt.status in _ACTIVE_JOB_STATUSES:
                     observed.append(prior_attempt.id)
                 continue
-            claim = (
-                await db.execute(
-                    select(AcquisitionDispatchClaim, Job)
-                    .outerjoin(Job, Job.id == AcquisitionDispatchClaim.job_id)
-                    .where(
-                        AcquisitionDispatchClaim.catalog_album_id == album_id,
-                        AcquisitionDispatchClaim.catalog_track_id == track.id,
-                    )
-                )
-            ).one_or_none()
+            claim = exact_claims_by_track.get(track.id)
             if claim is not None:
                 _claim_row, owner = claim
-                if (
-                    owner is None
-                    or owner.catalog_album_id != album_id
-                    or owner.catalog_track_id != track.id
-                ):
-                    raise ValueError("catalog acquisition claim does not own the exact track")
                 if owner.status in _ACTIVE_JOB_STATUSES:
                     observed.append(owner.id)
                     await _link_discography_job(
