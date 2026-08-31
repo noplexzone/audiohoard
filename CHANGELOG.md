@@ -8,12 +8,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Honor the configured slskd source-search budget independently from the transfer download timeout so search capacity is explicit and predictable.
+- Yield local acquisition capacity while slskd explicitly queues a transfer, then reacquire it before active supervision, completion, or non-cancellation failure handling.
+- Reconcile terminal jobs whose exact durable slskd attempts remain queued or downloading through fresh canonical UUID, peer, and normalized-path ownership checks before centralized provider cleanup.
+- Fence background job execution with durable tokens, expiring leases, independent heartbeats, lease-expiry watchdog takeover, active-attempt adoption, atomic terminal ownership checks, and cancellation-safe dispatcher admission release.
+- Bound externally queued provider workflows separately from active local acquisition slots without leaking capacity during cancellation.
+- Coalesce identical raw slskd searches through event-loop-local immutable snapshots and bounded saturation backpressure without sharing tasks across event loops.
 - Start the durable discography batch runner non-blockingly after serialized startup recovery so long maintenance and reconciliation initial cycles cannot leave persisted batches queued.
 - Exclude preserved failure history from cancelled discography batches from Activity issue counts and queue-failure pages.
 - Move orphan-history pruning out of startup into bounded writer-friendly periodic batches, and commit legacy catalog reconciliation in small units so background repair cannot starve valid logins.
 - Retry the complete valid-login session transaction across transient SQLite writer locks so startup maintenance cannot turn correct credentials into an internal server error.
 - Fence durable discography batches by exact persisted provider identity, one acquisition attempt per track and execution generation, one equivalent active scope, transitive cancellation, and cancellation-aware continuation admission so bulk queue recovery cannot multiply work or outlive cancellation.
 - Send direct discography queue actions to Activity instead of a batch-status page, acknowledge the queue immediately, show deduplicated not-yet-materialized work under Active downloads and in the polling Downloads queue, and surface pre-materialization failures with their existing retry controls.
+- Acquire each bulk catalog release through one exact release-folder root before creating unresolved-only track fallbacks, with durable release/track ownership interlocks, exact file-to-manifest reconciliation, restart-safe fallback repair, and role-aware batch closure.
 
 ## [0.26.0] - 2026-08-25
 

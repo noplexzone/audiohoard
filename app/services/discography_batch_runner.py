@@ -23,15 +23,16 @@ from app.models.discography_batch import (
     DiscographyBatchItem,
     DiscographyBatchItemJob,
     DiscographyBatchItemState,
+    DiscographyBatchJobRole,
     DiscographyBatchState,
 )
 from app.models.job import Job, JobStatus
-from app.services.catalog import (
-    DiscographyLeaseLostError,
-    expand_catalog_album_missing_track_jobs,
-    project_catalog_album_queue_targets,
-)
+from app.services.catalog import DiscographyLeaseLostError, project_catalog_album_queue_targets
 from app.services.catalog_manifest import catalog_manifest_issue
+from app.services.release_admission import (
+    ReleaseRootAdmissionStatus,
+    materialize_batch_release_root_job,
+)
 from app.settings_service import QualityProfile, get_runtime_settings
 
 logger = logging.getLogger(__name__)
@@ -129,8 +130,17 @@ class DiscographyBatchRunner:
             waiting_ids = await self._next_waiting_items()
             if waiting_ids:
                 changed = False
-                async with self._session_factory() as db:
-                    for waiting_id in waiting_ids:
+                for waiting_id in waiting_ids:
+                    fallback_ids = await self._repair_partial_release_fallbacks(waiting_id)
+                    for job_id in fallback_ids:
+                        if not await self._may_dispatch_waiting_fallback(job_id):
+                            continue
+                        dispatch_result = self._dispatcher(job_id)
+                        if inspect.isawaitable(dispatch_result):
+                            await dispatch_result
+                    if fallback_ids:
+                        changed = True
+                    async with self._session_factory() as db:
                         item_changed = await self._reconcile_item(db, waiting_id, attempted=True)
                         if item_changed:
                             await self._finish_batch_for_item(db, waiting_id)
@@ -148,7 +158,7 @@ class DiscographyBatchRunner:
                                 )
                                 .values(updated_at=datetime.now(UTC))
                             )
-                    await db.commit()
+                        await db.commit()
                 return changed
             return await self._reconcile_idle_batch()
         item_id, requires_hydration, lease_token = claimed
@@ -205,23 +215,51 @@ class DiscographyBatchRunner:
                     return True
                 renotify_observed = item.reason_code == "resume_pending_dispatch"
                 profile = self._quality_profile or (await get_runtime_settings(db)).quality_profile
-                outcome = await expand_catalog_album_missing_track_jobs(
+                outcome = await materialize_batch_release_root_job(
                     db,
-                    album,
-                    quality_profile=profile,
-                    batch_item_id=item_id,
+                    item_id,
+                    execution_generation=item.execution_generation,
                     batch_lease_token=lease_token,
-                    max_new_jobs=25,
+                    quality_profile=profile,
                     library_root=self._library_root,
                 )
-                dispatch_ids = tuple(
-                    dict.fromkeys(
-                        (
-                            *outcome.created_job_ids,
-                            *(outcome.observed_job_ids if renotify_observed else ()),
+                root_dispatch_ids = (
+                    (outcome.job_id,)
+                    if outcome.job_id is not None
+                    and (
+                        outcome.status == ReleaseRootAdmissionStatus.created
+                        or (
+                            renotify_observed
+                            and outcome.status == ReleaseRootAdmissionStatus.observed
                         )
                     )
+                    else ()
                 )
+                fallback_dispatch_ids: tuple[int, ...] = ()
+                if renotify_observed and outcome.job_id is not None:
+                    root_status = await db.scalar(
+                        select(Job.status).where(Job.id == outcome.job_id)
+                    )
+                    if root_status == JobStatus.partial:
+                        fallback_dispatch_ids = tuple(
+                            int(value)
+                            for value in (
+                                await db.scalars(
+                                    select(DiscographyBatchItemJob.job_id)
+                                    .join(Job, Job.id == DiscographyBatchItemJob.job_id)
+                                    .where(
+                                        DiscographyBatchItemJob.item_id == item.id,
+                                        DiscographyBatchItemJob.generation
+                                        == item.execution_generation,
+                                        DiscographyBatchItemJob.role
+                                        == DiscographyBatchJobRole.track_fallback,
+                                        Job.status == JobStatus.pending,
+                                    )
+                                    .order_by(DiscographyBatchItemJob.id)
+                                )
+                            ).all()
+                        )
+                dispatch_ids = tuple(dict.fromkeys((*root_dispatch_ids, *fallback_dispatch_ids)))
 
             # Expansion commits links and jobs. Dispatch is deliberately
             # after the session closes. Pending observed jobs are included so
@@ -297,6 +335,128 @@ class DiscographyBatchRunner:
                 .limit(25)
             )
             return [int(value) for value in values]
+
+    async def _repair_partial_release_fallbacks(self, item_id: int) -> tuple[int, ...]:
+        """Repair the post-terminal gap without repeating release-level provider work."""
+        async with self._session_factory() as db:
+            item = await db.scalar(
+                select(DiscographyBatchItem)
+                .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+                .where(
+                    DiscographyBatchItem.id == item_id,
+                    DiscographyBatchItem.state == DiscographyBatchItemState.waiting,
+                    DiscographyBatch.state.in_(_ACTIVE_BATCHES),
+                )
+                .options(
+                    selectinload(DiscographyBatchItem.catalog_album).selectinload(
+                        CatalogAlbum.tracks
+                    )
+                )
+            )
+            if item is None or item.catalog_album is None:
+                return ()
+            rows = (
+                await db.execute(
+                    select(DiscographyBatchItemJob, Job)
+                    .outerjoin(Job, Job.id == DiscographyBatchItemJob.job_id)
+                    .where(
+                        DiscographyBatchItemJob.item_id == item.id,
+                        DiscographyBatchItemJob.generation == item.execution_generation,
+                    )
+                    .order_by(DiscographyBatchItemJob.id)
+                )
+            ).all()
+            root_rows = [
+                (link, job)
+                for link, job in rows
+                if link.role == DiscographyBatchJobRole.release_root
+            ]
+            fallback_rows = [
+                (link, job)
+                for link, job in rows
+                if link.role == DiscographyBatchJobRole.track_fallback
+            ]
+            if len(root_rows) != 1:
+                return ()
+            root_link, root_job = root_rows[0]
+            album = item.catalog_album
+            if (
+                root_job is None
+                or root_link.catalog_track_id is not None
+                or root_job.catalog_album_id != album.id
+                or root_job.catalog_track_id is not None
+                or root_job.status != JobStatus.partial
+            ):
+                return ()
+            album_track_ids = {track.id for track in album.tracks}
+            fallback_jobs: dict[int, Job] = {}
+            for link, job in fallback_rows:
+                if (
+                    job is None
+                    or link.catalog_track_id is None
+                    or link.catalog_track_id not in album_track_ids
+                    or job.catalog_album_id != album.id
+                    or job.catalog_track_id != link.catalog_track_id
+                ):
+                    return ()
+                fallback_jobs[int(link.catalog_track_id)] = job
+            profile = self._quality_profile or (await get_runtime_settings(db)).quality_profile
+            projection = (
+                await project_catalog_album_queue_targets(
+                    db,
+                    [album.id],
+                    quality_profile=profile,
+                    library_root=self._library_root,
+                )
+            )[album.id]
+            targets = set(projection.target_track_ids)
+            runtime = await get_runtime_settings(db)
+            max_attempts = runtime.max_partial_attempts
+            repair_requests: list[tuple[int, list[int]]] = []
+            root_targets = sorted(targets - set(fallback_jobs))
+            if root_targets and root_job.partial_attempt < max_attempts:
+                repair_requests.append((root_job.id, root_targets))
+            for track_id, fallback_job in sorted(fallback_jobs.items()):
+                if (
+                    track_id in targets
+                    and fallback_job.status == JobStatus.partial
+                    and fallback_job.partial_attempt < max_attempts
+                ):
+                    repair_requests.append((fallback_job.id, [track_id]))
+            if not repair_requests:
+                return ()
+
+            from app.jobs.runner import _spawn_continuation_jobs
+
+            committed: list[int] = []
+            for parent_id, track_ids in repair_requests:
+                committed.extend(
+                    await _spawn_continuation_jobs(parent_id, track_ids, album.id, db)
+                )
+            return tuple(dict.fromkeys(committed))
+
+    async def _may_dispatch_waiting_fallback(self, job_id: int) -> bool:
+        async with self._session_factory() as db:
+            return bool(
+                await db.scalar(
+                    select(DiscographyBatchItemJob.id)
+                    .join(
+                        DiscographyBatchItem,
+                        DiscographyBatchItem.id == DiscographyBatchItemJob.item_id,
+                    )
+                    .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+                    .join(Job, Job.id == DiscographyBatchItemJob.job_id)
+                    .where(
+                        DiscographyBatchItemJob.job_id == job_id,
+                        DiscographyBatchItemJob.generation
+                        == DiscographyBatchItem.execution_generation,
+                        DiscographyBatchItemJob.role == DiscographyBatchJobRole.track_fallback,
+                        DiscographyBatchItem.state == DiscographyBatchItemState.waiting,
+                        DiscographyBatch.state.in_(_ACTIVE_BATCHES),
+                        Job.status == JobStatus.pending,
+                    )
+                )
+            )
 
     async def _claim_pending(self, now: datetime) -> tuple[int, bool, str] | None:
         for attempt in range(6):
@@ -504,55 +664,153 @@ class DiscographyBatchRunner:
         )[item.catalog_album.id]
         targets = set(projection.target_track_ids)
         generation_rows = (
-            (
-                await db.execute(
-                    select(DiscographyBatchItemJob.catalog_track_id, Job.status)
-                    .join(Job, Job.id == DiscographyBatchItemJob.job_id)
-                    .where(
-                        DiscographyBatchItemJob.item_id == item.id,
-                        DiscographyBatchItemJob.generation == item.execution_generation,
-                        DiscographyBatchItemJob.catalog_track_id.in_(targets),
-                    )
+            await db.execute(
+                select(DiscographyBatchItemJob, Job)
+                .outerjoin(Job, Job.id == DiscographyBatchItemJob.job_id)
+                .where(
+                    DiscographyBatchItemJob.item_id == item.id,
+                    DiscographyBatchItemJob.generation == item.execution_generation,
                 )
-            ).all()
-            if targets
-            else []
+                .order_by(DiscographyBatchItemJob.id)
+            )
+        ).all()
+        roles = {link.role for link, _job in generation_rows}
+        role_aware = bool(
+            roles
+            & {
+                DiscographyBatchJobRole.release_root,
+                DiscographyBatchJobRole.track_fallback,
+            }
         )
-        attempted_track_ids = {
-            int(track_id) for track_id, _status in generation_rows if track_id is not None
-        }
-        active = {
-            int(track_id)
-            for track_id, status in generation_rows
-            if track_id is not None and status in (JobStatus.pending, JobStatus.running)
-        }
-        unattempted = targets - attempted_track_ids
         item.target_count = len(targets)
-        item.active_count = len(active)
-        item.estimated_job_count = len(unattempted)
-        if not targets:
-            item.state = DiscographyBatchItemState.complete
-            item.reason_code = "verified_complete"
-            item.completed_at = now
-        elif unattempted:
-            item.state = DiscographyBatchItemState.pending
-            item.reason_code = "targets_remain"
-        elif active:
-            item.state = DiscographyBatchItemState.waiting
-            item.reason_code = "active_jobs"
-        elif attempted_track_ids:
-            item.state = DiscographyBatchItemState.failed
-            item.reason_code = "current_generation_attempts_exhausted"
-            item.error_detail = "acquisition work ended without verified library artifacts"
-            item.completed_at = now
-        elif attempted:
-            item.state = DiscographyBatchItemState.failed
-            item.reason_code = "targets_remain_without_active_jobs"
-            item.error_detail = "acquisition work ended without verified library artifacts"
-            item.completed_at = now
+        if role_aware:
+            malformed = DiscographyBatchJobRole.legacy_track in roles
+            root_rows = [
+                (link, job)
+                for link, job in generation_rows
+                if link.role == DiscographyBatchJobRole.release_root
+            ]
+            fallback_rows = [
+                (link, job)
+                for link, job in generation_rows
+                if link.role == DiscographyBatchJobRole.track_fallback
+            ]
+            if len(root_rows) != 1:
+                malformed = True
+            album_track_ids = {track.id for track in item.catalog_album.tracks}
+            if root_rows:
+                root_link, root_job = root_rows[0]
+                malformed = malformed or (
+                    root_job is None
+                    or root_link.catalog_track_id is not None
+                    or root_job.catalog_album_id != item.catalog_album.id
+                    or root_job.catalog_track_id is not None
+                )
+                if (
+                    root_job is not None
+                    and root_job.status in (JobStatus.pending, JobStatus.running)
+                    and fallback_rows
+                ):
+                    malformed = True
+            else:
+                root_job = None
+            fallback_statuses: dict[int, JobStatus] = {}
+            for link, job in fallback_rows:
+                if (
+                    job is None
+                    or link.catalog_track_id is None
+                    or link.catalog_track_id not in album_track_ids
+                    or job.catalog_album_id != item.catalog_album.id
+                    or job.catalog_track_id != link.catalog_track_id
+                ):
+                    malformed = True
+                    continue
+                fallback_statuses[int(link.catalog_track_id)] = job.status
+            if malformed:
+                item.state = DiscographyBatchItemState.failed
+                item.reason_code = "malformed_batch_job_evidence"
+                item.error_detail = "current-generation batch job evidence is malformed"
+                item.active_count = 0
+                item.estimated_job_count = len(targets)
+                item.completed_at = now
+            elif not targets:
+                item.state = DiscographyBatchItemState.complete
+                item.reason_code = "verified_complete"
+                item.error_detail = None
+                item.active_count = 0
+                item.estimated_job_count = 0
+                item.completed_at = now
+            elif root_job is not None and root_job.status in (
+                JobStatus.pending,
+                JobStatus.running,
+            ):
+                item.state = DiscographyBatchItemState.waiting
+                item.reason_code = "active_release_root"
+                item.error_detail = None
+                item.active_count = 1
+                item.estimated_job_count = 0
+                item.completed_at = None
+            else:
+                attempted_track_ids = set(fallback_statuses) & targets
+                active = {
+                    track_id
+                    for track_id, status in fallback_statuses.items()
+                    if track_id in targets and status in (JobStatus.pending, JobStatus.running)
+                }
+                item.active_count = len(active)
+                item.estimated_job_count = len(targets - attempted_track_ids)
+                if active:
+                    item.state = DiscographyBatchItemState.waiting
+                    item.reason_code = "active_jobs"
+                    item.error_detail = None
+                    item.completed_at = None
+                else:
+                    item.state = DiscographyBatchItemState.failed
+                    item.reason_code = "current_generation_attempts_exhausted"
+                    item.error_detail = (
+                        "release-root and fallback work ended without verified library artifacts"
+                    )
+                    item.completed_at = now
         else:
-            item.state = DiscographyBatchItemState.pending
-            item.reason_code = None
+            legacy_rows = [
+                (link.catalog_track_id, job.status)
+                for link, job in generation_rows
+                if job is not None and link.catalog_track_id in targets
+            ]
+            attempted_track_ids = {
+                int(track_id) for track_id, _status in legacy_rows if track_id is not None
+            }
+            active = {
+                int(track_id)
+                for track_id, status in legacy_rows
+                if track_id is not None and status in (JobStatus.pending, JobStatus.running)
+            }
+            unattempted = targets - attempted_track_ids
+            item.active_count = len(active)
+            item.estimated_job_count = len(unattempted)
+            if not targets:
+                item.state = DiscographyBatchItemState.complete
+                item.reason_code = "verified_complete"
+                item.completed_at = now
+            elif unattempted:
+                item.state = DiscographyBatchItemState.pending
+                item.reason_code = "targets_remain"
+            elif active:
+                item.state = DiscographyBatchItemState.waiting
+                item.reason_code = "active_jobs"
+            elif attempted_track_ids:
+                item.state = DiscographyBatchItemState.failed
+                item.reason_code = "current_generation_attempts_exhausted"
+                item.error_detail = "acquisition work ended without verified library artifacts"
+                item.completed_at = now
+            elif attempted:
+                item.state = DiscographyBatchItemState.failed
+                item.reason_code = "targets_remain_without_active_jobs"
+                item.error_detail = "acquisition work ended without verified library artifacts"
+                item.completed_at = now
+            else:
+                item.state = DiscographyBatchItemState.pending
+                item.reason_code = None
         return db.is_modified(item, include_collections=False)
 
     async def _finish_batch_for_item(self, db: AsyncSession, item_id: int) -> None:

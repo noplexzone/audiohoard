@@ -17,7 +17,10 @@ from sqlalchemy.orm import selectinload
 
 from app.database import run_with_sqlite_lock_retry
 from app.media_formats import IMPORTABLE_AUDIO_SUFFIXES
-from app.models.acquisition_claim import AcquisitionDispatchClaim
+from app.models.acquisition_claim import (
+    AcquisitionDispatchClaim,
+    CatalogReleaseAcquisitionClaim,
+)
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -1038,6 +1041,51 @@ async def expand_catalog_album_missing_track_jobs(
         }
         missing_count = len(target_ids)
         complete_track_ids = frozenset(manifest_ids - target_ids)
+
+        # Validate every exact-track claim before any root/link lifecycle exit can
+        # mask malformed ownership. This shares the same BEGIN IMMEDIATE writer
+        # reservation as the admission decisions below.
+        exact_claims_by_track: dict[int, tuple[AcquisitionDispatchClaim, Job]] = {}
+        exact_claim_rows = (
+            await db.execute(
+                select(AcquisitionDispatchClaim, Job)
+                .outerjoin(Job, Job.id == AcquisitionDispatchClaim.job_id)
+                .where(AcquisitionDispatchClaim.catalog_album_id == album_id)
+            )
+        ).all()
+        for exact_claim, exact_owner in exact_claim_rows:
+            if (
+                exact_owner is None
+                or exact_owner.catalog_album_id != album_id
+                or exact_owner.catalog_track_id != exact_claim.catalog_track_id
+                or exact_claim.catalog_track_id not in manifest_ids
+            ):
+                raise ValueError("catalog acquisition claim does not own the exact track")
+            exact_claims_by_track[exact_claim.catalog_track_id] = (exact_claim, exact_owner)
+
+        # A release-root owns the physical folder acquisition for the whole album.
+        # This check shares the same BEGIN IMMEDIATE reservation as exact-track
+        # claims, so root-first and track-first races serialize without overlap.
+        release_claim = (
+            await db.execute(
+                select(CatalogReleaseAcquisitionClaim, Job)
+                .outerjoin(Job, Job.id == CatalogReleaseAcquisitionClaim.job_id)
+                .where(CatalogReleaseAcquisitionClaim.catalog_album_id == album_id)
+            )
+        ).one_or_none()
+        if release_claim is not None:
+            _claim, release_owner = release_claim
+            if (
+                release_owner is None
+                or release_owner.catalog_album_id != album_id
+                or release_owner.catalog_track_id is not None
+            ):
+                raise ValueError("catalog release claim does not own an exact release root")
+            if release_owner.status in _ACTIVE_JOB_STATUSES:
+                observed.append(release_owner.id)
+                await db.commit()
+                return
+
         generation_links: dict[int, Job] = {}
         if batch_item_id is not None and item_generation is not None and target_ids:
             generation_links = {
@@ -1064,19 +1112,10 @@ async def expand_catalog_album_missing_track_jobs(
                 if prior_attempt.status in _ACTIVE_JOB_STATUSES:
                     observed.append(prior_attempt.id)
                 continue
-            claim = (
-                await db.execute(
-                    select(AcquisitionDispatchClaim, Job)
-                    .outerjoin(Job, Job.id == AcquisitionDispatchClaim.job_id)
-                    .where(
-                        AcquisitionDispatchClaim.catalog_album_id == album_id,
-                        AcquisitionDispatchClaim.catalog_track_id == track.id,
-                    )
-                )
-            ).one_or_none()
+            claim = exact_claims_by_track.get(track.id)
             if claim is not None:
-                claim_row, owner = claim
-                if owner is not None and owner.status in _ACTIVE_JOB_STATUSES:
+                _claim_row, owner = claim
+                if owner.status in _ACTIVE_JOB_STATUSES:
                     observed.append(owner.id)
                     await _link_discography_job(
                         db,
@@ -1087,9 +1126,6 @@ async def expand_catalog_album_missing_track_jobs(
                         DiscographyJobOwnership.observed,
                     )
                     continue
-                if owner is None:
-                    await db.delete(claim_row)
-                    await db.flush()
             if len(created) >= new_job_limit:
                 continue
 

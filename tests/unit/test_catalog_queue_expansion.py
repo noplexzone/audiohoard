@@ -9,7 +9,10 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.database import Base
-from app.models.acquisition_claim import AcquisitionDispatchClaim
+from app.models.acquisition_claim import (
+    AcquisitionDispatchClaim,
+    CatalogReleaseAcquisitionClaim,
+)
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -368,3 +371,144 @@ async def test_locked_commit_retry_resets_attempt_local_outcome(
     assert len(outcome.created_job_ids) == 1
     assert outcome.observed_job_ids == ()
     assert await db_session.scalar(select(func.count(Job.id))) == 1
+
+
+async def test_direct_expansion_rejects_malformed_terminal_release_claim(
+    db_session: AsyncSession,
+) -> None:
+    album = await _album(db_session, 2)
+    other = await _album(db_session)
+    wrong_root = Job(
+        source="priority",
+        query="wrong root",
+        status=JobStatus.done,
+        catalog_album=other,
+    )
+    db_session.add(wrong_root)
+    await db_session.flush()
+    db_session.add(CatalogReleaseAcquisitionClaim(catalog_album_id=album.id, job_id=wrong_root.id))
+    await db_session.commit()
+    wrong_root_id = wrong_root.id
+
+    with pytest.raises(ValueError, match="release claim"):
+        await expand_catalog_album_missing_track_jobs(db_session, album, quality_profile=PROFILE)
+    await db_session.rollback()
+    assert await db_session.scalar(select(func.count(Job.id))) == 1
+    assert await db_session.get(Job, wrong_root_id) is not None
+
+
+async def test_direct_expansion_rejects_malformed_exact_track_claim(
+    db_session: AsyncSession,
+) -> None:
+    album = await _album(db_session, 2)
+    wrong_owner = Job(
+        source="priority",
+        query="wrong track",
+        status=JobStatus.running,
+        catalog_album=album,
+        catalog_track=album.tracks[1],
+    )
+    db_session.add(wrong_owner)
+    await db_session.flush()
+    db_session.add(
+        AcquisitionDispatchClaim(
+            catalog_album_id=album.id,
+            catalog_track_id=album.tracks[0].id,
+            job_id=wrong_owner.id,
+        )
+    )
+    await db_session.commit()
+    wrong_owner_id = wrong_owner.id
+
+    with pytest.raises(ValueError, match="exact track"):
+        await expand_catalog_album_missing_track_jobs(db_session, album, quality_profile=PROFILE)
+    await db_session.rollback()
+    assert await db_session.scalar(select(func.count(Job.id))) == 1
+    assert await db_session.get(Job, wrong_owner_id) is not None
+
+
+async def test_direct_expansion_validates_exact_claim_before_active_root_return(
+    db_session: AsyncSession,
+) -> None:
+    album = await _album(db_session, 2)
+    root = Job(
+        source="priority",
+        query="root",
+        status=JobStatus.running,
+        catalog_album=album,
+    )
+    wrong_owner = Job(
+        source="priority",
+        query="wrong track",
+        status=JobStatus.running,
+        catalog_album=album,
+        catalog_track=album.tracks[1],
+    )
+    db_session.add_all([root, wrong_owner])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            CatalogReleaseAcquisitionClaim(catalog_album_id=album.id, job_id=root.id),
+            AcquisitionDispatchClaim(
+                catalog_album_id=album.id,
+                catalog_track_id=album.tracks[0].id,
+                job_id=wrong_owner.id,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="exact track"):
+        await expand_catalog_album_missing_track_jobs(db_session, album, quality_profile=PROFILE)
+    await db_session.rollback()
+    assert await db_session.scalar(select(func.count(Job.id))) == 2
+
+
+async def test_direct_expansion_validates_exact_claim_before_generation_link_skip(
+    db_session: AsyncSession,
+) -> None:
+    album = await _album(db_session, 2)
+    item = await _item(db_session, album)
+    linked_owner = Job(
+        source="priority",
+        query="linked track",
+        status=JobStatus.running,
+        catalog_album=album,
+        catalog_track=album.tracks[0],
+    )
+    wrong_owner = Job(
+        source="priority",
+        query="wrong track",
+        status=JobStatus.running,
+        catalog_album=album,
+        catalog_track=album.tracks[1],
+    )
+    db_session.add_all([linked_owner, wrong_owner])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            DiscographyBatchItemJob(
+                item_id=item.id,
+                generation=item.execution_generation,
+                catalog_track_id=album.tracks[0].id,
+                job_id=linked_owner.id,
+                ownership=DiscographyJobOwnership.observed,
+            ),
+            AcquisitionDispatchClaim(
+                catalog_album_id=album.id,
+                catalog_track_id=album.tracks[0].id,
+                job_id=wrong_owner.id,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="exact track"):
+        await expand_catalog_album_missing_track_jobs(
+            db_session,
+            album,
+            quality_profile=PROFILE,
+            batch_item_id=item.id,
+        )
+    await db_session.rollback()
+    assert await db_session.scalar(select(func.count(Job.id))) == 2

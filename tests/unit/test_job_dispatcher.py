@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 from collections.abc import AsyncGenerator
@@ -18,7 +19,12 @@ os.environ.setdefault("SECRET_KEY", "test-secret")
 
 from app.database import Base
 from app.jobs import runner as job_runner
-from app.jobs.dispatcher import JobDispatcher, JobNotFoundError, JobNotRetryableError
+from app.jobs.dispatcher import (
+    JobDispatcher,
+    JobNotFoundError,
+    JobNotRetryableError,
+    current_acquisition_permit,
+)
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.job import Job, JobStatus
 from app.models.track import Track
@@ -929,6 +935,299 @@ async def test_dispatcher_respects_max_concurrent_jobs() -> None:
     await dispatcher.shutdown()
 
 
+async def _assert_dispatcher_counts(
+    dispatcher: JobDispatcher, *, active: int, inflight: int
+) -> None:
+    await asyncio.sleep(0.02)
+    assert dispatcher.active_jobs == active
+    assert dispatcher.inflight_jobs == inflight
+
+
+async def test_derived_inflight_limit_bounds_yielded_workflows() -> None:
+    entered: list[int] = []
+    five_entered = asyncio.Event()
+    sixth_entered = asyncio.Event()
+    releases = {job_id: asyncio.Event() for job_id in range(1, 7)}
+
+    async def yielded_runner(job_id: int) -> None:
+        permit = current_acquisition_permit()
+        assert permit is not None
+        await permit.yield_permit()
+        entered.append(job_id)
+        if len(entered) == 5:
+            five_entered.set()
+        if job_id == 6:
+            sixth_entered.set()
+        await releases[job_id].wait()
+
+    dispatcher = JobDispatcher(runner=yielded_runner, max_concurrent_jobs=1)
+    tasks = [await dispatcher.dispatch(job_id) for job_id in range(1, 7)]
+
+    await asyncio.wait_for(five_entered.wait(), timeout=1)
+    await asyncio.sleep(0.02)
+    assert 6 not in entered
+    assert not sixth_entered.is_set()
+    assert dispatcher.active_jobs == 0
+    assert dispatcher.inflight_jobs == dispatcher.max_inflight_jobs == 5
+
+    releases[entered[0]].set()
+    await asyncio.wait_for(sixth_entered.wait(), timeout=1)
+
+    for release in releases.values():
+        release.set()
+    await asyncio.gather(*tasks)
+    assert dispatcher.active_jobs == dispatcher.inflight_jobs == 0
+
+
+async def test_yielded_provider_wait_is_inflight_but_not_active_local() -> None:
+    yielded = asyncio.Event()
+    release = asyncio.Event()
+
+    async def yielded_runner(job_id: int) -> None:
+        permit = current_acquisition_permit()
+        assert permit is not None
+        await permit.yield_permit()
+        yielded.set()
+        await release.wait()
+
+    dispatcher = JobDispatcher(runner=yielded_runner, max_concurrent_jobs=1)
+    task = await dispatcher.dispatch(1)
+    await asyncio.wait_for(yielded.wait(), timeout=1)
+
+    assert dispatcher.active_jobs == 0
+    assert dispatcher.inflight_jobs == 1
+
+    release.set()
+    await task
+    assert dispatcher.active_jobs == dispatcher.inflight_jobs == 0
+
+
+async def test_local_resize_updates_derived_inflight_limit_and_admission() -> None:
+    entered: list[int] = []
+    five_entered = asyncio.Event()
+    ten_entered = asyncio.Event()
+    eleventh_entered = asyncio.Event()
+    releases = {job_id: asyncio.Event() for job_id in range(1, 12)}
+
+    async def yielded_runner(job_id: int) -> None:
+        permit = current_acquisition_permit()
+        assert permit is not None
+        await permit.yield_permit()
+        entered.append(job_id)
+        if len(entered) == 5:
+            five_entered.set()
+        if len(entered) == 10:
+            ten_entered.set()
+        if job_id == 11:
+            eleventh_entered.set()
+        await releases[job_id].wait()
+
+    dispatcher = JobDispatcher(runner=yielded_runner, max_concurrent_jobs=1)
+    tasks = [await dispatcher.dispatch(job_id) for job_id in range(1, 11)]
+    await asyncio.wait_for(five_entered.wait(), timeout=1)
+    assert dispatcher.max_inflight_jobs == dispatcher.inflight_jobs == 5
+
+    await dispatcher.set_max_concurrent_jobs(2)
+    await asyncio.wait_for(ten_entered.wait(), timeout=1)
+    assert dispatcher.max_inflight_jobs == dispatcher.inflight_jobs == 10
+
+    await dispatcher.set_max_concurrent_jobs(1)
+    eleventh = await dispatcher.dispatch(11)
+    await asyncio.sleep(0.02)
+    assert dispatcher.max_inflight_jobs == 5
+    assert dispatcher.inflight_jobs == 10
+    assert not eleventh_entered.is_set()
+
+    for job_id in entered[:5]:
+        releases[job_id].set()
+    await asyncio.gather(*(tasks[job_id - 1] for job_id in entered[:5]))
+    assert dispatcher.inflight_jobs == 5
+    assert not eleventh_entered.is_set()
+
+    releases[entered[5]].set()
+    await asyncio.wait_for(eleventh_entered.wait(), timeout=1)
+
+    for release in releases.values():
+        release.set()
+    await asyncio.gather(*tasks, eleventh)
+    assert dispatcher.active_jobs == dispatcher.inflight_jobs == 0
+
+
+async def test_cancellation_during_inflight_finalizer_cannot_leak_capacity() -> None:
+    runner_entered = asyncio.Event()
+    finalizer_entered = asyncio.Event()
+    release_finalizer = asyncio.Event()
+    later_ran = asyncio.Event()
+
+    async def runner(job_id: int) -> None:
+        if job_id == 1:
+            runner_entered.set()
+            await asyncio.Event().wait()
+        else:
+            later_ran.set()
+
+    dispatcher = JobDispatcher(runner=runner, max_concurrent_jobs=1, max_inflight_jobs=1)
+    original_release_inflight = dispatcher._release_inflight
+
+    async def blocked_release_inflight() -> None:
+        finalizer_entered.set()
+        await release_finalizer.wait()
+        await original_release_inflight()
+
+    dispatcher._release_inflight = blocked_release_inflight  # type: ignore[method-assign]
+    task = await dispatcher.dispatch(1)
+    await asyncio.wait_for(runner_entered.wait(), timeout=1)
+    task.cancel()
+    await asyncio.wait_for(finalizer_entered.wait(), timeout=1)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert dispatcher.active_jobs == 0
+    assert dispatcher.inflight_jobs == 1
+
+    release_finalizer.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert dispatcher.active_jobs == 0
+    assert dispatcher.inflight_jobs == 0
+
+    later = await dispatcher.dispatch(2)
+    await asyncio.wait_for(later, timeout=1)
+    assert later_ran.is_set()
+    assert dispatcher.active_jobs == 0
+    assert dispatcher.inflight_jobs == 0
+
+
+async def test_explicit_inflight_limit_stays_fixed_across_local_resize() -> None:
+    entered: list[int] = []
+    two_entered = asyncio.Event()
+    third_entered = asyncio.Event()
+    releases = {job_id: asyncio.Event() for job_id in (1, 2, 3)}
+
+    async def yielded_runner(job_id: int) -> None:
+        permit = current_acquisition_permit()
+        assert permit is not None
+        await permit.yield_permit()
+        entered.append(job_id)
+        if len(entered) == 2:
+            two_entered.set()
+        if job_id == 3:
+            third_entered.set()
+        await releases[job_id].wait()
+
+    dispatcher = JobDispatcher(runner=yielded_runner, max_concurrent_jobs=1, max_inflight_jobs=2)
+    tasks = [await dispatcher.dispatch(job_id) for job_id in (1, 2, 3)]
+    await asyncio.wait_for(two_entered.wait(), timeout=1)
+
+    await dispatcher.set_max_concurrent_jobs(2)
+    await asyncio.sleep(0.02)
+    assert dispatcher.max_inflight_jobs == dispatcher.inflight_jobs == 2
+    assert not third_entered.is_set()
+
+    releases[entered[0]].set()
+    await asyncio.wait_for(third_entered.wait(), timeout=1)
+    for release in releases.values():
+        release.set()
+    await asyncio.gather(*tasks)
+    assert dispatcher.active_jobs == dispatcher.inflight_jobs == 0
+
+
+@pytest.mark.parametrize("boundary", ["workflow", "local", "yielded", "runner"])
+async def test_cancellation_at_admission_boundaries_releases_owned_capacity(
+    boundary: str,
+) -> None:
+    first_started = asyncio.Event()
+    yielded = asyncio.Event()
+    release_first = asyncio.Event()
+    later_ran = asyncio.Event()
+
+    async def controlled_runner(job_id: int) -> None:
+        if job_id == 99:
+            later_ran.set()
+            return
+        if job_id == 1:
+            first_started.set()
+        if boundary == "yielded":
+            permit = current_acquisition_permit()
+            assert permit is not None
+            await permit.yield_permit()
+            yielded.set()
+        await release_first.wait()
+
+    explicit_inflight = 1 if boundary == "workflow" else 2
+    dispatcher = JobDispatcher(
+        runner=controlled_runner,
+        max_concurrent_jobs=1,
+        max_inflight_jobs=explicit_inflight,
+    )
+    first = await dispatcher.dispatch(1)
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    if boundary == "workflow":
+        target = await dispatcher.dispatch(2)
+        await _assert_dispatcher_counts(dispatcher, active=1, inflight=1)
+    elif boundary == "local":
+        target = await dispatcher.dispatch(2)
+        await _assert_dispatcher_counts(dispatcher, active=1, inflight=2)
+    else:
+        target = first
+        if boundary == "yielded":
+            await asyncio.wait_for(yielded.wait(), timeout=1)
+            await _assert_dispatcher_counts(dispatcher, active=0, inflight=1)
+        else:
+            await _assert_dispatcher_counts(dispatcher, active=1, inflight=1)
+
+    target.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await target
+    release_first.set()
+    if first is not target:
+        await first
+    await _assert_dispatcher_counts(dispatcher, active=0, inflight=0)
+
+    later = await dispatcher.dispatch(99)
+    await asyncio.wait_for(later, timeout=1)
+    assert later_ran.is_set()
+    assert dispatcher.active_jobs == dispatcher.inflight_jobs == 0
+
+
+async def test_all_yielded_inflight_workflows_do_not_block_local_reacquisition() -> None:
+    yielded_jobs: set[int] = set()
+    all_yielded = asyncio.Event()
+    reacquire = asyncio.Event()
+    reacquired = asyncio.Event()
+    release_others = asyncio.Event()
+
+    async def yielded_runner(job_id: int) -> None:
+        permit = current_acquisition_permit()
+        assert permit is not None
+        await permit.yield_permit()
+        yielded_jobs.add(job_id)
+        if len(yielded_jobs) == 3:
+            all_yielded.set()
+        if job_id == 1:
+            await reacquire.wait()
+            await permit.acquire()
+            reacquired.set()
+            return
+        await release_others.wait()
+
+    dispatcher = JobDispatcher(runner=yielded_runner, max_concurrent_jobs=1, max_inflight_jobs=3)
+    tasks = [await dispatcher.dispatch(job_id) for job_id in (1, 2, 3)]
+    await asyncio.wait_for(all_yielded.wait(), timeout=1)
+    assert dispatcher.active_jobs == 0
+    assert dispatcher.inflight_jobs == 3
+
+    reacquire.set()
+    await asyncio.wait_for(reacquired.wait(), timeout=1)
+    await tasks[0]
+    assert dispatcher.inflight_jobs == 2
+
+    release_others.set()
+    await asyncio.gather(*tasks)
+    assert dispatcher.active_jobs == dispatcher.inflight_jobs == 0
+
+
 async def test_increasing_parallel_limit_starts_waiting_jobs() -> None:
     started: list[int] = []
     two_started = asyncio.Event()
@@ -954,7 +1253,7 @@ async def test_increasing_parallel_limit_starts_waiting_jobs() -> None:
     await dispatcher.shutdown()
 
 
-async def test_queued_transfer_keeps_slot_until_terminal_completion(tmp_path: Path) -> None:
+async def test_queued_transfer_yields_slot_so_later_job_starts(tmp_path: Path) -> None:
     first_queued = asyncio.Event()
     allow_first_to_finish = asyncio.Event()
     second_started = asyncio.Event()
@@ -993,14 +1292,209 @@ async def test_queued_transfer_keeps_slot_until_terminal_completion(tmp_path: Pa
     second = await dispatcher.dispatch(2)
 
     await asyncio.wait_for(first_queued.wait(), timeout=1)
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(second_started.wait(), timeout=0.05)
+    await asyncio.wait_for(second_started.wait(), timeout=1)
     assert not first.done()
 
     allow_first_to_finish.set()
     await asyncio.wait_for(second_started.wait(), timeout=1)
     await asyncio.gather(first, second)
     await dispatcher.shutdown()
+
+
+async def test_queued_transfer_reacquires_before_active_completion(tmp_path: Path) -> None:
+    queued = asyncio.Event()
+    allow_active = asyncio.Event()
+    second_holds_slot = asyncio.Event()
+    release_second = asyncio.Event()
+    staged = tmp_path / "song.flac"
+    staged.write_bytes(b"audio")
+    status_calls = 0
+
+    class Adapter:
+        async def status(self, transfer_id: str) -> CapabilityState:
+            nonlocal status_calls
+            status_calls += 1
+            if status_calls == 1:
+                queued.set()
+                return CapabilityState(True, "Queued")
+            await allow_active.wait()
+            return CapabilityState(True, "Completed")
+
+        async def cancel(self, *args, **kwargs) -> bool:
+            return True
+
+    async def controlled_runner(job_id: int) -> None:
+        if job_id == 1:
+            await job_runner._poll_slskd_transfer(
+                "transfer-1", "peer", staged.name, Adapter(), tmp_path, 0.001, 1
+            )
+        else:
+            second_holds_slot.set()
+            await release_second.wait()
+
+    dispatcher = JobDispatcher(runner=controlled_runner, max_concurrent_jobs=1)
+    first = await dispatcher.dispatch(1)
+    second = await dispatcher.dispatch(2)
+    await asyncio.wait_for(queued.wait(), timeout=1)
+    await asyncio.wait_for(second_holds_slot.wait(), timeout=1)
+    allow_active.set()
+    await asyncio.sleep(0.02)
+    assert not first.done()
+    release_second.set()
+    await asyncio.gather(first, second)
+    assert dispatcher._active_jobs == 0
+
+
+@pytest.mark.parametrize("transition_state", ["InProgress", "Completed"])
+async def test_queued_transfer_reacquires_before_provider_id_checkpoint(
+    tmp_path: Path, transition_state: str
+) -> None:
+    queued = asyncio.Event()
+    allow_transition = asyncio.Event()
+    second_holds_slot = asyncio.Event()
+    release_second = asyncio.Event()
+    provider_id_checkpointed = asyncio.Event()
+    checkpoint_active_jobs: list[int] = []
+    staged = tmp_path / "song.flac"
+    staged.write_bytes(b"audio")
+    status_calls = 0
+
+    class Adapter:
+        async def status(self, transfer_id: str) -> CapabilityState:
+            nonlocal status_calls
+            status_calls += 1
+            if status_calls == 1:
+                queued.set()
+                return CapabilityState(True, "Queued")
+            await allow_transition.wait()
+            if status_calls == 2:
+                return CapabilityState(True, transition_state, {"id": "canonical-provider-uuid"})
+            return CapabilityState(True, "Completed", {"id": "canonical-provider-uuid"})
+
+        async def cancel(self, *args, **kwargs) -> bool:
+            return True
+
+    dispatcher: JobDispatcher
+
+    async def on_provider_id(provider_id: str) -> None:
+        assert provider_id == "canonical-provider-uuid"
+        checkpoint_active_jobs.append(dispatcher._active_jobs)
+        provider_id_checkpointed.set()
+
+    async def controlled_runner(job_id: int) -> None:
+        if job_id == 1:
+            await job_runner._poll_slskd_transfer(
+                "transfer-1",
+                "peer",
+                staged.name,
+                Adapter(),  # type: ignore[arg-type]
+                tmp_path,
+                0.001,
+                1,
+                on_provider_id,
+            )
+        else:
+            second_holds_slot.set()
+            await release_second.wait()
+
+    dispatcher = JobDispatcher(runner=controlled_runner, max_concurrent_jobs=1)
+    first = await dispatcher.dispatch(1)
+    second = await dispatcher.dispatch(2)
+    await asyncio.wait_for(queued.wait(), timeout=1)
+    await asyncio.wait_for(second_holds_slot.wait(), timeout=1)
+    allow_transition.set()
+    await asyncio.sleep(0.02)
+
+    assert not provider_id_checkpointed.is_set()
+    assert not first.done()
+
+    release_second.set()
+    await asyncio.gather(first, second)
+    assert checkpoint_active_jobs == [1]
+    assert dispatcher._active_jobs == 0
+
+
+async def test_queued_transfer_reacquires_before_non_cancellation_error(tmp_path: Path) -> None:
+    queued = asyncio.Event()
+    fail = asyncio.Event()
+    second_holds_slot = asyncio.Event()
+    release_second = asyncio.Event()
+    calls = 0
+
+    class Adapter:
+        async def status(self, transfer_id: str) -> CapabilityState:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                queued.set()
+                return CapabilityState(True, "Queued")
+            await fail.wait()
+            raise RuntimeError("provider failed")
+
+        async def cancel(self, *args, **kwargs) -> bool:
+            return True
+
+    async def controlled_runner(job_id: int) -> None:
+        if job_id == 1:
+            await job_runner._poll_slskd_transfer(
+                "transfer-1", "peer", "song.flac", Adapter(), tmp_path, 0.001, 1
+            )
+        else:
+            second_holds_slot.set()
+            await release_second.wait()
+
+    dispatcher = JobDispatcher(runner=controlled_runner, max_concurrent_jobs=1)
+    first = await dispatcher.dispatch(1)
+    second = await dispatcher.dispatch(2)
+    await asyncio.wait_for(queued.wait(), timeout=1)
+    await asyncio.wait_for(second_holds_slot.wait(), timeout=1)
+    fail.set()
+    await asyncio.sleep(0.02)
+    assert not first.done()
+    release_second.set()
+    with pytest.raises(RuntimeError, match="provider failed"):
+        await first
+    await second
+    assert dispatcher._active_jobs == 0
+
+
+async def test_cancellation_while_queue_permit_is_yielded_does_not_deadlock(
+    tmp_path: Path,
+) -> None:
+    queued = asyncio.Event()
+    second_holds_slot = asyncio.Event()
+    release_second = asyncio.Event()
+
+    class Adapter:
+        async def status(self, transfer_id: str) -> CapabilityState:
+            queued.set()
+            return CapabilityState(True, "Queued")
+
+        async def cancel(self, *args, **kwargs) -> bool:
+            return True
+
+    async def controlled_runner(job_id: int) -> None:
+        if job_id == 1:
+            await job_runner._poll_slskd_transfer(
+                "transfer-1", "peer", "song.flac", Adapter(), tmp_path, 1, 10
+            )
+        else:
+            second_holds_slot.set()
+            await release_second.wait()
+
+    dispatcher = JobDispatcher(runner=controlled_runner, max_concurrent_jobs=1)
+    first = await dispatcher.dispatch(1)
+    second = await dispatcher.dispatch(2)
+    await asyncio.wait_for(queued.wait(), timeout=1)
+    await asyncio.wait_for(second_holds_slot.wait(), timeout=1)
+    assert dispatcher._active_jobs == dispatcher._configured_limit() == 1
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(first, timeout=0.2)
+    assert dispatcher._active_jobs == dispatcher._configured_limit() == 1
+    release_second.set()
+    await second
+    assert dispatcher._active_jobs == 0
 
 
 async def test_decreasing_parallel_limit_does_not_cancel_active_jobs() -> None:
@@ -1375,3 +1869,41 @@ async def test_cancel_waiting_job_persists_cancelled_before_task_exit(
     release_first.set()
     await first_task
     await dispatcher.shutdown()
+
+
+async def test_dispatcher_logs_and_consumes_execution_lease_loss(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def lost_runner(job_id: int) -> None:
+        raise job_runner.ExecutionLeaseLost(f"job {job_id} lease lost")
+
+    dispatcher = JobDispatcher(runner=lost_runner)
+    with caplog.at_level("ERROR"):
+        task = await dispatcher.dispatch(73)
+        await asyncio.gather(task, return_exceptions=True)
+    assert isinstance(task.exception(), job_runner.ExecutionLeaseLost)
+    assert "Job 73 task raised unhandled exception" in caplog.text
+
+
+async def test_fire_and_forget_dispatch_consumes_logged_lease_loss() -> None:
+    contexts: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+
+    async def lost_runner(job_id: int) -> None:
+        raise job_runner.ExecutionLeaseLost(f"job {job_id} lease lost")
+
+    try:
+        dispatcher = JobDispatcher(runner=lost_runner)
+        task = await dispatcher.dispatch(74)
+        await asyncio.wait({task})
+        await asyncio.sleep(0)
+        del task
+        gc.collect()
+        await asyncio.sleep(0)
+        assert not any(
+            context.get("message") == "Task exception was never retrieved" for context in contexts
+        )
+    finally:
+        loop.set_exception_handler(previous_handler)

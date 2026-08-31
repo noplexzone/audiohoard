@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import ParseResult, urlparse
+from uuid import uuid4
 
 from sqlalchemy import select, text, update
 from sqlalchemy.engine import CursorResult
@@ -44,6 +45,15 @@ from app.models.acquisition_attempt import (
     RetentionDisposition,
 )
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
+from app.models.discography_batch import (
+    DiscographyBatch,
+    DiscographyBatchItem,
+    DiscographyBatchItemJob,
+    DiscographyBatchItemState,
+    DiscographyBatchJobRole,
+    DiscographyBatchState,
+    DiscographyJobOwnership,
+)
 from app.models.import_plan import ImportPlan
 from app.models.job import Job, JobStatus
 from app.models.path_preview import PathPreview
@@ -85,6 +95,10 @@ from app.sources.tidal import TidalAdapter
 from app.sources.youtube import ProviderError, YouTubeAdapter
 
 logger = logging.getLogger(__name__)
+
+
+class ExecutionLeaseLost(Exception):
+    """Raised when a background runner no longer owns its job execution lease."""
 
 
 @dataclass(frozen=True)
@@ -350,6 +364,9 @@ async def _poll_slskd_transfer(
     """Poll slskd until terminal and return the staged path plus exact provider ID."""
     import time as _time
 
+    from app.jobs.dispatcher import current_acquisition_permit
+
+    permit = current_acquisition_permit()
     deadline = _time.monotonic() + poll_timeout
     try:
         while True:
@@ -360,15 +377,23 @@ async def _poll_slskd_transfer(
                 )
             state = await adapter.status(transfer_id)
 
+            acq_state = map_slskd_transfer_state(state)
+            externally_queued = acq_state in {
+                AcquisitionState.queued,
+                AcquisitionState.searching,
+            }
+            if permit is not None and not externally_queued:
+                await permit.acquire()
+
             provider_id = state.extra.get("id") or state.extra.get("transferId")
             if provider_id is not None and str(provider_id) != transfer_id:
                 transfer_id = str(provider_id)
                 if on_provider_id is not None:
                     await on_provider_id(transfer_id)
-
-            acq_state = map_slskd_transfer_state(state)
             if on_provider_state is not None:
                 await on_provider_state(acq_state)
+            if permit is not None and externally_queued:
+                await permit.yield_permit()
             if acq_state != AcquisitionState.downloaded and on_partial_path is not None:
                 partial_path = _provider_local_path(state.extra)
                 if partial_path is not None:
@@ -398,6 +423,10 @@ async def _poll_slskd_transfer(
             await asyncio.shield(on_cancelled())
         with contextlib.suppress(Exception):
             await asyncio.shield(adapter.cancel(username, filename, transfer_id))
+        raise
+    except Exception:
+        if permit is not None:
+            await permit.acquire()
         raise
 
 
@@ -488,6 +517,162 @@ async def _poll_sab_job(
         await asyncio.sleep(min(poll_interval, max(0.01, remaining)))
 
 
+_TERMINAL_JOB_STATUSES = {
+    JobStatus.done,
+    JobStatus.partial,
+    JobStatus.failed,
+    JobStatus.cancelled,
+}
+
+
+def _lease_duration(cfg: Settings) -> timedelta:
+    return timedelta(seconds=float(cfg.job_watchdog_threshold_seconds))
+
+
+async def _claim_execution_lease(
+    db: AsyncSession, job_id: int, token: str, lease_duration: timedelta
+) -> bool:
+    claimed = False
+
+    async def operation() -> None:
+        nonlocal claimed
+        claimed = False
+        now = _now()
+        result = await db.execute(
+            update(Job)
+            .where(
+                Job.id == job_id,
+                Job.status == JobStatus.pending,
+                Job.execution_token.is_(None),
+            )
+            .values(
+                status=JobStatus.running,
+                execution_token=token,
+                execution_lease_expires_at=now + lease_duration,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        claimed = isinstance(result, CursorResult) and result.rowcount == 1
+        claimed_job: Job | None = None
+        if claimed:
+            # Keep retry instrumentation and session observers aligned with the
+            # conditional SQL claim without making the loaded row part of the CAS.
+            claimed_job = await db.get(Job, job_id, populate_existing=True)
+        await db.commit()
+        _ = claimed_job
+
+    await run_with_sqlite_lock_retry(db, operation)
+    return claimed
+
+
+async def _heartbeat_execution_lease(
+    job_id: int,
+    token: str,
+    lease_duration: timedelta,
+    stop: asyncio.Event,
+) -> None:
+    factory = get_session_factory()
+    interval = max(0.01, lease_duration.total_seconds() / 3)
+    while not stop.is_set():
+        # The committed claim already covers the first interval. Waiting before
+        # the first refresh avoids overlapping a short execution transaction and
+        # still renews at no more than one-third of the lease duration.
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return
+        except TimeoutError:
+            pass
+        alive = False
+        async with factory() as db:
+
+            async def heartbeat_once() -> None:
+                nonlocal alive
+                now = _now()
+                result = await db.execute(
+                    update(Job)
+                    .where(
+                        Job.id == job_id,
+                        Job.status == JobStatus.running,
+                        Job.execution_token == token,
+                    )
+                    .values(
+                        execution_lease_expires_at=now + lease_duration,
+                        updated_at=now,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                alive = isinstance(result, CursorResult) and result.rowcount == 1
+                await db.commit()
+
+            await run_with_sqlite_lock_retry(db, heartbeat_once)
+        if not alive:
+            if stop.is_set():
+                return
+            raise ExecutionLeaseLost(f"job {job_id} execution heartbeat lost ownership")
+
+
+async def _prove_execution_lease(db: AsyncSession, job_id: int, token: str) -> None:
+    # A token-filtered no-op UPDATE is the transaction fence: it acquires the
+    # database write boundary before any dirty sibling rows are flushed. A SELECT
+    # followed by commit would leave a takeover window between proof and write.
+    with db.no_autoflush:
+        result = await db.execute(
+            update(Job)
+            .where(
+                Job.id == job_id,
+                Job.status == JobStatus.running,
+                Job.execution_token == token,
+            )
+            .values(execution_token=Job.execution_token)
+            .execution_options(synchronize_session=False)
+        )
+    owned = isinstance(result, CursorResult) and result.rowcount == 1
+    if not owned:
+        await db.rollback()
+        raise ExecutionLeaseLost(f"job {job_id} execution lease was replaced")
+
+
+async def _commit_job_progress(
+    db: AsyncSession,
+    job: Job,
+    expected_token: str,
+    heartbeat_stop: asyncio.Event | None = None,
+) -> None:
+    """Fence and commit one complete background progress or terminal transaction."""
+    if job.status in _TERMINAL_JOB_STATUSES and heartbeat_stop is not None:
+        # Stop renewal before the terminal CAS clears the token. The token fence
+        # serializes any heartbeat already inside its update; a zero-row heartbeat
+        # after this request is therefore normal terminal shutdown, not lease loss.
+        heartbeat_stop.set()
+    connection = await db.connection()
+    with contextlib.suppress(Exception):
+        await connection.exec_driver_sql("PRAGMA busy_timeout=200")
+    try:
+        for attempt in range(4):
+            try:
+                await _prove_execution_lease(db, job.id, expected_token)
+                if job.status in _TERMINAL_JOB_STATUSES:
+                    job.execution_token = None
+                    job.execution_lease_expires_at = None
+                await db.commit()
+                return
+            except Exception as exc:
+                if not is_sqlite_database_locked(exc):
+                    await db.rollback()
+                    raise
+                # The no-op fence runs before autoflush. If SQLite leaves this
+                # transaction usable, retry only that database boundary and retain
+                # every pending sibling mutation. Never replay execution/provider I/O.
+                if not db.is_active or attempt == 3:
+                    await db.rollback()
+                    raise
+                await asyncio.sleep(0.25 * (attempt + 1))
+    finally:
+        with contextlib.suppress(Exception):
+            await connection.exec_driver_sql("PRAGMA busy_timeout=30000")
+
+
 async def _persist_job_envelope(
     db: AsyncSession,
     job_id: int,
@@ -496,6 +681,7 @@ async def _persist_job_envelope(
     status: JobStatus,
     result_json: str | None = None,
     cancel_active_tracks: bool = False,
+    expected_token: str | None = None,
 ) -> bool:
     """Persist one short job-envelope transition with rollback-safe retries."""
     transitioned = False
@@ -504,11 +690,17 @@ async def _persist_job_envelope(
         nonlocal transitioned
         transitioned = False
         values: dict[str, object] = {"status": status, "updated_at": _now()}
+        if status in _TERMINAL_JOB_STATUSES:
+            values["execution_token"] = None
+            values["execution_lease_expires_at"] = None
         if result_json is not None:
             values["result_json"] = result_json
+        conditions = [Job.id == job_id, Job.status.in_(expected_statuses)]
+        if expected_token is not None:
+            conditions.append(Job.execution_token == expected_token)
         result = await db.execute(
             update(Job)
-            .where(Job.id == job_id, Job.status.in_(expected_statuses))
+            .where(*conditions)
             .values(**values)
             .execution_options(synchronize_session=False)
         )
@@ -546,12 +738,47 @@ def _job_error_result(code: str, operation: str, *, retryable: bool) -> str:
     return json.dumps({"error": {"code": code, "operation": operation, "retryable": retryable}})
 
 
+async def _invoke_job_execution(
+    job_id: int,
+    db: AsyncSession,
+    cfg: Settings,
+    *,
+    commit_progress: bool,
+    expected_token: str | None,
+    heartbeat_stop: asyncio.Event | None = None,
+) -> _ContinuationRequest | None:
+    """Invoke the execution seam without replaying work to infer hook compatibility."""
+    parameters = inspect.signature(_run_job_in_session).parameters
+    if "heartbeat_stop" in parameters:
+        return await _run_job_in_session(
+            job_id,
+            db,
+            cfg,
+            commit_progress=commit_progress,
+            expected_token=expected_token,
+            heartbeat_stop=heartbeat_stop,
+        )
+    if "expected_token" in parameters:
+        return await _run_job_in_session(
+            job_id,
+            db,
+            cfg,
+            commit_progress=commit_progress,
+            expected_token=expected_token,
+        )
+    if "commit_progress" in parameters:
+        return await _run_job_in_session(job_id, db, cfg, commit_progress=commit_progress)
+    return await _run_job_in_session(job_id, db, cfg)
+
+
 async def run_job(
     job_id: int, db: AsyncSession | None = None, settings: Settings | None = None
 ) -> None:
     if db is not None:
         cfg = settings or await build_effective_settings(db, get_settings())
-        continuation = await _run_job_in_session(job_id, db, cfg)
+        continuation = await _invoke_job_execution(
+            job_id, db, cfg, commit_progress=False, expected_token=None
+        )
         if continuation is not None:
             # This legacy caller-owned session path intentionally commits execution
             # state before continuation creation starts its isolated transaction.
@@ -562,7 +789,7 @@ async def run_job(
                 continuation.catalog_album_id,
                 db,
             )
-            await _dispatch_continuation_jobs(direct_continuation_ids or [])
+            await _dispatch_continuation_jobs(direct_continuation_ids or [], db=db)
         return
 
     # Background path: short independent sessions with committed checkpoints.
@@ -602,14 +829,13 @@ async def run_job(
 
     cfg = cfg_built
 
-    # Phase 2: commit pending->running before any provider work so observers see it.
+    # Phase 2: atomically claim pending work before any provider boundary is crossed.
+    execution_token = str(uuid4())
+    lease_duration = _lease_duration(cfg)
     try:
         async with factory() as session:
-            claimed = await _persist_job_envelope(
-                session,
-                job_id,
-                expected_statuses={JobStatus.pending},
-                status=JobStatus.running,
+            claimed = await _claim_execution_lease(
+                session, job_id, execution_token, lease_duration
             )
         if not claimed:
             return
@@ -634,17 +860,36 @@ async def run_job(
                 )
         return
 
-    # Phase 3: provider/filesystem execution occurs once. Only primitive terminal
-    # envelope data crosses into the rollback-safe persistence closure.
-    try:
+    # Phase 3: heartbeat in its own short sessions while provider/filesystem work
+    # executes exactly once in the execution session.
+    heartbeat_stop = asyncio.Event()
+    heartbeat = asyncio.create_task(
+        _heartbeat_execution_lease(job_id, execution_token, lease_duration, heartbeat_stop),
+        name=f"job-{job_id}-heartbeat",
+    )
+    lease_lost = False
+    terminal_persisted = False
+
+    async def execute_owned_work() -> None:
+        nonlocal terminal_persisted
         continuation_ids: list[int] = []
         async with factory() as session:
-            continuation = await _run_job_in_session(job_id, session, cfg, commit_progress=True)
+            continuation = await _invoke_job_execution(
+                job_id,
+                session,
+                cfg,
+                commit_progress=True,
+                expected_token=execution_token,
+                heartbeat_stop=heartbeat_stop,
+            )
+            # Provider/filesystem execution is complete. Stop refreshing before the
+            # terminal token is cleared so a normal terminal commit cannot look like
+            # heartbeat ownership loss while continuations are created.
+            heartbeat_stop.set()
             current = await session.get(Job, job_id)
             if current is None:
                 return
             terminal_status = current.status
-            terminal_result = current.result_json
             if terminal_status not in {
                 JobStatus.done,
                 JobStatus.partial,
@@ -652,24 +897,11 @@ async def run_job(
                 JobStatus.cancelled,
             }:
                 raise RuntimeError(f"job {job_id} execution did not reach a terminal status")
-            # Real execution has already committed the complete terminal unit. This
-            # extra commit supports caller/test implementations; if it alone locks,
-            # reconstruct only their terminal envelope without replaying execution.
-            try:
-                await session.commit()
-            except Exception as exc:
-                await session.rollback()
-                if not is_sqlite_database_locked(exc):
-                    raise
-                committed = await _persist_job_envelope(
-                    session,
-                    job_id,
-                    expected_statuses={JobStatus.running},
-                    status=terminal_status,
-                    result_json=terminal_result,
-                )
-                if not committed:
-                    return
+            # The real runner commits terminal state through the fenced seam. Test
+            # implementations may leave it pending, so finish that same transaction.
+            if current.execution_token == execution_token:
+                await _commit_job_progress(session, current, execution_token)
+            terminal_persisted = True
             if continuation is not None:
                 continuation_ids = await _spawn_continuation_jobs(
                     continuation.parent_job_id,
@@ -678,51 +910,113 @@ async def run_job(
                     session,
                 )
         await _dispatch_continuation_jobs(continuation_ids)
-    except asyncio.CancelledError:
-        async with factory() as session:
-            await _persist_job_envelope(
-                session,
-                job_id,
-                expected_statuses={JobStatus.pending, JobStatus.running},
-                status=JobStatus.cancelled,
-                result_json=_job_error_result("cancelled", "job", retryable=True),
-                cancel_active_tracks=True,
-            )
-        raise
-    except Exception:
-        logger.exception("Job %d failed", job_id)
-        async with factory() as session:
-            await _persist_job_envelope(
-                session,
-                job_id,
-                expected_statuses={JobStatus.pending, JobStatus.running},
-                status=JobStatus.failed,
-                result_json=_job_error_result("job_failed", "job", retryable=True),
-            )
-    finally:
-        try:
-            from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
 
-            await cleanup_terminal_acquisitions(
-                factory,
-                slskd_url=cfg.slskd_url,
-                slskd_api_key=cfg.slskd_api_key,
-                job_ids={job_id},
-                slskd_complete_root=cfg.slskd_complete_root,
-                slskd_incomplete_root=cfg.slskd_incomplete_root,
-                partial_minimum_age=timedelta(seconds=cfg.slskd_directory_sweep_min_age_seconds),
-            )
+    execution_task = asyncio.create_task(execute_owned_work(), name=f"job-{job_id}-execution")
+    try:
+        done, _ = await asyncio.wait(
+            {execution_task, heartbeat}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if heartbeat in done:
+            heartbeat_error = heartbeat.exception()
+            if heartbeat_error is not None:
+                lease_lost = True
+                execution_task.cancel()
+                await asyncio.gather(execution_task, return_exceptions=True)
+                raise ExecutionLeaseLost(
+                    f"job {job_id} execution heartbeat failed"
+                ) from heartbeat_error
+        await execution_task
+    except ExecutionLeaseLost:
+        lease_lost = True
+        raise
+    except asyncio.CancelledError:
+        execution_task.cancel()
+        await asyncio.gather(execution_task, return_exceptions=True)
+        try:
+            async with factory() as session:
+                transitioned = await _persist_job_envelope(
+                    session,
+                    job_id,
+                    expected_statuses={JobStatus.pending, JobStatus.running},
+                    status=JobStatus.cancelled,
+                    result_json=_job_error_result("cancelled", "job", retryable=True),
+                    cancel_active_tracks=True,
+                    expected_token=execution_token,
+                )
         except Exception:
-            logger.exception("Job %d terminal acquisition cleanup failed", job_id)
+            logger.exception("Job %d cancellation persistence failed", job_id)
+            transitioned = False
+        terminal_persisted = transitioned
+        if not transitioned:
+            lease_lost = True
+        raise
+    except Exception as exc:
+        logger.exception("Job %d failed", job_id)
+        try:
+            async with factory() as session:
+                transitioned = await _persist_job_envelope(
+                    session,
+                    job_id,
+                    expected_statuses={JobStatus.pending, JobStatus.running},
+                    status=JobStatus.failed,
+                    result_json=_job_error_result("job_failed", "job", retryable=True),
+                    expected_token=execution_token,
+                )
+        except Exception:
+            logger.exception("Job %d failure persistence failed", job_id)
+            transitioned = False
+        terminal_persisted = transitioned
+        if not transitioned:
+            lease_lost = True
+            raise ExecutionLeaseLost(
+                f"job {job_id} execution lease was replaced or could not be persisted"
+            ) from exc
+    finally:
+        heartbeat_stop.set()
+        heartbeat_results = await asyncio.gather(heartbeat, return_exceptions=True)
+        heartbeat_error = heartbeat_results[0]
+        if isinstance(heartbeat_error, BaseException) and not lease_lost:
+            logger.error(
+                "Job %d heartbeat task failed during teardown: %s", job_id, heartbeat_error
+            )
+        if terminal_persisted and not lease_lost:
+            try:
+                from app.services.acquisition_cleanup import cleanup_terminal_acquisitions
+
+                await cleanup_terminal_acquisitions(
+                    factory,
+                    slskd_url=cfg.slskd_url,
+                    slskd_api_key=cfg.slskd_api_key,
+                    job_ids={job_id},
+                    slskd_complete_root=cfg.slskd_complete_root,
+                    slskd_incomplete_root=cfg.slskd_incomplete_root,
+                    partial_minimum_age=timedelta(
+                        seconds=cfg.slskd_directory_sweep_min_age_seconds
+                    ),
+                )
+            except Exception:
+                logger.exception("Job %d terminal acquisition cleanup failed", job_id)
 
 
 async def _run_job_in_session(
-    job_id: int, db: AsyncSession, cfg: Settings, *, commit_progress: bool = False
+    job_id: int,
+    db: AsyncSession,
+    cfg: Settings,
+    *,
+    commit_progress: bool = False,
+    expected_token: str | None = None,
+    heartbeat_stop: asyncio.Event | None = None,
 ) -> _ContinuationRequest | None:
     job = await db.get(Job, job_id)
     if job is None:
         logger.error("Job %d not found", job_id)
         return None
+
+    async def persist_progress() -> None:
+        if expected_token is None:
+            await db.commit()
+        else:
+            await _commit_job_progress(db, job, expected_token, heartbeat_stop=heartbeat_stop)
 
     if job.catalog_album_id is not None and job.catalog_track_id is not None:
         from app.services.acquisition_ownership import (
@@ -738,9 +1032,10 @@ async def _run_job_in_session(
                 {"tracks_created": 0, "skipped": "exact_catalog_track_owned"}, sort_keys=True
             )
             job.updated_at = _now()
-            await db.flush()
             if commit_progress:
-                await db.commit()
+                await persist_progress()
+            else:
+                await db.flush()
             return None
         claimed = await claim_catalog_acquisition(
             db, job.catalog_album_id, job.catalog_track_id, job.id
@@ -753,9 +1048,10 @@ async def _run_job_in_session(
                 sort_keys=True,
             )
             job.updated_at = _now()
-            await db.flush()
             if commit_progress:
-                await db.commit()
+                await persist_progress()
+            else:
+                await db.flush()
             return None
 
     job.status = JobStatus.running
@@ -764,7 +1060,7 @@ async def _run_job_in_session(
     # Bug 5: release the SQLite write lock before long provider HTTP/search/polling so
     # concurrent settings writes are not blocked during the acquisition wait.
     if commit_progress:
-        await db.commit()
+        await persist_progress()
 
     continuation_request: _ContinuationRequest | None = None
     try:
@@ -788,7 +1084,7 @@ async def _run_job_in_session(
 
                 catalog_album = await _fetch_and_store_album(db, cfg, catalog_album)
                 if commit_progress:
-                    await db.commit()
+                    await persist_progress()
             except Exception:
                 logger.warning(
                     "Compilation artist-credit hydration failed for album %d (job %d)",
@@ -802,7 +1098,7 @@ async def _run_job_in_session(
             job,
             cfg,
             db,
-            checkpoint=db.commit if commit_progress else None,
+            checkpoint=persist_progress if commit_progress else None,
         )
         catalog_album = await _load_catalog_album(db, job.catalog_album_id)
         catalog_tracks = list(catalog_album.tracks) if catalog_album is not None else []
@@ -820,7 +1116,7 @@ async def _run_job_in_session(
 
                 catalog_album = await _fetch_and_store_album(db, cfg, catalog_album)
                 if commit_progress:
-                    await db.commit()
+                    await persist_progress()
                 catalog_album = await _load_catalog_album(db, job.catalog_album_id)
                 if catalog_album is not None:
                     catalog_tracks = list(catalog_album.tracks)
@@ -887,18 +1183,34 @@ async def _run_job_in_session(
             await db.flush()
             return None
 
+        root_catalog_matches: dict[int, CatalogAlbumTrack] = {}
+        reconciliation_failures: list[dict[str, object]] = []
+        prowlarr_release_candidates = bool(results) and all(
+            result.source == "prowlarr" for result in results
+        )
         if (
             catalog_album is not None
             and job.catalog_track_id is None
-            and results
-            and all(result.source == "prowlarr" for result in results)
+            and not prowlarr_release_candidates
+        ):
+            reconciled, reconciliation_failures = _reconcile_release_root_results(
+                results, catalog_tracks
+            )
+            root_catalog_matches = {id(result): track for result, track in reconciled}
+            accepted = set(root_catalog_matches)
+            results = [result for result in results if id(result) in accepted]
+
+        if (
+            catalog_album is not None
+            and job.catalog_track_id is None
+            and prowlarr_release_candidates
         ):
             # Prowlarr results are alternative release candidates, not tracks.
             # Acquire one candidate and report manifest gaps rather than enqueueing
             # every NZB and assigning candidates to tracks by position.
             results = results[:1]
         tracks_created = 0
-        failures: list[dict[str, object]] = []
+        failures: list[dict[str, object]] = list(reconciliation_failures)
         artifact_missing_gate: dict[str, object] | None = None
         root_job = await _root_job(job, db)
         existing_releases = list(
@@ -926,7 +1238,7 @@ async def _run_job_in_session(
         for result in results:
             attempt = await _candidate_attempt(db, job, result)
             if commit_progress:
-                await db.commit()
+                await persist_progress()
             if (
                 result.source == "slskd"
                 and selected_catalog_track is not None
@@ -947,7 +1259,9 @@ async def _run_job_in_session(
                     }
                 )
                 continue
-            catalog_track = _catalog_track_for_result(result, catalog_tracks, job.catalog_track_id)
+            catalog_track = root_catalog_matches.get(id(result)) or _catalog_track_for_result(
+                result, catalog_tracks, job.catalog_track_id
+            )
             track_title = catalog_track.title if catalog_track is not None else result.title
             track_album = catalog_album.title if catalog_album is not None else result.album
             track = _existing_track_for_result(
@@ -1046,11 +1360,11 @@ async def _run_job_in_session(
                 attempt.track_id = track.id
                 if commit_progress:
                     job.updated_at = _now()
-                    await db.commit()
+                    await persist_progress()
 
                 async def checkpoint() -> None:
                     job.updated_at = _now()
-                    await db.commit()
+                    await persist_progress()
 
                 prepare_kwargs: dict[str, object] = {
                     "checkpoint": checkpoint if commit_progress else None,
@@ -1059,7 +1373,7 @@ async def _run_job_in_session(
                     prepare_kwargs["attempt"] = attempt
                 source_job_id, source_status = await _call_prepare_acquisition(
                     result,
-                    job.source,
+                    result.source,
                     cfg,
                     track,
                     **prepare_kwargs,  # type: ignore[arg-type]
@@ -1159,7 +1473,7 @@ async def _run_job_in_session(
                             )
                         await db.flush()
                         if commit_progress:
-                            await db.commit()
+                            await persist_progress()
                 logger.warning("Provider result processing failed with code %s", exc.code)
                 if artifact_missing_gate is not None:
                     break
@@ -1178,7 +1492,7 @@ async def _run_job_in_session(
                 failures.append({"code": "result_processing_failed"})
             if commit_progress:
                 job.updated_at = _now()
-                await db.commit()
+                await persist_progress()
 
         if artifact_missing_gate is not None:
             job.status = JobStatus.failed
@@ -1306,9 +1620,10 @@ async def _run_job_in_session(
         )
         job.updated_at = _now()
 
-    await db.flush()
     if commit_progress:
-        await db.commit()
+        await persist_progress()
+    else:
+        await db.flush()
     return continuation_request
 
 
@@ -1327,6 +1642,196 @@ def _catalog_disc_total(tracks: list[CatalogAlbumTrack]) -> int | None:
     discs = [track.disc for track in tracks if track.disc and track.disc > 0]
     total = max(discs, default=1)
     return total if total > 1 else None
+
+
+def _result_disc_position(result: SearchResult) -> tuple[int, int] | None:
+    raw_title = result.title or ""
+    metadata = result.metadata or {}
+    disc: int | None = None
+    position: int | None = None
+    try:
+        raw_position = metadata.get("track_no")
+        if isinstance(raw_position, (int, str, float)):
+            position = int(raw_position)
+    except (ValueError, TypeError):
+        position = None
+    try:
+        raw_disc = metadata.get("disc")
+        if isinstance(raw_disc, (int, str, float)):
+            disc = int(raw_disc)
+    except (ValueError, TypeError):
+        disc = None
+    if position is None:
+        compound = _DISC_TRACK_PREFIX_RE.match(raw_title)
+        if compound:
+            disc = int(compound.group(1))
+            position = int(compound.group(2))
+        else:
+            single = _SINGLE_TRACK_PREFIX_RE.match(raw_title)
+            if single:
+                position = int(single.group(1))
+    if position is None or position <= 0:
+        return None
+    return (disc if disc is not None and disc > 0 else 1, position)
+
+
+def _position_from_text(value: str) -> tuple[int, int] | None:
+    compound = _DISC_TRACK_PREFIX_RE.match(value)
+    if compound:
+        disc, position = int(compound.group(1)), int(compound.group(2))
+        return (disc, position) if disc > 0 and position > 0 else None
+    single = _SINGLE_TRACK_PREFIX_RE.match(value)
+    if single:
+        position = int(single.group(1))
+        return (1, position) if position > 0 else None
+    return None
+
+
+def _release_root_position_evidence(result: SearchResult) -> set[tuple[int, int]]:
+    evidence: set[tuple[int, int]] = set()
+    metadata = result.metadata or {}
+    try:
+        raw_position = metadata.get("track_no")
+        position = int(raw_position) if isinstance(raw_position, (int, str, float)) else None
+        raw_disc = metadata.get("disc")
+        disc = int(raw_disc) if isinstance(raw_disc, (int, str, float)) else 1
+    except (ValueError, TypeError):
+        position = None
+        disc = 1
+    if position is not None and position > 0 and disc > 0:
+        evidence.add((disc, position))
+    if result.title:
+        parsed = _position_from_text(result.title)
+        if parsed is not None:
+            evidence.add(parsed)
+    filename = metadata.get("filename")
+    if isinstance(filename, str) and filename.strip():
+        basename = filename.strip().replace("\\", "/").rsplit("/", 1)[-1]
+        parsed = _position_from_text(basename)
+        if parsed is not None:
+            evidence.add(parsed)
+    return evidence
+
+
+def _release_root_title_matches(
+    raw_title: str, tracks: list[CatalogAlbumTrack]
+) -> list[CatalogAlbumTrack]:
+    exact = [
+        track for track in tracks if track.title.casefold().strip() == raw_title.casefold().strip()
+    ]
+    if exact:
+        return exact
+    normalized = normalize_for_catalog_match(raw_title)
+    matches = [track for track in tracks if normalize_for_catalog_match(track.title) == normalized]
+    if matches:
+        return matches
+    stripped = normalize_for_catalog_match(strip_non_identity_descriptors(raw_title))
+    if not stripped:
+        return []
+    return [
+        track
+        for track in tracks
+        if normalize_for_catalog_match(strip_non_identity_descriptors(track.title)) == stripped
+    ]
+
+
+def _release_root_result_identity_evidence(result: SearchResult) -> tuple[str, ...]:
+    evidence: list[str] = []
+    if result.title and result.title.strip():
+        evidence.append(result.title.strip())
+    filename = (result.metadata or {}).get("filename")
+    if isinstance(filename, str) and filename.strip():
+        normalized_filename = filename.strip().replace("\\", "/").rsplit("/", 1)[-1]
+        if normalized_filename not in evidence:
+            evidence.append(normalized_filename)
+    return tuple(evidence)
+
+
+def _release_root_result_matches_track(result: SearchResult, track: CatalogAlbumTrack) -> bool:
+    evidence = _release_root_result_identity_evidence(result)
+    return not evidence or all(
+        _targeted_title_matches(value, value, track.title) for value in evidence
+    )
+
+
+def _release_root_artifact_identity(result: SearchResult) -> tuple[str, str, str] | None:
+    metadata = result.metadata or {}
+    return normalize_source_candidate_identity(
+        result.source,
+        metadata.get("username"),
+        metadata.get("filename"),
+    )
+
+
+def _reconcile_release_root_results(
+    results: Sequence[SearchResult],
+    tracks: list[CatalogAlbumTrack],
+) -> tuple[list[tuple[SearchResult, CatalogAlbumTrack]], list[dict[str, object]]]:
+    """Bind per-file results to exact manifest and physical artifact identities."""
+    provisional: list[
+        tuple[
+            SearchResult,
+            CatalogAlbumTrack | None,
+            str | None,
+            tuple[str, str, str] | None,
+        ]
+    ] = []
+    for result in results:
+        position_evidence = _release_root_position_evidence(result)
+        error: str | None = None
+        if len(position_evidence) > 1:
+            matches: list[CatalogAlbumTrack] = []
+            error = "catalog_result_position_contradiction"
+        elif position_evidence:
+            position = next(iter(position_evidence))
+            matches = [track for track in tracks if (track.disc, track.position) == position]
+        else:
+            matches = _release_root_title_matches(result.title or "", tracks)
+        track = matches[0] if len(matches) == 1 else None
+        if track is not None and not _release_root_result_matches_track(result, track):
+            track = None
+            error = "catalog_result_identity_contradiction"
+        elif len(matches) > 1:
+            error = "catalog_result_ambiguous"
+        elif (
+            track is None
+            and not _release_root_result_identity_evidence(result)
+            and len(tracks) == 1
+        ):
+            track = tracks[0]
+        elif track is None:
+            error = error or "catalog_result_unmatched"
+        provisional.append((result, track, error, _release_root_artifact_identity(result)))
+
+    identity_counts: dict[int, int] = {}
+    artifact_counts: dict[tuple[str, str, str], int] = {}
+    for _result, track, _error, artifact_identity in provisional:
+        if track is not None:
+            identity_counts[track.id] = identity_counts.get(track.id, 0) + 1
+        if artifact_identity is not None:
+            artifact_counts[artifact_identity] = artifact_counts.get(artifact_identity, 0) + 1
+
+    reconciled: list[tuple[SearchResult, CatalogAlbumTrack]] = []
+    failures: list[dict[str, object]] = []
+    for result, track, error, artifact_identity in provisional:
+        if artifact_identity is not None and artifact_counts.get(artifact_identity, 0) > 1:
+            error = "catalog_result_duplicate_artifact"
+            track = None
+        elif track is not None and identity_counts.get(track.id, 0) > 1:
+            error = "catalog_result_duplicate_identity"
+            track = None
+        if track is not None:
+            reconciled.append((result, track))
+            continue
+        failures.append(
+            {
+                "code": error or "catalog_result_unmatched",
+                "operation": "catalog_reconciliation",
+                "retryable": False,
+                "result_title": result.title,
+            }
+        )
+    return reconciled, failures
 
 
 def _catalog_track_for_result(
@@ -1607,12 +2112,7 @@ def _slskd_search_timeout_seconds(runtime: object | None) -> float:
     if runtime is None:
         return 300.0
     configured_budget = float(getattr(runtime, "source_search_budget_seconds", 300) or 300)
-    download_timeout = float(getattr(runtime, "slskd_download_timeout_seconds", 600) or 600)
-    # slskd can keep valid searches active for several minutes during bulk dispatch.
-    # Never let a legacy low UI value turn those in-flight searches into false
-    # sources_exhausted failures, but cap search waiting at fifteen minutes so a
-    # dead search cannot monopolize the queue forever.
-    return min(900.0, max(configured_budget, min(download_timeout, 900.0)))
+    return min(900.0, max(3.0, configured_budget))
 
 
 def _source_adapter(source: str, cfg: Settings, runtime: object | None = None) -> SourceAdapter:
@@ -2645,14 +3145,69 @@ async def _spawn_continuation_jobs(
             await db.rollback()
             return
 
+        if parent_job.catalog_album_id != catalog_album_id:
+            raise ValueError("continuation parent owns a different catalog album")
+        parent_track_id = parent_job.catalog_track_id
+        if parent_track_id is not None and requested_track_ids != (parent_track_id,):
+            raise ValueError("exact-track continuation requested a different catalog track")
+        expected_role = (
+            DiscographyBatchJobRole.release_root
+            if parent_track_id is None
+            else DiscographyBatchJobRole.track_fallback
+        )
+        context_rows = (
+            await db.execute(
+                select(
+                    DiscographyBatchItemJob,
+                    DiscographyBatchItem,
+                    DiscographyBatch,
+                )
+                .join(
+                    DiscographyBatchItem,
+                    DiscographyBatchItem.id == DiscographyBatchItemJob.item_id,
+                )
+                .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+                .where(
+                    DiscographyBatchItemJob.job_id == parent_job_id,
+                    DiscographyBatchItemJob.role == expected_role,
+                )
+                .order_by(DiscographyBatchItemJob.id)
+            )
+        ).all()
+        active_contexts: list[tuple[DiscographyBatchItemJob, DiscographyBatchItem]] = []
+        active_item_states = {
+            DiscographyBatchItemState.pending,
+            DiscographyBatchItemState.hydrating,
+            DiscographyBatchItemState.expanding,
+            DiscographyBatchItemState.waiting,
+        }
+        for context_link, item, batch in context_rows:
+            expected_track_id = None if parent_track_id is None else parent_track_id
+            if context_link.catalog_track_id != expected_track_id:
+                raise ValueError("batch continuation link carries the wrong catalog track")
+            if item.catalog_album_id != catalog_album_id:
+                raise ValueError("batch continuation item owns a different album")
+            if (
+                context_link.generation != item.execution_generation
+                or batch.state not in (DiscographyBatchState.queued, DiscographyBatchState.running)
+                or item.state not in active_item_states
+            ):
+                continue
+            active_contexts.append((context_link, item))
+        if context_rows and not active_contexts:
+            committed_ids.clear()
+            await db.rollback()
+            return
+
         tracks_by_id = {track.id: track for track in catalog_album.tracks}
         next_attempt = parent_job.partial_attempt + 1
         for track_id in requested_track_ids:
             catalog_track = tracks_by_id.get(track_id)
             if catalog_track is None:
-                continue
-            duplicate = await db.scalar(
-                select(Job.id).where(
+                raise ValueError("continuation track does not belong to the release root")
+            continuation = await db.scalar(
+                select(Job)
+                .where(
                     Job.catalog_album_id == catalog_album_id,
                     Job.catalog_track_id == track_id,
                     (
@@ -2663,26 +3218,80 @@ async def _spawn_continuation_jobs(
                         | Job.status.in_([JobStatus.pending, JobStatus.running])
                     ),
                 )
+                .order_by(Job.id)
+                .limit(1)
             )
-            if duplicate is not None:
-                continue
-            continuation = Job(
-                source="priority",
-                query=_targeted_query_variants(
-                    _catalog_track_artist_name(catalog_album, catalog_track),
-                    catalog_album.title,
-                    catalog_track.title,
-                )[0],
-                status=JobStatus.pending,
-                catalog_album_id=catalog_album_id,
-                catalog_track_id=track_id,
-                parent_job_id=parent_job_id,
-                partial_attempt=next_attempt,
-                result_json=json.dumps({"continuation_of": parent_job_id}, sort_keys=True),
-            )
-            db.add(continuation)
-            await db.flush()
-            attempt_ids.append(continuation.id)
+            created = continuation is None
+            if continuation is None:
+                continuation = Job(
+                    source="priority",
+                    query=_targeted_query_variants(
+                        _catalog_track_artist_name(catalog_album, catalog_track),
+                        catalog_album.title,
+                        catalog_track.title,
+                    )[0],
+                    status=JobStatus.pending,
+                    catalog_album_id=catalog_album_id,
+                    catalog_track_id=track_id,
+                    parent_job_id=parent_job_id,
+                    partial_attempt=next_attempt,
+                    result_json=json.dumps({"continuation_of": parent_job_id}, sort_keys=True),
+                )
+                db.add(continuation)
+                await db.flush()
+                attempt_ids.append(continuation.id)
+            if (
+                continuation.catalog_album_id != catalog_album_id
+                or continuation.catalog_track_id != track_id
+            ):
+                raise ValueError("continuation job does not own the exact requested track")
+            for context_link, item in active_contexts:
+                existing_link = await db.scalar(
+                    select(DiscographyBatchItemJob).where(
+                        DiscographyBatchItemJob.item_id == item.id,
+                        DiscographyBatchItemJob.generation == item.execution_generation,
+                        DiscographyBatchItemJob.catalog_track_id == track_id,
+                    )
+                )
+                if existing_link is not None:
+                    existing_job = await db.get(Job, existing_link.job_id)
+                    if (
+                        existing_link.role != DiscographyBatchJobRole.track_fallback
+                        or existing_job is None
+                        or existing_job.catalog_album_id != catalog_album_id
+                        or existing_job.catalog_track_id != track_id
+                    ):
+                        raise ValueError("batch fallback link does not own the exact track")
+                    if parent_track_id is not None:
+                        if existing_link.job_id != parent_job_id:
+                            raise ValueError(
+                                "batch fallback retry does not advance its current owner"
+                            )
+                        existing_link.job_id = continuation.id
+                        existing_link.ownership = (
+                            DiscographyJobOwnership.created
+                            if created
+                            and context_link.ownership == DiscographyJobOwnership.created
+                            else DiscographyJobOwnership.observed
+                        )
+                    continue
+                if parent_track_id is not None:
+                    raise ValueError("batch fallback retry lost its current role link")
+                db.add(
+                    DiscographyBatchItemJob(
+                        item_id=item.id,
+                        job_id=continuation.id,
+                        generation=item.execution_generation,
+                        catalog_track_id=track_id,
+                        ownership=(
+                            DiscographyJobOwnership.created
+                            if created
+                            and context_link.ownership == DiscographyJobOwnership.created
+                            else DiscographyJobOwnership.observed
+                        ),
+                        role=DiscographyBatchJobRole.track_fallback,
+                    )
+                )
         await db.commit()
         committed_ids[:] = attempt_ids
 
@@ -2690,12 +3299,57 @@ async def _spawn_continuation_jobs(
     return committed_ids
 
 
-async def _dispatch_continuation_jobs(continuation_ids: Sequence[int]) -> None:
-    """Dispatch only continuation rows returned by a successful creation commit."""
+async def _continuation_dispatch_allowed(
+    continuation_id: int, *, db: AsyncSession | None = None
+) -> bool:
+    """Fence batch fallback dispatch against pause/cancel after child commit."""
+    if db is None:
+        async with get_session_factory()() as owned_db:
+            return await _continuation_dispatch_allowed(continuation_id, db=owned_db)
+    linked = await db.scalar(
+        select(DiscographyBatchItemJob.id).where(DiscographyBatchItemJob.job_id == continuation_id)
+    )
+    if linked is None:
+        return True
+    return bool(
+        await db.scalar(
+            select(DiscographyBatchItemJob.id)
+            .join(
+                DiscographyBatchItem,
+                DiscographyBatchItem.id == DiscographyBatchItemJob.item_id,
+            )
+            .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+            .join(Job, Job.id == DiscographyBatchItemJob.job_id)
+            .where(
+                DiscographyBatchItemJob.job_id == continuation_id,
+                DiscographyBatchItemJob.role == DiscographyBatchJobRole.track_fallback,
+                DiscographyBatchItemJob.generation == DiscographyBatchItem.execution_generation,
+                DiscographyBatchItem.state.in_(
+                    (
+                        DiscographyBatchItemState.pending,
+                        DiscographyBatchItemState.hydrating,
+                        DiscographyBatchItemState.expanding,
+                        DiscographyBatchItemState.waiting,
+                    )
+                ),
+                DiscographyBatch.state.in_(
+                    (DiscographyBatchState.queued, DiscographyBatchState.running)
+                ),
+                Job.status == JobStatus.pending,
+            )
+        )
+    )
+
+
+async def _dispatch_continuation_jobs(
+    continuation_ids: Sequence[int], *, db: AsyncSession | None = None
+) -> None:
+    """Dispatch committed continuations only while durable ownership permits it."""
     from app.jobs.dispatcher import job_dispatcher
 
     for continuation_id in continuation_ids:
-        await job_dispatcher.dispatch(continuation_id)
+        if await _continuation_dispatch_allowed(continuation_id, db=db):
+            await job_dispatcher.dispatch(continuation_id)
 
 
 async def _compute_path_preview(track: Track, db: AsyncSession, cfg: Settings) -> None:

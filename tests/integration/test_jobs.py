@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import pytest
 from httpx import AsyncClient
+
+from app.jobs.dispatcher import job_dispatcher
 
 
 async def test_create_job_returns_201(client: AsyncClient) -> None:
@@ -16,7 +19,13 @@ async def test_create_job_returns_201(client: AsyncClient) -> None:
     assert "id" in data
 
 
-async def test_create_job_accepts_tidal_and_rejects_unknown_sources(client: AsyncClient) -> None:
+async def test_create_job_accepts_tidal_and_rejects_unknown_sources(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def do_not_execute_source_job(_job_id: int) -> None:
+        return None
+
+    monkeypatch.setattr(job_dispatcher, "dispatch", do_not_execute_source_job)
     tidal = await client.post(
         "/jobs",
         json={"source": "tidal", "query": "https://tidal.com/browse/track/123"},

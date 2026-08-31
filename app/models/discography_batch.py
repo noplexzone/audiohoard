@@ -60,6 +60,12 @@ class DiscographyJobOwnership(StrEnum):
     observed = "observed"
 
 
+class DiscographyBatchJobRole(StrEnum):
+    legacy_track = "legacy_track"
+    release_root = "release_root"
+    track_fallback = "track_fallback"
+
+
 class DiscographyBatch(Base):
     __tablename__ = "discography_batches"
     __table_args__ = (
@@ -241,6 +247,16 @@ class DiscographyBatchItemJob(Base):
     __tablename__ = "discography_batch_item_jobs"
     __table_args__ = (
         CheckConstraint("ownership IN ('created', 'observed')", name="discographyjobownership"),
+        CheckConstraint(
+            "role IN ('legacy_track', 'release_root', 'track_fallback')",
+            name="discographybatchjobrole",
+        ),
+        CheckConstraint(
+            "role = 'legacy_track' OR "
+            "(role = 'release_root' AND catalog_track_id IS NULL) OR "
+            "(role = 'track_fallback' AND catalog_track_id IS NOT NULL)",
+            name="ck_discography_batch_job_role_track",
+        ),
         UniqueConstraint(
             "item_id", "generation", "job_id", name="uq_discography_batch_item_generation_job"
         ),
@@ -253,6 +269,14 @@ class DiscographyBatchItemJob(Base):
             unique=True,
             sqlite_where=text("catalog_track_id IS NOT NULL"),
         ),
+        Index(
+            "uq_discography_batch_item_generation_release_root",
+            "item_id",
+            "generation",
+            unique=True,
+            sqlite_where=text("role = 'release_root'"),
+            postgresql_where=text("role = 'release_root'"),
+        ).ddl_if(dialect=("sqlite", "postgresql")),  # type: ignore[arg-type]
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -264,6 +288,12 @@ class DiscographyBatchItemJob(Base):
     catalog_track_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ownership: Mapped[DiscographyJobOwnership] = mapped_column(
         Enum(DiscographyJobOwnership, native_enum=False, create_constraint=False), nullable=False
+    )
+    role: Mapped[DiscographyBatchJobRole] = mapped_column(
+        Enum(DiscographyBatchJobRole, native_enum=False, create_constraint=False),
+        nullable=False,
+        default=DiscographyBatchJobRole.legacy_track,
+        server_default=DiscographyBatchJobRole.legacy_track.value,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

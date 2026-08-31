@@ -67,6 +67,14 @@ async def test_confirmation_unchanged_queues_and_controls_cancel_created_pending
     db_session: AsyncSession,
 ) -> None:
     album = await _album(db_session)
+    album.track_count = 3
+    album.tracks.extend(
+        [
+            CatalogAlbumTrack(disc=1, position=2, title="Track Two"),
+            CatalogAlbumTrack(disc=1, position=3, title="Track Three"),
+        ]
+    )
+    await db_session.flush()
     preview = await create_discography_batch_preview(
         db_session,
         DiscographyScopeKind.wanted_selected,
@@ -81,9 +89,28 @@ async def test_confirmation_unchanged_queues_and_controls_cancel_created_pending
     )
     assert item is not None and item.state == DiscographyBatchItemState.pending
 
-    created_pending = Job(source="priority", query="created", status=JobStatus.pending)
-    created_running = Job(source="priority", query="running", status=JobStatus.running)
-    observed_pending = Job(source="priority", query="observed", status=JobStatus.pending)
+    catalog_tracks = sorted(album.tracks, key=lambda track: track.position)
+    created_pending = Job(
+        source="priority",
+        query="created",
+        status=JobStatus.pending,
+        catalog_album=album,
+        catalog_track=catalog_tracks[0],
+    )
+    created_running = Job(
+        source="priority",
+        query="running",
+        status=JobStatus.running,
+        catalog_album=album,
+        catalog_track=catalog_tracks[1],
+    )
+    observed_pending = Job(
+        source="priority",
+        query="observed",
+        status=JobStatus.pending,
+        catalog_album=album,
+        catalog_track=catalog_tracks[2],
+    )
     db_session.add_all([created_pending, created_running, observed_pending])
     await db_session.flush()
     created_descendant = Job(
@@ -105,16 +132,19 @@ async def test_confirmation_unchanged_queues_and_controls_cancel_created_pending
             DiscographyBatchItemJob(
                 item_id=item.id,
                 job_id=created_pending.id,
+                catalog_track_id=catalog_tracks[0].id,
                 ownership=DiscographyJobOwnership.created,
             ),
             DiscographyBatchItemJob(
                 item_id=item.id,
                 job_id=created_running.id,
+                catalog_track_id=catalog_tracks[1].id,
                 ownership=DiscographyJobOwnership.created,
             ),
             DiscographyBatchItemJob(
                 item_id=item.id,
                 job_id=observed_pending.id,
+                catalog_track_id=catalog_tracks[2].id,
                 ownership=DiscographyJobOwnership.observed,
             ),
         ]

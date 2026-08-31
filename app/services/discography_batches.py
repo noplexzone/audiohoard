@@ -12,7 +12,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.acquisition_claim import AcquisitionDispatchClaim
+from app.models.acquisition_claim import (
+    AcquisitionDispatchClaim,
+    CatalogReleaseAcquisitionClaim,
+)
 from app.models.catalog_entities import (
     CatalogAlbum,
     CatalogAlbumProvider,
@@ -24,6 +27,7 @@ from app.models.discography_batch import (
     DiscographyBatchItem,
     DiscographyBatchItemJob,
     DiscographyBatchItemState,
+    DiscographyBatchJobRole,
     DiscographyBatchState,
     DiscographyJobOwnership,
     DiscographyScopeKind,
@@ -809,18 +813,117 @@ async def pause_discography_batch(
     return DiscographyBatchControlResult(batch.id, batch.state)
 
 
+def _batch_job_link_shape_valid(
+    link: DiscographyBatchItemJob,
+    item: DiscographyBatchItem,
+    job: Job | None,
+) -> bool:
+    if (
+        job is None
+        or link.generation != item.execution_generation
+        or item.catalog_album_id is None
+        or job.catalog_album_id != item.catalog_album_id
+    ):
+        return False
+    if link.role == DiscographyBatchJobRole.release_root:
+        return link.catalog_track_id is None and job.catalog_track_id is None
+    if link.role == DiscographyBatchJobRole.track_fallback:
+        return link.catalog_track_id is not None and job.catalog_track_id == link.catalog_track_id
+    if link.role == DiscographyBatchJobRole.legacy_track:
+        return link.catalog_track_id is not None and job.catalog_track_id == link.catalog_track_id
+    return False
+
+
+async def _transfer_shared_created_job_ownership(db: AsyncSession, batch_id: int) -> None:
+    """Keep shared physical work owned or fail closed on malformed evidence."""
+    creator_rows = (
+        await db.execute(
+            select(DiscographyBatchItemJob, DiscographyBatchItem, Job)
+            .join(
+                DiscographyBatchItem,
+                DiscographyBatchItem.id == DiscographyBatchItemJob.item_id,
+            )
+            .outerjoin(Job, Job.id == DiscographyBatchItemJob.job_id)
+            .where(
+                DiscographyBatchItem.batch_id == batch_id,
+                DiscographyBatchItemJob.ownership == DiscographyJobOwnership.created,
+            )
+            .order_by(DiscographyBatchItemJob.id)
+        )
+    ).all()
+    active_item_states = (
+        DiscographyBatchItemState.pending,
+        DiscographyBatchItemState.hydrating,
+        DiscographyBatchItemState.expanding,
+        DiscographyBatchItemState.waiting,
+    )
+    active_batch_states = (
+        DiscographyBatchState.queued,
+        DiscographyBatchState.running,
+        DiscographyBatchState.paused,
+    )
+    for creator_link, creator_item, job in creator_rows:
+        if not _batch_job_link_shape_valid(creator_link, creator_item, job):
+            raise DiscographyScopeError("malformed batch job ownership")
+        observer_rows = (
+            await db.execute(
+                select(DiscographyBatchItemJob, DiscographyBatchItem, Job)
+                .join(
+                    DiscographyBatchItem,
+                    DiscographyBatchItem.id == DiscographyBatchItemJob.item_id,
+                )
+                .join(DiscographyBatch, DiscographyBatch.id == DiscographyBatchItem.batch_id)
+                .outerjoin(Job, Job.id == DiscographyBatchItemJob.job_id)
+                .where(
+                    DiscographyBatchItemJob.job_id == creator_link.job_id,
+                    DiscographyBatchItemJob.id != creator_link.id,
+                    DiscographyBatchItem.state.in_(active_item_states),
+                    DiscographyBatch.state.in_(active_batch_states),
+                    DiscographyBatch.id != batch_id,
+                )
+                .order_by(DiscographyBatchItemJob.id)
+            )
+        ).all()
+        candidates: list[DiscographyBatchItemJob] = []
+        for observer_link, observer_item, observer_job in observer_rows:
+            if (
+                observer_link.ownership != DiscographyJobOwnership.observed
+                or observer_link.role != creator_link.role
+                or observer_link.catalog_track_id != creator_link.catalog_track_id
+                or not _batch_job_link_shape_valid(observer_link, observer_item, observer_job)
+            ):
+                raise DiscographyScopeError("malformed batch job ownership")
+            candidates.append(observer_link)
+        if not candidates:
+            continue
+        creator_link.ownership = DiscographyJobOwnership.observed
+        candidates[0].ownership = DiscographyJobOwnership.created
+    await db.flush()
+
+
 async def cancel_discography_batch(
     db: AsyncSession, batch_id: int
 ) -> DiscographyBatchControlResult:
+    reject_pending_orm_changes(db)
+    await db.rollback()
+    if db.get_bind().dialect.name == "sqlite":
+        # Ownership transfer and physical cancellation form one writer decision.
+        # A deferred SQLite transaction lets concurrent cancellations both act on
+        # stale ownership, so reserve the writer before reading either batch.
+        await db.execute(text("BEGIN IMMEDIATE"))
     batch = await db.get(DiscographyBatch, batch_id)
     if batch is None:
         raise DiscographyScopeError("discography batch does not exist")
+    if batch.state == DiscographyBatchState.cancelled:
+        await db.commit()
+        return DiscographyBatchControlResult(batch.id, batch.state)
     if batch.state not in {
         DiscographyBatchState.queued,
         DiscographyBatchState.running,
         DiscographyBatchState.paused,
     }:
         raise DiscographyScopeError("batch is not cancellable")
+    await _transfer_shared_created_job_ownership(db, batch_id)
     cancelled = tuple(
         int(row.id)
         for row in (
@@ -947,6 +1050,34 @@ async def resume_discography_batch(
             if targets
             else set()
         )
+        pending_fallback_ids = (
+            tuple(
+                int(value)
+                for value in (
+                    await db.scalars(
+                        select(DiscographyBatchItemJob.job_id)
+                        .join(Job, Job.id == DiscographyBatchItemJob.job_id)
+                        .where(
+                            DiscographyBatchItemJob.item_id == item.id,
+                            DiscographyBatchItemJob.generation == item.execution_generation,
+                            DiscographyBatchItemJob.role == DiscographyBatchJobRole.track_fallback,
+                            DiscographyBatchItemJob.catalog_track_id.in_(targets),
+                            Job.status == JobStatus.pending,
+                        )
+                    )
+                ).all()
+            )
+            if targets
+            else ()
+        )
+        release_root_status = await db.scalar(
+            select(Job.status)
+            .join(
+                CatalogReleaseAcquisitionClaim,
+                CatalogReleaseAcquisitionClaim.job_id == Job.id,
+            )
+            .where(CatalogReleaseAcquisitionClaim.catalog_album_id == album.id)
+        )
         pending = (
             set(
                 int(value)
@@ -968,11 +1099,14 @@ async def resume_discography_batch(
         if not targets:
             item.state = DiscographyBatchItemState.complete
             item.reason_code = "verified_complete"
-        elif pending:
+        elif release_root_status == JobStatus.pending or pending or pending_fallback_ids:
             # Re-notify durable pending work after pause without spending a retry generation.
             item.state = DiscographyBatchItemState.pending
             item.reason_code = "resume_pending_dispatch"
             reset.append(item.id)
+        elif release_root_status == JobStatus.running:
+            item.state = DiscographyBatchItemState.waiting
+            item.reason_code = "active_release_root"
         elif active:
             item.state = DiscographyBatchItemState.waiting
             item.reason_code = "active_jobs"

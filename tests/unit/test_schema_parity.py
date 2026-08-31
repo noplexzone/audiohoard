@@ -28,6 +28,7 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "catalog_albums",
         "catalog_artist_identities",
         "catalog_artists",
+        "catalog_release_acquisition_claims",
         "deletion_operations",
         "discography_batch_item_jobs",
         "discography_batch_items",
@@ -138,3 +139,16 @@ def test_0016_normalizes_legacy_verification_state_before_sqlite_rebuild(
         engine.dispose()
     assert state == "pending"
     assert temporary == 0
+
+
+def test_release_root_partial_index_is_omitted_for_unsupported_dialects() -> None:
+    statements: list[str] = []
+
+    def collect(sql, *multiparams, **params) -> None:
+        del multiparams, params
+        statements.append(str(sql.compile(dialect=engine.dialect)))
+
+    engine = sa.create_mock_engine("mysql://", collect)
+    Base.metadata.create_all(engine)
+    emitted = "\n".join(statements)
+    assert "uq_discography_batch_item_generation_release_root" not in emitted

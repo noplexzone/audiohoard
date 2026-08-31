@@ -185,19 +185,22 @@ async def test_completed_missing_artifact_is_retained_by_cleanup_reconciler(
 
 
 async def _terminal_intent(
-    db_session: AsyncSession, *, provider_uuid: str | None = None
+    db_session: AsyncSession,
+    *,
+    provider_uuid: str | None = None,
+    provider_state: ProviderTransferState | None = None,
+    remote_path: str = "Album/01 Song.flac",
 ) -> AcquisitionAttempt:
     job = Job(source="slskd", query="Artist Song", status="cancelled")
     attempt = AcquisitionAttempt(
         job=job,
         provider="slskd",
         peer="peer",
-        remote_path="Album/01 Song.flac",
-        provisional_transfer_id="peer:Album/01 Song.flac",
+        remote_path=remote_path,
+        provisional_transfer_id=f"peer:{remote_path}",
         provider_uuid=provider_uuid,
-        provider_state=ProviderTransferState.enqueued
-        if provider_uuid
-        else ProviderTransferState.pending,
+        provider_state=provider_state
+        or (ProviderTransferState.enqueued if provider_uuid else ProviderTransferState.pending),
         provider_enqueued_at=datetime.now(UTC) if provider_uuid else None,
     )
     db_session.add_all([job, attempt])
@@ -246,6 +249,72 @@ async def test_terminal_job_reconciles_unique_enqueue_intent_to_exact_uuid_clean
     assert await cleanup_durable_slskd_transfers(_factory(db_session), adapter) == 1
     assert ("delete", "peer", UUID) in adapter.calls
     assert all(call[0] != "delete" or call[2] == UUID for call in adapter.calls)
+
+
+@pytest.mark.parametrize(
+    "provider_state",
+    [ProviderTransferState.queued, ProviderTransferState.downloading],
+)
+async def test_terminal_job_reconciles_exact_active_transfer_before_canonical_cleanup(
+    db_session: AsyncSession, provider_state: ProviderTransferState
+) -> None:
+    attempt = await _terminal_intent(
+        db_session,
+        provider_uuid=UUID,
+        provider_state=provider_state,
+    )
+    matching = {"id": UUID, "username": "peer", "filename": r"Album\01 Song.flac"}
+    adapter = ReconcileAdapter([matching], [[matching], []])
+
+    assert await reconcile_terminal_slskd_intents(_factory(db_session), adapter) == 1
+    await db_session.refresh(attempt)
+    assert attempt.provider_state is ProviderTransferState.cancelled
+    assert attempt.outcome is AttemptOutcome.failed
+    assert attempt.provider_terminal_at is not None
+    assert attempt.terminal_at is not None
+    attempt_id = attempt.id
+    await db_session.rollback()
+
+    assert await cleanup_durable_slskd_transfers(_factory(db_session), adapter) == 1
+    assert [call for call in adapter.calls if call[0] == "delete"] == [("delete", "peer", UUID)]
+    async with _factory(db_session)() as db:
+        current = await db.get(AcquisitionAttempt, attempt_id)
+        assert current is not None
+        assert current.provider_cleanup_state is CleanupState.completed
+
+
+@pytest.mark.parametrize(
+    "matches",
+    [
+        [],
+        [
+            {"id": UUID, "username": "peer", "filename": "Album/01 Song.flac"},
+            {"id": UUID, "username": "peer", "filename": "Album/01 Song.flac"},
+        ],
+        [{"id": UUID, "username": "other-peer", "filename": "Album/01 Song.flac"}],
+        [{"id": UUID, "username": "peer", "filename": "Other/01 Song.flac"}],
+        [{"id": OTHER_UUID, "username": "peer", "filename": "Album/01 Song.flac"}],
+    ],
+    ids=["zero", "multiple", "peer-mismatch", "path-mismatch", "replacement-uuid"],
+)
+async def test_terminal_exact_active_attempt_retains_unproven_cleanup_obligation(
+    db_session: AsyncSession, matches: list[dict[str, object]]
+) -> None:
+    attempt = await _terminal_intent(
+        db_session,
+        provider_uuid=UUID,
+        provider_state=ProviderTransferState.downloading,
+    )
+    adapter = ReconcileAdapter(matches)
+
+    assert await reconcile_terminal_slskd_intents(_factory(db_session), adapter) == 0
+    assert await cleanup_durable_slskd_transfers(_factory(db_session), adapter) == 0
+    assert all(call[0] != "delete" for call in adapter.calls)
+    await db_session.refresh(attempt)
+    assert attempt.provider_state is ProviderTransferState.downloading
+    assert attempt.outcome is AttemptOutcome.pending
+    assert attempt.terminal_at is None
+    assert attempt.provider_cleanup_state is CleanupState.pending
 
 
 async def test_terminal_intent_never_adopts_or_deletes_racing_replacement(
@@ -389,6 +458,93 @@ async def test_terminal_intent_never_adopts_new_attempt_before_uuid_checkpoint(
     assert cleaned == 0
     assert old_attempt.provider_uuid is None
     assert old_attempt.provider_state is ProviderTransferState.pending
+    assert all(call[0] != "delete" for call in adapter.calls)
+
+
+@pytest.mark.parametrize("old_uses_windows_path", [True, False])
+async def test_terminal_intent_retains_normalized_equivalent_unresolved_generation(
+    db_session: AsyncSession,
+    old_uses_windows_path: bool,
+) -> None:
+    windows_path = "Album" + chr(92) + "01 Song.flac"
+    unix_path = "Album/01 Song.flac"
+    old_path, new_path = (
+        (windows_path, unix_path) if old_uses_windows_path else (unix_path, windows_path)
+    )
+    old_attempt = await _terminal_intent(db_session, remote_path=old_path)
+    db_session.add(
+        AcquisitionAttempt(
+            job=Job(source="slskd", query="replacement"),
+            provider="slskd",
+            peer="peer",
+            remote_path=new_path,
+            provisional_transfer_id=f"peer:{new_path}",
+            provider_uuid=None,
+            provider_state=ProviderTransferState.pending,
+        )
+    )
+    await db_session.commit()
+    adapter = ReconcileAdapter(
+        [{"id": UUID, "username": "peer", "filename": old_path}],
+        [[{"id": UUID, "username": "peer", "filename": old_path}], []],
+    )
+
+    assert await reconcile_terminal_slskd_intents(_factory(db_session), adapter) == 0
+    assert await cleanup_durable_slskd_transfers(_factory(db_session), adapter) == 0
+    await db_session.refresh(old_attempt)
+    assert old_attempt.provider_uuid is None
+    assert old_attempt.provider_state is ProviderTransferState.pending
+    assert old_attempt.terminal_at is None
+    assert old_attempt.provider_cleanup_state is CleanupState.pending
+    assert all(call[0] != "delete" for call in adapter.calls)
+
+
+@pytest.mark.parametrize("old_uses_windows_path", [True, False])
+async def test_terminal_intent_retains_normalized_replacement_during_uuid_checkpoint_race(
+    db_session: AsyncSession,
+    old_uses_windows_path: bool,
+) -> None:
+    windows_path = "Album" + chr(92) + "01 Song.flac"
+    unix_path = "Album/01 Song.flac"
+    old_path, new_path = (
+        (windows_path, unix_path) if old_uses_windows_path else (unix_path, windows_path)
+    )
+    old_attempt = await _terminal_intent(db_session, remote_path=old_path)
+
+    class SeparatorReplacementAdapter(ReconcileAdapter):
+        async def match_provisional_transfer(
+            self, username: str, filename: str, *, force_refresh: bool = False
+        ) -> ProvisionalTransferMatch:
+            evidence = await super().match_provisional_transfer(
+                username, filename, force_refresh=force_refresh
+            )
+            async with _factory(db_session)() as db:
+                db.add(
+                    AcquisitionAttempt(
+                        job=Job(source="slskd", query="replacement"),
+                        provider="slskd",
+                        peer="peer",
+                        remote_path=new_path,
+                        provisional_transfer_id=f"peer:{new_path}",
+                        provider_uuid=None,
+                        provider_state=ProviderTransferState.pending,
+                    )
+                )
+                await db.commit()
+            return evidence
+
+    adapter = SeparatorReplacementAdapter(
+        [{"id": UUID, "username": "peer", "filename": old_path}],
+        [[{"id": UUID, "username": "peer", "filename": old_path}], []],
+    )
+
+    assert await reconcile_terminal_slskd_intents(_factory(db_session), adapter) == 0
+    assert await cleanup_durable_slskd_transfers(_factory(db_session), adapter) == 0
+    await db_session.refresh(old_attempt)
+    assert old_attempt.provider_uuid is None
+    assert old_attempt.provider_state is ProviderTransferState.pending
+    assert old_attempt.terminal_at is None
+    assert old_attempt.provider_cleanup_state is CleanupState.pending
     assert all(call[0] != "delete" for call in adapter.calls)
 
 
