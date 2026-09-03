@@ -20,6 +20,7 @@ os.environ.setdefault("SECRET_KEY", "test-secret")
 from app.database import Base
 from app.jobs import runner as job_runner
 from app.jobs.dispatcher import (
+    AcquisitionPermit,
     JobDispatcher,
     JobNotFoundError,
     JobNotRetryableError,
@@ -1096,6 +1097,27 @@ async def test_cancellation_during_inflight_finalizer_cannot_leak_capacity() -> 
     assert later_ran.is_set()
     assert dispatcher.active_jobs == 0
     assert dispatcher.inflight_jobs == 0
+
+
+async def test_cancellation_while_yield_waits_for_condition_lock_releases_exactly_once() -> None:
+    dispatcher = JobDispatcher(max_concurrent_jobs=1)
+    permit = AcquisitionPermit(dispatcher)
+    await permit.acquire()
+    await dispatcher._limit_condition.acquire()
+
+    yielding = asyncio.create_task(permit.yield_permit())
+    await asyncio.sleep(0)
+    yielding.cancel()
+    await asyncio.sleep(0)
+    assert dispatcher.active_jobs == 1
+
+    dispatcher._limit_condition.release()
+    with pytest.raises(asyncio.CancelledError):
+        await yielding
+
+    assert dispatcher.active_jobs == 0
+    await permit.release()
+    assert dispatcher.active_jobs == 0
 
 
 async def test_explicit_inflight_limit_stays_fixed_across_local_resize() -> None:
