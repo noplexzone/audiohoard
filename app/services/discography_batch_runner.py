@@ -749,13 +749,6 @@ class DiscographyBatchRunner:
                 item.active_count = 0
                 item.estimated_job_count = len(targets)
                 item.completed_at = now
-            elif not targets:
-                item.state = DiscographyBatchItemState.complete
-                item.reason_code = "verified_complete"
-                item.error_detail = None
-                item.active_count = 0
-                item.estimated_job_count = 0
-                item.completed_at = now
             elif root_job is not None and root_job.status in (
                 JobStatus.pending,
                 JobStatus.running,
@@ -766,6 +759,13 @@ class DiscographyBatchRunner:
                 item.active_count = 1
                 item.estimated_job_count = 0
                 item.completed_at = None
+            elif not targets:
+                item.state = DiscographyBatchItemState.complete
+                item.reason_code = "verified_complete"
+                item.error_detail = None
+                item.active_count = 0
+                item.estimated_job_count = 0
+                item.completed_at = now
             else:
                 attempted_track_ids = set(fallback_statuses) & targets
                 active = {

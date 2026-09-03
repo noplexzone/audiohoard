@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Keep discography batches active until their release-root job is terminal, even when file-backed projection becomes complete mid-run.
+- Let fenced acquisition progress checkpoints wait through ordinary SQLite writer contention instead of failing completed provider/import work after sub-second lock retries.
 - Expanded legacy low slskd search budgets to a provider-realistic five-minute minimum for durable acquisitions, preventing false `sources_exhausted` results while searches are still producing matches.
 - Fence terminal continuation spawning against parent retries and replacement release roots, atomically claim exact-track fallbacks, and release yielded acquisition permits safely under cancellation.
 - Honor the configured slskd source-search budget independently from the transfer download timeout so search capacity is explicit and predictable.

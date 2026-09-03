@@ -704,6 +704,105 @@ async def test_background_concurrent_claim_executes_provider_once(
     await engine.dispose()
 
 
+async def test_progress_checkpoint_survives_a_real_sqlite_writer_lock(tmp_path) -> None:
+    database_path = tmp_path / "progress-lock.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    token = "checkpoint-owner"
+    async with factory() as session:
+        job = Job(
+            source="slskd",
+            query="locked progress",
+            status=JobStatus.running,
+            execution_token=token,
+        )
+        session.add(job)
+        await session.commit()
+        job_id = job.id
+
+    lock = sqlite3.connect(database_path, timeout=0.1)
+    lock.execute("BEGIN IMMEDIATE")
+
+    async def release_lock() -> None:
+        await asyncio.sleep(3.0)
+        lock.rollback()
+        lock.close()
+
+    release = asyncio.create_task(release_lock())
+    try:
+        async with factory() as session:
+            job = await session.get(Job, job_id)
+            assert job is not None
+            attempt = AcquisitionAttempt(
+                job_id=job_id,
+                provider="slskd",
+                outcome="selected",
+            )
+            session.add(attempt)
+            job.result_json = json.dumps({"checkpoint": "selected"})
+            await runner._commit_job_progress(session, job, token)
+        await release
+    finally:
+        if not release.done():
+            await release
+
+    async with factory() as observer:
+        persisted = await observer.get(Job, job_id)
+        attempts = list(
+            (
+                await observer.scalars(
+                    select(AcquisitionAttempt).where(AcquisitionAttempt.job_id == job_id)
+                )
+            ).all()
+        )
+        assert persisted is not None
+        assert json.loads(persisted.result_json or "{}")["checkpoint"] == "selected"
+        assert len(attempts) == 1
+        assert attempts[0].outcome == "selected"
+    await engine.dispose()
+
+
+async def test_progress_checkpoint_cancellation_interrupts_sqlite_busy_wait(tmp_path) -> None:
+    database_path = tmp_path / "progress-lock-cancel.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    token = "checkpoint-owner"
+    async with factory() as session:
+        job = Job(
+            source="slskd",
+            query="cancel locked progress",
+            status=JobStatus.running,
+            execution_token=token,
+        )
+        session.add(job)
+        await session.commit()
+        job_id = job.id
+
+    lock = sqlite3.connect(database_path, timeout=0.1)
+    lock.execute("BEGIN IMMEDIATE")
+    checkpoint: asyncio.Task[None] | None = None
+    try:
+        async with factory() as session:
+            job = await session.get(Job, job_id)
+            assert job is not None
+            job.result_json = json.dumps({"checkpoint": "selected"})
+            checkpoint = asyncio.create_task(runner._commit_job_progress(session, job, token))
+            await asyncio.sleep(0.1)
+            checkpoint.cancel()
+            await asyncio.sleep(1.0)
+            assert checkpoint.done(), "SQLite busy wait ignored checkpoint cancellation"
+    finally:
+        lock.rollback()
+        lock.close()
+        if checkpoint is not None:
+            await asyncio.gather(checkpoint, return_exceptions=True)
+    await engine.dispose()
+
+
 async def test_background_final_terminal_write_retries_without_repeating_work(
     db_session: AsyncSession, test_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
