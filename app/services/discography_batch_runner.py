@@ -412,26 +412,42 @@ class DiscographyBatchRunner:
             targets = set(projection.target_track_ids)
             runtime = await get_runtime_settings(db)
             max_attempts = runtime.max_partial_attempts
-            repair_requests: list[tuple[int, list[int]]] = []
+            from app.jobs.runner import _ParentTerminalEvidence, _spawn_continuation_jobs
+
+            def terminal_evidence(job: Job) -> _ParentTerminalEvidence:
+                return _ParentTerminalEvidence(
+                    status=job.status,
+                    result_json=job.result_json,
+                    updated_at=job.updated_at,
+                    execution_token=job.execution_token,
+                )
+
+            repair_requests: list[tuple[int, list[int], _ParentTerminalEvidence]] = []
             root_targets = sorted(targets - set(fallback_jobs))
             if root_targets and root_job.partial_attempt < max_attempts:
-                repair_requests.append((root_job.id, root_targets))
+                repair_requests.append((root_job.id, root_targets, terminal_evidence(root_job)))
             for track_id, fallback_job in sorted(fallback_jobs.items()):
                 if (
                     track_id in targets
                     and fallback_job.status == JobStatus.partial
                     and fallback_job.partial_attempt < max_attempts
                 ):
-                    repair_requests.append((fallback_job.id, [track_id]))
+                    repair_requests.append(
+                        (fallback_job.id, [track_id], terminal_evidence(fallback_job))
+                    )
             if not repair_requests:
                 return ()
 
-            from app.jobs.runner import _spawn_continuation_jobs
-
             committed: list[int] = []
-            for parent_id, track_ids in repair_requests:
+            for parent_id, track_ids, evidence in repair_requests:
                 committed.extend(
-                    await _spawn_continuation_jobs(parent_id, track_ids, album.id, db)
+                    await _spawn_continuation_jobs(
+                        parent_id,
+                        track_ids,
+                        album.id,
+                        db,
+                        terminal_evidence=evidence,
+                    )
                 )
             return tuple(dict.fromkeys(committed))
 
