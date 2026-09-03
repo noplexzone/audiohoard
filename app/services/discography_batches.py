@@ -1096,10 +1096,7 @@ async def resume_discography_batch(
             if targets
             else set()
         )
-        if not targets:
-            item.state = DiscographyBatchItemState.complete
-            item.reason_code = "verified_complete"
-        elif release_root_status == JobStatus.pending or pending or pending_fallback_ids:
+        if release_root_status == JobStatus.pending or pending or pending_fallback_ids:
             # Re-notify durable pending work after pause without spending a retry generation.
             item.state = DiscographyBatchItemState.pending
             item.reason_code = "resume_pending_dispatch"
@@ -1107,6 +1104,9 @@ async def resume_discography_batch(
         elif release_root_status == JobStatus.running:
             item.state = DiscographyBatchItemState.waiting
             item.reason_code = "active_release_root"
+        elif not targets:
+            item.state = DiscographyBatchItemState.complete
+            item.reason_code = "verified_complete"
         elif active:
             item.state = DiscographyBatchItemState.waiting
             item.reason_code = "active_jobs"

@@ -660,9 +660,12 @@ async def _commit_job_progress(
         heartbeat_stop.set()
     connection = await db.connection()
     with contextlib.suppress(Exception):
-        await connection.exec_driver_sql("PRAGMA busy_timeout=200")
+        # Retry in cancellable slices. A single long SQLite busy handler blocks the
+        # aiosqlite worker (including rollback/close) after asyncio cancellation.
+        await connection.exec_driver_sql("PRAGMA busy_timeout=500")
+    deadline = asyncio.get_running_loop().time() + 30.0
     try:
-        for attempt in range(4):
+        while True:
             try:
                 await _prove_execution_lease(db, job.id, expected_token)
                 if job.status in _TERMINAL_JOB_STATUSES:
@@ -677,10 +680,10 @@ async def _commit_job_progress(
                 # The no-op fence runs before autoflush. If SQLite leaves this
                 # transaction usable, retry only that database boundary and retain
                 # every pending sibling mutation. Never replay execution/provider I/O.
-                if not db.is_active or attempt == 3:
+                if not db.is_active or asyncio.get_running_loop().time() >= deadline:
                     await db.rollback()
                     raise
-                await asyncio.sleep(0.25 * (attempt + 1))
+                await asyncio.sleep(0.1)
     finally:
         with contextlib.suppress(Exception):
             await connection.exec_driver_sql("PRAGMA busy_timeout=30000")

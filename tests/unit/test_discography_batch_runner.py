@@ -125,6 +125,76 @@ async def test_runner_materializes_one_release_root_and_second_pass_is_idempoten
     await engine.dispose()
 
 
+async def test_verified_projection_waits_for_active_release_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'active-root.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    batch_id, item_id = await _seed(factory)
+    runner = DiscographyBatchRunner(
+        factory,
+        dispatcher=lambda _job_id: None,
+        quality_profile=PROFILE,
+    )
+    assert await runner.run_once()
+
+    async with factory() as db:
+        item = await db.get(DiscographyBatchItem, item_id)
+        root = await db.scalar(select(Job))
+        assert item is not None and root is not None
+        root.status = JobStatus.running
+        await db.commit()
+
+    async def project_complete(_db, album_ids, **_kwargs):
+        return {album_id: SimpleNamespace(target_track_ids=()) for album_id in album_ids}
+
+    monkeypatch.setattr(
+        discography_batch_runner,
+        "project_catalog_album_queue_targets",
+        project_complete,
+    )
+    monkeypatch.setattr(
+        discography_batches,
+        "project_catalog_album_queue_targets",
+        project_complete,
+    )
+    await runner.run_once()
+
+    async with factory() as db:
+        batch = await db.get(DiscographyBatch, batch_id)
+        item = await db.get(DiscographyBatchItem, item_id)
+        assert batch is not None and batch.state == DiscographyBatchState.running
+        assert item is not None and item.state == DiscographyBatchItemState.waiting
+        assert item.reason_code == "active_release_root"
+        assert item.active_count == 1
+        assert item.completed_at is None
+
+        await pause_discography_batch(db, batch_id)
+        await resume_discography_batch(db, batch_id, quality_profile=PROFILE)
+        await db.refresh(item)
+        assert item.state == DiscographyBatchItemState.waiting
+        assert item.reason_code == "active_release_root"
+        assert item.completed_at is None
+
+        root = await db.scalar(select(Job))
+        assert root is not None
+        root.status = JobStatus.done
+        await db.commit()
+
+    assert await runner.run_once()
+    async with factory() as db:
+        batch = await db.get(DiscographyBatch, batch_id)
+        item = await db.get(DiscographyBatchItem, item_id)
+        assert batch is not None and batch.state == DiscographyBatchState.completed
+        assert item is not None and item.state == DiscographyBatchItemState.complete
+        assert item.reason_code == "verified_complete"
+    await engine.dispose()
+
+
 async def test_terminal_link_without_verified_artifact_fails_item(tmp_path: Path) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'terminal.db'}")
     async with engine.begin() as connection:
