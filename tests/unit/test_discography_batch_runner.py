@@ -797,6 +797,57 @@ async def test_partial_release_root_repairs_missing_fallback_materialization(
     await engine.dispose()
 
 
+async def test_partial_release_repair_rejects_parent_retried_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'stale-repair.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    _batch_id, item_id = await _seed(factory)
+    dispatched: list[int] = []
+    runner = DiscographyBatchRunner(factory, dispatcher=dispatched.append, quality_profile=PROFILE)
+
+    assert await runner.run_once()
+    async with factory() as db:
+        root = await db.scalar(select(Job))
+        assert root is not None and root.catalog_album_id is not None
+        track_id = await db.scalar(
+            select(CatalogAlbumTrack.id).where(CatalogAlbumTrack.album_id == root.catalog_album_id)
+        )
+        assert track_id is not None
+        root.status = JobStatus.partial
+        root.result_json = json.dumps({"missing_catalog_track_ids": [track_id]})
+        await db.commit()
+        root_id = root.id
+
+    from app.jobs import runner as job_runner
+
+    original_spawn = job_runner._spawn_continuation_jobs
+
+    async def retry_before_spawn(*args, **kwargs):
+        async with factory() as retry:
+            parent = await retry.get(Job, root_id)
+            assert parent is not None
+            parent.status = JobStatus.pending
+            parent.result_json = None
+            parent.updated_at = datetime.now(UTC)
+            await retry.commit()
+        return await original_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(job_runner, "_spawn_continuation_jobs", retry_before_spawn)
+
+    assert not await runner.run_once()
+    async with factory() as db:
+        jobs = list((await db.scalars(select(Job).order_by(Job.id))).all())
+        parent = await db.get(Job, root_id)
+        assert parent is not None and parent.status == JobStatus.pending
+        assert len(jobs) == 1
+        assert await db.scalar(select(func.count(DiscographyBatchItemJob.id))) == 1
+    assert dispatched == [root_id]
+    await engine.dispose()
+
+
 async def test_active_root_with_fallback_link_fails_closed(tmp_path: Path) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'mixed-owners.db'}")
     async with engine.begin() as connection:

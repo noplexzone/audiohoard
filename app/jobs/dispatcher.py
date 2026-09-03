@@ -71,8 +71,17 @@ class AcquisitionPermit:
     async def yield_permit(self) -> None:
         if not self._held:
             return
+        release_task = asyncio.create_task(self._dispatcher._release_slot())
+        deferred_cancellation: asyncio.CancelledError | None = None
+        while not release_task.done():
+            try:
+                await asyncio.shield(release_task)
+            except asyncio.CancelledError as exc:
+                deferred_cancellation = exc
+        release_task.result()
         self._held = False
-        await self._dispatcher._release_slot()
+        if deferred_cancellation is not None:
+            raise deferred_cancellation
 
     async def release(self) -> None:
         await self.yield_permit()

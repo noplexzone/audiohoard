@@ -9,7 +9,7 @@ import logging
 import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import ParseResult, urlparse
@@ -43,6 +43,10 @@ from app.models.acquisition_attempt import (
     CleanupState,
     ProviderTransferState,
     RetentionDisposition,
+)
+from app.models.acquisition_claim import (
+    AcquisitionDispatchClaim,
+    CatalogReleaseAcquisitionClaim,
 )
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack
 from app.models.discography_batch import (
@@ -102,10 +106,19 @@ class ExecutionLeaseLost(Exception):
 
 
 @dataclass(frozen=True)
+class _ParentTerminalEvidence:
+    status: JobStatus
+    result_json: str | None
+    updated_at: datetime
+    execution_token: str | None
+
+
+@dataclass(frozen=True)
 class _ContinuationRequest:
     parent_job_id: int
     catalog_album_id: int
     missing_catalog_track_ids: tuple[int, ...]
+    terminal_evidence: _ParentTerminalEvidence | None = None
 
 
 # Compound disc-track prefix: "2-01 - Title", "cd2-01 - Title", "2.01. Title"
@@ -788,6 +801,7 @@ async def run_job(
                 list(continuation.missing_catalog_track_ids),
                 continuation.catalog_album_id,
                 db,
+                terminal_evidence=continuation.terminal_evidence,
             )
             await _dispatch_continuation_jobs(direct_continuation_ids or [], db=db)
         return
@@ -908,6 +922,7 @@ async def run_job(
                     list(continuation.missing_catalog_track_ids),
                     continuation.catalog_album_id,
                     session,
+                    terminal_evidence=continuation.terminal_evidence,
                 )
         await _dispatch_continuation_jobs(continuation_ids)
 
@@ -1624,6 +1639,16 @@ async def _run_job_in_session(
         await persist_progress()
     else:
         await db.flush()
+    if continuation_request is not None:
+        continuation_request = replace(
+            continuation_request,
+            terminal_evidence=_ParentTerminalEvidence(
+                status=job.status,
+                result_json=job.result_json,
+                updated_at=job.updated_at,
+                execution_token=expected_token,
+            ),
+        )
     return continuation_request
 
 
@@ -3114,11 +3139,20 @@ async def _cancelled_batch_owns_job_ancestor(job_id: int, db: AsyncSession) -> b
     return blocked is not None
 
 
+def _same_terminal_generation(left: datetime, right: datetime) -> bool:
+    def as_utc(value: datetime) -> datetime:
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+    return as_utc(left) == as_utc(right)
+
+
 async def _spawn_continuation_jobs(
     parent_job_id: int,
     missing_catalog_track_ids: list[int],
     catalog_album_id: int,
     db: AsyncSession,
+    *,
+    terminal_evidence: _ParentTerminalEvidence | None = None,
 ) -> list[int]:
     """Commit idempotent targeted continuations with rollback-safe retries."""
     requested_track_ids = tuple(dict.fromkeys(missing_catalog_track_ids))
@@ -3144,12 +3178,64 @@ async def _spawn_continuation_jobs(
             committed_ids.clear()
             await db.rollback()
             return
+        if terminal_evidence is not None and (
+            parent_job.status != terminal_evidence.status
+            or parent_job.result_json != terminal_evidence.result_json
+            or not _same_terminal_generation(parent_job.updated_at, terminal_evidence.updated_at)
+            or parent_job.execution_token is not None
+        ):
+            committed_ids.clear()
+            await db.rollback()
+            return
 
         if parent_job.catalog_album_id != catalog_album_id:
             raise ValueError("continuation parent owns a different catalog album")
         parent_track_id = parent_job.catalog_track_id
         if parent_track_id is not None and requested_track_ids != (parent_track_id,):
             raise ValueError("exact-track continuation requested a different catalog track")
+        tracks_by_id = {track.id: track for track in catalog_album.tracks}
+        manifest_ids = set(tracks_by_id)
+        exact_claims_by_track: dict[int, tuple[AcquisitionDispatchClaim, Job]] = {}
+        exact_claim_rows = (
+            await db.execute(
+                select(AcquisitionDispatchClaim, Job)
+                .outerjoin(Job, Job.id == AcquisitionDispatchClaim.job_id)
+                .where(AcquisitionDispatchClaim.catalog_album_id == catalog_album_id)
+            )
+        ).all()
+        for exact_claim, exact_owner in exact_claim_rows:
+            if (
+                exact_owner is None
+                or exact_owner.catalog_album_id != catalog_album_id
+                or exact_owner.catalog_track_id != exact_claim.catalog_track_id
+                or exact_claim.catalog_track_id not in manifest_ids
+            ):
+                raise ValueError("catalog acquisition claim does not own the exact track")
+            exact_claims_by_track[exact_claim.catalog_track_id] = (exact_claim, exact_owner)
+
+        release_claim = (
+            await db.execute(
+                select(CatalogReleaseAcquisitionClaim, Job)
+                .outerjoin(Job, Job.id == CatalogReleaseAcquisitionClaim.job_id)
+                .where(CatalogReleaseAcquisitionClaim.catalog_album_id == catalog_album_id)
+            )
+        ).one_or_none()
+        if release_claim is not None:
+            _claim, release_owner = release_claim
+            if (
+                release_owner is None
+                or release_owner.catalog_album_id != catalog_album_id
+                or release_owner.catalog_track_id is not None
+            ):
+                raise ValueError("catalog release claim does not own an exact release root")
+            if release_owner.id != parent_job_id and release_owner.status in {
+                JobStatus.pending,
+                JobStatus.running,
+            }:
+                committed_ids.clear()
+                await db.rollback()
+                return
+
         expected_role = (
             DiscographyBatchJobRole.release_root
             if parent_track_id is None
@@ -3199,27 +3285,36 @@ async def _spawn_continuation_jobs(
             await db.rollback()
             return
 
-        tracks_by_id = {track.id: track for track in catalog_album.tracks}
         next_attempt = parent_job.partial_attempt + 1
         for track_id in requested_track_ids:
             catalog_track = tracks_by_id.get(track_id)
             if catalog_track is None:
                 raise ValueError("continuation track does not belong to the release root")
-            continuation = await db.scalar(
-                select(Job)
-                .where(
-                    Job.catalog_album_id == catalog_album_id,
-                    Job.catalog_track_id == track_id,
-                    (
+            claim_entry = exact_claims_by_track.get(track_id)
+            claim_row: AcquisitionDispatchClaim | None = None
+            claim_owner: Job | None = None
+            if claim_entry is not None:
+                claim_row, claim_owner = claim_entry
+            continuation = (
+                claim_owner
+                if claim_owner is not None
+                and claim_owner.status in {JobStatus.pending, JobStatus.running}
+                else await db.scalar(
+                    select(Job)
+                    .where(
+                        Job.catalog_album_id == catalog_album_id,
+                        Job.catalog_track_id == track_id,
                         (
-                            (Job.parent_job_id == parent_job_id)
-                            & (Job.partial_attempt == next_attempt)
-                        )
-                        | Job.status.in_([JobStatus.pending, JobStatus.running])
-                    ),
+                            (
+                                (Job.parent_job_id == parent_job_id)
+                                & (Job.partial_attempt == next_attempt)
+                            )
+                            | Job.status.in_([JobStatus.pending, JobStatus.running])
+                        ),
+                    )
+                    .order_by(Job.id)
+                    .limit(1)
                 )
-                .order_by(Job.id)
-                .limit(1)
             )
             created = continuation is None
             if continuation is None:
@@ -3245,6 +3340,21 @@ async def _spawn_continuation_jobs(
                 or continuation.catalog_track_id != track_id
             ):
                 raise ValueError("continuation job does not own the exact requested track")
+            if claim_row is None:
+                db.add(
+                    AcquisitionDispatchClaim(
+                        catalog_album_id=catalog_album_id,
+                        catalog_track_id=track_id,
+                        job_id=continuation.id,
+                    )
+                )
+            elif claim_row.job_id != continuation.id:
+                if claim_owner is not None and claim_owner.status in {
+                    JobStatus.pending,
+                    JobStatus.running,
+                }:
+                    raise ValueError("active exact-track claim has a conflicting continuation")
+                claim_row.job_id = continuation.id
             for context_link, item in active_contexts:
                 existing_link = await db.scalar(
                     select(DiscographyBatchItemJob).where(

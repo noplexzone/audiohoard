@@ -4,17 +4,20 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.database import Base
 from app.jobs.runner import (
     _catalog_disc_total,
     _catalog_track_for_result,
     _fetch_slskd_album_results,
+    _ParentTerminalEvidence,
     _spawn_continuation_jobs,
 )
 from app.metadata.filename_parse import parsed_position_evidence
+from app.models.acquisition_claim import AcquisitionDispatchClaim
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.discography_batch import (
     DiscographyBatch,
@@ -815,6 +818,57 @@ async def test_stale_release_root_generation_cannot_spawn_orphan_fallback(
 
     assert continuation_ids == []
     assert await db_session.scalar(select(Job.id).where(Job.parent_job_id == root_id)) is None
+
+
+async def test_parent_retry_between_terminal_commit_and_spawn_creates_nothing(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'parent-retry.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as seed:
+            artist = CatalogArtist(name="Artist")
+            album = CatalogAlbum(artist=artist, title="Album", track_count=1)
+            track = CatalogAlbumTrack(album=album, position=1, disc=1, title="One")
+            parent = Job(
+                source="priority",
+                query="Artist Album",
+                status=JobStatus.partial,
+                result_json='{"missing_catalog_track_ids": [1]}',
+                catalog_album=album,
+            )
+            seed.add_all([artist, album, track, parent])
+            await seed.commit()
+            parent_id, album_id, track_id = parent.id, album.id, track.id
+            evidence = _ParentTerminalEvidence(
+                status=parent.status,
+                result_json=parent.result_json,
+                updated_at=parent.updated_at,
+                execution_token="finished-generation",
+            )
+
+        async with factory() as retry:
+            retried = await retry.get(Job, parent_id)
+            assert retried is not None
+            retried.status = JobStatus.pending
+            retried.result_json = None
+            await retry.commit()
+
+        async with factory() as stale:
+            continuation_ids = await _spawn_continuation_jobs(
+                parent_id,
+                [track_id],
+                album_id,
+                stale,
+                terminal_evidence=evidence,
+            )
+
+        assert continuation_ids == []
+        async with factory() as observer:
+            assert await observer.scalar(select(func.count(Job.id))) == 1
+            assert await observer.scalar(select(func.count(AcquisitionDispatchClaim.id))) == 0
+    finally:
+        await engine.dispose()
 
 
 async def test_cancelling_shared_root_creator_transfers_ownership_to_active_observer(

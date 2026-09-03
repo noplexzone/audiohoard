@@ -11,6 +11,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.database import Base
+from app.jobs.runner import _spawn_continuation_jobs
 from app.models.acquisition_claim import AcquisitionDispatchClaim, CatalogReleaseAcquisitionClaim
 from app.models.catalog_entities import CatalogAlbum, CatalogAlbumTrack, CatalogArtist
 from app.models.discography_batch import (
@@ -478,6 +479,94 @@ async def test_root_and_direct_track_admission_race_never_overlap(tmp_path: Path
         else:
             assert root.status == ReleaseRootAdmissionStatus.waiting_for_tracks
             assert len(tracks.created_job_ids) == 2
+
+
+@pytest.mark.parametrize("attempt", range(8))
+async def test_replacement_root_and_terminal_continuation_race_never_overlap(
+    tmp_path: Path, attempt: int
+) -> None:
+    async with _database(tmp_path / f"root-continuation-race-{attempt}.db") as factory:
+        async with factory() as seed:
+            album, items = await _seed(seed, item_count=2, track_count=1)
+            root = Job(
+                source="priority",
+                query="Release Artist Atomic Album",
+                status=JobStatus.partial,
+                result_json='{"missing_catalog_track_ids": [1]}',
+                catalog_album=album,
+            )
+            items[0].state = DiscographyBatchItemState.waiting
+            seed.add(root)
+            await seed.flush()
+            seed.add_all(
+                [
+                    CatalogReleaseAcquisitionClaim(catalog_album_id=album.id, job_id=root.id),
+                    DiscographyBatchItemJob(
+                        item_id=items[0].id,
+                        job_id=root.id,
+                        generation=items[0].execution_generation,
+                        catalog_track_id=None,
+                        ownership=DiscographyJobOwnership.created,
+                        role=DiscographyBatchJobRole.release_root,
+                    ),
+                ]
+            )
+            await seed.commit()
+            root_id = root.id
+            album_id = album.id
+            track_id = album.tracks[0].id
+            replacement_item_id = items[1].id
+
+        gate = asyncio.Event()
+        ready_lock = asyncio.Lock()
+        ready = 0
+
+        async def rendezvous() -> None:
+            nonlocal ready
+            async with ready_lock:
+                ready += 1
+                if ready == 2:
+                    gate.set()
+            await gate.wait()
+
+        async def spawn_fallback() -> list[int]:
+            async with factory() as db:
+                await rendezvous()
+                return await _spawn_continuation_jobs(root_id, [track_id], album_id, db)
+
+        async def admit_replacement():
+            async with factory() as db:
+                await rendezvous()
+                return await _admit(db, replacement_item_id)
+
+        fallback_ids, root_outcome = await asyncio.gather(spawn_fallback(), admit_replacement())
+        async with factory() as observer:
+            active_roots = int(
+                await observer.scalar(
+                    select(func.count(Job.id)).where(
+                        Job.catalog_album_id == album_id,
+                        Job.catalog_track_id.is_(None),
+                        Job.status.in_((JobStatus.pending, JobStatus.running)),
+                    )
+                )
+                or 0
+            )
+            active_tracks = int(
+                await observer.scalar(
+                    select(func.count(Job.id)).where(
+                        Job.catalog_album_id == album_id,
+                        Job.catalog_track_id == track_id,
+                        Job.status.in_((JobStatus.pending, JobStatus.running)),
+                    )
+                )
+                or 0
+            )
+            track_claims = int(
+                await observer.scalar(select(func.count(AcquisitionDispatchClaim.id))) or 0
+            )
+
+        assert bool(fallback_ids) != (root_outcome.status == ReleaseRootAdmissionStatus.created)
+        assert (active_roots, active_tracks, track_claims) in {(1, 0, 0), (0, 1, 1)}
 
 
 async def test_malformed_active_track_claim_fails_closed(tmp_path: Path) -> None:

@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Fence terminal continuation spawning against parent retries and replacement release roots, atomically claim exact-track fallbacks, and release yielded acquisition permits safely under cancellation.
 - Honor the configured slskd source-search budget independently from the transfer download timeout so search capacity is explicit and predictable.
 - Yield local acquisition capacity while slskd explicitly queues a transfer, then reacquire it before active supervision, completion, or non-cancellation failure handling.
 - Reconcile terminal jobs whose exact durable slskd attempts remain queued or downloading through fresh canonical UUID, peer, and normalized-path ownership checks before centralized provider cleanup.
