@@ -2137,7 +2137,7 @@ def _slskd_search_timeout_seconds(runtime: object | None) -> float:
     if runtime is None:
         return 300.0
     configured_budget = float(getattr(runtime, "source_search_budget_seconds", 300) or 300)
-    return min(900.0, max(3.0, configured_budget))
+    return min(900.0, max(300.0, configured_budget))
 
 
 def _source_adapter(source: str, cfg: Settings, runtime: object | None = None) -> SourceAdapter:

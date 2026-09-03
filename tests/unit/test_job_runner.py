@@ -51,18 +51,22 @@ async def _create_job(db_session: AsyncSession, source: str = "youtube") -> Job:
     return job
 
 
-@pytest.mark.parametrize("budget", [30, 90, 900])
-def test_slskd_search_timeout_uses_configured_budget_independent_of_download_timeout(
-    budget: int,
+@pytest.mark.parametrize(
+    ("configured_budget", "expected_timeout"),
+    [(30, 300), (90, 300), (300, 300), (900, 900)],
+)
+def test_slskd_search_timeout_expands_legacy_low_budgets_independent_of_download_timeout(
+    configured_budget: int,
+    expected_timeout: int,
 ) -> None:
     from types import SimpleNamespace
 
     runtime = SimpleNamespace(
-        source_search_budget_seconds=budget,
-        slskd_download_timeout_seconds=600 if budget != 90 else 1800,
+        source_search_budget_seconds=configured_budget,
+        slskd_download_timeout_seconds=600 if configured_budget != 90 else 1800,
     )
 
-    assert runner._slskd_search_timeout_seconds(runtime) == float(budget)
+    assert runner._slskd_search_timeout_seconds(runtime) == float(expected_timeout)
 
 
 def test_targeted_query_variants_normalize_and_simplify_titles() -> None:
